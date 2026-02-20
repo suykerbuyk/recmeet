@@ -1,0 +1,13 @@
+[project]
+name = "recmeet"
+version = "0.1.0"
+description = "Record, transcribe, and summarize meetings"
+requires-python = ">=3.10"
+dependencies = [
+    "faster-whisper>=1.0.0",
+    "requests>=2.28.0",
+    "python-dotenv>=1.0.0",
+]
+
+[project.scripts]
+recmeet = "recmeet:main"
