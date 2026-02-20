@@ -17,6 +17,12 @@ import requests
 from dotenv import load_dotenv
 
 API_URL = "https://api.x.ai/v1/chat/completions"
+
+
+class AudioValidationError(Exception):
+    """Raised when audio file validation fails."""
+
+
 DEFAULT_DEVICE_PATTERN = r"bd.h200|00:05:30:00:05:4E"
 SUMMARY_SYSTEM_PROMPT = (
     "You are a precise meeting summarizer. Produce a well-structured Markdown summary. "
@@ -66,8 +72,8 @@ def notify(title, body=""):
         pass
 
 
-def detect_device(pattern):
-    """Auto-detect a PipeWire/PulseAudio source matching the given regex pattern."""
+def _list_pactl_sources():
+    """Return a list of all PipeWire/PulseAudio source names."""
     try:
         result = subprocess.run(
             ["pactl", "list", "short", "sources"],
@@ -82,22 +88,33 @@ def detect_device(pattern):
         print(f"Error running pactl: {e.stderr.strip()}", file=sys.stderr)
         sys.exit(1)
 
-    regex = re.compile(pattern, re.IGNORECASE)
     sources = []
     for line in result.stdout.strip().splitlines():
         fields = line.split("\t")
         if len(fields) >= 2:
-            name = fields[1]
-            sources.append(name)
-            if regex.search(name):
-                return name
+            sources.append(fields[1])
+    return sources
 
-    print(f"Error: No source matching pattern '{pattern}' found.", file=sys.stderr)
-    print("\nAvailable sources:", file=sys.stderr)
-    for s in sources:
-        print(f"  {s}", file=sys.stderr)
-    print(f"\nUse --source <name> to specify one explicitly.", file=sys.stderr)
-    sys.exit(1)
+
+def detect_sources(pattern):
+    """Auto-detect mic and monitor sources matching the given regex pattern.
+
+    Returns {"mic": name|None, "monitor": name|None, "all_sources": [...]}.
+    Sources whose names end in .monitor are classified as monitors; others as mic inputs.
+    """
+    all_sources = _list_pactl_sources()
+    regex = re.compile(pattern, re.IGNORECASE)
+
+    mic = None
+    monitor = None
+    for name in all_sources:
+        if regex.search(name):
+            if name.endswith(".monitor"):
+                monitor = monitor or name
+            else:
+                mic = mic or name
+
+    return {"mic": mic, "monitor": monitor, "all_sources": all_sources}
 
 
 def find_recorder():
@@ -124,13 +141,11 @@ def display_elapsed(stop_event):
     print("\r" + " " * 30 + "\r", end="", flush=True, file=sys.stderr)
 
 
-def record_audio(source, output_path):
-    """Record audio from the given PipeWire/PulseAudio source until Ctrl+C."""
-    recorder = find_recorder()
+def _build_record_cmd(recorder, source, output_path):
+    """Build a recorder command list for the given source and output path."""
     output_str = str(output_path)
-
     if recorder == "pw-record":
-        cmd = [
+        return [
             "pw-record",
             "--target", source,
             "--format", "s16",
@@ -138,16 +153,21 @@ def record_audio(source, output_path):
             "--channels", "1",
             output_str,
         ]
-    else:
-        cmd = [
-            "parecord",
-            "--device", source,
-            "--file-format=wav",
-            "--format=s16le",
-            "--rate=16000",
-            "--channels=1",
-            output_str,
-        ]
+    return [
+        "parecord",
+        "--device", source,
+        "--file-format=wav",
+        "--format=s16le",
+        "--rate=16000",
+        "--channels=1",
+        output_str,
+    ]
+
+
+def record_audio(source, output_path):
+    """Record audio from the given PipeWire/PulseAudio source until Ctrl+C."""
+    recorder = find_recorder()
+    cmd = _build_record_cmd(recorder, source, output_path)
 
     print(f"Recording from: {source}")
     print(f"Using: {recorder}")
@@ -172,16 +192,94 @@ def record_audio(source, output_path):
     return output_path
 
 
-def validate_audio(path, min_duration=1.0):
+def record_dual_audio(mic_source, monitor_source, mic_path, monitor_path):
+    """Record from mic and monitor sources in parallel until Ctrl+C.
+
+    Sends SIGINT to both processes on Ctrl+C, with SIGKILL fallback after 5s.
+    """
+    recorder = find_recorder()
+    mic_cmd = _build_record_cmd(recorder, mic_source, mic_path)
+    monitor_cmd = _build_record_cmd(recorder, monitor_source, monitor_path)
+
+    print(f"Recording mic:     {mic_source}")
+    print(f"Recording monitor: {monitor_source}")
+    print(f"Using: {recorder}")
+    print("Press Ctrl+C to stop.\n")
+
+    mic_proc = subprocess.Popen(mic_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    monitor_proc = subprocess.Popen(monitor_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+
+    stop_event = threading.Event()
+    timer_thread = threading.Thread(target=display_elapsed, args=(stop_event,), daemon=True)
+    timer_thread.start()
+
+    def _stop_proc(proc):
+        """Send SIGINT, wait up to 5s, then SIGKILL if still alive."""
+        try:
+            proc.send_signal(signal.SIGINT)
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+
+    try:
+        # Wait for either process to exit (shouldn't happen before Ctrl+C)
+        while mic_proc.poll() is None and monitor_proc.poll() is None:
+            time.sleep(0.1)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        _stop_proc(mic_proc)
+        _stop_proc(monitor_proc)
+        stop_event.set()
+        timer_thread.join(timeout=2)
+
+    print("Recording stopped.")
+
+
+def mix_audio(mic_path, monitor_path, output_path):
+    """Mix mic and monitor WAV files into a single file using ffmpeg.
+
+    Falls back to copying the mic recording if ffmpeg fails.
+    """
+    import shutil
+
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", str(mic_path),
+        "-i", str(monitor_path),
+        "-filter_complex", "amix=inputs=2:duration=longest:normalize=0",
+        "-ar", "16000",
+        "-ac", "1",
+        str(output_path),
+    ]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        if result.returncode == 0:
+            print(f"Mixed audio saved: {output_path}")
+            return
+        print(f"Warning: ffmpeg mix failed (exit {result.returncode}): {result.stderr.strip()}", file=sys.stderr)
+    except FileNotFoundError:
+        print("Warning: ffmpeg not found, cannot mix audio streams.", file=sys.stderr)
+    except subprocess.TimeoutExpired:
+        print("Warning: ffmpeg timed out while mixing audio.", file=sys.stderr)
+
+    # Fallback: use mic recording as the combined audio
+    print("Falling back to mic-only audio for transcription.", file=sys.stderr)
+    shutil.copy2(str(mic_path), str(output_path))
+
+
+def validate_audio(path, min_duration=1.0, label="Audio"):
     """Validate that the audio file exists and has a minimum duration.
 
     Tries Python's wave module first. If the WAV header is truncated (common when
     pw-record is interrupted), falls back to ffprobe, then to a raw file-size estimate.
+
+    Raises AudioValidationError on failure.
     """
     path = Path(path)
     if not path.exists() or path.stat().st_size == 0:
-        print("Error: Audio file is missing or empty.", file=sys.stderr)
-        sys.exit(1)
+        raise AudioValidationError(f"{label} file is missing or empty.")
 
     # Try standard wave module
     try:
@@ -191,9 +289,8 @@ def validate_audio(path, min_duration=1.0):
             if rate > 0 and frames > 0:
                 duration = frames / rate
                 if duration < min_duration:
-                    print(f"Error: Recording too short ({duration:.1f}s).", file=sys.stderr)
-                    sys.exit(1)
-                print(f"Audio validated: {duration:.1f}s, {rate}Hz")
+                    raise AudioValidationError(f"{label} too short ({duration:.1f}s).")
+                print(f"{label} validated: {duration:.1f}s, {rate}Hz")
                 return duration
     except wave.Error:
         pass
@@ -208,9 +305,8 @@ def validate_audio(path, min_duration=1.0):
         if result.returncode == 0 and result.stdout.strip():
             duration = float(result.stdout.strip())
             if duration < min_duration:
-                print(f"Error: Recording too short ({duration:.1f}s).", file=sys.stderr)
-                sys.exit(1)
-            print(f"Audio validated (ffprobe): {duration:.1f}s")
+                raise AudioValidationError(f"{label} too short ({duration:.1f}s).")
+            print(f"{label} validated (ffprobe): {duration:.1f}s")
             return duration
     except (FileNotFoundError, subprocess.TimeoutExpired, ValueError):
         pass
@@ -219,13 +315,11 @@ def validate_audio(path, min_duration=1.0):
     # WAV header is 44 bytes
     data_size = path.stat().st_size - 44
     if data_size <= 0:
-        print("Error: Audio file contains no data.", file=sys.stderr)
-        sys.exit(1)
+        raise AudioValidationError(f"{label} file contains no data.")
     duration = data_size / 32000
     if duration < min_duration:
-        print(f"Error: Recording too short (~{duration:.1f}s).", file=sys.stderr)
-        sys.exit(1)
-    print(f"Audio validated (estimated): ~{duration:.1f}s")
+        raise AudioValidationError(f"{label} too short (~{duration:.1f}s).")
+    print(f"{label} validated (estimated): ~{duration:.1f}s")
     return duration
 
 
@@ -314,13 +408,46 @@ def parse_args():
         prog="recmeet",
         description="Record, transcribe, and summarize meetings.",
     )
-    parser.add_argument("--source", help="PipeWire/PulseAudio source (auto-detected if omitted)")
+    parser.add_argument("--source", help="PipeWire/PulseAudio mic source (auto-detected if omitted)")
+    parser.add_argument("--monitor", nargs="?", const="auto", default=None,
+                        help="Monitor/speaker source (auto-detected if omitted; 'default' for system default output)")
+    parser.add_argument("--mic-only", action="store_true", help="Record mic only (skip monitor capture)")
     parser.add_argument("--model", default="base", help="Whisper model: tiny/base/small/medium/large-v3 (default: base)")
     parser.add_argument("--output-dir", default="./meetings", help="Base directory for outputs (default: ./meetings)")
     parser.add_argument("--api-key", help="xAI API key (default: from env/dotenv)")
     parser.add_argument("--no-summary", action="store_true", help="Skip Grok summary (record + transcribe only)")
     parser.add_argument("--device-pattern", default=DEFAULT_DEVICE_PATTERN, help=f"Regex for device auto-detection (default: {DEFAULT_DEVICE_PATTERN})")
     return parser.parse_args()
+
+
+def _resolve_monitor_source(args, detected=None):
+    """Determine the monitor source based on CLI flags and auto-detection.
+
+    If `detected` is provided (from a prior detect_sources call), reuses it
+    to avoid a redundant pactl query.
+
+    Returns the monitor source name, or None for mic-only mode.
+    """
+    if args.mic_only:
+        return None
+
+    # Explicit --monitor with a specific source name
+    if args.monitor and args.monitor not in ("auto", "default"):
+        return args.monitor
+
+    # --monitor default: use the system default output's monitor
+    if args.monitor == "default":
+        all_sources = detected["all_sources"] if detected else _list_pactl_sources()
+        for name in all_sources:
+            if name.endswith(".monitor"):
+                return name
+        print("Warning: No monitor source found. Falling back to mic-only.", file=sys.stderr)
+        return None
+
+    # Auto-detect (default behavior, or --monitor with no value)
+    if not detected:
+        detected = detect_sources(args.device_pattern)
+    return detected["monitor"]
 
 
 def main():
@@ -334,9 +461,31 @@ def main():
         print("Use --no-summary to skip summarization.", file=sys.stderr)
         sys.exit(1)
 
-    # Detect audio source
-    source = args.source or detect_device(args.device_pattern)
-    print(f"Audio source: {source}")
+    # Detect audio sources
+    detected = None
+    if args.source:
+        mic_source = args.source
+    else:
+        detected = detect_sources(args.device_pattern)
+        mic_source = detected["mic"]
+        if not mic_source:
+            print(f"Error: No mic source matching pattern '{args.device_pattern}' found.", file=sys.stderr)
+            print("\nAvailable sources:", file=sys.stderr)
+            for s in detected["all_sources"]:
+                print(f"  {s}", file=sys.stderr)
+            print(f"\nUse --source <name> to specify one explicitly.", file=sys.stderr)
+            sys.exit(1)
+
+    monitor_source = _resolve_monitor_source(args, detected)
+    dual_mode = monitor_source is not None
+
+    if dual_mode:
+        print(f"Mic source:     {mic_source}")
+        print(f"Monitor source: {monitor_source}")
+    else:
+        print(f"Audio source: {mic_source}")
+        if not args.mic_only:
+            print("No monitor source found — recording mic only.")
 
     # Create output directory
     out_dir = create_output_dir(args.output_dir)
@@ -346,11 +495,39 @@ def main():
     print(f"Output directory: {out_dir}")
 
     # Record
-    notify("Recording started", f"Source: {source}")
-    record_audio(source, audio_path)
+    if dual_mode:
+        mic_path = out_dir / "mic.wav"
+        monitor_path = out_dir / "monitor.wav"
+        notify("Recording started", f"Mic: {mic_source}\nMonitor: {monitor_source}")
+        record_dual_audio(mic_source, monitor_source, mic_path, monitor_path)
 
-    # Validate
-    validate_audio(audio_path)
+        # Validate mic (fatal)
+        try:
+            validate_audio(mic_path, label="Mic audio")
+        except AudioValidationError as e:
+            print(f"Error: {e}", file=sys.stderr)
+            sys.exit(1)
+
+        # Validate monitor (non-fatal — monitor may be silent)
+        try:
+            validate_audio(monitor_path, label="Monitor audio")
+        except AudioValidationError as e:
+            print(f"Warning: Monitor audio unusable ({e}). Using mic only.", file=sys.stderr)
+            import shutil
+            shutil.copy2(str(mic_path), str(audio_path))
+            dual_mode = False
+
+        if dual_mode:
+            mix_audio(mic_path, monitor_path, audio_path)
+    else:
+        notify("Recording started", f"Source: {mic_source}")
+        record_audio(mic_source, audio_path)
+
+        try:
+            validate_audio(audio_path)
+        except AudioValidationError as e:
+            print(f"Error: {e}", file=sys.stderr)
+            sys.exit(1)
 
     # Transcribe
     notify("Transcribing...", f"Model: {args.model}")
