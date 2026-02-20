@@ -195,15 +195,21 @@ def record_audio(source, output_path):
 def record_dual_audio(mic_source, monitor_source, mic_path, monitor_path):
     """Record from mic and monitor sources in parallel until Ctrl+C.
 
+    Uses pw-record for the mic but always parecord for the monitor, because
+    .monitor sources are a PulseAudio abstraction that pw-record doesn't capture.
+
     Sends SIGINT to both processes on Ctrl+C, with SIGKILL fallback after 5s.
     """
     recorder = find_recorder()
     mic_cmd = _build_record_cmd(recorder, mic_source, mic_path)
-    monitor_cmd = _build_record_cmd(recorder, monitor_source, monitor_path)
+    # Monitor sources require parecord — pw-record records silence from .monitor names
+    if subprocess.run(["which", "parecord"], capture_output=True).returncode != 0:
+        print("Error: parecord required for monitor capture. Install pipewire-pulse or pulseaudio-utils.", file=sys.stderr)
+        sys.exit(1)
+    monitor_cmd = _build_record_cmd("parecord", monitor_source, monitor_path)
 
-    print(f"Recording mic:     {mic_source}")
-    print(f"Recording monitor: {monitor_source}")
-    print(f"Using: {recorder}")
+    print(f"Recording mic:     {mic_source} (via {recorder})")
+    print(f"Recording monitor: {monitor_source} (via parecord)")
     print("Press Ctrl+C to stop.\n")
 
     mic_proc = subprocess.Popen(mic_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
