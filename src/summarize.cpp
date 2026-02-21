@@ -156,9 +156,31 @@ std::string summarize_local(const std::string& transcript,
         throw RecmeetError("Failed to create LLM context");
     }
 
-    // Build prompt
-    std::string prompt = std::string(SYSTEM_PROMPT) + "\n\n" +
-                         build_user_prompt(transcript, context);
+    // Build prompt using model's chat template
+    std::string user_prompt = build_user_prompt(transcript, context);
+    const char* tmpl = llama_model_chat_template(model, nullptr);
+
+    llama_chat_message messages[] = {
+        {"system", SYSTEM_PROMPT},
+        {"user",   user_prompt.c_str()},
+    };
+
+    // First call with length=0 to get required buffer size
+    int32_t needed = llama_chat_apply_template(
+        tmpl, messages, 2, true, nullptr, 0);
+    if (needed < 0) {
+        // Fallback: raw concatenation if template not recognized
+        fprintf(stderr, "Warning: chat template not available, using raw prompt\n");
+    }
+
+    std::string prompt;
+    if (needed > 0) {
+        std::vector<char> buf(needed + 1);
+        llama_chat_apply_template(tmpl, messages, 2, true, buf.data(), buf.size());
+        prompt.assign(buf.data(), needed);
+    } else {
+        prompt = std::string(SYSTEM_PROMPT) + "\n\n" + user_prompt;
+    }
 
     // Tokenize
     const llama_vocab* vocab = llama_model_get_vocab(model);

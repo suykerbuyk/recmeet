@@ -49,6 +49,10 @@ TranscriptResult transcribe(const fs::path& model_path, const fs::path& audio_pa
     wparams.print_progress = true;
     wparams.print_timestamps = false;
 
+    // Relax no-speech suppression — default logprob_thold (-1.0) can be too
+    // aggressive for smaller models on Bluetooth mic audio.
+    wparams.logprob_thold = -2.0f;
+
     // Language forcing
     if (!language.empty()) {
         int lang_check = whisper_lang_id(language.c_str());
@@ -59,7 +63,7 @@ TranscriptResult transcribe(const fs::path& model_path, const fs::path& audio_pa
         fprintf(stderr, "Language forced: %s\n", language.c_str());
     } else {
         wparams.language = nullptr;
-        wparams.detect_language = true;
+        wparams.detect_language = false;
     }
 
     fprintf(stderr, "Transcribing...\n");
