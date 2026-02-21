@@ -1,5 +1,6 @@
 #include "config.h"
 #include "device_enum.h"
+#include "model_manager.h"
 #include "notify.h"
 #include "pipeline.h"
 #include "util.h"
@@ -113,6 +114,20 @@ static void on_record(GtkMenuItem*, gpointer) {
 
     g_tray.pipeline_thread = std::thread([] {
         try {
+            // Pre-check: download whisper model if needed
+            if (!is_whisper_model_cached(g_tray.cfg.whisper_model)) {
+                notify("Downloading model",
+                       "Whisper '" + g_tray.cfg.whisper_model + "' — please wait...");
+                ensure_whisper_model(g_tray.cfg.whisper_model);
+                notify("Model ready",
+                       "Whisper '" + g_tray.cfg.whisper_model + "' downloaded.");
+            }
+
+            // Pre-check: validate LLM model if configured
+            if (!g_tray.cfg.no_summary && !g_tray.cfg.llm_model.empty()) {
+                ensure_llama_model(g_tray.cfg.llm_model);
+            }
+
             auto on_phase = [](const std::string& phase) {
                 fprintf(stderr, "[tray] Phase: %s\n", phase.c_str());
                 if (phase == "transcribing" || phase == "summarizing")

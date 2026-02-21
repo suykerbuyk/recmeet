@@ -56,6 +56,55 @@ TEST_CASE("ensure_whisper_model: returns expected filename for each model", "[mo
     }
 }
 
+TEST_CASE("is_whisper_model_cached: returns false when model not present", "[model_manager]") {
+    fs::path model_dir = models_dir() / "whisper";
+    fs::path fake = model_dir / "ggml-tiny.bin";
+    bool existed = fs::exists(fake);
+    if (existed) fs::rename(fake, fake.string() + ".bak");
+
+    CHECK_FALSE(is_whisper_model_cached("tiny"));
+
+    if (existed) fs::rename(fake.string() + ".bak", fake);
+}
+
+TEST_CASE("is_whisper_model_cached: returns true when model is cached", "[model_manager]") {
+    fs::path model_dir = models_dir() / "whisper";
+    fs::create_directories(model_dir);
+    fs::path fake = model_dir / "ggml-tiny.bin";
+
+    bool existed = fs::exists(fake) && fs::file_size(fake) > 0;
+    if (!existed) {
+        std::ofstream out(fake, std::ios::binary);
+        out << "fake model data";
+    }
+
+    CHECK(is_whisper_model_cached("tiny"));
+
+    if (!existed) fs::remove(fake);
+}
+
+TEST_CASE("is_whisper_model_cached: returns false for zero-byte file", "[model_manager]") {
+    fs::path model_dir = models_dir() / "whisper";
+    fs::create_directories(model_dir);
+    fs::path fake = model_dir / "ggml-small.bin";
+
+    bool existed = fs::exists(fake);
+    fs::path backup = fake.string() + ".bak";
+    if (existed) fs::rename(fake, backup);
+
+    // Create zero-byte file
+    { std::ofstream out(fake, std::ios::binary); }
+
+    CHECK_FALSE(is_whisper_model_cached("small"));
+
+    fs::remove(fake);
+    if (existed) fs::rename(backup, fake);
+}
+
+TEST_CASE("is_whisper_model_cached: throws for unknown model name", "[model_manager]") {
+    CHECK_THROWS_AS(is_whisper_model_cached("nonexistent"), RecmeetError);
+}
+
 #if RECMEET_USE_LLAMA
 TEST_CASE("ensure_llama_model: returns path for existing file", "[model_manager]") {
     auto dir = fs::temp_directory_path() / "recmeet_test_llama";

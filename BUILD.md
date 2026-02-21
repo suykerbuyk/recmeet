@@ -192,6 +192,66 @@ CLI or tray binaries.
 
 ---
 
+## Debug and release builds
+
+CMake supports several build types that control optimization and debug info.
+The vendor libraries (whisper.cpp, llama.cpp) default to `Release` when no
+build type is specified, so a plain `cmake -B build -G Ninja` already produces
+optimized binaries.
+
+### Release (default)
+
+```bash
+cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+ninja -C build
+```
+
+Enables `-O3` optimization, no debug assertions. This is what you get by
+default and what you'd ship.
+
+### Debug
+
+```bash
+cmake -B build-debug -G Ninja -DCMAKE_BUILD_TYPE=Debug
+ninja -C build-debug
+```
+
+Enables `-g` debug symbols and `-O0` (no optimization). Use this when you need
+to step through code with `gdb` or `lldb`. Binaries will be larger and slower.
+
+Note: using a separate directory (`build-debug`) lets you keep both a release
+and debug build around simultaneously. You can name it anything.
+
+### RelWithDebInfo
+
+```bash
+cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo
+ninja -C build
+```
+
+Enables `-O2` optimization *and* debug symbols. Good middle ground — fast
+binaries that you can still attach a debugger to. Useful for profiling.
+
+### Stripping binaries
+
+Release binaries include symbol tables by default (`not stripped`). To reduce
+binary size for distribution:
+
+```bash
+strip build/recmeet build/recmeet-tray
+```
+
+### Summary
+
+| Build type | Optimization | Debug symbols | Use case |
+|---|---|---|---|
+| `Release` | `-O3` | No | Default, production |
+| `Debug` | `-O0` | Yes (`-g`) | Debugging with gdb/lldb |
+| `RelWithDebInfo` | `-O2` | Yes (`-g`) | Profiling, crash analysis |
+| `MinSizeRel` | `-Os` | No | Smallest binary |
+
+---
+
 ## Clean build
 
 If something seems wrong or you want to start fresh:

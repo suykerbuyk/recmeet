@@ -17,3 +17,8 @@ compile_commands.json
 .cache/
 .idea/
 *.swp
+
+# AI session context (local-only, never committed)
+CLAUDE.md
+RESUME.md
+commit.msg

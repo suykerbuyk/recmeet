@@ -41,6 +41,15 @@ void download_file(const std::string& url, const fs::path& dest) {
 
 } // anonymous namespace
 
+bool is_whisper_model_cached(const std::string& model_name) {
+    auto it = WHISPER_MODELS.find(model_name);
+    if (it == WHISPER_MODELS.end())
+        throw RecmeetError("Unknown whisper model: " + model_name +
+                           ". Available: tiny, base, small, medium, large-v3");
+    fs::path model_path = models_dir() / "whisper" / it->second.filename;
+    return fs::exists(model_path) && fs::file_size(model_path) > 0;
+}
+
 fs::path ensure_whisper_model(const std::string& model_name) {
     auto it = WHISPER_MODELS.find(model_name);
     if (it == WHISPER_MODELS.end())

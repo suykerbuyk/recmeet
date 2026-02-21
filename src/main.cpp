@@ -1,5 +1,6 @@
 #include "cli.h"
 #include "device_enum.h"
+#include "model_manager.h"
 #include "notify.h"
 #include "pipeline.h"
 #include "util.h"
@@ -87,6 +88,38 @@ int main(int argc, char* argv[]) {
     sigaction(SIGTERM, &sa, nullptr);
 
     notify_init();
+
+    // Pre-check: ensure whisper model is available before recording
+    try {
+        if (!is_whisper_model_cached(cfg.whisper_model)) {
+            fprintf(stderr, "Whisper model '%s' not found locally.\n", cfg.whisper_model.c_str());
+            fprintf(stderr, "Download now? [Y/n] ");
+            int ch = getchar();
+            if (ch == 'n' || ch == 'N') {
+                fprintf(stderr, "Aborted. Use --model to select a different model.\n");
+                notify_cleanup();
+                return 1;
+            }
+            fprintf(stderr, "Downloading...\n");
+            ensure_whisper_model(cfg.whisper_model);
+            fprintf(stderr, "Model ready.\n\n");
+        }
+    } catch (const RecmeetError& e) {
+        fprintf(stderr, "Error: %s\n", e.what());
+        notify_cleanup();
+        return 1;
+    }
+
+    // Pre-check: validate LLM model path if local summarization is configured
+    if (!cfg.no_summary && !cfg.llm_model.empty()) {
+        try {
+            ensure_llama_model(cfg.llm_model);
+        } catch (const RecmeetError& e) {
+            fprintf(stderr, "Error: %s\n", e.what());
+            notify_cleanup();
+            return 1;
+        }
+    }
 
     fprintf(stderr, "Press Ctrl+C to stop recording.\n\n");
 
