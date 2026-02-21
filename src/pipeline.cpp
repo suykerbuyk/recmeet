@@ -18,6 +18,15 @@
 
 namespace recmeet {
 
+std::string read_context_file(const fs::path& path) {
+    if (path.empty() || !fs::exists(path)) return "";
+    std::ifstream in(path);
+    if (!in) return "";
+    std::ostringstream buf;
+    buf << in.rdbuf();
+    return buf.str();
+}
+
 namespace {
 
 void display_elapsed(StopToken& stop) {
@@ -31,15 +40,6 @@ void display_elapsed(StopToken& stop) {
         std::this_thread::sleep_for(std::chrono::seconds(1));
     }
     fprintf(stderr, "\r                    \r");
-}
-
-std::string read_context_file(const fs::path& path) {
-    if (path.empty() || !fs::exists(path)) return "";
-    std::ifstream in(path);
-    if (!in) return "";
-    std::ostringstream buf;
-    buf << in.rdbuf();
-    return buf.str();
 }
 
 } // anonymous namespace

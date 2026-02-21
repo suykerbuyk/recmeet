@@ -18,6 +18,9 @@ struct PipelineResult {
 /// Phase callback — called with phase name: "recording", "transcribing", "summarizing", "complete".
 using PhaseCallback = std::function<void(const std::string&)>;
 
+/// Read entire file as string. Returns empty if missing or unreadable.
+std::string read_context_file(const fs::path& path);
+
 /// Run the full pipeline: record → validate → mix → transcribe → summarize → obsidian output.
 PipelineResult run_pipeline(const Config& cfg, StopToken& stop, PhaseCallback on_phase = nullptr);
 

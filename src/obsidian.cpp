@@ -44,11 +44,11 @@ fs::path write_obsidian_note(const ObsidianConfig& config, const MeetingData& da
     fs::path note_dir = config.vault_path / subfolder_buf;
     fs::create_directories(note_dir);
 
-    // Note filename: Meeting YYYY-MM-DD HH-MM.md
+    // Note filename: Meeting_YYYY-MM-DD_HH-MM.md
     std::string safe_time = data.time;
     for (auto& c : safe_time)
         if (c == ':') c = '-';
-    std::string filename = "Meeting " + data.date + " " + safe_time + ".md";
+    std::string filename = "Meeting_" + data.date + "_" + safe_time + ".md";
     fs::path note_path = note_dir / filename;
 
     std::ofstream out(note_path);

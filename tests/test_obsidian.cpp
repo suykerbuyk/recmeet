@@ -127,6 +127,70 @@ TEST_CASE("write_obsidian_note: creates note with frontmatter and sections", "[o
     fs::remove_all(dir);
 }
 
+TEST_CASE("write_obsidian_note: subfolder creates dated directories", "[obsidian]") {
+    auto dir = tmp_dir();
+
+    ObsidianConfig config;
+    config.vault_path = dir;
+    config.subfolder = "Meetings/%Y/";
+
+    MeetingData data;
+    data.date = "2026-02-21";
+    data.time = "09:00";
+    data.transcript_text = "[00:00 - 00:01] Test.";
+
+    fs::path note = write_obsidian_note(config, data);
+    REQUIRE(fs::exists(note));
+
+    // The path should contain "Meetings/2026/" (current year)
+    std::string note_str = note.string();
+    CHECK(note_str.find("Meetings/") != std::string::npos);
+
+    fs::remove_all(dir);
+}
+
+TEST_CASE("extract_action_items: stops before next heading with different level", "[obsidian]") {
+    std::string summary =
+        "### Action Items\n"
+        "- Task one\n"
+        "- Task two\n"
+        "### Next Section\n"
+        "- Not an action item\n"
+        "- Also not\n";
+
+    auto items = extract_action_items(summary);
+    REQUIRE(items.size() == 2);
+    CHECK(items[0] == "Task one");
+    CHECK(items[1] == "Task two");
+}
+
+TEST_CASE("write_obsidian_note: extracts one-liner for frontmatter", "[obsidian]") {
+    auto dir = tmp_dir();
+
+    ObsidianConfig config;
+    config.vault_path = dir;
+    config.subfolder = "";
+
+    MeetingData data;
+    data.date = "2026-02-21";
+    data.time = "11:00";
+    data.summary_text =
+        "### Overview\n"
+        "The team discussed Q1 roadmap priorities.\n\n"
+        "### Key Points\n"
+        "- Point 1\n";
+    data.transcript_text = "[00:00 - 00:05] Hello.";
+
+    fs::path note = write_obsidian_note(config, data);
+    REQUIRE(fs::exists(note));
+
+    std::string content = read_file(note);
+    // Frontmatter should contain a summary field with the first sentence
+    CHECK(content.find("summary: \"The team discussed Q1 roadmap priorities.\"") != std::string::npos);
+
+    fs::remove_all(dir);
+}
+
 TEST_CASE("write_obsidian_note: handles empty summary gracefully", "[obsidian]") {
     auto dir = tmp_dir();
 

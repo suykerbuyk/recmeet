@@ -1,4 +1,4 @@
-#include "config.h"
+#include "cli.h"
 #include "device_enum.h"
 #include "notify.h"
 #include "pipeline.h"
@@ -8,8 +8,6 @@
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
-#include <cstring>
-#include <getopt.h>
 
 using namespace recmeet;
 
@@ -50,55 +48,11 @@ static void print_version() {
 }
 
 int main(int argc, char* argv[]) {
-    static const struct option long_opts[] = {
-        {"source",         required_argument, nullptr, 's'},
-        {"monitor",        required_argument, nullptr, 'm'},
-        {"mic-only",       no_argument,       nullptr, 'M'},
-        {"model",          required_argument, nullptr, 'W'},
-        {"output-dir",     required_argument, nullptr, 'o'},
-        {"api-key",        required_argument, nullptr, 'k'},
-        {"api-url",        required_argument, nullptr, 'u'},
-        {"api-model",      required_argument, nullptr, 'A'},
-        {"no-summary",     no_argument,       nullptr, 'N'},
-        {"device-pattern", required_argument, nullptr, 'd'},
-        {"context-file",   required_argument, nullptr, 'c'},
-        {"obsidian-vault", required_argument, nullptr, 'O'},
-        {"llm-model",      required_argument, nullptr, 'L'},
-        {"list-sources",   no_argument,       nullptr, 'l'},
-        {"help",           no_argument,       nullptr, 'h'},
-        {"version",        no_argument,       nullptr, 'v'},
-        {nullptr, 0, nullptr, 0},
-    };
-
-    // Load config file as defaults
-    Config cfg = load_config();
-    bool list_sources = false;
-
-    int opt;
-    while ((opt = getopt_long(argc, argv, "hv", long_opts, nullptr)) != -1) {
-        switch (opt) {
-            case 's': cfg.mic_source = optarg; break;
-            case 'm': cfg.monitor_source = optarg; break;
-            case 'M': cfg.mic_only = true; break;
-            case 'W': cfg.whisper_model = optarg; break;
-            case 'o': cfg.output_dir = optarg; break;
-            case 'k': cfg.api_key = optarg; break;
-            case 'u': cfg.api_url = optarg; break;
-            case 'A': cfg.api_model = optarg; break;
-            case 'N': cfg.no_summary = true; break;
-            case 'd': cfg.device_pattern = optarg; break;
-            case 'c': cfg.context_file = optarg; break;
-            case 'O':
-                cfg.obsidian.vault_path = optarg;
-                cfg.obsidian_enabled = true;
-                break;
-            case 'L': cfg.llm_model = optarg; break;
-            case 'l': list_sources = true; break;
-            case 'v': print_version(); return 0;
-            case 'h': print_usage(); return 0;
-            default:  print_usage(); return 1;
-        }
-    }
+    auto cli = recmeet::parse_cli(argc, argv);
+    if (cli.show_version) { print_version(); return 0; }
+    if (cli.show_help) { print_usage(); return 0; }
+    Config cfg = cli.cfg;
+    bool list_sources = cli.list_sources;
 
     // List sources mode
     if (list_sources) {

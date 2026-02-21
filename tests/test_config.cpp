@@ -1,6 +1,7 @@
 #include <catch2/catch_test_macros.hpp>
 #include "config.h"
 
+#include <cstdlib>
 #include <fstream>
 
 using namespace recmeet;
@@ -101,6 +102,90 @@ TEST_CASE("load_config: returns defaults when no file exists", "[config]") {
     CHECK(cfg.obsidian_enabled == false);
 
     // Restore
+    if (had_config)
+        fs::rename(backup, cfg_path);
+}
+
+TEST_CASE("load_config: handles malformed YAML gracefully", "[config]") {
+    fs::path cfg_path = config_dir() / "config.yaml";
+    fs::path backup = config_dir() / "config.yaml.bak";
+    bool had_config = fs::exists(cfg_path);
+    if (had_config)
+        fs::rename(cfg_path, backup);
+
+    // Write garbled content
+    fs::create_directories(config_dir());
+    {
+        std::ofstream out(cfg_path);
+        out << "{{{{not yaml at all!!!:::\n\x01\x02\x03\n";
+    }
+
+    // Should not crash — returns some config (likely defaults)
+    Config cfg = load_config();
+    CHECK_FALSE(cfg.whisper_model.empty()); // Still has a default
+
+    // Restore
+    if (had_config)
+        fs::rename(backup, cfg_path);
+    else
+        fs::remove(cfg_path);
+}
+
+TEST_CASE("load_config: partial config fills only specified fields", "[config]") {
+    fs::path cfg_path = config_dir() / "config.yaml";
+    fs::path backup = config_dir() / "config.yaml.bak";
+    bool had_config = fs::exists(cfg_path);
+    if (had_config)
+        fs::rename(cfg_path, backup);
+
+    // Write config with only whisper model specified
+    fs::create_directories(config_dir());
+    {
+        std::ofstream out(cfg_path);
+        out << "transcription:\n  model: tiny\n";
+    }
+
+    Config cfg = load_config();
+    CHECK(cfg.whisper_model == "tiny");
+    // Others should be defaults
+    CHECK(cfg.api_url == "https://api.x.ai/v1/chat/completions");
+    CHECK(cfg.api_model == "grok-3");
+    CHECK(cfg.mic_only == false);
+    CHECK(cfg.obsidian_enabled == false);
+
+    // Restore
+    if (had_config)
+        fs::rename(backup, cfg_path);
+    else
+        fs::remove(cfg_path);
+}
+
+TEST_CASE("load_config: reads XAI_API_KEY from environment", "[config]") {
+    fs::path cfg_path = config_dir() / "config.yaml";
+    fs::path backup = config_dir() / "config.yaml.bak";
+    bool had_config = fs::exists(cfg_path);
+    if (had_config)
+        fs::rename(cfg_path, backup);
+
+    // Remove config file so only env var matters
+    if (fs::exists(cfg_path))
+        fs::remove(cfg_path);
+
+    // Save and set env var
+    const char* old_key = std::getenv("XAI_API_KEY");
+    std::string saved_key = old_key ? old_key : "";
+    setenv("XAI_API_KEY", "test-api-key-12345", 1);
+
+    Config cfg = load_config();
+    CHECK(cfg.api_key == "test-api-key-12345");
+
+    // Restore env
+    if (saved_key.empty())
+        unsetenv("XAI_API_KEY");
+    else
+        setenv("XAI_API_KEY", saved_key.c_str(), 1);
+
+    // Restore config
     if (had_config)
         fs::rename(backup, cfg_path);
 }

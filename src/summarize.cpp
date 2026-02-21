@@ -60,13 +60,6 @@ std::string json_extract_string(const std::string& json, const std::string& key)
     return result;
 }
 
-namespace {
-
-const char* SYSTEM_PROMPT =
-    "You are a precise meeting summarizer. Produce a well-structured Markdown summary. "
-    "Use the exact section headings provided. Be thorough but concise. "
-    "If a section has no relevant content, write 'None identified.'";
-
 std::string build_user_prompt(const std::string& transcript, const std::string& context) {
     std::ostringstream oss;
     oss << "Summarize the following meeting transcript.\n\n";
@@ -92,6 +85,13 @@ std::string build_user_prompt(const std::string& transcript, const std::string& 
 
     return oss.str();
 }
+
+namespace {
+
+const char* SYSTEM_PROMPT =
+    "You are a precise meeting summarizer. Produce a well-structured Markdown summary. "
+    "Use the exact section headings provided. Be thorough but concise. "
+    "If a section has no relevant content, write 'None identified.'";
 
 } // anonymous namespace
 

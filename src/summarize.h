@@ -12,6 +12,9 @@ std::string json_escape(const std::string& s);
 /// Extract a string value from JSON by key (simple, non-recursive).
 std::string json_extract_string(const std::string& json, const std::string& key);
 
+/// Build the user prompt for meeting summarization (exposed for testing).
+std::string build_user_prompt(const std::string& transcript, const std::string& context = "");
+
 /// Summarize a transcript using an HTTP API (Grok, OpenAI-compatible).
 std::string summarize_http(const std::string& transcript,
                             const std::string& api_url,

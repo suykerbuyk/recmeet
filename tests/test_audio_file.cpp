@@ -4,6 +4,7 @@
 
 #include <cmath>
 #include <fstream>
+#include <sndfile.h>
 
 using namespace recmeet;
 using Catch::Matchers::WithinAbs;
@@ -81,6 +82,46 @@ TEST_CASE("validate_audio: empty file", "[audio_file]") {
     CHECK_THROWS_AS(validate_audio(wav), AudioValidationError);
 
     fs::remove(wav);
+}
+
+TEST_CASE("read_wav_float: handles stereo by downmixing", "[audio_file]") {
+    auto dir = tmp_dir();
+    fs::path wav = dir / "stereo.wav";
+
+    // Write a stereo WAV file directly using libsndfile
+    SF_INFO info = {};
+    info.samplerate = SAMPLE_RATE;
+    info.channels = 2;
+    info.format = SF_FORMAT_WAV | SF_FORMAT_PCM_16;
+
+    SNDFILE* sf = sf_open(wav.c_str(), SFM_WRITE, &info);
+    REQUIRE(sf != nullptr);
+
+    // Write 100 frames of stereo: left=0.5, right=-0.5
+    // After downmix, each frame should be ~0.0
+    int n_frames = 100;
+    std::vector<int16_t> stereo_samples(n_frames * 2);
+    for (int i = 0; i < n_frames; ++i) {
+        stereo_samples[i * 2]     = 16000;  // left
+        stereo_samples[i * 2 + 1] = -16000; // right
+    }
+    sf_write_short(sf, stereo_samples.data(), stereo_samples.size());
+    sf_close(sf);
+
+    auto mono = read_wav_float(wav);
+    REQUIRE(mono.size() == static_cast<size_t>(n_frames));
+
+    // Downmixed: (16000 + -16000) / 2 / 32768 ≈ 0.0
+    for (int i = 0; i < n_frames; ++i) {
+        CHECK_THAT(mono[i], WithinAbs(0.0, 0.01));
+    }
+
+    fs::remove(wav);
+}
+
+TEST_CASE("write_wav: throws on invalid directory", "[audio_file]") {
+    std::vector<int16_t> samples(100, 0);
+    CHECK_THROWS_AS(write_wav("/nonexistent/dir/test.wav", samples), RecmeetError);
 }
 
 TEST_CASE("write_wav: empty samples creates valid header-only file", "[audio_file]") {
