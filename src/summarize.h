@@ -1,0 +1,29 @@
+#pragma once
+
+#include "util.h"
+
+#include <string>
+
+namespace recmeet {
+
+/// Escape a string for embedding inside a JSON string literal.
+std::string json_escape(const std::string& s);
+
+/// Extract a string value from JSON by key (simple, non-recursive).
+std::string json_extract_string(const std::string& json, const std::string& key);
+
+/// Summarize a transcript using an HTTP API (Grok, OpenAI-compatible).
+std::string summarize_http(const std::string& transcript,
+                            const std::string& api_url,
+                            const std::string& api_key,
+                            const std::string& model = "grok-3",
+                            const std::string& context = "");
+
+#if RECMEET_USE_LLAMA
+/// Summarize a transcript using a local llama.cpp model.
+std::string summarize_local(const std::string& transcript,
+                             const fs::path& model_path,
+                             const std::string& context = "");
+#endif
+
+} // namespace recmeet

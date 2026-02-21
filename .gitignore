@@ -1,4 +1,19 @@
+# Python prototype
 .venv/
-.env
 __pycache__/
+
+# Secrets
+.env
+
+# Output
 meetings/
+
+# Build
+build/
+cmake-build-*/
+compile_commands.json
+
+# Editor
+.cache/
+.idea/
+*.swp
