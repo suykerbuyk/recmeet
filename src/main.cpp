@@ -28,6 +28,7 @@ static void print_usage() {
         "  --monitor NAME       Monitor/speaker source (auto-detect if omitted)\n"
         "  --mic-only           Record mic only (skip monitor capture)\n"
         "  --model NAME         Whisper model: tiny/base/small/medium/large-v3 (default: base)\n"
+        "  --language CODE      Force whisper language (e.g. en, de, ja; default: auto-detect)\n"
         "  --output-dir DIR     Base directory for outputs (default: ./meetings)\n"
         "  --api-key KEY        xAI/OpenAI API key (default: from env/config)\n"
         "  --api-url URL        API endpoint (default: https://api.x.ai/v1/chat/completions)\n"

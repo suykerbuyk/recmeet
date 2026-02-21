@@ -84,3 +84,13 @@ TEST_CASE("parse_cli: --context-file sets context_file", "[cli]") {
     auto cli = run_cli({"recmeet", "--context-file", "/tmp/notes.md"});
     CHECK(cli.cfg.context_file == "/tmp/notes.md");
 }
+
+TEST_CASE("parse_cli: --language sets language", "[cli]") {
+    auto cli = run_cli({"recmeet", "--language", "en"});
+    CHECK(cli.cfg.language == "en");
+}
+
+TEST_CASE("parse_cli: default language is empty (auto-detect)", "[cli]") {
+    auto cli = run_cli({"recmeet"});
+    CHECK(cli.cfg.language.empty());
+}

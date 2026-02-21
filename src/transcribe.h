@@ -25,6 +25,8 @@ struct TranscriptResult {
 /// Transcribe a WAV file using whisper.cpp.
 /// model_path: path to GGUF model file.
 /// audio_path: path to WAV file (will be read and converted to float32).
-TranscriptResult transcribe(const fs::path& model_path, const fs::path& audio_path);
+/// language: ISO 639-1 code (e.g. "en") to force; empty = auto-detect.
+TranscriptResult transcribe(const fs::path& model_path, const fs::path& audio_path,
+                            const std::string& language = "");
 
 } // namespace recmeet

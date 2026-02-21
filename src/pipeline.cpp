@@ -185,7 +185,7 @@ PipelineResult run_pipeline(const Config& cfg, StopToken& stop, PhaseCallback on
     notify("Transcribing...", "Model: " + cfg.whisper_model);
 
     fs::path model_path = ensure_whisper_model(cfg.whisper_model);
-    auto result = transcribe(model_path, audio_path);
+    auto result = transcribe(model_path, audio_path, cfg.language);
 
     std::string transcript_text = result.to_string();
     if (transcript_text.empty())

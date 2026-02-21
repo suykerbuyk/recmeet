@@ -28,7 +28,8 @@ std::string TranscriptResult::to_string() const {
     return oss.str();
 }
 
-TranscriptResult transcribe(const fs::path& model_path, const fs::path& audio_path) {
+TranscriptResult transcribe(const fs::path& model_path, const fs::path& audio_path,
+                            const std::string& language) {
     fprintf(stderr, "Loading whisper model: %s\n", model_path.filename().c_str());
 
     whisper_context_params cparams = whisper_context_default_params();
@@ -47,6 +48,19 @@ TranscriptResult transcribe(const fs::path& model_path, const fs::path& audio_pa
     wparams.n_threads = 4;
     wparams.print_progress = true;
     wparams.print_timestamps = false;
+
+    // Language forcing
+    if (!language.empty()) {
+        int lang_check = whisper_lang_id(language.c_str());
+        if (lang_check < 0)
+            throw RecmeetError("Unknown language code: " + language);
+        wparams.language = language.c_str();
+        wparams.detect_language = false;
+        fprintf(stderr, "Language forced: %s\n", language.c_str());
+    } else {
+        wparams.language = nullptr;
+        wparams.detect_language = true;
+    }
 
     fprintf(stderr, "Transcribing...\n");
     int ret = whisper_full(ctx, wparams, samples.data(), samples.size());

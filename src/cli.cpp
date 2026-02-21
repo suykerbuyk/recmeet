@@ -19,6 +19,7 @@ CliResult parse_cli(int argc, char* argv[]) {
         {"context-file",   required_argument, nullptr, 'c'},
         {"obsidian-vault", required_argument, nullptr, 'O'},
         {"llm-model",      required_argument, nullptr, 'L'},
+        {"language",       required_argument, nullptr, 'g'},
         {"list-sources",   no_argument,       nullptr, 'l'},
         {"help",           no_argument,       nullptr, 'h'},
         {"version",        no_argument,       nullptr, 'v'},
@@ -47,6 +48,7 @@ CliResult parse_cli(int argc, char* argv[]) {
                 result.cfg.obsidian_enabled = true;
                 break;
             case 'L': result.cfg.llm_model = optarg; break;
+            case 'g': result.cfg.language = optarg; break;
             case 'l': result.list_sources = true; break;
             case 'v': result.show_version = true; return result;
             case 'h': result.show_help = true; return result;

@@ -108,6 +108,7 @@ Config load_config() {
 
     // Transcription section
     cfg.whisper_model = get_val(entries, "transcription", "model", cfg.whisper_model);
+    cfg.language = get_val(entries, "transcription", "language", "");
 
     // Summary section
     cfg.api_url = get_val(entries, "summary", "api_url", cfg.api_url);
@@ -155,6 +156,8 @@ void save_config(const Config& cfg) {
 
     out << "\ntranscription:\n"
         << "  model: " << cfg.whisper_model << "\n";
+    if (!cfg.language.empty())
+        out << "  language: " << cfg.language << "\n";
 
     out << "\nsummary:\n"
         << "  api_url: \"" << cfg.api_url << "\"\n"

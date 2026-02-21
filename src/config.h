@@ -18,6 +18,7 @@ struct Config {
 
     // Transcription
     std::string whisper_model = "base";
+    std::string language; // empty = auto-detect, otherwise ISO 639-1 code (e.g. "en")
 
     // Summarization
     std::string api_url = "https://api.x.ai/v1/chat/completions";

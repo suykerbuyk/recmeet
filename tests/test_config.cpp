@@ -24,6 +24,7 @@ TEST_CASE("save_config + load_config round-trip", "[config]") {
     cfg.monitor_source = "alsa_output.test.monitor";
     cfg.mic_only = true;
     cfg.whisper_model = "small";
+    cfg.language = "en";
     cfg.api_url = "https://api.example.com/v1/chat";
     cfg.api_model = "gpt-4";
     cfg.no_summary = true;
@@ -52,6 +53,7 @@ TEST_CASE("save_config + load_config round-trip", "[config]") {
     CHECK(content.find("monitor_source: \"alsa_output.test.monitor\"") != std::string::npos);
     CHECK(content.find("mic_only: true") != std::string::npos);
     CHECK(content.find("model: small") != std::string::npos);
+    CHECK(content.find("language: en") != std::string::npos);
     CHECK(content.find("api_url: \"https://api.example.com/v1/chat\"") != std::string::npos);
     CHECK(content.find("model: gpt-4") != std::string::npos);
     CHECK(content.find("disabled: true") != std::string::npos);
@@ -68,6 +70,7 @@ TEST_CASE("save_config + load_config round-trip", "[config]") {
     CHECK(loaded.monitor_source == "alsa_output.test.monitor");
     CHECK(loaded.mic_only == true);
     CHECK(loaded.whisper_model == "small");
+    CHECK(loaded.language == "en");
     CHECK(loaded.api_url == "https://api.example.com/v1/chat");
     CHECK(loaded.api_model == "gpt-4");
     CHECK(loaded.no_summary == true);
