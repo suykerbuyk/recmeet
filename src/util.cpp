@@ -2,6 +2,7 @@
 
 #include <chrono>
 #include <cstdlib>
+#include <fstream>
 #include <iomanip>
 #include <sstream>
 #include <thread>
@@ -45,6 +46,15 @@ fs::path create_output_dir(const fs::path& base_dir) {
         }
     }
     throw RecmeetError("Too many sessions in the same minute.");
+}
+
+void write_text_file(const fs::path& path, const std::string& content) {
+    std::ofstream out(path);
+    if (!out)
+        throw RecmeetError("Failed to write file: " + path.string());
+    out << content;
+    if (!out)
+        throw RecmeetError("Write error: " + path.string());
 }
 
 int default_thread_count() {

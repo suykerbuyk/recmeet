@@ -1,6 +1,9 @@
 #include <catch2/catch_test_macros.hpp>
 #include "util.h"
 
+#include <fstream>
+#include <sys/stat.h>
+
 using namespace recmeet;
 
 TEST_CASE("StopToken: default state is not requested", "[util]") {
@@ -92,6 +95,74 @@ TEST_CASE("default_thread_count: returns hardware_concurrency - 1 when available
     } else {
         CHECK(n == 1);
     }
+}
+
+// ---------------------------------------------------------------------------
+// write_text_file tests
+// ---------------------------------------------------------------------------
+
+TEST_CASE("write_text_file: writes content to new file", "[util]") {
+    auto dir = fs::temp_directory_path() / "recmeet_test_write";
+    fs::create_directories(dir);
+    fs::path file = dir / "output.txt";
+
+    write_text_file(file, "hello world\n");
+
+    std::ifstream in(file);
+    std::string content((std::istreambuf_iterator<char>(in)),
+                         std::istreambuf_iterator<char>());
+    CHECK(content == "hello world\n");
+
+    fs::remove_all(dir);
+}
+
+TEST_CASE("write_text_file: overwrites existing file", "[util]") {
+    auto dir = fs::temp_directory_path() / "recmeet_test_write";
+    fs::create_directories(dir);
+    fs::path file = dir / "overwrite.txt";
+
+    write_text_file(file, "first");
+    write_text_file(file, "second");
+
+    std::ifstream in(file);
+    std::string content((std::istreambuf_iterator<char>(in)),
+                         std::istreambuf_iterator<char>());
+    CHECK(content == "second");
+
+    fs::remove_all(dir);
+}
+
+TEST_CASE("write_text_file: throws for nonexistent directory", "[util]") {
+    fs::path file = "/nonexistent/path/recmeet_test/output.txt";
+    CHECK_THROWS_AS(write_text_file(file, "data"), RecmeetError);
+}
+
+TEST_CASE("write_text_file: throws for read-only directory", "[util]") {
+    auto dir = fs::temp_directory_path() / "recmeet_test_readonly";
+    fs::create_directories(dir);
+    fs::path file = dir / "blocked.txt";
+
+    // Make directory read-only
+    chmod(dir.c_str(), 0555);
+
+    CHECK_THROWS_AS(write_text_file(file, "data"), RecmeetError);
+
+    // Restore permissions for cleanup
+    chmod(dir.c_str(), 0755);
+    fs::remove_all(dir);
+}
+
+TEST_CASE("write_text_file: handles empty content", "[util]") {
+    auto dir = fs::temp_directory_path() / "recmeet_test_write";
+    fs::create_directories(dir);
+    fs::path file = dir / "empty.txt";
+
+    write_text_file(file, "");
+
+    CHECK(fs::exists(file));
+    CHECK(fs::file_size(file) == 0);
+
+    fs::remove_all(dir);
 }
 
 TEST_CASE("audio constants are consistent", "[util]") {

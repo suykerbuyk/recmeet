@@ -93,10 +93,7 @@ PipelineResult run_pipeline(const Config& cfg, StopToken& stop, PhaseCallback on
         transcript_text = result.to_string();
         if (transcript_text.empty())
             throw RecmeetError("Transcription produced no text.");
-        {
-            std::ofstream out(transcript_path);
-            out << transcript_text;
-        }
+        write_text_file(transcript_path, transcript_text);
         fprintf(stderr, "Transcript saved: %s\n", transcript_path.c_str());
     } else {
         // --- Normal mode: detect sources, record, transcribe ---
@@ -252,10 +249,7 @@ PipelineResult run_pipeline(const Config& cfg, StopToken& stop, PhaseCallback on
         if (transcript_text.empty())
             throw RecmeetError("Transcription produced no text.");
 
-        {
-            std::ofstream out(transcript_path);
-            out << transcript_text;
-        }
+        write_text_file(transcript_path, transcript_text);
         fprintf(stderr, "Transcript saved: %s\n", transcript_path.c_str());
     }
 
@@ -302,8 +296,7 @@ PipelineResult run_pipeline(const Config& cfg, StopToken& stop, PhaseCallback on
         }
 
         if (!summary_text.empty()) {
-            std::ofstream out(summary_path);
-            out << summary_text;
+            write_text_file(summary_path, summary_text);
             pipe_result.summary_path = summary_path;
             fprintf(stderr, "Summary saved: %s\n", summary_path.c_str());
         }

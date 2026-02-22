@@ -4,6 +4,7 @@
 #include <spa/param/audio/format-utils.h>
 #include <spa/debug/types.h>
 
+#include <atomic>
 #include <cstring>
 
 namespace recmeet {
@@ -18,7 +19,7 @@ struct PwCaptureImpl {
 
     std::mutex buf_mtx;
     std::vector<int16_t> buffer;
-    bool running = false;
+    std::atomic<bool> running{false};
 };
 
 static void on_process(void* userdata) {
@@ -39,6 +40,14 @@ static void on_process(void* userdata) {
     {
         std::lock_guard lk(impl->buf_mtx);
         impl->buffer.insert(impl->buffer.end(), samples, samples + n_samples);
+        // Warn once when buffer exceeds ~120 minutes of audio (230 MB)
+        constexpr size_t WARN_SAMPLES = SAMPLE_RATE * 60 * 120;
+        if (impl->buffer.size() >= WARN_SAMPLES &&
+            impl->buffer.size() - n_samples < WARN_SAMPLES) {
+            fprintf(stderr, "\nWarning: Audio buffer exceeds 120 minutes (%.0f MB). "
+                    "Memory usage will continue to grow.\n",
+                    impl->buffer.size() * sizeof(int16_t) / (1024.0 * 1024.0));
+        }
     }
 
     pw_stream_queue_buffer(impl->stream, b);

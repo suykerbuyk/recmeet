@@ -53,6 +53,14 @@ void PulseMonitorCapture::start() {
             }
             std::lock_guard lk(buf_mtx_);
             buffer_.insert(buffer_.end(), chunk, chunk + chunk_samples);
+            // Warn once when buffer exceeds ~120 minutes of audio (230 MB)
+            constexpr size_t WARN_SAMPLES = SAMPLE_RATE * 60 * 120;
+            if (buffer_.size() >= WARN_SAMPLES &&
+                buffer_.size() - chunk_samples < WARN_SAMPLES) {
+                fprintf(stderr, "\nWarning: Audio buffer exceeds 120 minutes (%.0f MB). "
+                        "Memory usage will continue to grow.\n",
+                        buffer_.size() * sizeof(int16_t) / (1024.0 * 1024.0));
+            }
         }
 
         pa_simple_free(s);

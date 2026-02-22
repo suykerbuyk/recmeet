@@ -72,6 +72,13 @@ fs::path create_output_dir(const fs::path& base_dir);
 constexpr const char* DEFAULT_DEVICE_PATTERN = "bd.h200|00:05:30:00:05:4E";
 
 // ---------------------------------------------------------------------------
+// File writing helper
+// ---------------------------------------------------------------------------
+
+/// Write text content to a file, throwing RecmeetError on failure.
+void write_text_file(const fs::path& path, const std::string& content);
+
+// ---------------------------------------------------------------------------
 // Thread count helper
 // ---------------------------------------------------------------------------
 

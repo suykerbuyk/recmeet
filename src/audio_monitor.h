@@ -2,6 +2,7 @@
 
 #include "util.h"
 
+#include <atomic>
 #include <cstdint>
 #include <mutex>
 #include <string>
@@ -31,7 +32,7 @@ private:
     std::mutex buf_mtx_;
     std::vector<int16_t> buffer_;
     StopToken stop_;
-    bool running_ = false;
+    std::atomic<bool> running_{false};
 };
 
 } // namespace recmeet
