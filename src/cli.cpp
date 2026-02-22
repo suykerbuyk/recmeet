@@ -1,5 +1,6 @@
 #include "cli.h"
 
+#include <cstdlib>
 #include <getopt.h>
 
 namespace recmeet {
@@ -22,6 +23,8 @@ CliResult parse_cli(int argc, char* argv[]) {
         {"llm-model",      required_argument, nullptr, 'L'},
         {"language",       required_argument, nullptr, 'g'},
         {"reprocess",      required_argument, nullptr, 'R'},
+        {"no-diarize",     no_argument,       nullptr, 'D'},
+        {"num-speakers",   required_argument, nullptr, 'S'},
         {"list-sources",   no_argument,       nullptr, 'l'},
         {"help",           no_argument,       nullptr, 'h'},
         {"version",        no_argument,       nullptr, 'v'},
@@ -53,6 +56,8 @@ CliResult parse_cli(int argc, char* argv[]) {
             case 'L': result.cfg.llm_model = optarg; break;
             case 'g': result.cfg.language = optarg; break;
             case 'R': result.cfg.reprocess_dir = optarg; break;
+            case 'D': result.cfg.diarize = false; break;
+            case 'S': result.cfg.num_speakers = std::atoi(optarg); break;
             case 'l': result.list_sources = true; break;
             case 'v': result.show_version = true; return result;
             case 'h': result.show_help = true; return result;

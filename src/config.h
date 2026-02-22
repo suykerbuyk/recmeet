@@ -44,6 +44,10 @@ struct Config {
     // Local LLM
     std::string llm_model; // path or name, empty = use HTTP API
 
+    // Diarization (on by default when built with RECMEET_USE_SHERPA)
+    bool diarize = true;
+    int num_speakers = 0;  // 0 = auto-detect
+
     // Output
     fs::path output_dir = "./meetings";
 

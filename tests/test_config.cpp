@@ -106,6 +106,8 @@ TEST_CASE("load_config: returns defaults when no file exists", "[config]") {
     CHECK(cfg.api_model == "grok-3");
     CHECK(cfg.mic_only == false);
     CHECK(cfg.no_summary == false);
+    CHECK(cfg.diarize == true);
+    CHECK(cfg.num_speakers == 0);
     CHECK(cfg.obsidian_enabled == false);
 
     // Restore

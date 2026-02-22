@@ -114,3 +114,23 @@ TEST_CASE("parse_cli: default provider is xai", "[cli]") {
     auto cli = run_cli({"recmeet"});
     CHECK(cli.cfg.provider == "xai");
 }
+
+TEST_CASE("parse_cli: --no-diarize disables diarize", "[cli]") {
+    auto cli = run_cli({"recmeet", "--no-diarize"});
+    CHECK(cli.cfg.diarize == false);
+}
+
+TEST_CASE("parse_cli: default diarize is true", "[cli]") {
+    auto cli = run_cli({"recmeet"});
+    CHECK(cli.cfg.diarize == true);
+}
+
+TEST_CASE("parse_cli: --num-speakers sets num_speakers", "[cli]") {
+    auto cli = run_cli({"recmeet", "--num-speakers", "3"});
+    CHECK(cli.cfg.num_speakers == 3);
+}
+
+TEST_CASE("parse_cli: default num_speakers is 0", "[cli]") {
+    auto cli = run_cli({"recmeet"});
+    CHECK(cli.cfg.num_speakers == 0);
+}

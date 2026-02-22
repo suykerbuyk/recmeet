@@ -1,5 +1,6 @@
 #include "pipeline.h"
 #include "config.h"
+#include "diarize.h"
 #include "device_enum.h"
 #include "audio_capture.h"
 #include "audio_monitor.h"
@@ -57,7 +58,7 @@ PipelineResult run_pipeline(const Config& cfg, StopToken& stop, PhaseCallback on
     std::string transcript_text;
 
     if (!cfg.reprocess_dir.empty()) {
-        // --- Reprocess existing recording ---
+        // --- Reprocess existing recording from audio.wav ---
         out_dir = cfg.reprocess_dir;
         if (!fs::is_directory(out_dir))
             throw RecmeetError("Reprocess directory does not exist: " + out_dir.string());
@@ -66,35 +67,34 @@ PipelineResult run_pipeline(const Config& cfg, StopToken& stop, PhaseCallback on
         transcript_path = out_dir / "transcript.txt";
         summary_path = out_dir / "summary.md";
 
+        if (!fs::exists(audio_path))
+            throw RecmeetError("No audio.wav in reprocess directory: " + out_dir.string());
+
         fprintf(stderr, "Reprocessing: %s\n", out_dir.c_str());
 
-        if (fs::exists(transcript_path)) {
-            // Read existing transcript
-            std::ifstream in(transcript_path);
-            std::ostringstream buf;
-            buf << in.rdbuf();
-            transcript_text = buf.str();
-            if (transcript_text.empty())
-                throw RecmeetError("Transcript file is empty: " + transcript_path.string());
-            fprintf(stderr, "Using existing transcript: %s\n", transcript_path.c_str());
-        } else if (fs::exists(audio_path)) {
-            // Transcribe existing audio
-            phase("transcribing");
-            notify("Transcribing...", "Model: " + cfg.whisper_model);
-            fs::path model_path = ensure_whisper_model(cfg.whisper_model);
-            auto result = transcribe(model_path, audio_path, cfg.language);
-            transcript_text = result.to_string();
-            if (transcript_text.empty())
-                throw RecmeetError("Transcription produced no text.");
-            {
-                std::ofstream out(transcript_path);
-                out << transcript_text;
-            }
-            fprintf(stderr, "Transcript saved: %s\n", transcript_path.c_str());
-        } else {
-            throw RecmeetError("Reprocess directory has neither transcript.txt nor audio.wav: "
-                               + out_dir.string());
+        // Transcribe from source audio
+        phase("transcribing");
+        notify("Transcribing...", "Model: " + cfg.whisper_model);
+        fs::path model_path = ensure_whisper_model(cfg.whisper_model);
+        auto result = transcribe(model_path, audio_path, cfg.language);
+
+#if RECMEET_USE_SHERPA
+        if (cfg.diarize) {
+            phase("diarizing");
+            notify("Diarizing...", "Identifying speakers");
+            auto diar = diarize(audio_path, cfg.num_speakers);
+            result.segments = merge_speakers(result.segments, diar);
         }
+#endif
+
+        transcript_text = result.to_string();
+        if (transcript_text.empty())
+            throw RecmeetError("Transcription produced no text.");
+        {
+            std::ofstream out(transcript_path);
+            out << transcript_text;
+        }
+        fprintf(stderr, "Transcript saved: %s\n", transcript_path.c_str());
     } else {
         // --- Normal mode: detect sources, record, transcribe ---
 
@@ -235,6 +235,15 @@ PipelineResult run_pipeline(const Config& cfg, StopToken& stop, PhaseCallback on
 
         fs::path model_path = ensure_whisper_model(cfg.whisper_model);
         auto result = transcribe(model_path, audio_path, cfg.language);
+
+#if RECMEET_USE_SHERPA
+        if (cfg.diarize) {
+            phase("diarizing");
+            notify("Diarizing...", "Identifying speakers");
+            auto diar = diarize(audio_path, cfg.num_speakers);
+            result.segments = merge_speakers(result.segments, diar);
+        }
+#endif
 
         transcript_text = result.to_string();
         if (transcript_text.empty())

@@ -8,6 +8,7 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 # Options
 option(RECMEET_BUILD_TRAY  "Build system tray applet" ON)
 option(RECMEET_USE_LLAMA   "Enable local summarization via llama.cpp" ON)
+option(RECMEET_USE_SHERPA  "Enable speaker diarization via sherpa-onnx" OFF)
 option(RECMEET_BUILD_TESTS "Build unit tests" ON)
 
 # Version header
@@ -49,6 +50,34 @@ if(RECMEET_USE_LLAMA)
     add_subdirectory(vendor/llama.cpp)
 endif()
 
+# Vendor: sherpa-onnx (speaker diarization)
+if(RECMEET_USE_SHERPA)
+    include(FetchContent)
+    FetchContent_Declare(sherpa-onnx
+        GIT_REPOSITORY https://github.com/k2-fsa/sherpa-onnx.git
+        GIT_TAG v1.10.39
+    )
+    set(SHERPA_ONNX_ENABLE_TTS OFF CACHE BOOL "" FORCE)
+    set(SHERPA_ONNX_ENABLE_WEBSOCKET OFF CACHE BOOL "" FORCE)
+    set(SHERPA_ONNX_ENABLE_BINARY OFF CACHE BOOL "" FORCE)
+    set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
+    # sherpa-onnx's transitive deps require older CMake minimum versions
+    set(CMAKE_POLICY_VERSION_MINIMUM 3.5 CACHE STRING "" FORCE)
+    # sherpa-onnx uses CMAKE_SOURCE_DIR for its cmake modules, which is wrong
+    # under FetchContent. Pre-populate the module path before MakeAvailable.
+    FetchContent_GetProperties(sherpa-onnx)
+    if(NOT sherpa-onnx_POPULATED)
+        FetchContent_Populate(sherpa-onnx)
+        list(APPEND CMAKE_MODULE_PATH
+            ${sherpa-onnx_SOURCE_DIR}/cmake/Modules
+            ${sherpa-onnx_SOURCE_DIR}/cmake)
+        # sherpa-onnx uses CMAKE_SOURCE_DIR for include paths, which is wrong
+        # under FetchContent. Add the correct include path globally.
+        include_directories(${sherpa-onnx_SOURCE_DIR})
+        add_subdirectory(${sherpa-onnx_SOURCE_DIR} ${sherpa-onnx_BINARY_DIR})
+    endif()
+endif()
+
 # Core library (everything except main.cpp and tray.cpp)
 set(CORE_SOURCES
     src/util.cpp
@@ -66,6 +95,7 @@ set(CORE_SOURCES
     src/obsidian.cpp
     src/pipeline.cpp
     src/cli.cpp
+    src/diarize.cpp
 )
 
 add_library(recmeet_core STATIC ${CORE_SOURCES})
@@ -87,6 +117,11 @@ target_link_libraries(recmeet_core PUBLIC
 if(RECMEET_USE_LLAMA)
     target_link_libraries(recmeet_core PUBLIC llama)
     target_compile_definitions(recmeet_core PUBLIC RECMEET_USE_LLAMA=1)
+endif()
+
+if(RECMEET_USE_SHERPA)
+    target_link_libraries(recmeet_core PUBLIC sherpa-onnx-c-api)
+    target_compile_definitions(recmeet_core PUBLIC RECMEET_USE_SHERPA=1)
 endif()
 
 # CLI binary
@@ -131,6 +166,7 @@ if(RECMEET_BUILD_TESTS)
         tests/test_pipeline_helpers.cpp
         tests/test_cli.cpp
         tests/test_benchmark.cpp
+        tests/test_diarize.cpp
     )
     target_link_libraries(recmeet_tests PRIVATE recmeet_core Catch2::Catch2WithMain)
     catch_discover_tests(recmeet_tests)

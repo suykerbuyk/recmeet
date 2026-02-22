@@ -145,6 +145,11 @@ Config load_config() {
     cfg.no_summary = get_bool(entries, "summary", "disabled", false);
     cfg.llm_model = get_val(entries, "summary", "llm_model", "");
 
+    // Diarization section
+    cfg.diarize = get_bool(entries, "diarization", "enabled", true);
+    std::string ns = get_val(entries, "diarization", "num_speakers", "0");
+    cfg.num_speakers = std::atoi(ns.c_str());
+
     // Output section
     std::string out = get_val(entries, "output", "directory", "");
     if (!out.empty()) cfg.output_dir = out;
@@ -194,6 +199,14 @@ void save_config(const Config& cfg) {
         out << "  disabled: true\n";
     if (!cfg.llm_model.empty())
         out << "  llm_model: \"" << cfg.llm_model << "\"\n";
+
+    if (!cfg.diarize || cfg.num_speakers > 0) {
+        out << "\ndiarization:\n";
+        if (!cfg.diarize)
+            out << "  enabled: false\n";
+        if (cfg.num_speakers > 0)
+            out << "  num_speakers: " << cfg.num_speakers << "\n";
+    }
 
     out << "\noutput:\n"
         << "  directory: \"" << cfg.output_dir.string() << "\"\n";

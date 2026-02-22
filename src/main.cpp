@@ -1,5 +1,6 @@
 #include "cli.h"
 #include "config.h"
+#include "diarize.h"
 #include "device_enum.h"
 #include "model_manager.h"
 #include "notify.h"
@@ -41,7 +42,9 @@ static void print_usage() {
         "  --context-file PATH  Pre-meeting notes to include in summary prompt\n"
         "  --obsidian-vault DIR Obsidian vault path for note output\n"
         "  --llm-model PATH     Local GGUF model for summarization (instead of API)\n"
-        "  --reprocess DIR      Re-run summarization on existing recording directory\n"
+        "  --no-diarize         Disable speaker diarization\n"
+        "  --num-speakers N     Number of speakers (0 = auto-detect, default: 0)\n"
+        "  --reprocess DIR      Reprocess existing recording from audio.wav\n"
         "  --list-sources       List available audio sources and exit\n"
         "  -h, --help           Show this help\n"
         "  -v, --version        Show version\n"
@@ -104,12 +107,8 @@ int main(int argc, char* argv[]) {
 
     notify_init();
 
-    // In reprocess mode, skip whisper pre-check if transcript already exists
-    bool need_whisper = cfg.reprocess_dir.empty()
-        || !fs::exists(cfg.reprocess_dir / "transcript.txt");
-
-    // Pre-check: ensure whisper model is available before recording
-    if (need_whisper) {
+    // Pre-check: ensure whisper model is available before recording/reprocessing
+    {
         try {
             if (!is_whisper_model_cached(cfg.whisper_model)) {
                 fprintf(stderr, "Whisper model '%s' not found locally.\n", cfg.whisper_model.c_str());
@@ -140,6 +139,34 @@ int main(int argc, char* argv[]) {
             notify_cleanup();
             return 1;
         }
+    }
+
+    // Pre-check: diarization
+    if (cfg.diarize) {
+#if RECMEET_USE_SHERPA
+        if (!is_sherpa_model_cached()) {
+            fprintf(stderr, "Speaker diarization models not found locally.\n");
+            fprintf(stderr, "Download now? (~40 MB) [Y/n] ");
+            int ch = getchar();
+            if (ch == 'n' || ch == 'N') {
+                fprintf(stderr, "Diarization disabled.\n");
+                cfg.diarize = false;
+            } else {
+                try {
+                    ensure_sherpa_models();
+                    fprintf(stderr, "Diarization models ready.\n\n");
+                } catch (const RecmeetError& e) {
+                    fprintf(stderr, "Error downloading models: %s\n", e.what());
+                    fprintf(stderr, "Diarization disabled.\n");
+                    cfg.diarize = false;
+                }
+            }
+        }
+#else
+        fprintf(stderr, "Warning: Diarization requires sherpa-onnx support (not compiled in).\n");
+        fprintf(stderr, "Rebuild with: cmake -DRECMEET_USE_SHERPA=ON, or use --no-diarize to suppress.\n");
+        cfg.diarize = false;
+#endif
     }
 
     if (cfg.reprocess_dir.empty())

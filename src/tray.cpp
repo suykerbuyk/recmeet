@@ -1,4 +1,5 @@
 #include "config.h"
+#include "diarize.h"
 #include "device_enum.h"
 #include "model_manager.h"
 #include "notify.h"
@@ -137,9 +138,20 @@ static void on_record(GtkMenuItem*, gpointer) {
                 ensure_llama_model(g_tray.cfg.llm_model);
             }
 
+#if RECMEET_USE_SHERPA
+            // Pre-check: download sherpa models if diarization enabled
+            if (g_tray.cfg.diarize && !is_sherpa_model_cached()) {
+                notify("Downloading models",
+                       "Speaker diarization models — please wait...");
+                ensure_sherpa_models();
+                notify("Models ready",
+                       "Speaker diarization models downloaded.");
+            }
+#endif
+
             auto on_phase = [](const std::string& phase) {
                 fprintf(stderr, "[tray] Phase: %s\n", phase.c_str());
-                if (phase == "transcribing" || phase == "summarizing")
+                if (phase == "transcribing" || phase == "diarizing" || phase == "summarizing")
                     g_idle_add(on_pipeline_processing, nullptr);
             };
             run_pipeline(g_tray.cfg, g_tray.stop, on_phase);
@@ -196,6 +208,13 @@ static void on_no_summary_toggled(GtkCheckMenuItem* item, gpointer) {
     g_tray.cfg.no_summary = gtk_check_menu_item_get_active(item);
     save_config(g_tray.cfg);
 }
+
+#if RECMEET_USE_SHERPA
+static void on_diarize_toggled(GtkCheckMenuItem* item, gpointer) {
+    g_tray.cfg.diarize = gtk_check_menu_item_get_active(item);
+    save_config(g_tray.cfg);
+}
+#endif
 
 // --- Provider / model callbacks ---
 
@@ -577,6 +596,15 @@ static void build_menu() {
         if (!is_idle) gtk_widget_set_sensitive(item, FALSE);
         gtk_menu_shell_append(GTK_MENU_SHELL(menu), item);
     }
+#if RECMEET_USE_SHERPA
+    {
+        auto* item = gtk_check_menu_item_new_with_label("Speaker Diarization");
+        gtk_check_menu_item_set_active(GTK_CHECK_MENU_ITEM(item), g_tray.cfg.diarize);
+        g_signal_connect(item, "toggled", G_CALLBACK(on_diarize_toggled), nullptr);
+        if (!is_idle) gtk_widget_set_sensitive(item, FALSE);
+        gtk_menu_shell_append(GTK_MENU_SHELL(menu), item);
+    }
+#endif
 
     gtk_menu_shell_append(GTK_MENU_SHELL(menu), gtk_separator_menu_item_new());
 

@@ -1,4 +1,5 @@
 #include <catch2/catch_test_macros.hpp>
+#include "diarize.h"
 #include "transcribe.h"
 #include "summarize.h"
 #include "model_manager.h"
@@ -310,6 +311,44 @@ TEST_CASE("Summarize reference transcript with Grok API", "[benchmark]") {
     CHECK(summary.find("Open Questions") != std::string::npos);
     CHECK(summary.find("Participants") != std::string::npos);
 }
+
+#if RECMEET_USE_SHERPA
+TEST_CASE("Diarize debate audio with sherpa-onnx", "[benchmark]") {
+    fs::path root = find_project_root();
+    if (root.empty())
+        SKIP("Project root with assets/ not found");
+
+    fs::path audio_path = root / "assets" / "biden_trump_debate_2020.wav";
+    if (!fs::exists(audio_path))
+        SKIP("Reference audio not found: " + audio_path.string());
+    if (!is_sherpa_model_cached())
+        SKIP("Sherpa diarization models not cached");
+
+    auto t0 = std::chrono::steady_clock::now();
+    auto result = diarize(audio_path, 3);  // Biden, Trump, moderator
+    auto t1 = std::chrono::steady_clock::now();
+    double secs = std::chrono::duration<double>(t1 - t0).count();
+
+    fprintf(stderr, "\n[benchmark] Sherpa-onnx speaker diarization:\n");
+    fprintf(stderr, "  Speakers detected: %d\n", result.num_speakers);
+    fprintf(stderr, "  Segments: %zu\n", result.segments.size());
+    fprintf(stderr, "  Time: %.1fs\n", secs);
+
+    char buf[512];
+    snprintf(buf, sizeof(buf),
+        "\n      \"test\": \"sherpa_diarization\","
+        "\n      \"num_speakers_requested\": 3,"
+        "\n      \"num_speakers_detected\": %d,"
+        "\n      \"segments\": %zu,"
+        "\n      \"time_secs\": %.1f",
+        result.num_speakers, result.segments.size(), secs);
+    BenchmarkResults::add(buf);
+
+    CHECK(result.num_speakers >= 2);
+    CHECK(result.num_speakers <= 5);
+    CHECK(!result.segments.empty());
+}
+#endif
 
 #if RECMEET_USE_LLAMA
 TEST_CASE("Summarize reference transcript with local LLM", "[benchmark]") {
