@@ -1,9 +1,14 @@
 ## Restoring full AI thread context:
 
-Read CLAUDE.md, then read each document it references (RESUME.md, BUILD.md) to
-restore full project context. After reading, briefly confirm what you loaded and
-note the current state: test count, any known issues, and what was last worked on
-based on recent git history.
+Read `CLAUDE.md` for AI-specific workflow rules, then read each document it
+references in referenced order to restore full project context:
+
+1. `RESUME.md` — project purpose, architecture, design decisions, test results
+2. `BUILD.md` — build system tutorial (CMake/Ninja)
+3. `tasks/*.md` — open bugs and planned improvements
+
+After reading, briefly confirm what you loaded and note the current state:
+test count, open tasks, and what was last worked on based on recent git history.
 
 ## Workflow Orchestration
 

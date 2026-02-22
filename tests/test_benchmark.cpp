@@ -374,16 +374,11 @@ TEST_CASE("Summarize reference transcript with local LLM", "[benchmark]") {
     if (llm_model.empty())
         SKIP("No LLM .gguf model found in " + llm_dir.string());
 
-    // Load reference transcript, truncated to fit the 8192-token context window.
-    // The full 15-minute debate transcript exceeds it and triggers a ggml assertion
-    // in llama_decode. Use the first ~6000 chars (~1500 words) which leaves room
-    // for the prompt template and generation.
+    // Load full reference transcript — summarize_local() handles truncation internally
     std::ifstream ref_file(ref_path);
-    std::string full((std::istreambuf_iterator<char>(ref_file)),
-                      std::istreambuf_iterator<char>());
-    REQUIRE(!full.empty());
-    constexpr size_t MAX_CHARS = 6000;
-    std::string transcript = full.substr(0, std::min(full.size(), MAX_CHARS));
+    std::string transcript((std::istreambuf_iterator<char>(ref_file)),
+                            std::istreambuf_iterator<char>());
+    REQUIRE(!transcript.empty());
 
     auto t0 = std::chrono::steady_clock::now();
     std::string summary = summarize_local(transcript, llm_model);
@@ -455,14 +450,9 @@ TEST_CASE("Full pipeline: whisper transcribe then LLM summarize", "[benchmark]")
     std::string transcript_text = result.to_string();
     REQUIRE(!transcript_text.empty());
 
-    // Phase 2: Summarize (truncated to fit 8192-token context window).
-    // Timestamped text is more token-dense than plain text, so use a
-    // smaller limit than the standalone summarize test.
-    constexpr size_t MAX_CHARS = 4000;
-    std::string truncated = transcript_text.substr(0, std::min(transcript_text.size(), MAX_CHARS));
-
+    // Phase 2: Summarize — summarize_local() handles context-window truncation internally
     auto t2 = std::chrono::steady_clock::now();
-    std::string summary = summarize_local(truncated, llm_model);
+    std::string summary = summarize_local(transcript_text, llm_model);
     auto t3 = std::chrono::steady_clock::now();
     double summarize_secs = std::chrono::duration<double>(t3 - t2).count();
 

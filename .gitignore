@@ -16,9 +16,11 @@ compile_commands.json
 # Editor
 .cache/
 .idea/
+.zed/
 *.swp
 
 # AI session context (local-only, never committed)
 CLAUDE.md
 RESUME.md
 commit.msg
+tasks/

@@ -1,6 +1,8 @@
 [submodule "vendor/whisper.cpp"]
 	path = vendor/whisper.cpp
 	url = https://github.com/ggerganov/whisper.cpp.git
+	ignore = untracked
 [submodule "vendor/llama.cpp"]
 	path = vendor/llama.cpp
 	url = https://github.com/ggerganov/llama.cpp.git
+	ignore = untracked

@@ -189,8 +189,16 @@ std::string summarize_local(const std::string& transcript,
         throw RecmeetError("Failed to load LLM model: " + model_path.string());
     }
 
+    // Use model's native context size, capped to avoid OOM on CPU inference
+    constexpr uint32_t MAX_LOCAL_CTX = 32768;
+    constexpr int GENERATION_BUDGET = 4096;
+
+    int32_t model_ctx = llama_model_n_ctx_train(model);
+    uint32_t n_ctx = std::min(static_cast<uint32_t>(model_ctx), MAX_LOCAL_CTX);
+
     llama_context_params ctx_params = llama_context_default_params();
-    ctx_params.n_ctx = 8192;
+    ctx_params.n_ctx = n_ctx;
+    ctx_params.n_batch = n_ctx;  // allow full-prompt decode in a single batch
     ctx_params.n_threads = threads > 0 ? threads : default_thread_count();
 
     llama_context* ctx = llama_init_from_model(model, ctx_params);
@@ -199,6 +207,10 @@ std::string summarize_local(const std::string& transcript,
         llama_backend_free();
         throw RecmeetError("Failed to create LLM context");
     }
+
+    uint32_t actual_ctx = llama_n_ctx(ctx);
+    fprintf(stderr, "Context: %u tokens (model native: %d, cap: %u)\n",
+            actual_ctx, model_ctx, MAX_LOCAL_CTX);
 
     // Build prompt using model's chat template
     std::string user_prompt = build_user_prompt(transcript, context);
@@ -239,6 +251,23 @@ std::string summarize_local(const std::string& transcript,
     }
     tokens.resize(n_prompt);
 
+    // Truncate prompt to fit within context budget (prevents SIGABRT in llama_decode)
+    int max_prompt_tokens = static_cast<int>(actual_ctx) - GENERATION_BUDGET;
+    if (max_prompt_tokens < 256) {
+        llama_free(ctx);
+        llama_model_free(model);
+        llama_backend_free();
+        throw RecmeetError("LLM context too small: " + std::to_string(actual_ctx)
+                           + " tokens (need at least " + std::to_string(GENERATION_BUDGET + 256) + ")");
+    }
+
+    if (n_prompt > max_prompt_tokens) {
+        fprintf(stderr, "Warning: Prompt (%d tokens) exceeds context budget (%d tokens). "
+                        "Truncating transcript to fit.\n", n_prompt, max_prompt_tokens);
+        n_prompt = max_prompt_tokens;
+        tokens.resize(n_prompt);
+    }
+
     fprintf(stderr, "Prompt: %d tokens, generating summary...\n", n_prompt);
 
     // Helper: add a token to a batch
@@ -259,17 +288,22 @@ std::string summarize_local(const std::string& transcript,
     for (int i = 0; i < n_prompt; ++i)
         batch_add(batch, tokens[i], i, 0, i == n_prompt - 1);
 
-    if (llama_decode(ctx, batch) != 0) {
+    int decode_status = llama_decode(ctx, batch);
+    if (decode_status != 0) {
         llama_batch_free(batch);
         llama_free(ctx);
         llama_model_free(model);
         llama_backend_free();
-        throw RecmeetError("LLM decode failed");
+        if (decode_status == 1)
+            throw RecmeetError("LLM decode failed: no KV slot for batch (prompt: "
+                               + std::to_string(n_prompt) + " tokens, ctx: "
+                               + std::to_string(actual_ctx) + ")");
+        throw RecmeetError("LLM decode failed (status " + std::to_string(decode_status) + ")");
     }
 
     // Generate
     std::string result;
-    int max_tokens = 4096;
+    int max_tokens = GENERATION_BUDGET;
 
     auto* sampler = llama_sampler_chain_init(llama_sampler_chain_default_params());
     llama_sampler_chain_add(sampler, llama_sampler_init_temp(0.3f));
@@ -288,7 +322,8 @@ std::string summarize_local(const std::string& transcript,
 
         batch.n_tokens = 0;
         batch_add(batch, new_token, n_prompt + i, 0, true);
-        llama_decode(ctx, batch);
+        if (llama_decode(ctx, batch) != 0)
+            break;
     }
 
     llama_sampler_free(sampler);
