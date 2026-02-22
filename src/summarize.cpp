@@ -1,6 +1,7 @@
 #include "summarize.h"
 #include "http_client.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <sstream>
 #include <string>
@@ -58,6 +59,48 @@ std::string json_extract_string(const std::string& json, const std::string& key)
         pos++;
     }
     return result;
+}
+
+bool is_chat_model(const std::string& id) {
+    static const char* skip[] = {
+        "embed", "tts", "whisper", "dall-e", "image",
+        "video", "moderation", "audio", "realtime",
+    };
+    for (const auto* s : skip)
+        if (id.find(s) != std::string::npos)
+            return false;
+    return true;
+}
+
+std::vector<std::string> fetch_models(const std::string& models_url, const std::string& api_key) {
+    std::map<std::string, std::string> headers = {
+        {"Authorization", "Bearer " + api_key},
+    };
+    std::string response = http_get(models_url, headers);
+
+    // Extract all "id" values from the response JSON
+    std::vector<std::string> models;
+    std::string search = "\"id\"";
+    size_t pos = 0;
+    while ((pos = response.find(search, pos)) != std::string::npos) {
+        pos += search.size();
+        // Skip to the value string
+        pos = response.find('"', pos + 1); // skip ':'
+        if (pos == std::string::npos) break;
+        pos++; // skip opening quote
+
+        std::string id;
+        while (pos < response.size() && response[pos] != '"') {
+            id += response[pos];
+            pos++;
+        }
+
+        if (!id.empty() && is_chat_model(id))
+            models.push_back(id);
+    }
+
+    std::sort(models.begin(), models.end());
+    return models;
 }
 
 std::string build_user_prompt(const std::string& transcript, const std::string& context) {

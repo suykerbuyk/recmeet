@@ -9,6 +9,20 @@
 
 namespace recmeet {
 
+struct ProviderInfo {
+    const char* name;          // "xai", "openai", "anthropic"
+    const char* display;       // "xAI (Grok)", "OpenAI", "Anthropic"
+    const char* base_url;      // "https://api.x.ai/v1"
+    const char* env_var;       // "XAI_API_KEY"
+    const char* default_model; // "grok-3"
+};
+
+extern const ProviderInfo PROVIDERS[];
+extern const size_t NUM_PROVIDERS;
+
+const ProviderInfo* find_provider(const std::string& name);
+std::string resolve_api_key(const ProviderInfo& provider, const std::string& fallback_key);
+
 struct Config {
     // Audio
     std::string device_pattern = DEFAULT_DEVICE_PATTERN;
@@ -21,7 +35,8 @@ struct Config {
     std::string language; // empty = auto-detect, otherwise ISO 639-1 code (e.g. "en")
 
     // Summarization
-    std::string api_url = "https://api.x.ai/v1/chat/completions";
+    std::string provider = "xai";
+    std::string api_url; // empty = derived from provider
     std::string api_key;
     std::string api_model = "grok-3";
     bool no_summary = false;
@@ -38,6 +53,9 @@ struct Config {
 
     // Context
     fs::path context_file;
+
+    // Reprocess
+    fs::path reprocess_dir;
 };
 
 /// Load config from ~/.config/recmeet/config.yaml (creates default if missing).

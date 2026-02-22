@@ -25,6 +25,7 @@ TEST_CASE("save_config + load_config round-trip", "[config]") {
     cfg.mic_only = true;
     cfg.whisper_model = "small";
     cfg.language = "en";
+    cfg.provider = "openai";
     cfg.api_url = "https://api.example.com/v1/chat";
     cfg.api_model = "gpt-4";
     cfg.no_summary = true;
@@ -54,6 +55,7 @@ TEST_CASE("save_config + load_config round-trip", "[config]") {
     CHECK(content.find("mic_only: true") != std::string::npos);
     CHECK(content.find("model: small") != std::string::npos);
     CHECK(content.find("language: en") != std::string::npos);
+    CHECK(content.find("provider: openai") != std::string::npos);
     CHECK(content.find("api_url: \"https://api.example.com/v1/chat\"") != std::string::npos);
     CHECK(content.find("model: gpt-4") != std::string::npos);
     CHECK(content.find("disabled: true") != std::string::npos);
@@ -71,6 +73,7 @@ TEST_CASE("save_config + load_config round-trip", "[config]") {
     CHECK(loaded.mic_only == true);
     CHECK(loaded.whisper_model == "small");
     CHECK(loaded.language == "en");
+    CHECK(loaded.provider == "openai");
     CHECK(loaded.api_url == "https://api.example.com/v1/chat");
     CHECK(loaded.api_model == "gpt-4");
     CHECK(loaded.no_summary == true);
@@ -98,7 +101,8 @@ TEST_CASE("load_config: returns defaults when no file exists", "[config]") {
 
     Config cfg = load_config();
     CHECK(cfg.whisper_model == "base");
-    CHECK(cfg.api_url == "https://api.x.ai/v1/chat/completions");
+    CHECK(cfg.provider == "xai");
+    CHECK(cfg.api_url.empty());
     CHECK(cfg.api_model == "grok-3");
     CHECK(cfg.mic_only == false);
     CHECK(cfg.no_summary == false);
@@ -151,7 +155,8 @@ TEST_CASE("load_config: partial config fills only specified fields", "[config]")
     Config cfg = load_config();
     CHECK(cfg.whisper_model == "tiny");
     // Others should be defaults
-    CHECK(cfg.api_url == "https://api.x.ai/v1/chat/completions");
+    CHECK(cfg.provider == "xai");
+    CHECK(cfg.api_url.empty());
     CHECK(cfg.api_model == "grok-3");
     CHECK(cfg.mic_only == false);
     CHECK(cfg.obsidian_enabled == false);

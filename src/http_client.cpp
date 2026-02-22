@@ -61,6 +61,47 @@ std::string http_get(const std::string& url) {
     return response;
 }
 
+std::string http_get(const std::string& url,
+                      const std::map<std::string, std::string>& headers) {
+    ensure_curl();
+
+    CURL* curl = curl_easy_init();
+    if (!curl) throw RecmeetError("curl_easy_init failed");
+
+    struct curl_slist* hdr_list = nullptr;
+    for (const auto& [key, val] : headers)
+        hdr_list = curl_slist_append(hdr_list, (key + ": " + val).c_str());
+
+    std::string response;
+    curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+    if (hdr_list)
+        curl_easy_setopt(curl, CURLOPT_HTTPHEADER, hdr_list);
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_callback);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
+    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 15L);
+    std::string ua = std::string("recmeet/") + RECMEET_VERSION;
+    curl_easy_setopt(curl, CURLOPT_USERAGENT, ua.c_str());
+
+    CURLcode res = curl_easy_perform(curl);
+    if (hdr_list) curl_slist_free_all(hdr_list);
+
+    if (res != CURLE_OK) {
+        std::string err = curl_easy_strerror(res);
+        curl_easy_cleanup(curl);
+        throw RecmeetError("HTTP GET failed: " + err + " (" + url + ")");
+    }
+
+    long http_code = 0;
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
+    curl_easy_cleanup(curl);
+
+    if (http_code >= 400)
+        throw RecmeetError("HTTP GET " + std::to_string(http_code) + ": " + url);
+
+    return response;
+}
+
 std::string http_post_json(const std::string& url,
                             const std::string& json_body,
                             const std::map<std::string, std::string>& headers) {

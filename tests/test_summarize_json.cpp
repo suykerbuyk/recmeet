@@ -70,3 +70,25 @@ TEST_CASE("json_extract_string: OpenAI-style response", "[json]") {
     std::string content = json_extract_string(json, "content");
     CHECK(content == "### Overview\nThis was a planning meeting.");
 }
+
+TEST_CASE("is_chat_model: accepts chat models", "[summarize]") {
+    CHECK(is_chat_model("grok-3"));
+    CHECK(is_chat_model("grok-3-mini"));
+    CHECK(is_chat_model("gpt-4o"));
+    CHECK(is_chat_model("gpt-4o-mini"));
+    CHECK(is_chat_model("claude-sonnet-4-6"));
+    CHECK(is_chat_model("o1-preview"));
+}
+
+TEST_CASE("is_chat_model: rejects non-chat models", "[summarize]") {
+    CHECK_FALSE(is_chat_model("text-embedding-3-large"));
+    CHECK_FALSE(is_chat_model("text-embedding-ada-002"));
+    CHECK_FALSE(is_chat_model("tts-1"));
+    CHECK_FALSE(is_chat_model("tts-1-hd"));
+    CHECK_FALSE(is_chat_model("whisper-1"));
+    CHECK_FALSE(is_chat_model("dall-e-3"));
+    CHECK_FALSE(is_chat_model("dall-e-2"));
+    CHECK_FALSE(is_chat_model("text-moderation-latest"));
+    CHECK_FALSE(is_chat_model("gpt-4o-audio-preview"));
+    CHECK_FALSE(is_chat_model("gpt-4o-realtime-preview"));
+}

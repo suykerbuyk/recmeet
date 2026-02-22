@@ -3,6 +3,7 @@
 #include "model_manager.h"
 #include "notify.h"
 #include "pipeline.h"
+#include "summarize.h"
 #include "util.h"
 #include "version.h"
 
@@ -11,6 +12,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <mutex>
 #include <thread>
 
 using namespace recmeet;
@@ -52,6 +54,12 @@ struct TrayState {
     // Cached sources
     std::vector<AudioSource> mics;
     std::vector<AudioSource> monitors;
+
+    // Cached API models for current provider
+    std::vector<std::string> cached_models;
+    std::mutex models_mutex;
+    bool models_fetching = false;
+    std::string models_provider; // which provider the cache is for
 };
 
 static TrayState g_tray;
@@ -59,6 +67,7 @@ static TrayState g_tray;
 // Forward declarations
 static void build_menu();
 static void refresh_sources();
+static void fetch_provider_models();
 
 // --- Helpers ---
 
@@ -188,26 +197,90 @@ static void on_no_summary_toggled(GtkCheckMenuItem* item, gpointer) {
     save_config(g_tray.cfg);
 }
 
-// --- Summary backend callbacks ---
+// --- Provider / model callbacks ---
 
 static void choose_gguf_model();
 
-static void on_summary_api(GtkCheckMenuItem* item, gpointer) {
+static void on_provider_selected(GtkCheckMenuItem* item, gpointer data) {
     if (!gtk_check_menu_item_get_active(item)) return;
-    g_tray.cfg.llm_model.clear();
-    save_config(g_tray.cfg);
-}
+    auto* name = static_cast<const char*>(data);
 
-static void on_summary_local(GtkCheckMenuItem* item, gpointer) {
-    if (!gtk_check_menu_item_get_active(item)) return;
-    if (g_tray.cfg.llm_model.empty())
-        choose_gguf_model();
-    if (g_tray.cfg.llm_model.empty()) {
-        // User cancelled — revert to API. Rebuild menu to reset radio state.
+    if (!name) {
+        // Local LLM selected
+        if (g_tray.cfg.llm_model.empty())
+            choose_gguf_model();
+        if (g_tray.cfg.llm_model.empty()) {
+            build_menu(); // user cancelled — revert radio state
+            return;
+        }
+        save_config(g_tray.cfg);
         build_menu();
         return;
     }
+
+    // Cloud provider selected
+    g_tray.cfg.provider = name;
+    g_tray.cfg.llm_model.clear();
+
+    const auto* prov = find_provider(name);
+    if (prov)
+        g_tray.cfg.api_model = prov->default_model;
+
     save_config(g_tray.cfg);
+    fetch_provider_models();
+    build_menu();
+}
+
+static void on_api_model_selected(GtkCheckMenuItem* item, gpointer data) {
+    if (!gtk_check_menu_item_get_active(item)) return;
+    auto* model = static_cast<const char*>(data);
+    if (model) {
+        g_tray.cfg.api_model = model;
+        save_config(g_tray.cfg);
+    }
+}
+
+// --- Model fetching ---
+
+static gboolean on_models_fetched(gpointer) {
+    g_tray.models_fetching = false;
+    build_menu();
+    return G_SOURCE_REMOVE;
+}
+
+static void fetch_provider_models() {
+    if (g_tray.models_fetching) return;
+    if (!g_tray.cfg.llm_model.empty()) return; // using local LLM
+
+    const auto* prov = find_provider(g_tray.cfg.provider);
+    if (!prov) return;
+
+    g_tray.models_fetching = true;
+    g_tray.models_provider = g_tray.cfg.provider;
+
+    std::string provider_name = g_tray.cfg.provider;
+    std::string base_url = prov->base_url;
+    std::string fallback_key = g_tray.cfg.api_key;
+
+    std::thread([provider_name, base_url, fallback_key]() {
+        const auto* prov = find_provider(provider_name);
+        if (!prov) return;
+
+        std::string key = resolve_api_key(*prov, fallback_key);
+        if (key.empty()) {
+            g_idle_add(on_models_fetched, nullptr);
+            return;
+        }
+
+        try {
+            auto models = fetch_models(base_url + "/models", key);
+            std::lock_guard<std::mutex> lock(g_tray.models_mutex);
+            g_tray.cached_models = std::move(models);
+        } catch (const std::exception& e) {
+            fprintf(stderr, "[tray] Model fetch failed: %s\n", e.what());
+        }
+        g_idle_add(on_models_fetched, nullptr);
+    }).detach();
 }
 
 // --- File/folder chooser helpers ---
@@ -507,34 +580,94 @@ static void build_menu() {
 
     gtk_menu_shell_append(GTK_MENU_SHELL(menu), gtk_separator_menu_item_new());
 
-    // --- Summary backend submenu ---
+    // --- Summary submenu (Provider + Model) ---
     {
         auto* item = gtk_menu_item_new_with_label("Summary");
         auto* submenu = gtk_menu_new();
-        GSList* group = nullptr;
-
         bool use_local = !g_tray.cfg.llm_model.empty();
 
-        std::string api_label = "API (" + g_tray.cfg.api_model + ")";
-        auto* api_radio = gtk_radio_menu_item_new_with_label(group, api_label.c_str());
-        group = gtk_radio_menu_item_get_group(GTK_RADIO_MENU_ITEM(api_radio));
-        if (!use_local)
-            gtk_check_menu_item_set_active(GTK_CHECK_MENU_ITEM(api_radio), TRUE);
-        g_signal_connect(api_radio, "toggled", G_CALLBACK(on_summary_api), nullptr);
-        gtk_menu_shell_append(GTK_MENU_SHELL(submenu), api_radio);
+        // --- Provider sub-submenu ---
+        {
+            auto* prov_item = gtk_menu_item_new_with_label("Provider");
+            auto* prov_sub = gtk_menu_new();
+            GSList* group = nullptr;
 
-        std::string local_label = "Local LLM";
-        if (use_local) {
-            fs::path p(g_tray.cfg.llm_model);
-            local_label += " (" + p.filename().string() + ")";
-        } else {
-            local_label += " (not configured)";
+            for (size_t i = 0; i < NUM_PROVIDERS; ++i) {
+                auto* radio = gtk_radio_menu_item_new_with_label(group, PROVIDERS[i].display);
+                group = gtk_radio_menu_item_get_group(GTK_RADIO_MENU_ITEM(radio));
+                if (!use_local && g_tray.cfg.provider == PROVIDERS[i].name)
+                    gtk_check_menu_item_set_active(GTK_CHECK_MENU_ITEM(radio), TRUE);
+                g_signal_connect(radio, "toggled", G_CALLBACK(on_provider_selected),
+                                 const_cast<char*>(PROVIDERS[i].name));
+                gtk_menu_shell_append(GTK_MENU_SHELL(prov_sub), radio);
+            }
+
+            // Local LLM option
+            std::string local_label = "Local LLM";
+            if (use_local) {
+                fs::path p(g_tray.cfg.llm_model);
+                local_label += " (" + p.filename().string() + ")";
+            }
+            auto* local_radio = gtk_radio_menu_item_new_with_label(group, local_label.c_str());
+            if (use_local)
+                gtk_check_menu_item_set_active(GTK_CHECK_MENU_ITEM(local_radio), TRUE);
+            g_signal_connect(local_radio, "toggled", G_CALLBACK(on_provider_selected), nullptr);
+            gtk_menu_shell_append(GTK_MENU_SHELL(prov_sub), local_radio);
+
+            gtk_menu_item_set_submenu(GTK_MENU_ITEM(prov_item), prov_sub);
+            gtk_menu_shell_append(GTK_MENU_SHELL(submenu), prov_item);
         }
-        auto* local_radio = gtk_radio_menu_item_new_with_label(group, local_label.c_str());
-        if (use_local)
-            gtk_check_menu_item_set_active(GTK_CHECK_MENU_ITEM(local_radio), TRUE);
-        g_signal_connect(local_radio, "toggled", G_CALLBACK(on_summary_local), nullptr);
-        gtk_menu_shell_append(GTK_MENU_SHELL(submenu), local_radio);
+
+        gtk_menu_shell_append(GTK_MENU_SHELL(submenu), gtk_separator_menu_item_new());
+
+        // --- Model sub-submenu ---
+        {
+            auto* model_item = gtk_menu_item_new_with_label("Model");
+            auto* model_sub = gtk_menu_new();
+
+            if (use_local) {
+                // Disabled when using local LLM
+                gtk_widget_set_sensitive(model_item, FALSE);
+                auto* info = gtk_menu_item_new_with_label("(using local LLM)");
+                gtk_widget_set_sensitive(info, FALSE);
+                gtk_menu_shell_append(GTK_MENU_SHELL(model_sub), info);
+            } else if (g_tray.models_fetching) {
+                auto* info = gtk_menu_item_new_with_label("Loading...");
+                gtk_widget_set_sensitive(info, FALSE);
+                gtk_menu_shell_append(GTK_MENU_SHELL(model_sub), info);
+            } else {
+                std::lock_guard<std::mutex> lock(g_tray.models_mutex);
+                GSList* group = nullptr;
+                bool found_current = false;
+
+                // If cached models match current provider, show them
+                if (g_tray.models_provider == g_tray.cfg.provider && !g_tray.cached_models.empty()) {
+                    for (const auto& m : g_tray.cached_models) {
+                        auto* radio = gtk_radio_menu_item_new_with_label(group, m.c_str());
+                        group = gtk_radio_menu_item_get_group(GTK_RADIO_MENU_ITEM(radio));
+                        if (m == g_tray.cfg.api_model) {
+                            gtk_check_menu_item_set_active(GTK_CHECK_MENU_ITEM(radio), TRUE);
+                            found_current = true;
+                        }
+                        g_signal_connect(radio, "toggled", G_CALLBACK(on_api_model_selected),
+                                         const_cast<char*>(m.c_str()));
+                        gtk_menu_shell_append(GTK_MENU_SHELL(model_sub), radio);
+                    }
+                }
+
+                // Always show current model if not in list
+                if (!found_current) {
+                    auto* radio = gtk_radio_menu_item_new_with_label(group, g_tray.cfg.api_model.c_str());
+                    gtk_check_menu_item_set_active(GTK_CHECK_MENU_ITEM(radio), TRUE);
+                    g_signal_connect(radio, "toggled", G_CALLBACK(on_api_model_selected),
+                                     const_cast<char*>(g_tray.cfg.api_model.c_str()));
+                    gtk_menu_shell_append(GTK_MENU_SHELL(model_sub), radio);
+                }
+            }
+
+            gtk_menu_item_set_submenu(GTK_MENU_ITEM(model_item), model_sub);
+            gtk_menu_shell_append(GTK_MENU_SHELL(submenu), model_item);
+        }
 
         gtk_menu_item_set_submenu(GTK_MENU_ITEM(item), submenu);
         if (!is_idle) gtk_widget_set_sensitive(item, FALSE);
@@ -627,6 +760,7 @@ int main(int argc, char* argv[]) {
 
     refresh_sources();
     build_menu();
+    fetch_provider_models();
 
     fprintf(stderr, "recmeet-tray %s running (%zu mic(s), %zu monitor(s))\n",
             RECMEET_VERSION, g_tray.mics.size(), g_tray.monitors.size());

@@ -82,13 +82,38 @@ bool get_bool(const std::vector<YamlEntry>& entries,
 
 } // anonymous namespace
 
+const ProviderInfo PROVIDERS[] = {
+    {"xai",       "xAI (Grok)", "https://api.x.ai/v1",       "XAI_API_KEY",       "grok-3"},
+    {"openai",    "OpenAI",     "https://api.openai.com/v1",  "OPENAI_API_KEY",    "gpt-4o"},
+    {"anthropic", "Anthropic",  "https://api.anthropic.com/v1", "ANTHROPIC_API_KEY", "claude-sonnet-4-6"},
+};
+
+const size_t NUM_PROVIDERS = sizeof(PROVIDERS) / sizeof(PROVIDERS[0]);
+
+const ProviderInfo* find_provider(const std::string& name) {
+    for (size_t i = 0; i < NUM_PROVIDERS; ++i)
+        if (name == PROVIDERS[i].name)
+            return &PROVIDERS[i];
+    return nullptr;
+}
+
+std::string resolve_api_key(const ProviderInfo& provider, const std::string& fallback_key) {
+    if (const char* val = std::getenv(provider.env_var))
+        return val;
+    return fallback_key;
+}
+
 Config load_config() {
     Config cfg;
     fs::path path = config_dir() / "config.yaml";
 
-    // Also check for API key in environment
-    if (const char* key = std::getenv("XAI_API_KEY"))
-        cfg.api_key = key;
+    // Check for API key in environment (try provider-specific, then XAI_API_KEY for compat)
+    for (size_t i = 0; i < NUM_PROVIDERS; ++i) {
+        if (const char* key = std::getenv(PROVIDERS[i].env_var)) {
+            cfg.api_key = key;
+            break;
+        }
+    }
 
     if (!fs::exists(path))
         return cfg;
@@ -111,6 +136,7 @@ Config load_config() {
     cfg.language = get_val(entries, "transcription", "language", "");
 
     // Summary section
+    cfg.provider = get_val(entries, "summary", "provider", cfg.provider);
     cfg.api_url = get_val(entries, "summary", "api_url", cfg.api_url);
     std::string file_key = get_val(entries, "summary", "api_key", "");
     if (!file_key.empty())
@@ -160,8 +186,10 @@ void save_config(const Config& cfg) {
         out << "  language: " << cfg.language << "\n";
 
     out << "\nsummary:\n"
-        << "  api_url: \"" << cfg.api_url << "\"\n"
-        << "  model: " << cfg.api_model << "\n";
+        << "  provider: " << cfg.provider << "\n";
+    if (!cfg.api_url.empty())
+        out << "  api_url: \"" << cfg.api_url << "\"\n";
+    out << "  model: " << cfg.api_model << "\n";
     if (cfg.no_summary)
         out << "  disabled: true\n";
     if (!cfg.llm_model.empty())

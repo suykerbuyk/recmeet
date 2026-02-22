@@ -94,3 +94,23 @@ TEST_CASE("parse_cli: default language is empty (auto-detect)", "[cli]") {
     auto cli = run_cli({"recmeet"});
     CHECK(cli.cfg.language.empty());
 }
+
+TEST_CASE("parse_cli: --reprocess sets reprocess_dir", "[cli]") {
+    auto cli = run_cli({"recmeet", "--reprocess", "/some/dir"});
+    CHECK(cli.cfg.reprocess_dir == "/some/dir");
+}
+
+TEST_CASE("parse_cli: default reprocess_dir is empty", "[cli]") {
+    auto cli = run_cli({"recmeet"});
+    CHECK(cli.cfg.reprocess_dir.empty());
+}
+
+TEST_CASE("parse_cli: --provider sets provider", "[cli]") {
+    auto cli = run_cli({"recmeet", "--provider", "openai"});
+    CHECK(cli.cfg.provider == "openai");
+}
+
+TEST_CASE("parse_cli: default provider is xai", "[cli]") {
+    auto cli = run_cli({"recmeet"});
+    CHECK(cli.cfg.provider == "xai");
+}

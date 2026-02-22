@@ -1,4 +1,5 @@
 #include "pipeline.h"
+#include "config.h"
 #include "device_enum.h"
 #include "audio_capture.h"
 #include "audio_monitor.h"
@@ -49,153 +50,202 @@ PipelineResult run_pipeline(const Config& cfg, StopToken& stop, PhaseCallback on
         if (on_phase) on_phase(name);
     };
 
-    // --- Detect sources ---
-    std::string mic_source = cfg.mic_source;
-    std::string monitor_source = cfg.monitor_source;
+    fs::path out_dir;
+    fs::path audio_path;
+    fs::path transcript_path;
+    fs::path summary_path;
+    std::string transcript_text;
 
-    if (mic_source.empty()) {
-        auto detected = detect_sources(cfg.device_pattern);
-        if (detected.mic.empty()) {
-            fprintf(stderr, "No mic source matching '%s'\n", cfg.device_pattern.c_str());
-            fprintf(stderr, "Available sources:\n");
-            for (const auto& s : detected.all)
-                fprintf(stderr, "  %s  (%s)\n", s.name.c_str(), s.description.c_str());
-            throw DeviceError("No mic source found matching pattern: " + cfg.device_pattern);
-        }
-        mic_source = detected.mic;
-        if (!cfg.mic_only && monitor_source.empty())
-            monitor_source = detected.monitor;
-    }
+    if (!cfg.reprocess_dir.empty()) {
+        // --- Reprocess existing recording ---
+        out_dir = cfg.reprocess_dir;
+        if (!fs::is_directory(out_dir))
+            throw RecmeetError("Reprocess directory does not exist: " + out_dir.string());
 
-    bool dual_mode = !cfg.mic_only && !monitor_source.empty();
+        audio_path = out_dir / "audio.wav";
+        transcript_path = out_dir / "transcript.txt";
+        summary_path = out_dir / "summary.md";
 
-    if (dual_mode) {
-        fprintf(stderr, "Mic source:     %s\n", mic_source.c_str());
-        fprintf(stderr, "Monitor source: %s\n", monitor_source.c_str());
-    } else {
-        fprintf(stderr, "Audio source: %s\n", mic_source.c_str());
-        if (!cfg.mic_only)
-            fprintf(stderr, "No monitor source found — recording mic only.\n");
-    }
+        fprintf(stderr, "Reprocessing: %s\n", out_dir.c_str());
 
-    // --- Create output directory ---
-    fs::path out_dir = create_output_dir(cfg.output_dir);
-    fprintf(stderr, "Output directory: %s\n", out_dir.c_str());
-
-    fs::path audio_path = out_dir / "audio.wav";
-    fs::path transcript_path = out_dir / "transcript.txt";
-    fs::path summary_path = out_dir / "summary.md";
-
-    // --- Record ---
-    phase("recording");
-
-    if (dual_mode) {
-        notify("Recording started", "Mic: " + mic_source + "\nMonitor: " + monitor_source);
-
-        // Start mic capture via PipeWire
-        PipeWireCapture mic_cap(mic_source);
-        mic_cap.start();
-
-        // Start monitor capture — try PipeWire CAPTURE_SINK first, fall back to pa_simple
-        std::unique_ptr<PipeWireCapture> mon_pw;
-        std::unique_ptr<PulseMonitorCapture> mon_pa;
-
-        // For .monitor sources, go straight to pa_simple (pw_stream doesn't handle them)
-        const std::string mon_suffix = ".monitor";
-        bool is_pa_monitor = monitor_source.size() >= mon_suffix.size() &&
-            monitor_source.compare(monitor_source.size() - mon_suffix.size(),
-                                    mon_suffix.size(), mon_suffix) == 0;
-        if (is_pa_monitor) {
-            mon_pa = std::make_unique<PulseMonitorCapture>(monitor_source);
-            mon_pa->start();
+        if (fs::exists(transcript_path)) {
+            // Read existing transcript
+            std::ifstream in(transcript_path);
+            std::ostringstream buf;
+            buf << in.rdbuf();
+            transcript_text = buf.str();
+            if (transcript_text.empty())
+                throw RecmeetError("Transcript file is empty: " + transcript_path.string());
+            fprintf(stderr, "Using existing transcript: %s\n", transcript_path.c_str());
+        } else if (fs::exists(audio_path)) {
+            // Transcribe existing audio
+            phase("transcribing");
+            notify("Transcribing...", "Model: " + cfg.whisper_model);
+            fs::path model_path = ensure_whisper_model(cfg.whisper_model);
+            auto result = transcribe(model_path, audio_path, cfg.language);
+            transcript_text = result.to_string();
+            if (transcript_text.empty())
+                throw RecmeetError("Transcription produced no text.");
+            {
+                std::ofstream out(transcript_path);
+                out << transcript_text;
+            }
+            fprintf(stderr, "Transcript saved: %s\n", transcript_path.c_str());
         } else {
-            try {
-                mon_pw = std::make_unique<PipeWireCapture>(monitor_source, /*capture_sink=*/true);
-                mon_pw->start();
-            } catch (const RecmeetError& e) {
-                fprintf(stderr, "PipeWire monitor failed (%s), falling back to pa_simple\n", e.what());
+            throw RecmeetError("Reprocess directory has neither transcript.txt nor audio.wav: "
+                               + out_dir.string());
+        }
+    } else {
+        // --- Normal mode: detect sources, record, transcribe ---
+
+        // --- Detect sources ---
+        std::string mic_source = cfg.mic_source;
+        std::string monitor_source = cfg.monitor_source;
+
+        if (mic_source.empty()) {
+            auto detected = detect_sources(cfg.device_pattern);
+            if (detected.mic.empty()) {
+                fprintf(stderr, "No mic source matching '%s'\n", cfg.device_pattern.c_str());
+                fprintf(stderr, "Available sources:\n");
+                for (const auto& s : detected.all)
+                    fprintf(stderr, "  %s  (%s)\n", s.name.c_str(), s.description.c_str());
+                throw DeviceError("No mic source found matching pattern: " + cfg.device_pattern);
+            }
+            mic_source = detected.mic;
+            if (!cfg.mic_only && monitor_source.empty())
+                monitor_source = detected.monitor;
+        }
+
+        bool dual_mode = !cfg.mic_only && !monitor_source.empty();
+
+        if (dual_mode) {
+            fprintf(stderr, "Mic source:     %s\n", mic_source.c_str());
+            fprintf(stderr, "Monitor source: %s\n", monitor_source.c_str());
+        } else {
+            fprintf(stderr, "Audio source: %s\n", mic_source.c_str());
+            if (!cfg.mic_only)
+                fprintf(stderr, "No monitor source found — recording mic only.\n");
+        }
+
+        // --- Create output directory ---
+        out_dir = create_output_dir(cfg.output_dir);
+        fprintf(stderr, "Output directory: %s\n", out_dir.c_str());
+
+        audio_path = out_dir / "audio.wav";
+        transcript_path = out_dir / "transcript.txt";
+        summary_path = out_dir / "summary.md";
+
+        // --- Record ---
+        phase("recording");
+
+        if (dual_mode) {
+            notify("Recording started", "Mic: " + mic_source + "\nMonitor: " + monitor_source);
+
+            // Start mic capture via PipeWire
+            PipeWireCapture mic_cap(mic_source);
+            mic_cap.start();
+
+            // Start monitor capture — try PipeWire CAPTURE_SINK first, fall back to pa_simple
+            std::unique_ptr<PipeWireCapture> mon_pw;
+            std::unique_ptr<PulseMonitorCapture> mon_pa;
+
+            // For .monitor sources, go straight to pa_simple (pw_stream doesn't handle them)
+            const std::string mon_suffix = ".monitor";
+            bool is_pa_monitor = monitor_source.size() >= mon_suffix.size() &&
+                monitor_source.compare(monitor_source.size() - mon_suffix.size(),
+                                        mon_suffix.size(), mon_suffix) == 0;
+            if (is_pa_monitor) {
                 mon_pa = std::make_unique<PulseMonitorCapture>(monitor_source);
                 mon_pa->start();
+            } else {
+                try {
+                    mon_pw = std::make_unique<PipeWireCapture>(monitor_source, /*capture_sink=*/true);
+                    mon_pw->start();
+                } catch (const RecmeetError& e) {
+                    fprintf(stderr, "PipeWire monitor failed (%s), falling back to pa_simple\n", e.what());
+                    mon_pa = std::make_unique<PulseMonitorCapture>(monitor_source);
+                    mon_pa->start();
+                }
             }
+
+            // Display timer and wait for stop
+            StopToken timer_stop;
+            std::thread timer_thread(display_elapsed, std::ref(timer_stop));
+
+            while (!stop.stop_requested())
+                std::this_thread::sleep_for(std::chrono::milliseconds(200));
+
+            timer_stop.request();
+            timer_thread.join();
+            fprintf(stderr, "Recording stopped.\n");
+
+            // Stop captures
+            mic_cap.stop();
+            if (mon_pw) mon_pw->stop();
+            if (mon_pa) mon_pa->stop();
+
+            // Drain and write
+            auto mic_samples = mic_cap.drain();
+            auto mon_samples = mon_pw ? mon_pw->drain() : mon_pa->drain();
+
+            fs::path mic_path = out_dir / "mic.wav";
+            fs::path mon_path = out_dir / "monitor.wav";
+            write_wav(mic_path, mic_samples);
+            write_wav(mon_path, mon_samples);
+
+            // Validate mic (fatal)
+            validate_audio(mic_path, 1.0, "Mic audio");
+
+            // Validate monitor (non-fatal)
+            try {
+                validate_audio(mon_path, 1.0, "Monitor audio");
+                // Mix
+                auto mixed = mix_audio(mic_samples, mon_samples);
+                write_wav(audio_path, mixed);
+                fprintf(stderr, "Mixed audio saved: %s\n", audio_path.c_str());
+            } catch (const AudioValidationError& e) {
+                fprintf(stderr, "Warning: Monitor audio unusable (%s). Using mic only.\n", e.what());
+                write_wav(audio_path, mic_samples);
+            }
+        } else {
+            notify("Recording started", "Source: " + mic_source);
+
+            PipeWireCapture cap(mic_source);
+            cap.start();
+
+            StopToken timer_stop;
+            std::thread timer_thread(display_elapsed, std::ref(timer_stop));
+
+            while (!stop.stop_requested())
+                std::this_thread::sleep_for(std::chrono::milliseconds(200));
+
+            timer_stop.request();
+            timer_thread.join();
+            fprintf(stderr, "Recording stopped.\n");
+
+            cap.stop();
+            auto samples = cap.drain();
+            write_wav(audio_path, samples);
+            validate_audio(audio_path);
         }
 
-        // Display timer and wait for stop
-        StopToken timer_stop;
-        std::thread timer_thread(display_elapsed, std::ref(timer_stop));
+        // --- Transcribe ---
+        phase("transcribing");
+        notify("Transcribing...", "Model: " + cfg.whisper_model);
 
-        while (!stop.stop_requested())
-            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        fs::path model_path = ensure_whisper_model(cfg.whisper_model);
+        auto result = transcribe(model_path, audio_path, cfg.language);
 
-        timer_stop.request();
-        timer_thread.join();
-        fprintf(stderr, "Recording stopped.\n");
+        transcript_text = result.to_string();
+        if (transcript_text.empty())
+            throw RecmeetError("Transcription produced no text.");
 
-        // Stop captures
-        mic_cap.stop();
-        if (mon_pw) mon_pw->stop();
-        if (mon_pa) mon_pa->stop();
-
-        // Drain and write
-        auto mic_samples = mic_cap.drain();
-        auto mon_samples = mon_pw ? mon_pw->drain() : mon_pa->drain();
-
-        fs::path mic_path = out_dir / "mic.wav";
-        fs::path mon_path = out_dir / "monitor.wav";
-        write_wav(mic_path, mic_samples);
-        write_wav(mon_path, mon_samples);
-
-        // Validate mic (fatal)
-        validate_audio(mic_path, 1.0, "Mic audio");
-
-        // Validate monitor (non-fatal)
-        try {
-            validate_audio(mon_path, 1.0, "Monitor audio");
-            // Mix
-            auto mixed = mix_audio(mic_samples, mon_samples);
-            write_wav(audio_path, mixed);
-            fprintf(stderr, "Mixed audio saved: %s\n", audio_path.c_str());
-        } catch (const AudioValidationError& e) {
-            fprintf(stderr, "Warning: Monitor audio unusable (%s). Using mic only.\n", e.what());
-            write_wav(audio_path, mic_samples);
+        {
+            std::ofstream out(transcript_path);
+            out << transcript_text;
         }
-    } else {
-        notify("Recording started", "Source: " + mic_source);
-
-        PipeWireCapture cap(mic_source);
-        cap.start();
-
-        StopToken timer_stop;
-        std::thread timer_thread(display_elapsed, std::ref(timer_stop));
-
-        while (!stop.stop_requested())
-            std::this_thread::sleep_for(std::chrono::milliseconds(200));
-
-        timer_stop.request();
-        timer_thread.join();
-        fprintf(stderr, "Recording stopped.\n");
-
-        cap.stop();
-        auto samples = cap.drain();
-        write_wav(audio_path, samples);
-        validate_audio(audio_path);
+        fprintf(stderr, "Transcript saved: %s\n", transcript_path.c_str());
     }
-
-    // --- Transcribe ---
-    phase("transcribing");
-    notify("Transcribing...", "Model: " + cfg.whisper_model);
-
-    fs::path model_path = ensure_whisper_model(cfg.whisper_model);
-    auto result = transcribe(model_path, audio_path, cfg.language);
-
-    std::string transcript_text = result.to_string();
-    if (transcript_text.empty())
-        throw RecmeetError("Transcription produced no text.");
-
-    {
-        std::ofstream out(transcript_path);
-        out << transcript_text;
-    }
-    fprintf(stderr, "Transcript saved: %s\n", transcript_path.c_str());
 
     // --- Summarize ---
     PipelineResult pipe_result;
@@ -221,9 +271,15 @@ PipelineResult run_pipeline(const Config& cfg, StopToken& stop, PhaseCallback on
         } else
 #endif
         if (!cfg.api_key.empty()) {
+            std::string url = cfg.api_url;
+            if (url.empty()) {
+                const auto* prov = find_provider(cfg.provider);
+                if (prov) url = std::string(prov->base_url) + "/chat/completions";
+                else url = "https://api.x.ai/v1/chat/completions";
+            }
             notify("Summarizing...", "Sending to " + cfg.api_model);
             try {
-                summary_text = summarize_http(transcript_text, cfg.api_url,
+                summary_text = summarize_http(transcript_text, url,
                                                cfg.api_key, cfg.api_model, context_text);
             } catch (const std::exception& e) {
                 fprintf(stderr, "Warning: Summary failed — %s\n", e.what());

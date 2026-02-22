@@ -1,4 +1,5 @@
 #include "cli.h"
+#include "config.h"
 #include "device_enum.h"
 #include "model_manager.h"
 #include "notify.h"
@@ -31,14 +32,16 @@ static void print_usage() {
         "  --model NAME         Whisper model: tiny/base/small/medium/large-v3 (default: base)\n"
         "  --language CODE      Force whisper language (e.g. en, de, ja; default: auto-detect)\n"
         "  --output-dir DIR     Base directory for outputs (default: ./meetings)\n"
-        "  --api-key KEY        xAI/OpenAI API key (default: from env/config)\n"
-        "  --api-url URL        API endpoint (default: https://api.x.ai/v1/chat/completions)\n"
-        "  --api-model NAME     API model name (default: grok-3)\n"
+        "  --provider NAME      API provider: xai, openai, anthropic (default: xai)\n"
+        "  --api-key KEY        API key (default: from provider env var or config)\n"
+        "  --api-url URL        API endpoint override (default: derived from provider)\n"
+        "  --api-model NAME     API model name (default: provider's default model)\n"
         "  --no-summary         Skip summarization (record + transcribe only)\n"
         "  --device-pattern RE  Regex for device auto-detection\n"
         "  --context-file PATH  Pre-meeting notes to include in summary prompt\n"
         "  --obsidian-vault DIR Obsidian vault path for note output\n"
         "  --llm-model PATH     Local GGUF model for summarization (instead of API)\n"
+        "  --reprocess DIR      Re-run summarization on existing recording directory\n"
         "  --list-sources       List available audio sources and exit\n"
         "  -h, --help           Show this help\n"
         "  -v, --version        Show version\n"
@@ -72,10 +75,22 @@ int main(int argc, char* argv[]) {
         return 0;
     }
 
+    // Resolve API key from provider-specific env var
+    if (cfg.llm_model.empty()) {
+        const auto* prov = find_provider(cfg.provider);
+        if (prov) {
+            std::string key = resolve_api_key(*prov, cfg.api_key);
+            if (!key.empty())
+                cfg.api_key = key;
+        }
+    }
+
     // Validate: need API key for summary unless disabled or using local LLM
     if (!cfg.no_summary && cfg.api_key.empty() && cfg.llm_model.empty()) {
+        const auto* prov = find_provider(cfg.provider);
+        const char* env_var = prov ? prov->env_var : "XAI_API_KEY";
         fprintf(stderr, "Warning: No API key and no local LLM model. Summary will be skipped.\n");
-        fprintf(stderr, "Set XAI_API_KEY in environment, config, or use --api-key / --llm-model.\n");
+        fprintf(stderr, "Set %s in environment, config, or use --api-key / --llm-model.\n", env_var);
         fprintf(stderr, "Use --no-summary to suppress this warning.\n\n");
         cfg.no_summary = true;
     }
@@ -89,25 +104,31 @@ int main(int argc, char* argv[]) {
 
     notify_init();
 
+    // In reprocess mode, skip whisper pre-check if transcript already exists
+    bool need_whisper = cfg.reprocess_dir.empty()
+        || !fs::exists(cfg.reprocess_dir / "transcript.txt");
+
     // Pre-check: ensure whisper model is available before recording
-    try {
-        if (!is_whisper_model_cached(cfg.whisper_model)) {
-            fprintf(stderr, "Whisper model '%s' not found locally.\n", cfg.whisper_model.c_str());
-            fprintf(stderr, "Download now? [Y/n] ");
-            int ch = getchar();
-            if (ch == 'n' || ch == 'N') {
-                fprintf(stderr, "Aborted. Use --model to select a different model.\n");
-                notify_cleanup();
-                return 1;
+    if (need_whisper) {
+        try {
+            if (!is_whisper_model_cached(cfg.whisper_model)) {
+                fprintf(stderr, "Whisper model '%s' not found locally.\n", cfg.whisper_model.c_str());
+                fprintf(stderr, "Download now? [Y/n] ");
+                int ch = getchar();
+                if (ch == 'n' || ch == 'N') {
+                    fprintf(stderr, "Aborted. Use --model to select a different model.\n");
+                    notify_cleanup();
+                    return 1;
+                }
+                fprintf(stderr, "Downloading...\n");
+                ensure_whisper_model(cfg.whisper_model);
+                fprintf(stderr, "Model ready.\n\n");
             }
-            fprintf(stderr, "Downloading...\n");
-            ensure_whisper_model(cfg.whisper_model);
-            fprintf(stderr, "Model ready.\n\n");
+        } catch (const RecmeetError& e) {
+            fprintf(stderr, "Error: %s\n", e.what());
+            notify_cleanup();
+            return 1;
         }
-    } catch (const RecmeetError& e) {
-        fprintf(stderr, "Error: %s\n", e.what());
-        notify_cleanup();
-        return 1;
     }
 
     // Pre-check: validate LLM model path if local summarization is configured
@@ -121,7 +142,8 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    fprintf(stderr, "Press Ctrl+C to stop recording.\n\n");
+    if (cfg.reprocess_dir.empty())
+        fprintf(stderr, "Press Ctrl+C to stop recording.\n\n");
 
     try {
         auto result = run_pipeline(cfg, g_stop);
