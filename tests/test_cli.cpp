@@ -134,3 +134,13 @@ TEST_CASE("parse_cli: default num_speakers is 0", "[cli]") {
     auto cli = run_cli({"recmeet"});
     CHECK(cli.cfg.num_speakers == 0);
 }
+
+TEST_CASE("parse_cli: --threads sets threads", "[cli]") {
+    auto cli = run_cli({"recmeet", "--threads", "8"});
+    CHECK(cli.cfg.threads == 8);
+}
+
+TEST_CASE("parse_cli: default threads is 0", "[cli]") {
+    auto cli = run_cli({"recmeet"});
+    CHECK(cli.cfg.threads == 0);
+}

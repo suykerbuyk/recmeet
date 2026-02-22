@@ -29,7 +29,7 @@ std::string TranscriptResult::to_string() const {
 }
 
 TranscriptResult transcribe(const fs::path& model_path, const fs::path& audio_path,
-                            const std::string& language) {
+                            const std::string& language, int threads) {
     fprintf(stderr, "Loading whisper model: %s\n", model_path.filename().c_str());
 
     whisper_context_params cparams = whisper_context_default_params();
@@ -45,7 +45,7 @@ TranscriptResult transcribe(const fs::path& model_path, const fs::path& audio_pa
 
     // Set up whisper params
     whisper_full_params wparams = whisper_full_default_params(WHISPER_SAMPLING_GREEDY);
-    wparams.n_threads = 4;
+    wparams.n_threads = threads > 0 ? threads : default_thread_count();
     wparams.print_progress = true;
     wparams.print_timestamps = false;
 

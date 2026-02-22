@@ -150,6 +150,10 @@ Config load_config() {
     std::string ns = get_val(entries, "diarization", "num_speakers", "0");
     cfg.num_speakers = std::atoi(ns.c_str());
 
+    // General section
+    std::string threads_str = get_val(entries, "general", "threads", "0");
+    cfg.threads = std::atoi(threads_str.c_str());
+
     // Output section
     std::string out = get_val(entries, "output", "directory", "");
     if (!out.empty()) cfg.output_dir = out;
@@ -210,6 +214,11 @@ void save_config(const Config& cfg) {
 
     out << "\noutput:\n"
         << "  directory: \"" << cfg.output_dir.string() << "\"\n";
+
+    if (cfg.threads > 0) {
+        out << "\ngeneral:\n"
+            << "  threads: " << cfg.threads << "\n";
+    }
 
     if (cfg.obsidian_enabled) {
         out << "\nobsidian:\n"

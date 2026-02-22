@@ -25,6 +25,7 @@ CliResult parse_cli(int argc, char* argv[]) {
         {"reprocess",      required_argument, nullptr, 'R'},
         {"no-diarize",     no_argument,       nullptr, 'D'},
         {"num-speakers",   required_argument, nullptr, 'S'},
+        {"threads",        required_argument, nullptr, 'T'},
         {"list-sources",   no_argument,       nullptr, 'l'},
         {"help",           no_argument,       nullptr, 'h'},
         {"version",        no_argument,       nullptr, 'v'},
@@ -58,6 +59,7 @@ CliResult parse_cli(int argc, char* argv[]) {
             case 'R': result.cfg.reprocess_dir = optarg; break;
             case 'D': result.cfg.diarize = false; break;
             case 'S': result.cfg.num_speakers = std::atoi(optarg); break;
+            case 'T': result.cfg.threads = std::atoi(optarg); break;
             case 'l': result.list_sources = true; break;
             case 'v': result.show_version = true; return result;
             case 'h': result.show_help = true; return result;

@@ -30,6 +30,7 @@ TEST_CASE("save_config + load_config round-trip", "[config]") {
     cfg.api_model = "gpt-4";
     cfg.no_summary = true;
     cfg.llm_model = "/path/to/model.gguf";
+    cfg.threads = 12;
     cfg.output_dir = "/tmp/meetings";
     cfg.obsidian_enabled = true;
     cfg.obsidian.vault_path = "/home/user/obsidian/vault";
@@ -60,6 +61,7 @@ TEST_CASE("save_config + load_config round-trip", "[config]") {
     CHECK(content.find("model: gpt-4") != std::string::npos);
     CHECK(content.find("disabled: true") != std::string::npos);
     CHECK(content.find("llm_model: \"/path/to/model.gguf\"") != std::string::npos);
+    CHECK(content.find("threads: 12") != std::string::npos);
     CHECK(content.find("directory: \"/tmp/meetings\"") != std::string::npos);
     CHECK(content.find("vault: \"/home/user/obsidian/vault\"") != std::string::npos);
     CHECK(content.find("subfolder: \"Notes/%Y/\"") != std::string::npos);
@@ -78,6 +80,7 @@ TEST_CASE("save_config + load_config round-trip", "[config]") {
     CHECK(loaded.api_model == "gpt-4");
     CHECK(loaded.no_summary == true);
     CHECK(loaded.llm_model == "/path/to/model.gguf");
+    CHECK(loaded.threads == 12);
     CHECK(loaded.output_dir == "/tmp/meetings");
     CHECK(loaded.obsidian_enabled == true);
     CHECK(loaded.obsidian.vault_path == "/home/user/obsidian/vault");
@@ -108,6 +111,7 @@ TEST_CASE("load_config: returns defaults when no file exists", "[config]") {
     CHECK(cfg.no_summary == false);
     CHECK(cfg.diarize == true);
     CHECK(cfg.num_speakers == 0);
+    CHECK(cfg.threads == 0);
     CHECK(cfg.obsidian_enabled == false);
 
     // Restore

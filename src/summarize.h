@@ -31,9 +31,11 @@ std::string summarize_http(const std::string& transcript,
 
 #if RECMEET_USE_LLAMA
 /// Summarize a transcript using a local llama.cpp model.
+/// threads: number of CPU threads (0 = use default_thread_count()).
 std::string summarize_local(const std::string& transcript,
                              const fs::path& model_path,
-                             const std::string& context = "");
+                             const std::string& context = "",
+                             int threads = 0);
 #endif
 
 } // namespace recmeet

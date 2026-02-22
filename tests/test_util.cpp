@@ -79,6 +79,21 @@ TEST_CASE("create_output_dir: handles collision", "[util]") {
     fs::remove_all(base);
 }
 
+TEST_CASE("default_thread_count: returns at least 1", "[util]") {
+    int n = default_thread_count();
+    CHECK(n >= 1);
+}
+
+TEST_CASE("default_thread_count: returns hardware_concurrency - 1 when available", "[util]") {
+    unsigned hw = std::thread::hardware_concurrency();
+    int n = default_thread_count();
+    if (hw > 1) {
+        CHECK(n == static_cast<int>(hw - 1));
+    } else {
+        CHECK(n == 1);
+    }
+}
+
 TEST_CASE("audio constants are consistent", "[util]") {
     CHECK(SAMPLE_RATE == 16000);
     CHECK(CHANNELS == 1);

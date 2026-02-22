@@ -47,7 +47,7 @@ std::vector<TranscriptSegment> merge_speakers(
 }
 
 #if RECMEET_USE_SHERPA
-DiarizeResult diarize(const fs::path& audio_path, int num_speakers) {
+DiarizeResult diarize(const fs::path& audio_path, int num_speakers, int threads) {
     auto samples = read_wav_float(audio_path);
     if (samples.empty())
         throw RecmeetError("Cannot read audio for diarization: " + audio_path.string());
@@ -60,14 +60,15 @@ DiarizeResult diarize(const fs::path& audio_path, int num_speakers) {
 
     SherpaOnnxOfflineSpeakerSegmentationModelConfig seg_cfg{};
     seg_cfg.pyannote = pyannote;
-    seg_cfg.num_threads = 2;
+    int t = threads > 0 ? threads : default_thread_count();
+    seg_cfg.num_threads = t;
     seg_cfg.debug = 0;
     seg_cfg.provider = "cpu";
 
     // Configure embedding extractor
     SherpaOnnxSpeakerEmbeddingExtractorConfig emb_cfg{};
     emb_cfg.model = model_paths.embedding.c_str();
-    emb_cfg.num_threads = 2;
+    emb_cfg.num_threads = t;
     emb_cfg.debug = 0;
     emb_cfg.provider = "cpu";
 

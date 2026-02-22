@@ -51,6 +51,9 @@ PipelineResult run_pipeline(const Config& cfg, StopToken& stop, PhaseCallback on
         if (on_phase) on_phase(name);
     };
 
+    int threads = cfg.threads > 0 ? cfg.threads : default_thread_count();
+    fprintf(stderr, "Using %d threads for inference.\n", threads);
+
     fs::path out_dir;
     fs::path audio_path;
     fs::path transcript_path;
@@ -76,13 +79,13 @@ PipelineResult run_pipeline(const Config& cfg, StopToken& stop, PhaseCallback on
         phase("transcribing");
         notify("Transcribing...", "Model: " + cfg.whisper_model);
         fs::path model_path = ensure_whisper_model(cfg.whisper_model);
-        auto result = transcribe(model_path, audio_path, cfg.language);
+        auto result = transcribe(model_path, audio_path, cfg.language, threads);
 
 #if RECMEET_USE_SHERPA
         if (cfg.diarize) {
             phase("diarizing");
             notify("Diarizing...", "Identifying speakers");
-            auto diar = diarize(audio_path, cfg.num_speakers);
+            auto diar = diarize(audio_path, cfg.num_speakers, threads);
             result.segments = merge_speakers(result.segments, diar);
         }
 #endif
@@ -234,13 +237,13 @@ PipelineResult run_pipeline(const Config& cfg, StopToken& stop, PhaseCallback on
         notify("Transcribing...", "Model: " + cfg.whisper_model);
 
         fs::path model_path = ensure_whisper_model(cfg.whisper_model);
-        auto result = transcribe(model_path, audio_path, cfg.language);
+        auto result = transcribe(model_path, audio_path, cfg.language, threads);
 
 #if RECMEET_USE_SHERPA
         if (cfg.diarize) {
             phase("diarizing");
             notify("Diarizing...", "Identifying speakers");
-            auto diar = diarize(audio_path, cfg.num_speakers);
+            auto diar = diarize(audio_path, cfg.num_speakers, threads);
             result.segments = merge_speakers(result.segments, diar);
         }
 #endif
@@ -273,7 +276,7 @@ PipelineResult run_pipeline(const Config& cfg, StopToken& stop, PhaseCallback on
             notify("Summarizing...", "Local LLM");
             try {
                 fs::path llm_path = ensure_llama_model(cfg.llm_model);
-                summary_text = summarize_local(transcript_text, llm_path, context_text);
+                summary_text = summarize_local(transcript_text, llm_path, context_text, threads);
             } catch (const std::exception& e) {
                 fprintf(stderr, "Warning: Local summary failed — %s\n", e.what());
             }

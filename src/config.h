@@ -48,6 +48,9 @@ struct Config {
     bool diarize = true;
     int num_speakers = 0;  // 0 = auto-detect
 
+    // Performance
+    int threads = 0;  // 0 = auto-detect (hardware_concurrency - 1)
+
     // Output
     fs::path output_dir = "./meetings";
 

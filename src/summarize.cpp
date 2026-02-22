@@ -176,7 +176,8 @@ std::string summarize_http(const std::string& transcript,
 #if RECMEET_USE_LLAMA
 std::string summarize_local(const std::string& transcript,
                              const fs::path& model_path,
-                             const std::string& context) {
+                             const std::string& context,
+                             int threads) {
     fprintf(stderr, "Loading LLM model: %s\n", model_path.filename().c_str());
 
     llama_backend_init();
@@ -190,7 +191,7 @@ std::string summarize_local(const std::string& transcript,
 
     llama_context_params ctx_params = llama_context_default_params();
     ctx_params.n_ctx = 8192;
-    ctx_params.n_threads = 4;
+    ctx_params.n_threads = threads > 0 ? threads : default_thread_count();
 
     llama_context* ctx = llama_init_from_model(model, ctx_params);
     if (!ctx) {

@@ -4,6 +4,7 @@
 #include <cstdlib>
 #include <iomanip>
 #include <sstream>
+#include <thread>
 
 namespace recmeet {
 
@@ -44,6 +45,11 @@ fs::path create_output_dir(const fs::path& base_dir) {
         }
     }
     throw RecmeetError("Too many sessions in the same minute.");
+}
+
+int default_thread_count() {
+    unsigned n = std::thread::hardware_concurrency();
+    return (n > 1) ? static_cast<int>(n - 1) : 1;
 }
 
 } // namespace recmeet

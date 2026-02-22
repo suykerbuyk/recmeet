@@ -26,7 +26,8 @@ struct TranscriptResult {
 /// model_path: path to GGUF model file.
 /// audio_path: path to WAV file (will be read and converted to float32).
 /// language: ISO 639-1 code (e.g. "en") to force; empty = auto-detect.
+/// threads: number of CPU threads (0 = use default_thread_count()).
 TranscriptResult transcribe(const fs::path& model_path, const fs::path& audio_path,
-                            const std::string& language = "");
+                            const std::string& language = "", int threads = 0);
 
 } // namespace recmeet

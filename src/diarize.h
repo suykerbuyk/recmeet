@@ -22,7 +22,8 @@ struct DiarizeResult {
 #if RECMEET_USE_SHERPA
 /// Run speaker diarization on a WAV file using sherpa-onnx.
 /// num_speakers: 0 = auto-detect, >0 = force N clusters.
-DiarizeResult diarize(const fs::path& audio_path, int num_speakers = 0);
+/// threads: number of CPU threads (0 = use default_thread_count()).
+DiarizeResult diarize(const fs::path& audio_path, int num_speakers = 0, int threads = 0);
 #endif
 
 /// Merge speaker labels into transcript segments by timestamp overlap.

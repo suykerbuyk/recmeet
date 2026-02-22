@@ -5,6 +5,7 @@
 #include <filesystem>
 #include <stdexcept>
 #include <string>
+#include <thread>
 
 namespace recmeet {
 
@@ -69,5 +70,12 @@ fs::path create_output_dir(const fs::path& base_dir);
 // ---------------------------------------------------------------------------
 
 constexpr const char* DEFAULT_DEVICE_PATTERN = "bd.h200|00:05:30:00:05:4E";
+
+// ---------------------------------------------------------------------------
+// Thread count helper
+// ---------------------------------------------------------------------------
+
+/// Default thread count for inference engines: hardware_concurrency() - 1, minimum 1.
+int default_thread_count();
 
 } // namespace recmeet
