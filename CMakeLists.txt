@@ -130,6 +130,7 @@ if(RECMEET_BUILD_TESTS)
         tests/test_summarize_prompt.cpp
         tests/test_pipeline_helpers.cpp
         tests/test_cli.cpp
+        tests/test_benchmark.cpp
     )
     target_link_libraries(recmeet_tests PRIVATE recmeet_core Catch2::Catch2WithMain)
     catch_discover_tests(recmeet_tests)
