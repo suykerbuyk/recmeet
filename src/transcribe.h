@@ -8,7 +8,37 @@
 #include <string>
 #include <vector>
 
+struct whisper_context;  // forward-declare to avoid exposing whisper.h
+
 namespace recmeet {
+
+// ---------------------------------------------------------------------------
+// WhisperModel — RAII wrapper for a loaded whisper.cpp model
+// ---------------------------------------------------------------------------
+
+class WhisperModel {
+public:
+    /// Load a GGUF model from disk.  Throws RecmeetError on failure.
+    explicit WhisperModel(const fs::path& model_path);
+    ~WhisperModel();
+
+    WhisperModel(const WhisperModel&) = delete;
+    WhisperModel& operator=(const WhisperModel&) = delete;
+
+    WhisperModel(WhisperModel&& other) noexcept;
+    WhisperModel& operator=(WhisperModel&& other) noexcept;
+
+    whisper_context* get() const { return ctx_; }
+    const fs::path& path() const { return path_; }
+
+private:
+    whisper_context* ctx_ = nullptr;
+    fs::path path_;
+};
+
+// ---------------------------------------------------------------------------
+// Transcript types
+// ---------------------------------------------------------------------------
 
 struct TranscriptSegment {
     double start;  // seconds
@@ -25,11 +55,17 @@ struct TranscriptResult {
     std::string to_string() const;
 };
 
-/// Transcribe a WAV file using whisper.cpp.
-/// model_path: path to GGUF model file.
-/// audio_path: path to WAV file (will be read and converted to float32).
-/// language: ISO 639-1 code (e.g. "en") to force; empty = auto-detect.
-/// threads: number of CPU threads (0 = use default_thread_count()).
+// ---------------------------------------------------------------------------
+// Transcription functions
+// ---------------------------------------------------------------------------
+
+/// Transcribe a WAV file using a pre-loaded whisper model.
+/// Prefer this overload when transcribing multiple files to avoid reloading.
+TranscriptResult transcribe(WhisperModel& model, const fs::path& audio_path,
+                            const std::string& language = "", int threads = 0);
+
+/// Convenience: load the model, transcribe, then free.
+/// Equivalent to constructing a temporary WhisperModel and calling the above.
 TranscriptResult transcribe(const fs::path& model_path, const fs::path& audio_path,
                             const std::string& language = "", int threads = 0);
 

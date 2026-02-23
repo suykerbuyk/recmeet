@@ -13,6 +13,10 @@
 
 namespace recmeet {
 
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
 static std::string format_timestamp(double seconds) {
     int total = static_cast<int>(seconds);
     int mins = total / 60;
@@ -31,15 +35,46 @@ std::string TranscriptResult::to_string() const {
     return oss.str();
 }
 
-TranscriptResult transcribe(const fs::path& model_path, const fs::path& audio_path,
-                            const std::string& language, int threads) {
-    fprintf(stderr, "Loading whisper model: %s\n", model_path.filename().c_str());
+// ---------------------------------------------------------------------------
+// WhisperModel
+// ---------------------------------------------------------------------------
 
+WhisperModel::WhisperModel(const fs::path& model_path) : path_(model_path) {
+    fprintf(stderr, "Loading whisper model: %s\n", path_.filename().c_str());
     whisper_context_params cparams = whisper_context_default_params();
-    whisper_context* ctx = whisper_init_from_file_with_params(
-        model_path.c_str(), cparams);
-    if (!ctx)
-        throw RecmeetError("Failed to load whisper model: " + model_path.string());
+    ctx_ = whisper_init_from_file_with_params(path_.c_str(), cparams);
+    if (!ctx_)
+        throw RecmeetError("Failed to load whisper model: " + path_.string());
+}
+
+WhisperModel::~WhisperModel() {
+    if (ctx_)
+        whisper_free(ctx_);
+}
+
+WhisperModel::WhisperModel(WhisperModel&& other) noexcept
+    : ctx_(other.ctx_), path_(std::move(other.path_)) {
+    other.ctx_ = nullptr;
+}
+
+WhisperModel& WhisperModel::operator=(WhisperModel&& other) noexcept {
+    if (this != &other) {
+        if (ctx_)
+            whisper_free(ctx_);
+        ctx_ = other.ctx_;
+        path_ = std::move(other.path_);
+        other.ctx_ = nullptr;
+    }
+    return *this;
+}
+
+// ---------------------------------------------------------------------------
+// Transcription
+// ---------------------------------------------------------------------------
+
+TranscriptResult transcribe(WhisperModel& model, const fs::path& audio_path,
+                            const std::string& language, int threads) {
+    whisper_context* ctx = model.get();
 
     // Read audio as float32 [-1, 1]
     auto samples = read_wav_float(audio_path);
@@ -71,10 +106,8 @@ TranscriptResult transcribe(const fs::path& model_path, const fs::path& audio_pa
 
     fprintf(stderr, "Transcribing...\n");
     int ret = whisper_full(ctx, wparams, samples.data(), samples.size());
-    if (ret != 0) {
-        whisper_free(ctx);
+    if (ret != 0)
         throw RecmeetError("Whisper transcription failed (code " + std::to_string(ret) + ")");
-    }
 
     // Extract segments
     TranscriptResult result;
@@ -105,8 +138,13 @@ TranscriptResult transcribe(const fs::path& model_path, const fs::path& audio_pa
     fprintf(stderr, "Transcribed %d segments (language: %s)\n",
             (int)result.segments.size(), result.language.c_str());
 
-    whisper_free(ctx);
     return result;
+}
+
+TranscriptResult transcribe(const fs::path& model_path, const fs::path& audio_path,
+                            const std::string& language, int threads) {
+    WhisperModel model(model_path);
+    return transcribe(model, audio_path, language, threads);
 }
 
 } // namespace recmeet
