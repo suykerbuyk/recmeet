@@ -10,6 +10,7 @@
 #include <cmath>
 #include <iomanip>
 #include <sstream>
+#include <unistd.h>
 
 namespace recmeet {
 
@@ -84,7 +85,7 @@ TranscriptResult transcribe(WhisperModel& model, const fs::path& audio_path,
     // Set up whisper params
     whisper_full_params wparams = whisper_full_default_params(WHISPER_SAMPLING_GREEDY);
     wparams.n_threads = threads > 0 ? threads : default_thread_count();
-    wparams.print_progress = true;
+    wparams.print_progress = isatty(STDERR_FILENO);
     wparams.print_timestamps = false;
 
     // Relax no-speech suppression — default logprob_thold (-1.0) can be too

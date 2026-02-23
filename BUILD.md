@@ -282,6 +282,7 @@ cmake --install build --prefix /tmp/test-install
 | `recmeet` | `<prefix>/bin/` |
 | `recmeet-tray` | `<prefix>/bin/` (only when `RECMEET_BUILD_TRAY=ON`) |
 | `recmeet-tray.desktop` | `<prefix>/share/applications/` (only when `RECMEET_BUILD_TRAY=ON`) |
+| `recmeet-tray.service` | `<prefix>/lib/systemd/user/` (only when `RECMEET_BUILD_TRAY=ON`) |
 | `LICENSE-MIT` | `<prefix>/share/doc/recmeet/` |
 | `LICENSE-APACHE` | `<prefix>/share/doc/recmeet/` |
 | `AUTHORS` | `<prefix>/share/doc/recmeet/` |
@@ -382,6 +383,29 @@ The `.rpm` is configured with:
   dependencies (the RPM equivalent of `SHLIBDEPS`).
 - **`CPACK_RPM_FILE_NAME RPM-DEFAULT`** — uses the standard RPM naming
   convention (`name-version-release.arch.rpm`).
+
+### Autostart via systemd
+
+recmeet-tray ships a systemd user service. After installing, enable it for
+your user:
+
+    systemctl --user enable --now recmeet-tray.service
+
+This starts recmeet-tray automatically when your graphical session starts.
+To check status or stop:
+
+    systemctl --user status recmeet-tray.service
+    systemctl --user stop recmeet-tray.service
+    systemctl --user disable recmeet-tray.service
+
+**Sway prerequisite**: Your Sway config must import the session environment
+into systemd and activate `graphical-session.target`. Add to `~/.config/sway/config`:
+
+    exec systemctl --user import-environment DISPLAY WAYLAND_DISPLAY SWAYSOCK XDG_CURRENT_DESKTOP
+    exec systemctl --user start graphical-session.target
+
+Most Sway setups already include this. Without it, the service won't start
+because `graphical-session.target` is never activated.
 
 ### Cross-distro note
 

@@ -14,6 +14,11 @@
 #include <libayatana-appindicator/app-indicator.h>
 #include <gtk/gtk.h>
 
+#include <whisper.h>
+#ifdef RECMEET_USE_LLAMA
+#include <llama.h>
+#endif
+
 #include <cstdio>
 #include <cstdlib>
 #include <mutex>
@@ -807,6 +812,14 @@ static void build_menu() {
 int main(int argc, char* argv[]) {
     gtk_init(&argc, &argv);
     notify_init();
+
+    // Suppress vendor library log spam — the tray is a GUI app; GGML
+    // debug output on stderr is never useful (and floods journald when
+    // running as a systemd service).
+    whisper_log_set([](enum ggml_log_level, const char*, void*) {}, nullptr);
+#ifdef RECMEET_USE_LLAMA
+    llama_log_set([](enum ggml_log_level, const char*, void*) {}, nullptr);
+#endif
 
     g_tray.cfg = load_config();
 

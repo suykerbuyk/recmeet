@@ -1,0 +1,14 @@
+[Unit]
+Description=Recmeet Meeting Recorder Tray
+Documentation=https://github.com/suykerbuyk/recmeet
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=@RECMEET_TRAY_EXEC@
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=graphical-session.target

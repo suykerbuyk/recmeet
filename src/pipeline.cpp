@@ -20,6 +20,7 @@
 #include <fstream>
 #include <iomanip>
 #include <thread>
+#include <unistd.h>
 
 namespace recmeet {
 
@@ -35,6 +36,7 @@ std::string read_context_file(const fs::path& path) {
 namespace {
 
 void display_elapsed(StopToken& stop) {
+    if (!isatty(STDERR_FILENO)) return;  // no timer under systemd/journald
     auto start = std::chrono::steady_clock::now();
     while (!stop.stop_requested()) {
         auto now = std::chrono::steady_clock::now();

@@ -213,6 +213,29 @@ cmake -B build -G Ninja -DRECMEET_BUILD_TRAY=OFF -DRECMEET_USE_SHERPA=OFF
 ./build/recmeet_tests "[obsidian]"
 ```
 
+## Installing
+
+```bash
+sudo cmake --install build                       # install to /usr/local
+cmake --install build --prefix /tmp/test-install  # or a custom prefix
+```
+
+### Packages
+
+Pre-built packages for Arch Linux (PKGBUILD), Debian/Ubuntu (`.deb` via CPack), and Fedora/RHEL (`.rpm` via CPack) are supported. See [BUILD.md](BUILD.md) for packaging instructions and per-distro build dependencies.
+
+### Autostart via systemd
+
+recmeet-tray ships a systemd user service that starts the tray applet automatically with your graphical session:
+
+```bash
+systemctl --user enable --now recmeet-tray.service   # enable + start immediately
+systemctl --user status recmeet-tray.service          # check status
+systemctl --user disable --now recmeet-tray.service   # disable + stop
+```
+
+The service is tied to `graphical-session.target` and restarts automatically on crash. On Sway, your config must activate that target — see [BUILD.md](BUILD.md) for details.
+
 ## Project history
 
 recmeet started as a Python prototype that proved the pipeline in a single session: `pw-record` and `parecord` for capture, `faster-whisper` for transcription, the `requests` library for Grok API calls. Within two hours the core concept was validated — a local Linux box could record, transcribe, and summarize any meeting without cloud dependencies.

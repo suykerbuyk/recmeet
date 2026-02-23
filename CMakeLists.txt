@@ -208,6 +208,13 @@ if(RECMEET_BUILD_TRAY)
     install(TARGETS recmeet-tray RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
     install(FILES dist/recmeet-tray.desktop
         DESTINATION ${CMAKE_INSTALL_DATADIR}/applications)
+
+    # systemd user service (prefix-aware ExecStart path)
+    set(RECMEET_TRAY_EXEC "${CMAKE_INSTALL_FULL_BINDIR}/recmeet-tray")
+    configure_file(dist/recmeet-tray.service.in
+        ${CMAKE_BINARY_DIR}/recmeet-tray.service @ONLY)
+    install(FILES ${CMAKE_BINARY_DIR}/recmeet-tray.service
+        DESTINATION lib/systemd/user)
 endif()
 
 install(FILES LICENSE-MIT LICENSE-APACHE AUTHORS
