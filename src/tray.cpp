@@ -416,6 +416,31 @@ static void on_refresh_devices(GtkMenuItem*, gpointer) {
     notify("Devices refreshed", msg);
 }
 
+static void on_about(GtkMenuItem*, gpointer) {
+    auto* dialog = gtk_about_dialog_new();
+    gtk_about_dialog_set_program_name(GTK_ABOUT_DIALOG(dialog), "recmeet");
+    gtk_about_dialog_set_version(GTK_ABOUT_DIALOG(dialog), RECMEET_VERSION);
+    gtk_about_dialog_set_comments(GTK_ABOUT_DIALOG(dialog),
+        "Record, transcribe, and summarize meetings locally.");
+    gtk_about_dialog_set_website(GTK_ABOUT_DIALOG(dialog),
+        "https://github.com/suykerbuyk/recmeet");
+    gtk_about_dialog_set_website_label(GTK_ABOUT_DIALOG(dialog),
+        "GitHub Repository");
+    gtk_about_dialog_set_copyright(GTK_ABOUT_DIALOG(dialog),
+        "Copyright \xC2\xA9 2026 John Suykerbuyk and SykeTech LTD");
+    gtk_about_dialog_set_license(GTK_ABOUT_DIALOG(dialog),
+        "Dual-licensed under the MIT License and Apache License 2.0.\n\n"
+        "See LICENSE-MIT and LICENSE-APACHE for full text.");
+    gtk_about_dialog_set_wrap_license(GTK_ABOUT_DIALOG(dialog), TRUE);
+    const char* authors[] = {"John Suykerbuyk (SykeTech LTD)", nullptr};
+    gtk_about_dialog_set_authors(GTK_ABOUT_DIALOG(dialog), authors);
+    gtk_about_dialog_set_logo_icon_name(GTK_ABOUT_DIALOG(dialog),
+        "audio-input-microphone");
+
+    gtk_dialog_run(GTK_DIALOG(dialog));
+    gtk_widget_destroy(dialog);
+}
+
 static void on_quit(GtkMenuItem*, gpointer) {
     if (g_tray.state == TrayState::RECORDING) {
         g_tray.stop.request();
@@ -756,6 +781,11 @@ static void build_menu() {
     {
         auto* item = gtk_menu_item_new_with_label("Refresh Devices");
         g_signal_connect(item, "activate", G_CALLBACK(on_refresh_devices), nullptr);
+        gtk_menu_shell_append(GTK_MENU_SHELL(menu), item);
+    }
+    {
+        auto* item = gtk_menu_item_new_with_label("About");
+        g_signal_connect(item, "activate", G_CALLBACK(on_about), nullptr);
         gtk_menu_shell_append(GTK_MENU_SHELL(menu), item);
     }
 

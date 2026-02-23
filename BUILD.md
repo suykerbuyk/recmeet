@@ -353,6 +353,56 @@ The `.deb` is configured with:
 - **`CPACK_DEBIAN_FILE_NAME DEB-DEFAULT`** — uses the standard Debian naming
   convention (`name_version_arch.deb`).
 
+### Fedora / RHEL
+
+CPack can also produce `.rpm` packages. Build on a Fedora or RHEL system
+where `rpmbuild` is available.
+
+```bash
+# 1. Configure a release build
+cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+
+# 2. Build
+ninja -C build
+
+# 3. Generate the .rpm
+cd build && cpack -G RPM
+```
+
+This produces a file like `recmeet-0.1.0-1.x86_64.rpm` in the build directory.
+Install it with:
+
+```bash
+sudo dnf install ./recmeet-0.1.0-1.x86_64.rpm
+```
+
+The `.rpm` is configured with:
+
+- **`CPACK_RPM_PACKAGE_AUTOREQ ON`** — automatically detects shared library
+  dependencies (the RPM equivalent of `SHLIBDEPS`).
+- **`CPACK_RPM_FILE_NAME RPM-DEFAULT`** — uses the standard RPM naming
+  convention (`name-version-release.arch.rpm`).
+
+### Cross-distro note
+
+Packages should be built on their target distro. A `.deb` built on Ubuntu
+won't work on Fedora, and a `.rpm` built on Fedora won't work on Debian.
+The auto-dependency detection (`SHLIBDEPS` for DEB, `AUTOREQ` for RPM) maps
+ELF NEEDED entries to the correct package names for the distro where the build
+runs.
+
+### Build dependencies by distro
+
+| Dependency | Arch | Debian/Ubuntu | Fedora/RHEL |
+|---|---|---|---|
+| PipeWire | `pipewire` | `libpipewire-0.3-dev` | `pipewire-devel` |
+| PulseAudio | `libpulse` | `libpulse-dev` | `pulseaudio-libs-devel` |
+| libsndfile | `libsndfile` | `libsndfile1-dev` | `libsndfile-devel` |
+| curl | `curl` | `libcurl4-openssl-dev` | `libcurl-devel` |
+| libnotify | `libnotify` | `libnotify-dev` | `libnotify-devel` |
+| AppIndicator | `libayatana-appindicator` | `libayatana-appindicator3-dev` | `libayatana-appindicator-gtk3-devel` |
+| GTK3 | `gtk3` | `libgtk-3-dev` | `gtk3-devel` |
+
 ---
 
 ## Clean build

@@ -221,8 +221,21 @@ set(CPACK_PACKAGE_DESCRIPTION_SUMMARY
     "Record, transcribe, and summarize meetings locally")
 set(CPACK_DEBIAN_PACKAGE_SECTION "sound")
 set(CPACK_DEBIAN_PACKAGE_SHLIBDEPS ON)
-set(CPACK_DEBIAN_PACKAGE_DEPENDS
-    "pipewire, libpulse0, libsndfile1, libcurl4, libnotify4, libayatana-appindicator3-1, libgtk-3-0")
+# Shared library deps are auto-resolved by SHLIBDEPS from ELF binaries.
+# Only hardcode non-library runtime deps that dpkg-shlibdeps cannot detect.
+set(CPACK_DEBIAN_PACKAGE_DEPENDS "pipewire")
 set(CPACK_DEBIAN_FILE_NAME DEB-DEFAULT)
 set(CPACK_STRIP_FILES ON)
+
+# --- CPack RPM packaging ---
+set(CPACK_RPM_PACKAGE_LICENSE "MIT and Apache-2.0")
+set(CPACK_RPM_PACKAGE_GROUP "Applications/Multimedia")
+set(CPACK_RPM_PACKAGE_URL "https://github.com/suykerbuyk/recmeet")
+set(CPACK_RPM_PACKAGE_DESCRIPTION
+    "Record, transcribe, and summarize meetings locally using whisper.cpp")
+set(CPACK_RPM_PACKAGE_AUTOREQ ON)
+set(CPACK_RPM_PACKAGE_AUTOPROV ON)
+set(CPACK_RPM_FILE_NAME RPM-DEFAULT)
+set(CPACK_RPM_PACKAGE_REQUIRES "pipewire")
+
 include(CPack)
