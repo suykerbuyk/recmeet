@@ -1,4 +1,4 @@
-# Building and Testing recmeet
+# Building, Testing, and Packaging recmeet
 
 ## How the build system works
 
@@ -149,7 +149,9 @@ The `&&` ensures tests only run if the build succeeded.
 
 ## CMake options
 
-recmeet has three build options you can toggle at configure time:
+recmeet has four build options you can toggle at configure time. All features
+default to ON and the build type defaults to Release, so a plain
+`cmake -B build -G Ninja` gives you a fully-featured optimized build.
 
 ```bash
 # Disable the system tray applet (skips GTK3/AppIndicator dependency)
@@ -157,6 +159,9 @@ cmake -B build -G Ninja -DRECMEET_BUILD_TRAY=OFF
 
 # Disable llama.cpp local summarization
 cmake -B build -G Ninja -DRECMEET_USE_LLAMA=OFF
+
+# Disable sherpa-onnx speaker diarization (saves build time)
+cmake -B build -G Ninja -DRECMEET_USE_SHERPA=OFF
 
 # Disable building tests (skips Catch2 download)
 cmake -B build -G Ninja -DRECMEET_BUILD_TESTS=OFF
@@ -195,9 +200,8 @@ CLI or tray binaries.
 ## Debug and release builds
 
 CMake supports several build types that control optimization and debug info.
-The vendor libraries (whisper.cpp, llama.cpp) default to `Release` when no
-build type is specified, so a plain `cmake -B build -G Ninja` already produces
-optimized binaries.
+The build type defaults to `Release` when none is specified, so a plain
+`cmake -B build -G Ninja` already produces optimized binaries.
 
 ### Release (default)
 
@@ -249,6 +253,105 @@ strip build/recmeet build/recmeet-tray
 | `Debug` | `-O0` | Yes (`-g`) | Debugging with gdb/lldb |
 | `RelWithDebInfo` | `-O2` | Yes (`-g`) | Profiling, crash analysis |
 | `MinSizeRel` | `-Os` | No | Smallest binary |
+
+---
+
+## Installing
+
+After building, you can install recmeet into a prefix on the filesystem using
+CMake's install step. The install rules use `GNUInstallDirs` for portable paths
+and only install recmeet's own files — the vendored libraries (whisper.cpp,
+llama.cpp) are statically linked and excluded from the install tree.
+
+### Install to the default prefix (`/usr/local`)
+
+```bash
+sudo cmake --install build
+```
+
+### Install to a custom prefix (no root required)
+
+```bash
+cmake --install build --prefix /tmp/test-install
+```
+
+### What gets installed
+
+| File | Destination |
+|---|---|
+| `recmeet` | `<prefix>/bin/` |
+| `recmeet-tray` | `<prefix>/bin/` (only when `RECMEET_BUILD_TRAY=ON`) |
+| `recmeet-tray.desktop` | `<prefix>/share/applications/` (only when `RECMEET_BUILD_TRAY=ON`) |
+| `LICENSE-MIT` | `<prefix>/share/doc/recmeet/` |
+| `LICENSE-APACHE` | `<prefix>/share/doc/recmeet/` |
+| `AUTHORS` | `<prefix>/share/doc/recmeet/` |
+
+The `.desktop` file registers `recmeet-tray` with freedesktop-compliant desktop
+environments so it appears in application menus and can be configured for
+autostart.
+
+---
+
+## Packaging
+
+recmeet supports building distributable packages for Arch Linux and Debian/Ubuntu.
+Both packaging paths use the same CMake install rules, so the installed file
+layout is identical regardless of how you install.
+
+### Arch Linux
+
+A `PKGBUILD` is provided in `dist/arch/`. It builds from the local git repo
+and derives the package version from `git describe`.
+
+```bash
+cd dist/arch
+makepkg -sf          # build the package
+sudo pacman -U recmeet-git-*.pkg.tar.*   # install it
+```
+
+The `-s` flag auto-installs missing build dependencies. The `-f` flag forces
+a rebuild if a package file already exists.
+
+The PKGBUILD uses `git+file://` to clone from the local repo, so your working
+tree doesn't need to be clean — but only committed changes are included.
+To publish to the AUR, change the `source` URL to point at a remote git repo.
+
+Build options: the PKGBUILD only overrides `-DRECMEET_BUILD_TESTS=OFF` — all
+other options inherit the CMake defaults (Release, all features ON). Edit the
+`build()` function to change these.
+
+### Debian / Ubuntu
+
+CMake's CPack module can produce `.deb` packages directly from the build
+directory. No separate packaging files are needed.
+
+```bash
+# 1. Configure a release build
+cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+
+# 2. Build
+ninja -C build
+
+# 3. Generate the .deb
+cd build && cpack -G DEB
+```
+
+This produces a file like `recmeet_0.1.0_amd64.deb` in the build directory.
+Install it with:
+
+```bash
+sudo dpkg -i recmeet_0.1.0_amd64.deb
+sudo apt-get install -f   # resolve any missing dependencies
+```
+
+The `.deb` is configured with:
+
+- **`CPACK_DEBIAN_PACKAGE_SHLIBDEPS ON`** — automatically detects shared library
+  dependencies by running `dpkg-shlibdeps` on the installed binaries.
+- **`CPACK_STRIP_FILES ON`** — strips debug symbols, significantly reducing
+  package size.
+- **`CPACK_DEBIAN_FILE_NAME DEB-DEFAULT`** — uses the standard Debian naming
+  convention (`name_version_arch.deb`).
 
 ---
 

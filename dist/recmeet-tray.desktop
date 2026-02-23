@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Recmeet
+GenericName=Meeting Recorder
+Comment=Record, transcribe, and summarize meetings locally
+Exec=recmeet-tray
+Icon=audio-input-microphone
+Terminal=false
+Categories=AudioVideo;Audio;Utility;
+Keywords=meeting;record;transcribe;summarize;whisper;
+StartupNotify=false

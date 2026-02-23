@@ -1,0 +1,55 @@
+# Maintainer: recmeet contributors
+pkgname=recmeet-git
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="Record, transcribe, and summarize meetings locally"
+arch=('x86_64')
+url="https://github.com/anthropics/recmeet"
+license=('MIT' 'Apache-2.0')
+depends=(
+    'pipewire'
+    'libpulse'
+    'libsndfile'
+    'curl'
+    'libnotify'
+    'libayatana-appindicator'
+    'gtk3'
+)
+makedepends=(
+    'git'
+    'cmake'
+    'ninja'
+    'gcc'
+    'pkgconf'
+)
+provides=('recmeet')
+conflicts=('recmeet')
+source=("${pkgname}::git+file://${startdir}/../..")
+sha256sums=('SKIP')
+
+pkgver() {
+    cd "${pkgname}"
+    git describe --tags --match 'v[0-9]*' --long 2>/dev/null \
+        | sed 's/^v//; s/-/.r/; s/-/./' \
+        || printf "0.1.0.r%s.g%s" "$(git rev-list --count HEAD)" "$(git rev-parse --short HEAD)"
+}
+
+prepare() {
+    cd "${pkgname}"
+    git submodule update --init --recursive
+}
+
+build() {
+    cmake -S "${pkgname}" -B build -G Ninja \
+        -DCMAKE_INSTALL_PREFIX=/usr \
+        -DRECMEET_BUILD_TESTS=OFF
+    cmake --build build
+}
+
+package() {
+    DESTDIR="${pkgdir}" cmake --install build
+
+    cd "${pkgname}"
+    install -Dm644 LICENSE-MIT    "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE-MIT"
+    install -Dm644 LICENSE-APACHE "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE-APACHE"
+}

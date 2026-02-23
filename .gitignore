@@ -24,3 +24,9 @@ CLAUDE.md
 RESUME.md
 commit.msg
 tasks/
+
+# makepkg artifacts
+dist/arch/src/
+dist/arch/pkg/
+dist/arch/*.pkg.tar.*
+dist/arch/recmeet-git/

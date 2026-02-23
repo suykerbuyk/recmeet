@@ -5,10 +5,14 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
+if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+    set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
+endif()
+
 # Options
 option(RECMEET_BUILD_TRAY  "Build system tray applet" ON)
 option(RECMEET_USE_LLAMA   "Enable local summarization via llama.cpp" ON)
-option(RECMEET_USE_SHERPA  "Enable speaker diarization via sherpa-onnx" OFF)
+option(RECMEET_USE_SHERPA  "Enable speaker diarization via sherpa-onnx" ON)
 option(RECMEET_BUILD_TESTS "Build unit tests" ON)
 
 # Version header — regenerated at build time from git describe
@@ -46,7 +50,7 @@ set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
 set(WHISPER_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 set(WHISPER_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
 set(WHISPER_BUILD_SERVER OFF CACHE BOOL "" FORCE)
-add_subdirectory(vendor/whisper.cpp)
+add_subdirectory(vendor/whisper.cpp EXCLUDE_FROM_ALL)
 
 # Vendor: llama.cpp
 if(RECMEET_USE_LLAMA)
@@ -55,7 +59,7 @@ if(RECMEET_USE_LLAMA)
     set(LLAMA_BUILD_SERVER OFF CACHE BOOL "" FORCE)
     set(LLAMA_BUILD_TOOLS OFF CACHE BOOL "" FORCE)
     set(LLAMA_BUILD_COMMON OFF CACHE BOOL "" FORCE)
-    add_subdirectory(vendor/llama.cpp)
+    add_subdirectory(vendor/llama.cpp EXCLUDE_FROM_ALL)
 endif()
 
 # Vendor: sherpa-onnx (speaker diarization)
@@ -180,3 +184,31 @@ if(RECMEET_BUILD_TESTS)
     target_link_libraries(recmeet_tests PRIVATE recmeet_core Catch2::Catch2WithMain)
     catch_discover_tests(recmeet_tests)
 endif()
+
+# --- Install rules ---
+include(GNUInstallDirs)
+
+install(TARGETS recmeet RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+
+if(RECMEET_BUILD_TRAY)
+    install(TARGETS recmeet-tray RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+    install(FILES dist/recmeet-tray.desktop
+        DESTINATION ${CMAKE_INSTALL_DATADIR}/applications)
+endif()
+
+install(FILES LICENSE-MIT LICENSE-APACHE AUTHORS
+    DESTINATION ${CMAKE_INSTALL_DOCDIR})
+
+# --- CPack DEB packaging ---
+set(CPACK_PACKAGE_NAME "recmeet")
+set(CPACK_PACKAGE_VERSION "${PROJECT_VERSION}")
+set(CPACK_PACKAGE_CONTACT "recmeet contributors")
+set(CPACK_PACKAGE_DESCRIPTION_SUMMARY
+    "Record, transcribe, and summarize meetings locally")
+set(CPACK_DEBIAN_PACKAGE_SECTION "sound")
+set(CPACK_DEBIAN_PACKAGE_SHLIBDEPS ON)
+set(CPACK_DEBIAN_PACKAGE_DEPENDS
+    "pipewire, libpulse0, libsndfile1, libcurl4, libnotify4, libayatana-appindicator3-1, libgtk-3-0")
+set(CPACK_DEBIAN_FILE_NAME DEB-DEFAULT)
+set(CPACK_STRIP_FILES ON)
+include(CPack)
