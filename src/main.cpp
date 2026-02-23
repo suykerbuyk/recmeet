@@ -44,6 +44,7 @@ static void print_usage() {
         "  --llm-model PATH     Local GGUF model for summarization (instead of API)\n"
         "  --no-diarize         Disable speaker diarization\n"
         "  --num-speakers N     Number of speakers (0 = auto-detect, default: 0)\n"
+        "  --cluster-threshold F  Clustering distance threshold (default: 1.18, higher = fewer speakers)\n"
         "  --threads N          Number of CPU threads for inference (0 = auto-detect, default: 0)\n"
         "  --reprocess DIR      Reprocess existing recording from audio.wav\n"
         "  --list-sources       List available audio sources and exit\n"

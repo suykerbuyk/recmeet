@@ -47,6 +47,7 @@ struct Config {
     // Diarization (on by default when built with RECMEET_USE_SHERPA)
     bool diarize = true;
     int num_speakers = 0;  // 0 = auto-detect
+    float cluster_threshold = 1.18f;  // clustering distance threshold (lower = more splitting)
 
     // Performance
     int threads = 0;  // 0 = auto-detect (hardware_concurrency - 1)

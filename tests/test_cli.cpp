@@ -135,6 +135,16 @@ TEST_CASE("parse_cli: default num_speakers is 0", "[cli]") {
     CHECK(cli.cfg.num_speakers == 0);
 }
 
+TEST_CASE("parse_cli: --cluster-threshold sets cluster_threshold", "[cli]") {
+    auto cli = run_cli({"recmeet", "--cluster-threshold", "0.7"});
+    CHECK(cli.cfg.cluster_threshold == 0.7f);
+}
+
+TEST_CASE("parse_cli: default cluster_threshold is 1.18", "[cli]") {
+    auto cli = run_cli({"recmeet"});
+    CHECK(cli.cfg.cluster_threshold == 1.18f);
+}
+
 TEST_CASE("parse_cli: --threads sets threads", "[cli]") {
     auto cli = run_cli({"recmeet", "--threads", "8"});
     CHECK(cli.cfg.threads == 8);

@@ -149,6 +149,8 @@ Config load_config() {
     cfg.diarize = get_bool(entries, "diarization", "enabled", true);
     std::string ns = get_val(entries, "diarization", "num_speakers", "0");
     cfg.num_speakers = std::atoi(ns.c_str());
+    std::string ct = get_val(entries, "diarization", "cluster_threshold", "");
+    if (!ct.empty()) cfg.cluster_threshold = std::atof(ct.c_str());
 
     // General section
     std::string threads_str = get_val(entries, "general", "threads", "0");
@@ -204,12 +206,14 @@ void save_config(const Config& cfg) {
     if (!cfg.llm_model.empty())
         out << "  llm_model: \"" << cfg.llm_model << "\"\n";
 
-    if (!cfg.diarize || cfg.num_speakers > 0) {
+    if (!cfg.diarize || cfg.num_speakers > 0 || cfg.cluster_threshold != 1.18f) {
         out << "\ndiarization:\n";
         if (!cfg.diarize)
             out << "  enabled: false\n";
         if (cfg.num_speakers > 0)
             out << "  num_speakers: " << cfg.num_speakers << "\n";
+        if (cfg.cluster_threshold != 1.18f)
+            out << "  cluster_threshold: " << cfg.cluster_threshold << "\n";
     }
 
     out << "\noutput:\n"

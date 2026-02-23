@@ -47,7 +47,8 @@ std::vector<TranscriptSegment> merge_speakers(
 }
 
 #if RECMEET_USE_SHERPA
-DiarizeResult diarize(const fs::path& audio_path, int num_speakers, int threads) {
+DiarizeResult diarize(const fs::path& audio_path, int num_speakers, int threads,
+                      float threshold) {
     auto samples = read_wav_float(audio_path);
     if (samples.empty())
         throw RecmeetError("Cannot read audio for diarization: " + audio_path.string());
@@ -75,7 +76,7 @@ DiarizeResult diarize(const fs::path& audio_path, int num_speakers, int threads)
     // Configure clustering
     SherpaOnnxFastClusteringConfig cluster_cfg{};
     cluster_cfg.num_clusters = num_speakers > 0 ? num_speakers : -1;
-    cluster_cfg.threshold = 0.5f;
+    cluster_cfg.threshold = threshold;
 
     // Build top-level config
     SherpaOnnxOfflineSpeakerDiarizationConfig config{};

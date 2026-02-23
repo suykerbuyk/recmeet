@@ -85,7 +85,7 @@ PipelineResult run_pipeline(const Config& cfg, StopToken& stop, PhaseCallback on
         if (cfg.diarize) {
             phase("diarizing");
             notify("Diarizing...", "Identifying speakers");
-            auto diar = diarize(audio_path, cfg.num_speakers, threads);
+            auto diar = diarize(audio_path, cfg.num_speakers, threads, cfg.cluster_threshold);
             result.segments = merge_speakers(result.segments, diar);
         }
 #endif
@@ -240,7 +240,7 @@ PipelineResult run_pipeline(const Config& cfg, StopToken& stop, PhaseCallback on
         if (cfg.diarize) {
             phase("diarizing");
             notify("Diarizing...", "Identifying speakers");
-            auto diar = diarize(audio_path, cfg.num_speakers, threads);
+            auto diar = diarize(audio_path, cfg.num_speakers, threads, cfg.cluster_threshold);
             result.segments = merge_speakers(result.segments, diar);
         }
 #endif
