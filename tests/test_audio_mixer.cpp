@@ -1,3 +1,6 @@
+// Copyright (c) 2026 John Suykerbuyk and SykeTech LTD
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 #include <catch2/catch_test_macros.hpp>
 #include "audio_mixer.h"
 
