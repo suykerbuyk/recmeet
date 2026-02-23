@@ -9,10 +9,16 @@ if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
     set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
 endif()
 
+# Reduce binary size: emit each function/data item in its own section
+# so the linker can discard unreferenced symbols.
+add_compile_options(-ffunction-sections -fdata-sections)
+add_link_options(-Wl,--gc-sections)
+
 # Options
 option(RECMEET_BUILD_TRAY  "Build system tray applet" ON)
 option(RECMEET_USE_LLAMA   "Enable local summarization via llama.cpp" ON)
 option(RECMEET_USE_SHERPA  "Enable speaker diarization via sherpa-onnx" ON)
+option(RECMEET_USE_NOTIFY "Enable desktop notifications via libnotify" ON)
 option(RECMEET_BUILD_TESTS "Build unit tests" ON)
 
 # Version header — regenerated at build time from git describe
@@ -38,7 +44,9 @@ pkg_check_modules(PULSE REQUIRED IMPORTED_TARGET libpulse)
 pkg_check_modules(PULSE_SIMPLE REQUIRED IMPORTED_TARGET libpulse-simple)
 pkg_check_modules(SNDFILE REQUIRED IMPORTED_TARGET sndfile)
 pkg_check_modules(CURL REQUIRED IMPORTED_TARGET libcurl)
-pkg_check_modules(NOTIFY REQUIRED IMPORTED_TARGET libnotify)
+if(RECMEET_USE_NOTIFY)
+    pkg_check_modules(NOTIFY REQUIRED IMPORTED_TARGET libnotify)
+endif()
 
 if(RECMEET_BUILD_TRAY)
     pkg_check_modules(GTK3 REQUIRED IMPORTED_TARGET gtk+-3.0)
@@ -123,9 +131,13 @@ target_link_libraries(recmeet_core PUBLIC
     PkgConfig::PULSE_SIMPLE
     PkgConfig::SNDFILE
     PkgConfig::CURL
-    PkgConfig::NOTIFY
     whisper
 )
+
+if(RECMEET_USE_NOTIFY)
+    target_link_libraries(recmeet_core PUBLIC PkgConfig::NOTIFY)
+    target_compile_definitions(recmeet_core PUBLIC RECMEET_USE_NOTIFY=1)
+endif()
 
 if(RECMEET_USE_LLAMA)
     target_link_libraries(recmeet_core PUBLIC llama)
@@ -186,6 +198,8 @@ if(RECMEET_BUILD_TESTS)
 endif()
 
 # --- Install rules ---
+# Strip binaries on install (cmake --install); CPack already strips via CPACK_STRIP_FILES.
+install(CODE "set(CMAKE_INSTALL_DO_STRIP ON)")
 include(GNUInstallDirs)
 
 install(TARGETS recmeet RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})

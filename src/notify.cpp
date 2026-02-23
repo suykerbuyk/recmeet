@@ -3,8 +3,9 @@
 
 #include "notify.h"
 
+#if RECMEET_USE_NOTIFY
+
 #include <libnotify/notify.h>
-#include <cstdio>
 
 namespace recmeet {
 
@@ -30,3 +31,15 @@ void notify_cleanup() {
 }
 
 } // namespace recmeet
+
+#else // !RECMEET_USE_NOTIFY
+
+namespace recmeet {
+
+void notify_init() {}
+void notify(const std::string&, const std::string&) {}
+void notify_cleanup() {}
+
+} // namespace recmeet
+
+#endif
