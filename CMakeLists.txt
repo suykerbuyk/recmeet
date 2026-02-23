@@ -11,12 +11,20 @@ option(RECMEET_USE_LLAMA   "Enable local summarization via llama.cpp" ON)
 option(RECMEET_USE_SHERPA  "Enable speaker diarization via sherpa-onnx" OFF)
 option(RECMEET_BUILD_TESTS "Build unit tests" ON)
 
-# Version header
-set(RECMEET_VERSION_MAJOR ${PROJECT_VERSION_MAJOR})
-set(RECMEET_VERSION_MINOR ${PROJECT_VERSION_MINOR})
-set(RECMEET_VERSION_PATCH ${PROJECT_VERSION_PATCH})
-set(RECMEET_VERSION "${PROJECT_VERSION}")
-configure_file(src/version.h.in ${CMAKE_BINARY_DIR}/generated/version.h)
+# Version header — regenerated at build time from git describe
+find_package(Git QUIET)
+file(MAKE_DIRECTORY ${CMAKE_BINARY_DIR}/generated)
+add_custom_target(recmeet_version ALL
+    COMMAND ${CMAKE_COMMAND}
+        -DSOURCE_DIR=${CMAKE_SOURCE_DIR}
+        -DGIT_EXECUTABLE=${GIT_EXECUTABLE}
+        -DVERSION_IN=${CMAKE_SOURCE_DIR}/src/version.h.in
+        -DVERSION_OUT=${CMAKE_BINARY_DIR}/generated/version.h
+        -DFALLBACK_VERSION=${PROJECT_VERSION}
+        -P ${CMAKE_SOURCE_DIR}/cmake/version.cmake
+    BYPRODUCTS ${CMAKE_BINARY_DIR}/generated/version.h
+    COMMENT "Updating version.h"
+)
 
 # System dependencies
 find_package(PkgConfig REQUIRED)
@@ -99,6 +107,7 @@ set(CORE_SOURCES
 )
 
 add_library(recmeet_core STATIC ${CORE_SOURCES})
+add_dependencies(recmeet_core recmeet_version)
 target_include_directories(recmeet_core PUBLIC
     src
     ${CMAKE_BINARY_DIR}/generated
