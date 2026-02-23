@@ -36,21 +36,22 @@ add_custom_target(recmeet_version ALL
     COMMENT "Updating version.h"
 )
 
-# System dependencies
-find_package(PkgConfig REQUIRED)
+# System dependencies — distro detection + helpful error messages
+include(cmake/prerequisites.cmake)
+recmeet_check_pkg_config()
 find_package(Threads REQUIRED)
-pkg_check_modules(PIPEWIRE REQUIRED IMPORTED_TARGET libpipewire-0.3)
-pkg_check_modules(PULSE REQUIRED IMPORTED_TARGET libpulse)
-pkg_check_modules(PULSE_SIMPLE REQUIRED IMPORTED_TARGET libpulse-simple)
-pkg_check_modules(SNDFILE REQUIRED IMPORTED_TARGET sndfile)
-pkg_check_modules(CURL REQUIRED IMPORTED_TARGET libcurl)
+recmeet_pkg_check(PIPEWIRE      libpipewire-0.3)
+recmeet_pkg_check(PULSE         libpulse)
+recmeet_pkg_check(PULSE_SIMPLE  libpulse-simple)
+recmeet_pkg_check(SNDFILE       sndfile)
+recmeet_pkg_check(CURL          libcurl)
 if(RECMEET_USE_NOTIFY)
-    pkg_check_modules(NOTIFY REQUIRED IMPORTED_TARGET libnotify)
+    recmeet_pkg_check(NOTIFY    libnotify)
 endif()
 
 if(RECMEET_BUILD_TRAY)
-    pkg_check_modules(GTK3 REQUIRED IMPORTED_TARGET gtk+-3.0)
-    pkg_check_modules(APPINDICATOR REQUIRED IMPORTED_TARGET ayatana-appindicator3-0.1)
+    recmeet_pkg_check(GTK3          gtk+-3.0)
+    recmeet_pkg_check(APPINDICATOR  ayatana-appindicator3-0.1)
 endif()
 
 # Vendor: whisper.cpp

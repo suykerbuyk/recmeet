@@ -419,6 +419,10 @@ runs.
 
 | Dependency | Arch | Debian/Ubuntu | Fedora/RHEL |
 |---|---|---|---|
+| CMake | `cmake` | `cmake` | `cmake` |
+| Ninja | `ninja` | `ninja-build` | `ninja-build` |
+| C/C++ compiler | `gcc` | `build-essential` | `gcc-c++` |
+| pkg-config | `pkg-config` (in base) | `pkg-config` | `pkgconf-pkg-config` |
 | PipeWire | `pipewire` | `libpipewire-0.3-dev` | `pipewire-devel` |
 | PulseAudio | `libpulse` | `libpulse-dev` | `pulseaudio-libs-devel` |
 | libsndfile | `libsndfile` | `libsndfile1-dev` | `libsndfile-devel` |
@@ -445,9 +449,18 @@ ninja -C build
 
 **"ninja: error: loading 'build.ninja'"** — You haven't run `cmake -B build -G Ninja` yet, or the `build/` directory was deleted.
 
-**CMake can't find a library** — Install the missing system dependency. On Arch:
+**CMake can't find a library** — Install the missing system dependency:
 ```bash
+# Arch
 sudo pacman -S pipewire libpulse libsndfile curl libnotify libayatana-appindicator gtk3
+
+# Debian / Ubuntu
+sudo apt install libpipewire-0.3-dev libpulse-dev libsndfile1-dev libcurl4-openssl-dev \
+    libnotify-dev libayatana-appindicator3-dev libgtk-3-dev
+
+# Fedora / RHEL
+sudo dnf install pipewire-devel pulseaudio-libs-devel libsndfile-devel libcurl-devel \
+    libnotify-devel libayatana-appindicator-gtk3-devel gtk3-devel
 ```
 
 **Tests fail with "[integration]" errors** — Those tests need a running

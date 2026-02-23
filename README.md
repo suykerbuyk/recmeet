@@ -30,6 +30,22 @@ sudo pacman -S pipewire libpulse libsndfile curl libnotify \
                libayatana-appindicator gtk3 cmake ninja gcc
 ```
 
+### Dependencies (Debian / Ubuntu)
+
+```bash
+sudo apt install build-essential cmake ninja-build pkg-config \
+    libpipewire-0.3-dev libpulse-dev libsndfile1-dev libcurl4-openssl-dev \
+    libnotify-dev libayatana-appindicator3-dev libgtk-3-dev
+```
+
+### Dependencies (Fedora / RHEL)
+
+```bash
+sudo dnf install gcc-c++ cmake ninja-build pkgconf-pkg-config \
+    pipewire-devel pulseaudio-libs-devel libsndfile-devel libcurl-devel \
+    libnotify-devel libayatana-appindicator-gtk3-devel gtk3-devel
+```
+
 ### Build
 
 ```bash
