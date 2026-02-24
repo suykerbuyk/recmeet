@@ -55,6 +55,13 @@ if(RECMEET_BUILD_TRAY)
     recmeet_pkg_check(APPINDICATOR  ayatana-appindicator3-0.1)
 endif()
 
+# Vendor libraries use cmake_minimum_required as low as 3.1. Suppress the CMake 4.x
+# deprecation warnings ("Compatibility with CMake < 3.10 will be removed") since we
+# can't fix third-party CMakeLists.txt files (kaldi-native-fbank, kaldifst, openfst,
+# kissfft all override CMAKE_POLICY_VERSION_MINIMUM in their own scopes).
+set(CMAKE_WARN_DEPRECATED OFF CACHE BOOL "" FORCE)
+set(CMAKE_POLICY_VERSION_MINIMUM 3.10 CACHE STRING "" FORCE)
+
 # Vendor: whisper.cpp
 set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
 set(WHISPER_BUILD_TESTS OFF CACHE BOOL "" FORCE)
@@ -83,10 +90,16 @@ if(RECMEET_USE_SHERPA)
     set(SHERPA_ONNX_ENABLE_WEBSOCKET OFF CACHE BOOL "" FORCE)
     set(SHERPA_ONNX_ENABLE_BINARY OFF CACHE BOOL "" FORCE)
     set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
-    # sherpa-onnx's transitive deps require older CMake minimum versions
-    set(CMAKE_POLICY_VERSION_MINIMUM 3.5 CACHE STRING "" FORCE)
+    # Suppress dev warnings from sherpa-onnx's cmake files:
+    # CMP0169: FetchContent_Populate() deprecated in CMake 3.30 (used by onnxruntime, kaldi-* downloads)
+    # CMP0177: install() DESTINATION "./" normalization in CMake 3.31 (sherpa-onnx.pc install)
+    set(CMAKE_POLICY_DEFAULT_CMP0169 OLD)
+    set(CMAKE_POLICY_DEFAULT_CMP0177 OLD)
     FetchContent_MakeAvailable(sherpa-onnx)
 endif()
+
+# Re-enable deprecation warnings for our own code
+set(CMAKE_WARN_DEPRECATED ON CACHE BOOL "" FORCE)
 
 # Core library (everything except main.cpp and tray.cpp)
 set(CORE_SOURCES
