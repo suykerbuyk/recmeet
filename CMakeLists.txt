@@ -36,8 +36,9 @@ add_custom_target(recmeet_version ALL
     COMMENT "Updating version.h"
 )
 
-# System dependencies — distro detection + helpful error messages
+# Prerequisite checks — distro detection, submodules, helpful error messages
 include(cmake/prerequisites.cmake)
+recmeet_check_submodules()
 recmeet_check_pkg_config()
 find_package(Threads REQUIRED)
 recmeet_pkg_check(PIPEWIRE      libpipewire-0.3)

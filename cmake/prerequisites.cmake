@@ -84,7 +84,29 @@ set(_RECMEET_PKG_debian_ayatana-appindicator3-0.1  "libayatana-appindicator3-dev
 set(_RECMEET_PKG_fedora_ayatana-appindicator3-0.1  "libayatana-appindicator-gtk3-devel")
 
 # ---------------------------------------------------------------------------
-# 3. recmeet_check_pkg_config() — find pkg-config with a helpful error
+# 3. recmeet_check_submodules() — fail early if git submodules are missing
+# ---------------------------------------------------------------------------
+function(recmeet_check_submodules)
+    set(_missing)
+    foreach(_sub IN ITEMS vendor/whisper.cpp vendor/llama.cpp)
+        if(NOT EXISTS "${CMAKE_SOURCE_DIR}/${_sub}/CMakeLists.txt")
+            list(APPEND _missing "${_sub}")
+        endif()
+    endforeach()
+    if(_missing)
+        string(REPLACE ";" ", " _list "${_missing}")
+        message(FATAL_ERROR
+            "Git submodules not initialized: ${_list}\n"
+            "  Run this from the source directory:\n"
+            "    git submodule update --init --recursive\n"
+            "\n"
+            "  Or clone with submodules next time:\n"
+            "    git clone --recurse-submodules <url>\n")
+    endif()
+endfunction()
+
+# ---------------------------------------------------------------------------
+# 4. recmeet_check_pkg_config() — find pkg-config with a helpful error
 # ---------------------------------------------------------------------------
 # Must be a macro (not function) so find_package sets PKG_CONFIG_FOUND,
 # PKG_CONFIG_VERSION, etc. in the caller's scope where pkg_check_modules
@@ -103,7 +125,7 @@ macro(recmeet_check_pkg_config)
 endmacro()
 
 # ---------------------------------------------------------------------------
-# 4. recmeet_pkg_check() — wrapper around pkg_check_modules with hints
+# 5. recmeet_pkg_check() — wrapper around pkg_check_modules with hints
 # ---------------------------------------------------------------------------
 #   recmeet_pkg_check(<prefix> <pkg-config-module>)
 #
