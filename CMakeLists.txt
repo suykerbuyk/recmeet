@@ -76,8 +76,8 @@ endif()
 if(RECMEET_USE_SHERPA)
     include(FetchContent)
     FetchContent_Declare(sherpa-onnx
-        GIT_REPOSITORY https://github.com/k2-fsa/sherpa-onnx.git
-        GIT_TAG v1.10.39
+        GIT_REPOSITORY https://github.com/suykerbuyk/sherpa-onnx.git
+        GIT_TAG fix/replace-deprecated-istrstream
     )
     set(SHERPA_ONNX_ENABLE_TTS OFF CACHE BOOL "" FORCE)
     set(SHERPA_ONNX_ENABLE_WEBSOCKET OFF CACHE BOOL "" FORCE)
@@ -85,19 +85,7 @@ if(RECMEET_USE_SHERPA)
     set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
     # sherpa-onnx's transitive deps require older CMake minimum versions
     set(CMAKE_POLICY_VERSION_MINIMUM 3.5 CACHE STRING "" FORCE)
-    # sherpa-onnx uses CMAKE_SOURCE_DIR for its cmake modules, which is wrong
-    # under FetchContent. Pre-populate the module path before MakeAvailable.
-    FetchContent_GetProperties(sherpa-onnx)
-    if(NOT sherpa-onnx_POPULATED)
-        FetchContent_Populate(sherpa-onnx)
-        list(APPEND CMAKE_MODULE_PATH
-            ${sherpa-onnx_SOURCE_DIR}/cmake/Modules
-            ${sherpa-onnx_SOURCE_DIR}/cmake)
-        # sherpa-onnx uses CMAKE_SOURCE_DIR for include paths, which is wrong
-        # under FetchContent. Add the correct include path globally.
-        include_directories(${sherpa-onnx_SOURCE_DIR})
-        add_subdirectory(${sherpa-onnx_SOURCE_DIR} ${sherpa-onnx_BINARY_DIR})
-    endif()
+    FetchContent_MakeAvailable(sherpa-onnx)
 endif()
 
 # Core library (everything except main.cpp and tray.cpp)
