@@ -55,6 +55,10 @@ struct Config {
     // Performance
     int threads = 0;  // 0 = auto-detect (hardware_concurrency - 1)
 
+    // Logging
+    std::string log_level_str;  // "none", "error", "warn", "info" (default: "none")
+    fs::path log_dir;            // empty = default (~/.local/share/recmeet/logs/)
+
     // Output
     fs::path output_dir = "./meetings";
 

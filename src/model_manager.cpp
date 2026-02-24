@@ -3,6 +3,7 @@
 
 #include "model_manager.h"
 #include "http_client.h"
+#include "log.h"
 
 #include <cstdio>
 #include <fstream>
@@ -27,7 +28,7 @@ const std::map<std::string, ModelInfo> WHISPER_MODELS = {
 };
 
 void download_file(const std::string& url, const fs::path& dest) {
-    fprintf(stderr, "Downloading %s ...\n", url.c_str());
+    log_info("Downloading %s ...", url.c_str());
 
     // Use libcurl to download with progress
     auto data = http_get(url);
@@ -38,7 +39,7 @@ void download_file(const std::string& url, const fs::path& dest) {
     out.write(data.data(), data.size());
     out.close();
 
-    fprintf(stderr, "Downloaded: %s (%.1f MB)\n", dest.filename().c_str(),
+    log_info("Downloaded: %s (%.1f MB)", dest.filename().c_str(),
             data.size() / (1024.0 * 1024.0));
 }
 

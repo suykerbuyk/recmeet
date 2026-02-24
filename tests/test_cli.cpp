@@ -157,3 +157,13 @@ TEST_CASE("parse_cli: default threads is 0", "[cli]") {
     auto cli = run_cli({"recmeet"});
     CHECK(cli.cfg.threads == 0);
 }
+
+TEST_CASE("parse_cli: --log-level sets log level", "[cli]") {
+    auto cli = run_cli({"recmeet", "--log-level", "info"});
+    CHECK(cli.cfg.log_level_str == "info");
+}
+
+TEST_CASE("parse_cli: default log_level_str is none", "[cli]") {
+    auto cli = run_cli({"recmeet"});
+    CHECK((cli.cfg.log_level_str.empty() || cli.cfg.log_level_str == "none"));
+}

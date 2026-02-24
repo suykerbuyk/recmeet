@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 #include "audio_monitor.h"
+#include "log.h"
 
 #include <pulse/simple.h>
 #include <pulse/error.h>
@@ -40,7 +41,7 @@ void PulseMonitorCapture::start() {
             &error);
 
         if (!s) {
-            fprintf(stderr, "pa_simple_new failed: %s\n", pa_strerror(error));
+            log_error("pa_simple_new failed: %s", pa_strerror(error));
             running_ = false;
             return;
         }
@@ -51,7 +52,7 @@ void PulseMonitorCapture::start() {
 
         while (!stop_.stop_requested()) {
             if (pa_simple_read(s, chunk, sizeof(chunk), &error) < 0) {
-                fprintf(stderr, "pa_simple_read failed: %s\n", pa_strerror(error));
+                log_error("pa_simple_read failed: %s", pa_strerror(error));
                 break;
             }
             std::lock_guard lk(buf_mtx_);
@@ -60,8 +61,8 @@ void PulseMonitorCapture::start() {
             constexpr size_t WARN_SAMPLES = SAMPLE_RATE * 60 * 120;
             if (buffer_.size() >= WARN_SAMPLES &&
                 buffer_.size() - chunk_samples < WARN_SAMPLES) {
-                fprintf(stderr, "\nWarning: Audio buffer exceeds 120 minutes (%.0f MB). "
-                        "Memory usage will continue to grow.\n",
+                log_warn("Audio buffer exceeds 120 minutes (%.0f MB). "
+                        "Memory usage will continue to grow.",
                         buffer_.size() * sizeof(int16_t) / (1024.0 * 1024.0));
             }
         }

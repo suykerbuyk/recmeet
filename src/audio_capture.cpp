@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 #include "audio_capture.h"
+#include "log.h"
 
 #include <pipewire/pipewire.h>
 #include <spa/param/audio/format-utils.h>
@@ -47,8 +48,8 @@ static void on_process(void* userdata) {
         constexpr size_t WARN_SAMPLES = SAMPLE_RATE * 60 * 120;
         if (impl->buffer.size() >= WARN_SAMPLES &&
             impl->buffer.size() - n_samples < WARN_SAMPLES) {
-            fprintf(stderr, "\nWarning: Audio buffer exceeds 120 minutes (%.0f MB). "
-                    "Memory usage will continue to grow.\n",
+            log_warn("Audio buffer exceeds 120 minutes (%.0f MB). "
+                    "Memory usage will continue to grow.",
                     impl->buffer.size() * sizeof(int16_t) / (1024.0 * 1024.0));
         }
     }

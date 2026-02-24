@@ -30,6 +30,8 @@ CliResult parse_cli(int argc, char* argv[]) {
         {"num-speakers",   required_argument, nullptr, 'S'},
         {"cluster-threshold", required_argument, nullptr, 'C'},
         {"threads",        required_argument, nullptr, 'T'},
+        {"log-level",      required_argument, nullptr, 'E'},
+        {"log-dir",        required_argument, nullptr, 'F'},
         {"list-sources",   no_argument,       nullptr, 'l'},
         {"help",           no_argument,       nullptr, 'h'},
         {"version",        no_argument,       nullptr, 'v'},
@@ -65,6 +67,8 @@ CliResult parse_cli(int argc, char* argv[]) {
             case 'S': result.cfg.num_speakers = std::atoi(optarg); break;
             case 'C': result.cfg.cluster_threshold = std::atof(optarg); break;
             case 'T': result.cfg.threads = std::atoi(optarg); break;
+            case 'E': result.cfg.log_level_str = optarg; break;
+            case 'F': result.cfg.log_dir = optarg; break;
             case 'l': result.list_sources = true; break;
             case 'v': result.show_version = true; return result;
             case 'h': result.show_help = true; return result;

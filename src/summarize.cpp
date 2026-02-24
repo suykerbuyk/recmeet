@@ -3,6 +3,7 @@
 
 #include "summarize.h"
 #include "http_client.h"
+#include "log.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -160,7 +161,7 @@ std::string summarize_http(const std::string& transcript,
          << "\"max_tokens\":4096"
          << "}";
 
-    fprintf(stderr, "Requesting summary from %s (model: %s)...\n", api_url.c_str(), model.c_str());
+    log_info("Requesting summary from %s (model: %s)...", api_url.c_str(), model.c_str());
 
     std::map<std::string, std::string> headers = {
         {"Authorization", "Bearer " + api_key},
@@ -181,7 +182,7 @@ std::string summarize_local(const std::string& transcript,
                              const fs::path& model_path,
                              const std::string& context,
                              int threads) {
-    fprintf(stderr, "Loading LLM model: %s\n", model_path.filename().c_str());
+    log_info("Loading LLM model: %s", model_path.filename().c_str());
 
     llama_backend_init();
 
@@ -212,7 +213,7 @@ std::string summarize_local(const std::string& transcript,
     }
 
     uint32_t actual_ctx = llama_n_ctx(ctx);
-    fprintf(stderr, "Context: %u tokens (model native: %d, cap: %u)\n",
+    log_info("Context: %u tokens (model native: %d, cap: %u)",
             actual_ctx, model_ctx, MAX_LOCAL_CTX);
 
     // Build prompt using model's chat template
@@ -229,7 +230,7 @@ std::string summarize_local(const std::string& transcript,
         tmpl, messages, 2, true, nullptr, 0);
     if (needed < 0) {
         // Fallback: raw concatenation if template not recognized
-        fprintf(stderr, "Warning: chat template not available, using raw prompt\n");
+        log_warn("chat template not available, using raw prompt");
     }
 
     std::string prompt;
@@ -265,13 +266,13 @@ std::string summarize_local(const std::string& transcript,
     }
 
     if (n_prompt > max_prompt_tokens) {
-        fprintf(stderr, "Warning: Prompt (%d tokens) exceeds context budget (%d tokens). "
-                        "Truncating transcript to fit.\n", n_prompt, max_prompt_tokens);
+        log_warn("Prompt (%d tokens) exceeds context budget (%d tokens). "
+                 "Truncating transcript to fit.", n_prompt, max_prompt_tokens);
         n_prompt = max_prompt_tokens;
         tokens.resize(n_prompt);
     }
 
-    fprintf(stderr, "Prompt: %d tokens, generating summary...\n", n_prompt);
+    log_info("Prompt: %d tokens, generating summary...", n_prompt);
 
     // Helper: add a token to a batch
     auto batch_add = [](llama_batch& b, llama_token token, llama_pos pos,

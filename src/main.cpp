@@ -5,6 +5,7 @@
 #include "config.h"
 #include "diarize.h"
 #include "device_enum.h"
+#include "log.h"
 #include "model_manager.h"
 #include "notify.h"
 #include "pipeline.h"
@@ -50,6 +51,8 @@ static void print_usage() {
         "  --cluster-threshold F  Clustering distance threshold (default: 1.18, higher = fewer speakers)\n"
         "  --threads N          Number of CPU threads for inference (0 = auto-detect, default: 0)\n"
         "  --reprocess DIR      Reprocess existing recording from audio.wav\n"
+        "  --log-level LEVEL    Log level: none, error, warn, info (default: none)\n"
+        "  --log-dir DIR        Log file directory (default: ~/.local/share/recmeet/logs/)\n"
         "  --list-sources       List available audio sources and exit\n"
         "  -h, --help           Show this help\n"
         "  -v, --version        Show version\n"
@@ -67,6 +70,10 @@ int main(int argc, char* argv[]) {
     Config cfg = cli.cfg;
     bool list_sources = cli.list_sources;
 
+    // Initialize logging
+    auto log_level = parse_log_level(cfg.log_level_str);
+    log_init(log_level, cfg.log_dir);
+
     // List sources mode
     if (list_sources) {
         try {
@@ -77,9 +84,12 @@ int main(int argc, char* argv[]) {
                        s.is_monitor ? " [monitor]" : "");
             }
         } catch (const std::exception& e) {
+            log_error("list_sources failed: %s", e.what());
             fprintf(stderr, "Error: %s\n", e.what());
+            log_shutdown();
             return 1;
         }
+        log_shutdown();
         return 0;
     }
 
@@ -121,6 +131,7 @@ int main(int argc, char* argv[]) {
                 int ch = getchar();
                 if (ch == 'n' || ch == 'N') {
                     fprintf(stderr, "Aborted. Use --model to select a different model.\n");
+                    log_shutdown();
                     notify_cleanup();
                     return 1;
                 }
@@ -130,6 +141,7 @@ int main(int argc, char* argv[]) {
             }
         } catch (const RecmeetError& e) {
             fprintf(stderr, "Error: %s\n", e.what());
+            log_shutdown();
             notify_cleanup();
             return 1;
         }
@@ -141,6 +153,7 @@ int main(int argc, char* argv[]) {
             ensure_llama_model(cfg.llm_model);
         } catch (const RecmeetError& e) {
             fprintf(stderr, "Error: %s\n", e.what());
+            log_shutdown();
             notify_cleanup();
             return 1;
         }
@@ -182,14 +195,17 @@ int main(int argc, char* argv[]) {
         (void)result;
     } catch (const RecmeetError& e) {
         fprintf(stderr, "Error: %s\n", e.what());
+        log_shutdown();
         notify_cleanup();
         return 1;
     } catch (const std::exception& e) {
         fprintf(stderr, "Unexpected error: %s\n", e.what());
+        log_shutdown();
         notify_cleanup();
         return 1;
     }
 
+    log_shutdown();
     notify_cleanup();
     return 0;
 }

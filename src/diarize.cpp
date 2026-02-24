@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 #include "diarize.h"
+#include "log.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -93,7 +94,7 @@ DiarizeResult diarize(const fs::path& audio_path, int num_speakers, int threads,
     if (!sd)
         throw RecmeetError("Failed to create sherpa-onnx speaker diarization");
 
-    fprintf(stderr, "Diarizing %zu samples (%.1fs)...\n",
+    log_info("Diarizing %zu samples (%.1fs)...",
             samples.size(), samples.size() / 16000.0);
 
     const auto* raw_result = SherpaOnnxOfflineSpeakerDiarizationProcess(
@@ -125,7 +126,7 @@ DiarizeResult diarize(const fs::path& audio_path, int num_speakers, int threads,
     SherpaOnnxOfflineSpeakerDiarizationDestroyResult(raw_result);
     SherpaOnnxDestroyOfflineSpeakerDiarization(sd);
 
-    fprintf(stderr, "Diarization complete: %d speakers, %zu segments\n",
+    log_info("Diarization complete: %d speakers, %zu segments",
             result.num_speakers, result.segments.size());
 
     return result;

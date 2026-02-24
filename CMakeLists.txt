@@ -103,6 +103,7 @@ endif()
 # Core library (everything except main.cpp and tray.cpp)
 set(CORE_SOURCES
     src/util.cpp
+    src/log.cpp
     src/config.cpp
     src/notify.cpp
     src/device_enum.cpp
@@ -182,6 +183,7 @@ if(RECMEET_BUILD_TESTS)
         tests/test_audio_mixer.cpp
         tests/test_audio_file.cpp
         tests/test_obsidian.cpp
+        tests/test_log.cpp
         tests/test_config.cpp
         tests/test_util.cpp
         tests/test_summarize_json.cpp

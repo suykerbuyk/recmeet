@@ -35,6 +35,8 @@ TEST_CASE("save_config + load_config round-trip", "[config]") {
     cfg.llm_model = "/path/to/model.gguf";
     cfg.cluster_threshold = 0.8f;
     cfg.threads = 12;
+    cfg.log_level_str = "info";
+    cfg.log_dir = "/tmp/recmeet-test-logs";
     cfg.output_dir = "/tmp/meetings";
     cfg.obsidian_enabled = true;
     cfg.obsidian.vault_path = "/home/user/obsidian/vault";
@@ -67,6 +69,8 @@ TEST_CASE("save_config + load_config round-trip", "[config]") {
     CHECK(content.find("llm_model: \"/path/to/model.gguf\"") != std::string::npos);
     CHECK(content.find("cluster_threshold: 0.8") != std::string::npos);
     CHECK(content.find("threads: 12") != std::string::npos);
+    CHECK(content.find("level: info") != std::string::npos);
+    CHECK(content.find("directory: \"/tmp/recmeet-test-logs\"") != std::string::npos);
     CHECK(content.find("directory: \"/tmp/meetings\"") != std::string::npos);
     CHECK(content.find("vault: \"/home/user/obsidian/vault\"") != std::string::npos);
     CHECK(content.find("subfolder: \"Notes/%Y/\"") != std::string::npos);
@@ -87,6 +91,8 @@ TEST_CASE("save_config + load_config round-trip", "[config]") {
     CHECK(loaded.llm_model == "/path/to/model.gguf");
     CHECK(loaded.cluster_threshold == 0.8f);
     CHECK(loaded.threads == 12);
+    CHECK(loaded.log_level_str == "info");
+    CHECK(loaded.log_dir == "/tmp/recmeet-test-logs");
     CHECK(loaded.output_dir == "/tmp/meetings");
     CHECK(loaded.obsidian_enabled == true);
     CHECK(loaded.obsidian.vault_path == "/home/user/obsidian/vault");

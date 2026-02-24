@@ -9,6 +9,7 @@
 #include "audio_monitor.h"
 #include "audio_file.h"
 #include "audio_mixer.h"
+#include "log.h"
 #include "model_manager.h"
 #include "transcribe.h"
 #include "summarize.h"
@@ -57,7 +58,7 @@ PipelineResult run_pipeline(const Config& cfg, StopToken& stop, PhaseCallback on
     };
 
     int threads = cfg.threads > 0 ? cfg.threads : default_thread_count();
-    fprintf(stderr, "Using %d threads for inference.\n", threads);
+    log_info("Using %d threads for inference.", threads);
 
     fs::path out_dir;
     fs::path audio_path;
@@ -78,7 +79,7 @@ PipelineResult run_pipeline(const Config& cfg, StopToken& stop, PhaseCallback on
         if (!fs::exists(audio_path))
             throw RecmeetError("No audio.wav in reprocess directory: " + out_dir.string());
 
-        fprintf(stderr, "Reprocessing: %s\n", out_dir.c_str());
+        log_info("Reprocessing: %s", out_dir.c_str());
 
         // Transcribe from source audio
         phase("transcribing");
@@ -99,7 +100,7 @@ PipelineResult run_pipeline(const Config& cfg, StopToken& stop, PhaseCallback on
         if (transcript_text.empty())
             throw RecmeetError("Transcription produced no text.");
         write_text_file(transcript_path, transcript_text);
-        fprintf(stderr, "Transcript saved: %s\n", transcript_path.c_str());
+        log_info("Transcript saved: %s", transcript_path.c_str());
     } else {
         // --- Normal mode: detect sources, record, transcribe ---
 
@@ -124,17 +125,17 @@ PipelineResult run_pipeline(const Config& cfg, StopToken& stop, PhaseCallback on
         bool dual_mode = !cfg.mic_only && !monitor_source.empty();
 
         if (dual_mode) {
-            fprintf(stderr, "Mic source:     %s\n", mic_source.c_str());
-            fprintf(stderr, "Monitor source: %s\n", monitor_source.c_str());
+            log_info("Mic source:     %s", mic_source.c_str());
+            log_info("Monitor source: %s", monitor_source.c_str());
         } else {
-            fprintf(stderr, "Audio source: %s\n", mic_source.c_str());
+            log_info("Audio source: %s", mic_source.c_str());
             if (!cfg.mic_only)
-                fprintf(stderr, "No monitor source found — recording mic only.\n");
+                log_warn("No monitor source found — recording mic only.");
         }
 
         // --- Create output directory ---
         out_dir = create_output_dir(cfg.output_dir);
-        fprintf(stderr, "Output directory: %s\n", out_dir.c_str());
+        log_info("Output directory: %s", out_dir.c_str());
 
         audio_path = out_dir / "audio.wav";
         transcript_path = out_dir / "transcript.txt";
@@ -167,7 +168,7 @@ PipelineResult run_pipeline(const Config& cfg, StopToken& stop, PhaseCallback on
                     mon_pw = std::make_unique<PipeWireCapture>(monitor_source, /*capture_sink=*/true);
                     mon_pw->start();
                 } catch (const RecmeetError& e) {
-                    fprintf(stderr, "PipeWire monitor failed (%s), falling back to pa_simple\n", e.what());
+                    log_warn("PipeWire monitor failed (%s), falling back to pa_simple", e.what());
                     mon_pa = std::make_unique<PulseMonitorCapture>(monitor_source);
                     mon_pa->start();
                 }
@@ -207,9 +208,9 @@ PipelineResult run_pipeline(const Config& cfg, StopToken& stop, PhaseCallback on
                 // Mix
                 auto mixed = mix_audio(mic_samples, mon_samples);
                 write_wav(audio_path, mixed);
-                fprintf(stderr, "Mixed audio saved: %s\n", audio_path.c_str());
+                log_info("Mixed audio saved: %s", audio_path.c_str());
             } catch (const AudioValidationError& e) {
-                fprintf(stderr, "Warning: Monitor audio unusable (%s). Using mic only.\n", e.what());
+                log_warn("Monitor audio unusable (%s). Using mic only.", e.what());
                 write_wav(audio_path, mic_samples);
             }
         } else {
@@ -255,7 +256,7 @@ PipelineResult run_pipeline(const Config& cfg, StopToken& stop, PhaseCallback on
             throw RecmeetError("Transcription produced no text.");
 
         write_text_file(transcript_path, transcript_text);
-        fprintf(stderr, "Transcript saved: %s\n", transcript_path.c_str());
+        log_info("Transcript saved: %s", transcript_path.c_str());
     }
 
     // --- Summarize ---
@@ -277,7 +278,7 @@ PipelineResult run_pipeline(const Config& cfg, StopToken& stop, PhaseCallback on
                 fs::path llm_path = ensure_llama_model(cfg.llm_model);
                 summary_text = summarize_local(transcript_text, llm_path, context_text, threads);
             } catch (const std::exception& e) {
-                fprintf(stderr, "Warning: Local summary failed — %s\n", e.what());
+                log_warn("Local summary failed: %s", e.what());
             }
         } else
 #endif
@@ -293,20 +294,20 @@ PipelineResult run_pipeline(const Config& cfg, StopToken& stop, PhaseCallback on
                 summary_text = summarize_http(transcript_text, url,
                                                cfg.api_key, cfg.api_model, context_text);
             } catch (const std::exception& e) {
-                fprintf(stderr, "Warning: Summary failed — %s\n", e.what());
-                fprintf(stderr, "Transcript is still available.\n");
+                log_warn("Summary failed: %s", e.what());
+                log_warn("Transcript is still available.");
             }
         } else {
-            fprintf(stderr, "No API key and no local LLM — skipping summary.\n");
+            log_warn("No API key and no local LLM — skipping summary.");
         }
 
         if (!summary_text.empty()) {
             write_text_file(summary_path, summary_text);
             pipe_result.summary_path = summary_path;
-            fprintf(stderr, "Summary saved: %s\n", summary_path.c_str());
+            log_info("Summary saved: %s", summary_path.c_str());
         }
     } else {
-        fprintf(stderr, "Summary skipped (--no-summary).\n");
+        log_info("Summary skipped (--no-summary).");
     }
 
     // --- Obsidian output ---
@@ -332,7 +333,7 @@ PipelineResult run_pipeline(const Config& cfg, StopToken& stop, PhaseCallback on
 
             pipe_result.obsidian_path = write_obsidian_note(cfg.obsidian, md);
         } catch (const std::exception& e) {
-            fprintf(stderr, "Warning: Obsidian note failed — %s\n", e.what());
+            log_warn("Obsidian note failed: %s", e.what());
         }
     }
 

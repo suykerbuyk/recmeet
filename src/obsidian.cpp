@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 #include "obsidian.h"
+#include "log.h"
 
 #include <chrono>
 #include <ctime>
@@ -145,7 +146,7 @@ fs::path write_obsidian_note(const ObsidianConfig& config, const MeetingData& da
     }
 
     out.close();
-    fprintf(stderr, "Obsidian note: %s\n", note_path.c_str());
+    log_info("Obsidian note: %s", note_path.c_str());
     return note_path;
 }
 

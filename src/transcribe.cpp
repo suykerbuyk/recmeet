@@ -3,6 +3,7 @@
 
 #include "transcribe.h"
 #include "audio_file.h"
+#include "log.h"
 
 #include <whisper.h>
 
@@ -41,7 +42,7 @@ std::string TranscriptResult::to_string() const {
 // ---------------------------------------------------------------------------
 
 WhisperModel::WhisperModel(const fs::path& model_path) : path_(model_path) {
-    fprintf(stderr, "Loading whisper model: %s\n", path_.filename().c_str());
+    log_info("Loading whisper model: %s", path_.filename().c_str());
     whisper_context_params cparams = whisper_context_default_params();
     ctx_ = whisper_init_from_file_with_params(path_.c_str(), cparams);
     if (!ctx_)
@@ -79,7 +80,7 @@ TranscriptResult transcribe(WhisperModel& model, const fs::path& audio_path,
 
     // Read audio as float32 [-1, 1]
     auto samples = read_wav_float(audio_path);
-    fprintf(stderr, "Audio: %.1fs (%zu samples)\n",
+    log_info("Audio: %.1fs (%zu samples)",
             samples.size() / (float)SAMPLE_RATE, samples.size());
 
     // Set up whisper params
@@ -99,13 +100,13 @@ TranscriptResult transcribe(WhisperModel& model, const fs::path& audio_path,
             throw RecmeetError("Unknown language code: " + language);
         wparams.language = language.c_str();
         wparams.detect_language = false;
-        fprintf(stderr, "Language forced: %s\n", language.c_str());
+        log_info("Language forced: %s", language.c_str());
     } else {
         wparams.language = nullptr;
         wparams.detect_language = false;
     }
 
-    fprintf(stderr, "Transcribing...\n");
+    log_info("Transcribing...");
     int ret = whisper_full(ctx, wparams, samples.data(), samples.size());
     if (ret != 0)
         throw RecmeetError("Whisper transcription failed (code " + std::to_string(ret) + ")");
@@ -136,7 +137,7 @@ TranscriptResult transcribe(WhisperModel& model, const fs::path& audio_path,
     result.language = whisper_lang_str(lang_id);
     result.language_prob = 0.0f; // whisper.cpp doesn't expose per-segment lang probs easily
 
-    fprintf(stderr, "Transcribed %d segments (language: %s)\n",
+    log_info("Transcribed %d segments (language: %s)",
             (int)result.segments.size(), result.language.c_str());
 
     return result;

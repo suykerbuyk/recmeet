@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 #include "audio_file.h"
+#include "log.h"
 
 #include <sndfile.h>
 #include <cstdio>
@@ -74,7 +75,7 @@ double validate_audio(const fs::path& path, double min_duration,
         if (duration < min_duration)
             throw AudioValidationError(label + " too short (~" +
                                        std::to_string(duration) + "s).");
-        fprintf(stderr, "%s validated (estimated): ~%.1fs\n", label.c_str(), duration);
+        log_info("%s validated (estimated): ~%.1fs", label.c_str(), duration);
         return duration;
     }
 
@@ -85,7 +86,7 @@ double validate_audio(const fs::path& path, double min_duration,
         throw AudioValidationError(label + " too short (" +
                                    std::to_string(duration) + "s).");
 
-    fprintf(stderr, "%s validated: %.1fs, %dHz\n", label.c_str(), duration, info.samplerate);
+    log_info("%s validated: %.1fs, %dHz", label.c_str(), duration, info.samplerate);
     return duration;
 }
 

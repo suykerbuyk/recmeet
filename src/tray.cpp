@@ -4,6 +4,7 @@
 #include "config.h"
 #include "diarize.h"
 #include "device_enum.h"
+#include "log.h"
 #include "model_manager.h"
 #include "notify.h"
 #include "pipeline.h"
@@ -158,13 +159,13 @@ static void on_record(GtkMenuItem*, gpointer) {
 #endif
 
             auto on_phase = [](const std::string& phase) {
-                fprintf(stderr, "[tray] Phase: %s\n", phase.c_str());
+                log_info("[tray] Phase: %s", phase.c_str());
                 if (phase == "transcribing" || phase == "diarizing" || phase == "summarizing")
                     g_idle_add(on_pipeline_processing, nullptr);
             };
             run_pipeline(g_tray.cfg, g_tray.stop, on_phase);
         } catch (const std::exception& e) {
-            fprintf(stderr, "[tray] Pipeline error: %s\n", e.what());
+            log_error("[tray] Pipeline error: %s", e.what());
             notify("Recording failed", e.what());
         }
         g_idle_add(on_pipeline_done, nullptr);
@@ -304,7 +305,7 @@ static void fetch_provider_models() {
             std::lock_guard<std::mutex> lock(g_tray.models_mutex);
             g_tray.cached_models = std::move(models);
         } catch (const std::exception& e) {
-            fprintf(stderr, "[tray] Model fetch failed: %s\n", e.what());
+            log_error("[tray] Model fetch failed: %s", e.what());
         }
         g_idle_add(on_models_fetched, nullptr);
     }).detach();
@@ -468,7 +469,7 @@ static void refresh_sources() {
                 g_tray.mics.push_back(std::move(s));
         }
     } catch (const std::exception& e) {
-        fprintf(stderr, "[tray] Source enumeration failed: %s\n", e.what());
+        log_error("[tray] Source enumeration failed: %s", e.what());
         g_tray.mics.clear();
         g_tray.monitors.clear();
     }
@@ -823,6 +824,10 @@ int main(int argc, char* argv[]) {
 
     g_tray.cfg = load_config();
 
+    // Initialize logging
+    auto log_level = parse_log_level(g_tray.cfg.log_level_str);
+    log_init(log_level, g_tray.cfg.log_dir);
+
     // Create indicator
     G_GNUC_BEGIN_IGNORE_DEPRECATIONS
     g_tray.indicator = app_indicator_new(
@@ -836,10 +841,11 @@ int main(int argc, char* argv[]) {
     build_menu();
     fetch_provider_models();
 
-    fprintf(stderr, "recmeet-tray %s running (%zu mic(s), %zu monitor(s))\n",
+    log_info("recmeet-tray %s running (%zu mic(s), %zu monitor(s))",
             RECMEET_VERSION, g_tray.mics.size(), g_tray.monitors.size());
     gtk_main();
 
+    log_shutdown();
     notify_cleanup();
     return 0;
 }

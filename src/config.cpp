@@ -159,6 +159,11 @@ Config load_config() {
     std::string threads_str = get_val(entries, "general", "threads", "0");
     cfg.threads = std::atoi(threads_str.c_str());
 
+    // Logging section
+    cfg.log_level_str = get_val(entries, "logging", "level", "none");
+    std::string log_dir_val = get_val(entries, "logging", "directory", "");
+    if (!log_dir_val.empty()) cfg.log_dir = log_dir_val;
+
     // Output section
     std::string out = get_val(entries, "output", "directory", "");
     if (!out.empty()) cfg.output_dir = out;
@@ -225,6 +230,13 @@ void save_config(const Config& cfg) {
     if (cfg.threads > 0) {
         out << "\ngeneral:\n"
             << "  threads: " << cfg.threads << "\n";
+    }
+
+    if (cfg.log_level_str != "none" && !cfg.log_level_str.empty()) {
+        out << "\nlogging:\n"
+            << "  level: " << cfg.log_level_str << "\n";
+        if (!cfg.log_dir.empty())
+            out << "  directory: \"" << cfg.log_dir.string() << "\"\n";
     }
 
     if (cfg.obsidian_enabled) {
