@@ -23,7 +23,12 @@ struct DetectedSources {
 /// List all PulseAudio/PipeWire sources via pa_context introspection.
 std::vector<AudioSource> list_sources();
 
+/// Query PulseAudio/PipeWire for the server's default source name.
+/// Returns empty string on failure (never throws).
+std::string get_default_source_name();
+
 /// Auto-detect mic and monitor sources matching regex pattern.
+/// Empty pattern means "use system default source."
 DetectedSources detect_sources(const std::string& pattern);
 
 } // namespace recmeet

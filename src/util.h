@@ -72,7 +72,7 @@ fs::path create_output_dir(const fs::path& base_dir);
 // Default device pattern
 // ---------------------------------------------------------------------------
 
-constexpr const char* DEFAULT_DEVICE_PATTERN = "bd.h200|00:05:30:00:05:4E";
+constexpr const char* DEFAULT_DEVICE_PATTERN = "";
 
 // ---------------------------------------------------------------------------
 // File writing helper

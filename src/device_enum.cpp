@@ -62,6 +62,54 @@ void context_state_cb(pa_context* c, void* userdata) {
     }
 }
 
+struct ServerInfoContext {
+    std::string default_source_name;
+    bool done = false;
+    bool error = false;
+    pa_mainloop* mainloop = nullptr;
+};
+
+void server_info_cb(pa_context*, const pa_server_info* info, void* userdata) {
+    auto* ctx = static_cast<ServerInfoContext*>(userdata);
+    if (info && info->default_source_name)
+        ctx->default_source_name = info->default_source_name;
+    ctx->done = true;
+    pa_mainloop_quit(ctx->mainloop, 0);
+}
+
+void server_context_state_cb(pa_context* c, void* userdata) {
+    auto* ctx = static_cast<ServerInfoContext*>(userdata);
+    pa_context_state_t state = pa_context_get_state(c);
+    switch (state) {
+        case PA_CONTEXT_READY: {
+            pa_operation* op = pa_context_get_server_info(c, server_info_cb, userdata);
+            if (op) pa_operation_unref(op);
+            break;
+        }
+        case PA_CONTEXT_FAILED:
+            ctx->error = true;
+            ctx->done = true;
+            pa_mainloop_quit(ctx->mainloop, 1);
+            break;
+        case PA_CONTEXT_TERMINATED:
+            if (!ctx->done) {
+                ctx->error = true;
+                pa_mainloop_quit(ctx->mainloop, 1);
+            }
+            ctx->done = true;
+            break;
+        default:
+            break;
+    }
+}
+
+bool is_monitor_source(const AudioSource& src) {
+    const std::string suffix = ".monitor";
+    bool has_monitor_suffix = src.name.size() >= suffix.size() &&
+        src.name.compare(src.name.size() - suffix.size(), suffix.size(), suffix) == 0;
+    return src.is_monitor || has_monitor_suffix;
+}
+
 } // anonymous namespace
 
 std::vector<AudioSource> list_sources() {
@@ -103,25 +151,85 @@ std::vector<AudioSource> list_sources() {
     return ectx.sources;
 }
 
+std::string get_default_source_name() {
+    ServerInfoContext sctx;
+
+    pa_mainloop* ml = pa_mainloop_new();
+    if (!ml) return "";
+    sctx.mainloop = ml;
+
+    pa_mainloop_api* api = pa_mainloop_get_api(ml);
+    pa_context* ctx = pa_context_new(api, "recmeet-default");
+    if (!ctx) {
+        pa_mainloop_free(ml);
+        return "";
+    }
+
+    pa_context_set_state_callback(ctx, server_context_state_cb, &sctx);
+
+    if (pa_context_connect(ctx, nullptr, PA_CONTEXT_NOFLAGS, nullptr) < 0) {
+        pa_context_unref(ctx);
+        pa_mainloop_free(ml);
+        return "";
+    }
+
+    int ret = 0;
+    pa_mainloop_run(ml, &ret);
+
+    pa_context_disconnect(ctx);
+    pa_context_unref(ctx);
+    pa_mainloop_free(ml);
+
+    if (sctx.error) return "";
+    return sctx.default_source_name;
+}
+
 DetectedSources detect_sources(const std::string& pattern) {
     DetectedSources result;
     result.all = list_sources();
 
-    std::regex re(pattern, std::regex_constants::icase);
+    if (!pattern.empty()) {
+        // Explicit regex path
+        std::regex re(pattern, std::regex_constants::icase);
 
-    for (const auto& src : result.all) {
-        if (!std::regex_search(src.name, re))
-            continue;
-        const std::string suffix = ".monitor";
-        bool has_monitor_suffix = src.name.size() >= suffix.size() &&
-            src.name.compare(src.name.size() - suffix.size(), suffix.size(), suffix) == 0;
-        if (src.is_monitor || has_monitor_suffix) {
-            if (result.monitor.empty())
-                result.monitor = src.name;
-        } else {
-            if (result.mic.empty())
-                result.mic = src.name;
+        for (const auto& src : result.all) {
+            if (!std::regex_search(src.name, re))
+                continue;
+            if (is_monitor_source(src)) {
+                if (result.monitor.empty())
+                    result.monitor = src.name;
+            } else {
+                if (result.mic.empty())
+                    result.mic = src.name;
+            }
         }
+
+        return result;
+    }
+
+    // Empty pattern: use system default source
+    std::string default_name = get_default_source_name();
+
+    if (!default_name.empty()) {
+        for (const auto& src : result.all) {
+            if (src.name == default_name) {
+                if (is_monitor_source(src))
+                    result.monitor = src.name;
+                else
+                    result.mic = src.name;
+                break;
+            }
+        }
+    }
+
+    // Fill whichever slot(s) are still empty from first available
+    for (const auto& src : result.all) {
+        if (result.mic.empty() && !is_monitor_source(src))
+            result.mic = src.name;
+        if (result.monitor.empty() && is_monitor_source(src))
+            result.monitor = src.name;
+        if (!result.mic.empty() && !result.monitor.empty())
+            break;
     }
 
     return result;

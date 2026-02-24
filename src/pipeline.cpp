@@ -111,11 +111,18 @@ PipelineResult run_pipeline(const Config& cfg, StopToken& stop, PhaseCallback on
         if (mic_source.empty()) {
             auto detected = detect_sources(cfg.device_pattern);
             if (detected.mic.empty()) {
-                fprintf(stderr, "No mic source matching '%s'\n", cfg.device_pattern.c_str());
+                if (cfg.device_pattern.empty()) {
+                    fprintf(stderr, "No mic source detected\n");
+                } else {
+                    fprintf(stderr, "No mic source matching '%s'\n", cfg.device_pattern.c_str());
+                }
                 fprintf(stderr, "Available sources:\n");
                 for (const auto& s : detected.all)
                     fprintf(stderr, "  %s  (%s)\n", s.name.c_str(), s.description.c_str());
-                throw DeviceError("No mic source found matching pattern: " + cfg.device_pattern);
+                if (cfg.device_pattern.empty())
+                    throw DeviceError("No mic source detected");
+                else
+                    throw DeviceError("No mic source found matching pattern: " + cfg.device_pattern);
             }
             mic_source = detected.mic;
             if (!cfg.mic_only && monitor_source.empty())

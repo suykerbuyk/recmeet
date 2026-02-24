@@ -128,6 +128,34 @@ static gboolean on_pipeline_processing(gpointer) {
 
 static void on_record(GtkMenuItem*, gpointer) {
     if (g_tray.state != TrayState::IDLE) return;
+
+    // Pre-check: verify a mic can be found before flipping to RECORDING
+    if (g_tray.cfg.mic_source.empty()) {
+        try {
+            auto detected = detect_sources(g_tray.cfg.device_pattern);
+            if (detected.mic.empty()) {
+                std::string msg = "No microphone source detected.\n\nAvailable sources:";
+                for (const auto& s : detected.all)
+                    msg += "\n  " + s.description + " (" + s.name + ")";
+                auto* dialog = gtk_message_dialog_new(
+                    nullptr, GTK_DIALOG_MODAL, GTK_MESSAGE_WARNING,
+                    GTK_BUTTONS_OK, "%s", msg.c_str());
+                gtk_dialog_run(GTK_DIALOG(dialog));
+                gtk_widget_destroy(dialog);
+                refresh_sources();
+                build_menu();
+                return;
+            }
+        } catch (const std::exception& e) {
+            auto* dialog = gtk_message_dialog_new(
+                nullptr, GTK_DIALOG_MODAL, GTK_MESSAGE_ERROR,
+                GTK_BUTTONS_OK, "Device detection failed: %s", e.what());
+            gtk_dialog_run(GTK_DIALOG(dialog));
+            gtk_widget_destroy(dialog);
+            return;
+        }
+    }
+
     set_state(TrayState::RECORDING);
     g_tray.stop.reset();
 

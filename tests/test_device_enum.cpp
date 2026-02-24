@@ -31,7 +31,7 @@ TEST_CASE("list_sources: at least one monitor source exists", "[device_enum][int
     CHECK(found_monitor);
 }
 
-TEST_CASE("detect_sources: finds BD-H200 by default pattern", "[device_enum][integration]") {
+TEST_CASE("detect_sources: finds BD-H200 by explicit pattern", "[device_enum][integration]") {
     // This test is specific to the dev machine with BD-H200 connected
     auto result = detect_sources("bd.h200|00:05:30:00:05:4E");
 
@@ -46,6 +46,40 @@ TEST_CASE("detect_sources: finds BD-H200 by default pattern", "[device_enum][int
         CHECK(result.mic.find("00:05:30:00:05:4E") != std::string::npos);
     if (!result.monitor.empty())
         CHECK(result.monitor.find("00:05:30:00:05:4E") != std::string::npos);
+}
+
+TEST_CASE("detect_sources: empty pattern uses system default", "[device_enum][integration]") {
+    auto result = detect_sources("");
+
+    // With a running PA/PipeWire server, at least one slot should be filled
+    bool found_any = !result.mic.empty() || !result.monitor.empty();
+    CHECK(found_any);
+
+    // If a mic was found, verify it's not a monitor source
+    if (!result.mic.empty()) {
+        for (const auto& src : result.all) {
+            if (src.name == result.mic) {
+                CHECK_FALSE(src.is_monitor);
+                break;
+            }
+        }
+    }
+}
+
+TEST_CASE("get_default_source_name: returns non-empty on running PA", "[device_enum][integration]") {
+    auto name = get_default_source_name();
+    REQUIRE_FALSE(name.empty());
+
+    // The returned name should match one of the listed sources
+    auto sources = list_sources();
+    bool found = false;
+    for (const auto& src : sources) {
+        if (src.name == name) {
+            found = true;
+            break;
+        }
+    }
+    CHECK(found);
 }
 
 TEST_CASE("detect_sources: non-matching pattern returns empty", "[device_enum][integration]") {
