@@ -77,7 +77,7 @@ if(RECMEET_USE_SHERPA)
     include(FetchContent)
     FetchContent_Declare(sherpa-onnx
         GIT_REPOSITORY https://github.com/suykerbuyk/sherpa-onnx.git
-        GIT_TAG fix/replace-deprecated-istrstream
+        GIT_TAG fix/gcc15-deprecation-warnings
     )
     set(SHERPA_ONNX_ENABLE_TTS OFF CACHE BOOL "" FORCE)
     set(SHERPA_ONNX_ENABLE_WEBSOCKET OFF CACHE BOOL "" FORCE)
