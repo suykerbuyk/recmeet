@@ -130,43 +130,33 @@ Written alongside the transcript in the output directory. Filename includes an A
 ```
 Usage: recmeet [OPTIONS]
 
-Audio:
-  --source NAME          Mic source (auto-detect if omitted)
-  --monitor NAME         Speaker/monitor source (auto-detect if omitted)
-  --mic-only             Record mic only, skip monitor capture
-  --device-pattern RE    Regex for source auto-detection
+Record, transcribe, and summarize meetings.
 
-Transcription:
-  --model NAME           Whisper model: tiny/base/small/medium/large-v3 (default: base)
-  --language CODE        Force language (e.g. en, de, ja; default: auto-detect)
-
-Diarization:
-  --no-diarize           Disable speaker diarization
-  --num-speakers N       Expected speaker count (0 = auto-detect)
-  --cluster-threshold F  Clustering distance (default: 1.18; higher = fewer speakers)
-
-Summarization:
-  --provider NAME        API provider: xai, openai, anthropic (default: xai)
-  --api-key KEY          API key (or set XAI_API_KEY / OPENAI_API_KEY / ANTHROPIC_API_KEY)
-  --api-url URL          Custom API endpoint
-  --api-model NAME       API model name
-  --llm-model PATH       Local GGUF model (instead of API)
-  --no-summary           Skip summarization entirely
-
-Output:
-  --output-dir DIR       Base output directory (default: ./meetings)
-  --context-file PATH    Pre-meeting notes to include in summary prompt
-
-Logging:
-  --log-level LEVEL      Log level: none, error, warn, info (default: none)
-  --log-dir DIR          Log file directory (default: ~/.local/share/recmeet/logs/)
-
-General:
-  --threads N            CPU threads for inference (0 = auto-detect)
-  --reprocess DIR        Reprocess existing recording (full pipeline from audio.wav)
-  --list-sources         List available audio sources and exit
-  -h, --help             Show help
-  -v, --version          Show version
+Options:
+  --source NAME        PipeWire/PulseAudio mic source (auto-detect if omitted)
+  --monitor NAME       Monitor/speaker source (auto-detect if omitted)
+  --mic-only           Record mic only (skip monitor capture)
+  --model NAME         Whisper model: tiny/base/small/medium/large-v3 (default: base)
+  --language CODE      Force whisper language (e.g. en, de, ja; default: auto-detect)
+  --output-dir DIR     Base directory for outputs (default: ./meetings)
+  --provider NAME      API provider: xai, openai, anthropic (default: xai)
+  --api-key KEY        API key (default: from provider env var or config)
+  --api-url URL        API endpoint override (default: derived from provider)
+  --api-model NAME     API model name (default: provider's default model)
+  --no-summary         Skip summarization (record + transcribe only)
+  --device-pattern RE  Regex for device auto-detection
+  --context-file PATH  Pre-meeting notes to include in summary prompt
+  --llm-model PATH     Local GGUF model for summarization (instead of API)
+  --no-diarize         Disable speaker diarization
+  --num-speakers N     Number of speakers (0 = auto-detect, default: 0)
+  --cluster-threshold F  Clustering distance threshold (default: 1.18, higher = fewer speakers)
+  --threads N          Number of CPU threads for inference (0 = auto-detect, default: 0)
+  --reprocess DIR      Reprocess existing recording from audio.wav
+  --log-level LEVEL    Log level: none, error, warn, info (default: none)
+  --log-dir DIR        Log file directory (default: ~/.local/share/recmeet/logs/)
+  --list-sources       List available audio sources and exit
+  -h, --help           Show this help
+  -v, --version        Show version
 ```
 
 ## Configuration
@@ -268,14 +258,14 @@ The prototype also surfaced the key technical insight that shaped the architectu
 
 The rewrite to C++ was motivated by deployment simplicity. The Python version required a virtualenv, pip-installed packages, system-site-packages for GTK bindings, and careful dependency management across machines. The C++ version compiles to a single static binary with whisper.cpp and llama.cpp linked in. No runtime dependencies beyond the system libraries that any desktop Linux already has. Copy the binary, run it.
 
-From there, the project evolved through nine iterations: doubling test coverage and extracting testable modules, adding a full-featured system tray applet, model pre-download UX, fixing real bugs found during live end-to-end testing (whisper's `detect_language` trap, llama.cpp's chat template requirement), benchmark suites against reference audio, multi-provider API support, speaker diarization via sherpa-onnx, and hardening passes on error handling, context overflow, and clustering threshold tuning.
+From there, the project evolved through extensive iteration: doubling test coverage and extracting testable modules, adding a full-featured system tray applet, model pre-download UX, fixing real bugs found during live end-to-end testing (whisper's `detect_language` trap, llama.cpp's chat template requirement), benchmark suites against reference audio, multi-provider API support, speaker diarization via sherpa-onnx, packaging for Arch/Debian/Fedora, and hardening passes on error handling, context overflow, and clustering threshold tuning.
 
 ## Architecture
 
 Three binaries share a common static library:
 
 ```
-recmeet_core  (static library — 15 modules)
+recmeet_core  (static library — 17 modules)
     |
     +-- recmeet        (CLI binary)
     +-- recmeet-tray   (system tray, GTK3 + AppIndicator)

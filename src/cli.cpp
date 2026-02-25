@@ -47,7 +47,7 @@ CliResult parse_cli(int argc, char* argv[]) {
             case 'm': result.cfg.monitor_source = optarg; break;
             case 'M': result.cfg.mic_only = true; break;
             case 'W': result.cfg.whisper_model = optarg; break;
-            case 'o': result.cfg.output_dir = optarg; break;
+            case 'o': result.cfg.output_dir = optarg; result.cfg.output_dir_explicit = true; break;
             case 'k': result.cfg.api_key = optarg; break;
             case 'u': result.cfg.api_url = optarg; break;
             case 'A': result.cfg.api_model = optarg; break;

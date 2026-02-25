@@ -75,10 +75,10 @@ After the first-time setup, you typically just run:
 
 ```bash
 ninja -C build                          # rebuild (only recompiles changed files)
-./build/recmeet_tests "~[integration]"  # run unit tests
+./build/recmeet_tests "~[integration]~[benchmark]"  # run unit tests
 ```
 
-Ninja is smart about dependencies — if you edit `src/obsidian.cpp`, it
+Ninja is smart about dependencies — if you edit `src/note.cpp`, it
 recompiles only that file and re-links the binaries that use it. A no-op build
 (nothing changed) takes milliseconds.
 
@@ -89,12 +89,12 @@ recompiles only that file and re-links the binaries that use it. A no-op build
 ### Run all unit tests
 
 ```bash
-./build/recmeet_tests "~[integration]"
+./build/recmeet_tests "~[integration]~[benchmark]"
 ```
 
-The `"~[integration]"` filter *excludes* tests tagged `[integration]` because
-those need a live PipeWire/PulseAudio session. This is the command you'll use
-most often.
+The `"~[integration]~[benchmark]"` filter excludes tests tagged `[integration]`
+(need a live PipeWire/PulseAudio session) and `[benchmark]` (need whisper models
+and reference audio). This is the command you'll use most often.
 
 ### Run all tests (including integration)
 
@@ -116,13 +116,16 @@ Each test file tags its tests. Pass the tag to run just that group:
 ./build/recmeet_tests "[model_manager]"    # Model cache logic
 ./build/recmeet_tests "[summarize]"        # Prompt building
 ./build/recmeet_tests "[pipeline]"         # Pipeline helpers
-./build/recmeet_tests "[obsidian]"         # Obsidian note output
+./build/recmeet_tests "[note]"             # Meeting note output
 ./build/recmeet_tests "[config]"           # Config loading/saving
 ./build/recmeet_tests "[audio_file]"       # WAV read/write
-./build/recmeet_tests "[audio_mixer]"      # PCM mixing
+./build/recmeet_tests "[mixer]"            # PCM mixing
 ./build/recmeet_tests "[json]"             # JSON escape/extract
 ./build/recmeet_tests "[util]"             # Utility functions
+./build/recmeet_tests "[diarize]"          # Speaker diarization
+./build/recmeet_tests "[log]"              # Logging
 ./build/recmeet_tests "[device_enum]"      # PulseAudio device listing (integration)
+./build/recmeet_tests "[benchmark]"        # Transcription benchmarks (needs models + assets/)
 ```
 
 ### Run a single test by name
@@ -472,7 +475,7 @@ sudo dnf install pipewire-devel pulseaudio-libs-devel libsndfile-devel libcurl-d
 ```
 
 **Tests fail with "[integration]" errors** — Those tests need a running
-PipeWire session. Use `"~[integration]"` to skip them.
+PipeWire session. Use `"~[integration]~[benchmark]"` to skip them.
 
 **Build is slow on first run** — The first build compiles whisper.cpp and
 llama.cpp from source (~100+ files). Subsequent builds only recompile what
@@ -480,3 +483,20 @@ changed. Consider installing `ccache` to cache object files across clean builds:
 ```bash
 sudo pacman -S ccache
 ```
+
+---
+
+## Upstream dependency note
+
+sherpa-onnx is currently fetched from a fork (`suykerbuyk/sherpa-onnx`, branch
+`fix/gcc15-deprecation-warnings`) rather than the upstream `k2-fsa/sherpa-onnx`
+repository. This fork carries a GCC 15 deprecation warning fix submitted as
+upstream PR [#3216](https://github.com/k2-fsa/sherpa-onnx/pull/3216).
+
+Once that PR merges, update `CMakeLists.txt`:
+- Change `GIT_REPOSITORY` from the fork URL to `https://github.com/k2-fsa/sherpa-onnx.git`
+- Change `GIT_TAG` from `fix/gcc15-deprecation-warnings` to a release tag or commit on upstream
+
+The recmeet-side CMake workarounds (`CMP0169`, `CMP0177`, `CMAKE_WARN_DEPRECATED`)
+were added to suppress policy warnings from sherpa-onnx's build system. Once
+upstream adopts modern CMake policies, these may be removable.

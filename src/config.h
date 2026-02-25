@@ -61,6 +61,7 @@ struct Config {
 
     // Output
     fs::path output_dir = "./meetings";
+    bool output_dir_explicit = false;  // true when --output-dir passed on CLI
 
     // Meeting notes
     NoteConfig note;

@@ -60,6 +60,12 @@ TEST_CASE("parse_cli: --monitor sets monitor_source", "[cli]") {
 TEST_CASE("parse_cli: --output-dir sets output_dir", "[cli]") {
     auto cli = run_cli({"recmeet", "--output-dir", "/tmp/test_output"});
     CHECK(cli.cfg.output_dir == "/tmp/test_output");
+    CHECK(cli.cfg.output_dir_explicit == true);
+}
+
+TEST_CASE("parse_cli: default output_dir_explicit is false", "[cli]") {
+    auto cli = run_cli({"recmeet"});
+    CHECK(cli.cfg.output_dir_explicit == false);
 }
 
 TEST_CASE("parse_cli: --api-key sets api_key", "[cli]") {

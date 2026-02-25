@@ -63,16 +63,23 @@ PostprocessInput run_recording(const Config& cfg, StopToken& stop, PhaseCallback
 
     if (!cfg.reprocess_dir.empty()) {
         // --- Reprocess existing recording from audio.wav ---
-        pp.out_dir = cfg.reprocess_dir;
-        if (!fs::is_directory(pp.out_dir))
-            throw RecmeetError("Reprocess directory does not exist: " + pp.out_dir.string());
+        fs::path source_dir = cfg.reprocess_dir;
+        if (!fs::is_directory(source_dir))
+            throw RecmeetError("Reprocess directory does not exist: " + source_dir.string());
 
-        pp.audio_path = pp.out_dir / "audio.wav";
+        pp.audio_path = source_dir / "audio.wav";
+        if (!fs::exists(pp.audio_path))
+            throw RecmeetError("No audio.wav in reprocess directory: " + source_dir.string());
+
+        // Output goes to --output-dir if explicitly set, otherwise back to source dir
+        if (cfg.output_dir_explicit) {
+            pp.out_dir = cfg.output_dir;
+            fs::create_directories(pp.out_dir);
+        } else {
+            pp.out_dir = source_dir;
+        }
         pp.transcript_path = pp.out_dir / "transcript.txt";
         pp.summary_path = pp.out_dir / "summary.md";
-
-        if (!fs::exists(pp.audio_path))
-            throw RecmeetError("No audio.wav in reprocess directory: " + pp.out_dir.string());
 
         log_info("Reprocessing: %s", pp.out_dir.c_str());
 
