@@ -19,7 +19,6 @@
 #include <chrono>
 #include <cstdio>
 #include <fstream>
-#include <iomanip>
 #include <thread>
 #include <unistd.h>
 
@@ -285,7 +284,7 @@ PipelineResult run_postprocessing(const Config& cfg, const PostprocessInput& inp
         phase("summarizing");
 
 #if RECMEET_USE_LLAMA
-        if (!cfg.llm_model.empty()) {
+        if (!cfg.llm_model.empty()) {  // NOLINT(readability-misleading-indentation)
             // Local summarization
             notify("Summarizing...", "Local LLM");
             try {
@@ -315,7 +314,7 @@ PipelineResult run_postprocessing(const Config& cfg, const PostprocessInput& inp
             log_warn("No API key and no local LLM — skipping summary.");
         }
 
-        if (!summary_text.empty()) {
+        if (!summary_text.empty()) {  // NOLINT(readability-misleading-indentation)
             write_text_file(input.summary_path, summary_text);
             pipe_result.summary_path = input.summary_path;
             log_info("Summary saved: %s", input.summary_path.c_str());

@@ -3,7 +3,6 @@
 
 #include "cli.h"
 #include "config.h"
-#include "diarize.h"
 #include "device_enum.h"
 #include "log.h"
 #include "model_manager.h"
@@ -14,7 +13,6 @@
 
 #include <csignal>
 #include <cstdio>
-#include <cstdlib>
 
 using namespace recmeet;
 
