@@ -80,7 +80,7 @@ TEST_CASE("validate_audio: empty file", "[audio_file]") {
     fs::path wav = dir / "empty.wav";
 
     // Create a zero-byte file
-    { std::ofstream(wav); }
+    { std::ofstream{wav}; }
 
     CHECK_THROWS_AS(validate_audio(wav), AudioValidationError);
 
