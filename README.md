@@ -18,7 +18,7 @@ The result: full transcriptions with speaker labels, professionally structured s
 - **Transcribes** with whisper.cpp (tiny through large-v3 models, auto-downloaded on first use)
 - **Identifies speakers** via sherpa-onnx diarization (Pyannote segmentation + 3D-Speaker embeddings)
 - **Summarizes** via cloud API (xAI/OpenAI/Anthropic — all OpenAI-compatible) or a local GGUF model via llama.cpp — your choice
-- **Outputs** timestamped transcripts, structured summaries, and Obsidian vault notes with YAML frontmatter
+- **Outputs** timestamped transcripts, structured summaries, and meeting notes with YAML frontmatter (Obsidian-compatible)
 - **System tray applet** for point-and-click control from swaybar or any system tray
 
 ## Quick start
@@ -52,24 +52,21 @@ sudo dnf install gcc-c++ cmake ninja-build pkgconf-pkg-config \
 git clone --recurse-submodules https://github.com/syketech/recmeet.git
 cd recmeet
 
-# Without speaker diarization
 cmake -B build -G Ninja
 ninja -C build
-
-# With speaker diarization
-cmake -B build -G Ninja -DRECMEET_USE_SHERPA=ON
-ninja -C build
+# Speaker diarization is ON by default. To disable:
+# cmake -B build -G Ninja -DRECMEET_USE_SHERPA=OFF
 ```
 
 ### Run
 
 ```bash
 # Quick test — mic only, no summary, no API key needed
-./build/recmeet --mic-only --no-summary --model tiny
+./build/recmeet --mic-only --no-summary --no-diarize --model tiny
 
 # Full pipeline with cloud summarization
 export XAI_API_KEY=your-key-here
-./build/recmeet --model base --obsidian-vault ~/obsidian/Meetings/
+./build/recmeet --model base
 
 # Full pipeline with local LLM (no API key, no network)
 ./build/recmeet --model base \
@@ -100,7 +97,7 @@ Record ──► Transcribe ──► Diarize ──► Summarize ──► Outp
 
 4. **Summarize**: Either a cloud API call (xAI, OpenAI, or Anthropic — all use the same OpenAI-compatible endpoint) or a local GGUF model via llama.cpp. Same structured prompt for both paths. Dynamic context sizing with token-level truncation for long meetings.
 
-5. **Output**: Timestamped transcript, structured Markdown summary with action items, and optionally an Obsidian vault note with YAML frontmatter compatible with Dataview.
+5. **Output**: Timestamped transcript, structured Markdown summary with action items, and a meeting note with YAML frontmatter (Obsidian/Dataview-compatible).
 
 ## Output
 
@@ -113,6 +110,7 @@ meetings/2026-02-20_14-30/
   audio.wav        # Mixed — used for transcription
   transcript.txt   # Timestamped transcript with speaker labels
   summary.md       # Structured summary
+  Meeting_2026-02-20_14-30_Project_Kickoff.md  # Meeting note
 ```
 
 ### Transcript format
@@ -123,9 +121,9 @@ meetings/2026-02-20_14-30/
 [00:12 - 00:30] Speaker_01: Sure. We shipped the new auth flow yesterday.
 ```
 
-### Obsidian note
+### Meeting note
 
-Written to `~/vault/Meetings/2026/02/Meeting_2026-02-20_14-30.md` with YAML frontmatter (date, time, type, domain, status, tags, summary), a summary callout, action item checkboxes, and a foldable transcript section.
+Written alongside the transcript in the output directory. Filename includes an AI-derived title (e.g. `Meeting_2026-02-20_14-30_Project_Kickoff.md`). Contains YAML frontmatter with enriched metadata (date, time, type, domain, status, tags, summary), a summary callout, action item checkboxes, and a foldable transcript section. Compatible with Obsidian Dataview.
 
 ## CLI reference
 
@@ -157,8 +155,11 @@ Summarization:
 
 Output:
   --output-dir DIR       Base output directory (default: ./meetings)
-  --obsidian-vault DIR   Write Obsidian note to this vault
   --context-file PATH    Pre-meeting notes to include in summary prompt
+
+Logging:
+  --log-level LEVEL      Log level: none, error, warn, info (default: none)
+  --log-dir DIR          Log file directory (default: ~/.local/share/recmeet/logs/)
 
 General:
   --threads N            CPU threads for inference (0 = auto-detect)
@@ -174,22 +175,28 @@ General:
 
 ```yaml
 transcription:
-  whisper_model: base
+  model: base
   language: "" # empty = auto-detect
 
 diarization:
-  diarize: true
+  enabled: true
   num_speakers: 0 # 0 = auto-detect
   cluster_threshold: 1.18
 
-summarization:
+summary:
   provider: xai
-  api_model: grok-3
+  model: grok-3
   # api_key: ...         # prefer env vars instead
 
 output:
-  output_dir: ./meetings
-  # obsidian_vault: ~/obsidian/Meetings
+  directory: ./meetings
+
+notes:
+  domain: general
+
+logging:
+  level: none # none, error, warn, info
+  # directory: ~/.local/share/recmeet/logs/
 
 general:
   threads: 0 # 0 = auto-detect (cores - 1)
@@ -199,8 +206,9 @@ general:
 
 | Option                | Default | Effect                                                      |
 | --------------------- | ------- | ----------------------------------------------------------- |
-| `RECMEET_USE_SHERPA`  | OFF     | Enable speaker diarization (fetches sherpa-onnx via CMake)  |
+| `RECMEET_USE_SHERPA`  | ON      | Enable speaker diarization (fetches sherpa-onnx via CMake)  |
 | `RECMEET_USE_LLAMA`   | ON      | Enable local LLM summarization via llama.cpp                |
+| `RECMEET_USE_NOTIFY`  | ON      | Enable desktop notifications via libnotify                  |
 | `RECMEET_BUILD_TRAY`  | ON      | Build the system tray applet (requires GTK3 + AppIndicator) |
 | `RECMEET_BUILD_TESTS` | ON      | Build the Catch2 test suite                                 |
 
@@ -211,7 +219,7 @@ cmake -B build -G Ninja -DRECMEET_BUILD_TRAY=OFF -DRECMEET_USE_SHERPA=OFF
 
 ## Testing
 
-123 unit tests across 13 modules, plus integration and benchmark suites.
+143 unit tests, 576 assertions across 14 modules, plus integration and benchmark suites.
 
 ```bash
 # Unit tests (no hardware needed)
@@ -226,7 +234,7 @@ cmake -B build -G Ninja -DRECMEET_BUILD_TRAY=OFF -DRECMEET_USE_SHERPA=OFF
 # Single module
 ./build/recmeet_tests "[cli]"
 ./build/recmeet_tests "[diarize]"
-./build/recmeet_tests "[obsidian]"
+./build/recmeet_tests "[note]"
 ```
 
 ## Installing

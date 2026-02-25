@@ -462,6 +462,29 @@ static void on_set_llm_model(GtkMenuItem*, gpointer) {
     choose_gguf_model();
 }
 
+static void on_open_latest_session(GtkMenuItem*, gpointer) {
+    fs::path out_dir = g_tray.cfg.output_dir;
+    if (!fs::exists(out_dir) || !fs::is_directory(out_dir)) {
+        notify("No sessions", "Output directory does not exist: " + out_dir.string());
+        return;
+    }
+
+    std::vector<fs::path> sessions;
+    for (const auto& entry : fs::directory_iterator(out_dir)) {
+        if (entry.is_directory())
+            sessions.push_back(entry.path());
+    }
+
+    if (sessions.empty()) {
+        notify("No sessions", "No recording sessions found in: " + out_dir.string());
+        return;
+    }
+
+    std::sort(sessions.begin(), sessions.end());
+    std::string cmd = "xdg-open '" + sessions.back().string() + "' &";
+    std::system(cmd.c_str());
+}
+
 // --- Utility actions ---
 
 static void on_edit_config(GtkMenuItem*, gpointer) {
@@ -818,6 +841,10 @@ static void build_menu() {
         gtk_menu_shell_append(GTK_MENU_SHELL(submenu), out_info);
 
         gtk_menu_shell_append(GTK_MENU_SHELL(submenu), gtk_separator_menu_item_new());
+
+        auto* open_latest = gtk_menu_item_new_with_label("Open Latest Session");
+        g_signal_connect(open_latest, "activate", G_CALLBACK(on_open_latest_session), nullptr);
+        gtk_menu_shell_append(GTK_MENU_SHELL(submenu), open_latest);
 
         // Chooser actions
         auto* set_out = gtk_menu_item_new_with_label("Set Output Dir...");
