@@ -90,4 +90,18 @@ double validate_audio(const fs::path& path, double min_duration,
     return duration;
 }
 
+int get_audio_duration_seconds(const fs::path& path) {
+    if (!fs::exists(path)) return 0;
+
+    SF_INFO info = {};
+    SNDFILE* sf = sf_open(path.c_str(), SFM_READ, &info);
+    if (!sf) return 0;
+
+    int duration = (info.samplerate > 0)
+        ? static_cast<int>(info.frames / info.samplerate)
+        : 0;
+    sf_close(sf);
+    return duration;
+}
+
 } // namespace recmeet

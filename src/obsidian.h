@@ -18,6 +18,13 @@ struct ObsidianConfig {
     std::vector<std::string> tags;
 };
 
+struct MeetingMetadata {
+    std::string title;
+    std::string description;
+    std::vector<std::string> tags;
+    std::vector<std::string> participants;
+};
+
 struct MeetingData {
     std::string date;              // YYYY-MM-DD
     std::string time;              // HH:MM
@@ -26,6 +33,14 @@ struct MeetingData {
     std::string context_text;      // Pre-meeting notes (optional)
     fs::path output_dir;           // Path to raw files
     std::vector<std::string> action_items; // Extracted from summary
+
+    // AI-derived metadata
+    std::string title;
+    std::string description;
+    std::vector<std::string> ai_tags;
+    std::vector<std::string> participants;
+    int duration_seconds = 0;
+    std::string whisper_model;
 };
 
 /// Write an Obsidian-compatible meeting note to the vault.
@@ -34,5 +49,11 @@ fs::path write_obsidian_note(const ObsidianConfig& config, const MeetingData& da
 
 /// Extract action items from a summary (lines starting with "- " under "Action Items").
 std::vector<std::string> extract_action_items(const std::string& summary);
+
+/// Extract AI-derived metadata (Title, Tags, Description, Participants) from a summary.
+MeetingMetadata extract_meeting_metadata(const std::string& summary);
+
+/// Remove the metadata block (Title/Tags/Description lines) from the summary body.
+std::string strip_metadata_block(const std::string& summary);
 
 } // namespace recmeet

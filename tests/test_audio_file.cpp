@@ -127,6 +127,23 @@ TEST_CASE("write_wav: throws on invalid directory", "[audio_file]") {
     CHECK_THROWS_AS(write_wav("/nonexistent/dir/test.wav", samples), RecmeetError);
 }
 
+TEST_CASE("get_audio_duration_seconds: returns correct duration", "[audio_file]") {
+    auto dir = tmp_dir();
+    fs::path wav = dir / "duration.wav";
+
+    // 5 seconds of silence
+    std::vector<int16_t> samples(SAMPLE_RATE * 5, 0);
+    write_wav(wav, samples);
+
+    CHECK(get_audio_duration_seconds(wav) == 5);
+
+    fs::remove(wav);
+}
+
+TEST_CASE("get_audio_duration_seconds: missing file returns 0", "[audio_file]") {
+    CHECK(get_audio_duration_seconds("/nonexistent/path.wav") == 0);
+}
+
 TEST_CASE("write_wav: empty samples creates valid header-only file", "[audio_file]") {
     auto dir = tmp_dir();
     fs::path wav = dir / "empty_samples.wav";

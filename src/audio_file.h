@@ -23,4 +23,7 @@ std::vector<float> read_wav_float(const fs::path& path);
 double validate_audio(const fs::path& path, double min_duration = 1.0,
                       const std::string& label = "Audio");
 
+/// Return audio duration in seconds (truncated). Returns 0 on any error.
+int get_audio_duration_seconds(const fs::path& path);
+
 } // namespace recmeet

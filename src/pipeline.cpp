@@ -280,6 +280,8 @@ PipelineResult run_postprocessing(const Config& cfg, const PostprocessInput& inp
     std::string summary_text;
     std::string context_text = read_context_file(cfg.context_file);
 
+    MeetingMetadata metadata;
+
     if (!cfg.no_summary) {
         phase("summarizing");
 
@@ -315,6 +317,8 @@ PipelineResult run_postprocessing(const Config& cfg, const PostprocessInput& inp
         }
 
         if (!summary_text.empty()) {  // NOLINT(readability-misleading-indentation)
+            metadata = extract_meeting_metadata(summary_text);
+            summary_text = strip_metadata_block(summary_text);
             write_text_file(input.summary_path, summary_text);
             pipe_result.summary_path = input.summary_path;
             log_info("Summary saved: %s", input.summary_path.c_str());
@@ -343,6 +347,14 @@ PipelineResult run_postprocessing(const Config& cfg, const PostprocessInput& inp
             md.transcript_text = input.transcript_text;
             md.context_text = context_text;
             md.output_dir = input.out_dir;
+
+            // AI-derived metadata
+            md.title = metadata.title;
+            md.description = metadata.description;
+            md.ai_tags = metadata.tags;
+            md.participants = metadata.participants;
+            md.duration_seconds = get_audio_duration_seconds(input.audio_path);
+            md.whisper_model = cfg.whisper_model;
 
             pipe_result.obsidian_path = write_obsidian_note(cfg.obsidian, md);
         } catch (const std::exception& e) {

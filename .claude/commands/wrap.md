@@ -7,6 +7,10 @@ Specifically:
 - Compare against the actual codebase state (files, tests, architecture)
 - Update all sections that are stale: file inventory, test counts, module
   descriptions, architecture diagrams, design decisions, and test results
+- Retire completed tasks: check each file in tasks/ (not tasks/done/) against
+  the session's work and RESUME.md history — if a task has been implemented and
+  committed, update its status to "Done", move it to tasks/done/, and update
+  the RESUME.md file inventory accordingly
 - Rewrite commit.msg to document all code changes made in this session
 - Stage all modified and newly added project files (use git add with explicit
   file paths — never use git add -A or git add .)

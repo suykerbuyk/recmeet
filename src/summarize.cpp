@@ -115,7 +115,14 @@ std::string build_user_prompt(const std::string& transcript, const std::string& 
         oss << "## Pre-Meeting Context\n\n" << context << "\n\n";
     }
 
-    oss << "## Required Sections\n\n"
+    oss << "## Metadata\n\n"
+        << "At the very start of your response, before the section headings, "
+        << "include these fields, one per line, in exactly this format:\n\n"
+        << "Title: <short descriptive meeting title, 5-10 words>\n"
+        << "Tags: <comma-separated lowercase topic tags, 3-7 tags, use hyphens for multi-word>\n"
+        << "Description: <1-2 sentence summary of the meeting purpose and outcome>\n\n"
+        << "Then continue with the summary sections below.\n\n"
+        << "## Required Sections\n\n"
         << "### Overview\n"
         << "A 2-3 sentence high-level summary of what the meeting covered.\n\n"
         << "### Key Points\n"

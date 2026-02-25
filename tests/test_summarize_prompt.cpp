@@ -44,6 +44,20 @@ TEST_CASE("build_user_prompt: omits context section when empty", "[summarize]") 
     CHECK(prompt2.find("Pre-Meeting Context") == std::string::npos);
 }
 
+TEST_CASE("build_user_prompt: contains metadata instructions", "[summarize]") {
+    std::string prompt = build_user_prompt("Some transcript.");
+
+    CHECK(prompt.find("## Metadata") != std::string::npos);
+    CHECK(prompt.find("Title:") != std::string::npos);
+    CHECK(prompt.find("Tags:") != std::string::npos);
+    CHECK(prompt.find("Description:") != std::string::npos);
+
+    // Metadata section should appear before Required Sections
+    auto meta_pos = prompt.find("## Metadata");
+    auto req_pos = prompt.find("## Required Sections");
+    CHECK(meta_pos < req_pos);
+}
+
 TEST_CASE("build_user_prompt: escapes correctly for JSON embedding", "[summarize]") {
     std::string prompt = build_user_prompt("test transcript\nwith newlines");
     std::string escaped = json_escape(prompt);
