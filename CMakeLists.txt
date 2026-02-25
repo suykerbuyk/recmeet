@@ -123,7 +123,7 @@ set(CORE_SOURCES
     src/transcribe.cpp
     src/http_client.cpp
     src/summarize.cpp
-    src/obsidian.cpp
+    src/note.cpp
     src/pipeline.cpp
     src/cli.cpp
     src/diarize.cpp
@@ -190,7 +190,7 @@ if(RECMEET_BUILD_TESTS)
     add_executable(recmeet_tests
         tests/test_audio_mixer.cpp
         tests/test_audio_file.cpp
-        tests/test_obsidian.cpp
+        tests/test_note.cpp
         tests/test_log.cpp
         tests/test_config.cpp
         tests/test_util.cpp

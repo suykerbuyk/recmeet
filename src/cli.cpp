@@ -21,7 +21,6 @@ CliResult parse_cli(int argc, char* argv[]) {
         {"no-summary",     no_argument,       nullptr, 'N'},
         {"device-pattern", required_argument, nullptr, 'd'},
         {"context-file",   required_argument, nullptr, 'c'},
-        {"obsidian-vault", required_argument, nullptr, 'O'},
         {"provider",       required_argument, nullptr, 'P'},
         {"llm-model",      required_argument, nullptr, 'L'},
         {"language",       required_argument, nullptr, 'g'},
@@ -55,10 +54,6 @@ CliResult parse_cli(int argc, char* argv[]) {
             case 'N': result.cfg.no_summary = true; break;
             case 'd': result.cfg.device_pattern = optarg; break;
             case 'c': result.cfg.context_file = optarg; break;
-            case 'O':
-                result.cfg.obsidian.vault_path = optarg;
-                result.cfg.obsidian_enabled = true;
-                break;
             case 'P': result.cfg.provider = optarg; break;
             case 'L': result.cfg.llm_model = optarg; break;
             case 'g': result.cfg.language = optarg; break;

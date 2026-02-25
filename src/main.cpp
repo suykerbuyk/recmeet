@@ -42,7 +42,6 @@ static void print_usage() {
         "  --no-summary         Skip summarization (record + transcribe only)\n"
         "  --device-pattern RE  Regex for device auto-detection\n"
         "  --context-file PATH  Pre-meeting notes to include in summary prompt\n"
-        "  --obsidian-vault DIR Obsidian vault path for note output\n"
         "  --llm-model PATH     Local GGUF model for summarization (instead of API)\n"
         "  --no-diarize         Disable speaker diarization\n"
         "  --num-speakers N     Number of speakers (0 = auto-detect, default: 0)\n"

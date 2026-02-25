@@ -9,18 +9,15 @@
 
 using namespace recmeet;
 
-static fs::path tmp_dir() {
+static fs::path tmp_config() {
     fs::path dir = fs::temp_directory_path() / "recmeet_test_config";
     fs::create_directories(dir);
-    return dir;
+    return dir / "config.yaml";
 }
 
 TEST_CASE("save_config + load_config round-trip", "[config]") {
-    auto dir = tmp_dir();
-    fs::path config_path = dir / "config.yaml";
+    fs::path path = tmp_config();
 
-    // We can't easily override config_dir() since it reads XDG env vars,
-    // but we can test save_config by saving and reading back the file.
     Config cfg;
     cfg.device_pattern = "test-device|pattern";
     cfg.mic_source = "alsa_input.test";
@@ -38,20 +35,12 @@ TEST_CASE("save_config + load_config round-trip", "[config]") {
     cfg.log_level_str = "info";
     cfg.log_dir = "/tmp/recmeet-test-logs";
     cfg.output_dir = "/tmp/meetings";
-    cfg.obsidian_enabled = true;
-    cfg.obsidian.vault_path = "/home/user/obsidian/vault";
-    cfg.obsidian.subfolder = "Notes/%Y/";
-    cfg.obsidian.domain = "engineering";
+    cfg.note.domain = "engineering";
 
-    // Override config dir to our temp directory
-    // Since save_config uses config_dir(), we'll test the file content directly
-    save_config(cfg);
+    save_config(cfg, path);
+    REQUIRE(fs::exists(path));
 
-    // Read the actual saved file from the real config dir
-    fs::path actual_path = config_dir() / "config.yaml";
-    REQUIRE(fs::exists(actual_path));
-
-    std::ifstream in(actual_path);
+    std::ifstream in(path);
     std::ostringstream buf;
     buf << in.rdbuf();
     std::string content = buf.str();
@@ -72,12 +61,10 @@ TEST_CASE("save_config + load_config round-trip", "[config]") {
     CHECK(content.find("level: info") != std::string::npos);
     CHECK(content.find("directory: \"/tmp/recmeet-test-logs\"") != std::string::npos);
     CHECK(content.find("directory: \"/tmp/meetings\"") != std::string::npos);
-    CHECK(content.find("vault: \"/home/user/obsidian/vault\"") != std::string::npos);
-    CHECK(content.find("subfolder: \"Notes/%Y/\"") != std::string::npos);
     CHECK(content.find("domain: engineering") != std::string::npos);
 
-    // Now load it back and verify
-    Config loaded = load_config();
+    // Load it back and verify
+    Config loaded = load_config(path);
     CHECK(loaded.device_pattern == "test-device|pattern");
     CHECK(loaded.mic_source == "alsa_input.test");
     CHECK(loaded.monitor_source == "alsa_output.test.monitor");
@@ -94,27 +81,16 @@ TEST_CASE("save_config + load_config round-trip", "[config]") {
     CHECK(loaded.log_level_str == "info");
     CHECK(loaded.log_dir == "/tmp/recmeet-test-logs");
     CHECK(loaded.output_dir == "/tmp/meetings");
-    CHECK(loaded.obsidian_enabled == true);
-    CHECK(loaded.obsidian.vault_path == "/home/user/obsidian/vault");
-    CHECK(loaded.obsidian.subfolder == "Notes/%Y/");
-    CHECK(loaded.obsidian.domain == "engineering");
+    CHECK(loaded.note.domain == "engineering");
 
-    // Clean up: restore a default config
-    Config defaults;
-    save_config(defaults);
-
-    fs::remove_all(dir);
+    fs::remove_all(path.parent_path());
 }
 
 TEST_CASE("load_config: returns defaults when no file exists", "[config]") {
-    // Temporarily rename config if it exists
-    fs::path cfg_path = config_dir() / "config.yaml";
-    fs::path backup = config_dir() / "config.yaml.bak";
-    bool had_config = fs::exists(cfg_path);
-    if (had_config)
-        fs::rename(cfg_path, backup);
+    fs::path path = fs::temp_directory_path() / "recmeet_test_config_noexist" / "config.yaml";
+    fs::remove_all(path.parent_path());
 
-    Config cfg = load_config();
+    Config cfg = load_config(path);
     CHECK(cfg.whisper_model == "base");
     CHECK(cfg.provider == "xai");
     CHECK(cfg.api_url.empty());
@@ -125,85 +101,52 @@ TEST_CASE("load_config: returns defaults when no file exists", "[config]") {
     CHECK(cfg.num_speakers == 0);
     CHECK(cfg.cluster_threshold == 1.18f);
     CHECK(cfg.threads == 0);
-    CHECK(cfg.obsidian_enabled == false);
-
-    // Restore
-    if (had_config)
-        fs::rename(backup, cfg_path);
 }
 
 TEST_CASE("load_config: handles malformed YAML gracefully", "[config]") {
-    fs::path cfg_path = config_dir() / "config.yaml";
-    fs::path backup = config_dir() / "config.yaml.bak";
-    bool had_config = fs::exists(cfg_path);
-    if (had_config)
-        fs::rename(cfg_path, backup);
+    fs::path path = tmp_config();
 
-    // Write garbled content
-    fs::create_directories(config_dir());
     {
-        std::ofstream out(cfg_path);
+        std::ofstream out(path);
         out << "{{{{not yaml at all!!!:::\n\x01\x02\x03\n";
     }
 
     // Should not crash — returns some config (likely defaults)
-    Config cfg = load_config();
+    Config cfg = load_config(path);
     CHECK_FALSE(cfg.whisper_model.empty()); // Still has a default
 
-    // Restore
-    if (had_config)
-        fs::rename(backup, cfg_path);
-    else
-        fs::remove(cfg_path);
+    fs::remove_all(path.parent_path());
 }
 
 TEST_CASE("load_config: partial config fills only specified fields", "[config]") {
-    fs::path cfg_path = config_dir() / "config.yaml";
-    fs::path backup = config_dir() / "config.yaml.bak";
-    bool had_config = fs::exists(cfg_path);
-    if (had_config)
-        fs::rename(cfg_path, backup);
+    fs::path path = tmp_config();
 
-    // Write config with only whisper model specified
-    fs::create_directories(config_dir());
     {
-        std::ofstream out(cfg_path);
+        std::ofstream out(path);
         out << "transcription:\n  model: tiny\n";
     }
 
-    Config cfg = load_config();
+    Config cfg = load_config(path);
     CHECK(cfg.whisper_model == "tiny");
     // Others should be defaults
     CHECK(cfg.provider == "xai");
     CHECK(cfg.api_url.empty());
     CHECK(cfg.api_model == "grok-3");
     CHECK(cfg.mic_only == false);
-    CHECK(cfg.obsidian_enabled == false);
 
-    // Restore
-    if (had_config)
-        fs::rename(backup, cfg_path);
-    else
-        fs::remove(cfg_path);
+    fs::remove_all(path.parent_path());
 }
 
 TEST_CASE("load_config: reads XAI_API_KEY from environment", "[config]") {
-    fs::path cfg_path = config_dir() / "config.yaml";
-    fs::path backup = config_dir() / "config.yaml.bak";
-    bool had_config = fs::exists(cfg_path);
-    if (had_config)
-        fs::rename(cfg_path, backup);
-
-    // Remove config file so only env var matters
-    if (fs::exists(cfg_path))
-        fs::remove(cfg_path);
+    fs::path path = fs::temp_directory_path() / "recmeet_test_config_env" / "config.yaml";
+    fs::remove_all(path.parent_path());
 
     // Save and set env var
     const char* old_key = std::getenv("XAI_API_KEY");
     std::string saved_key = old_key ? old_key : "";
     setenv("XAI_API_KEY", "test-api-key-12345", 1);
 
-    Config cfg = load_config();
+    Config cfg = load_config(path);
     CHECK(cfg.api_key == "test-api-key-12345");
 
     // Restore env
@@ -211,8 +154,4 @@ TEST_CASE("load_config: reads XAI_API_KEY from environment", "[config]") {
         unsetenv("XAI_API_KEY");
     else
         setenv("XAI_API_KEY", saved_key.c_str(), 1);
-
-    // Restore config
-    if (had_config)
-        fs::rename(backup, cfg_path);
 }

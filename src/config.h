@@ -4,7 +4,7 @@
 #pragma once
 
 #include "util.h"
-#include "obsidian.h"
+#include "note.h"
 
 #include <string>
 #include <map>
@@ -62,9 +62,8 @@ struct Config {
     // Output
     fs::path output_dir = "./meetings";
 
-    // Obsidian
-    ObsidianConfig obsidian;
-    bool obsidian_enabled = false;
+    // Meeting notes
+    NoteConfig note;
 
     // Context
     fs::path context_file;
@@ -73,10 +72,10 @@ struct Config {
     fs::path reprocess_dir;
 };
 
-/// Load config from ~/.config/recmeet/config.yaml (creates default if missing).
-Config load_config();
+/// Load config. Uses path if provided, otherwise ~/.config/recmeet/config.yaml.
+Config load_config(const fs::path& config_path = {});
 
-/// Save config to ~/.config/recmeet/config.yaml.
-void save_config(const Config& cfg);
+/// Save config. Uses path if provided, otherwise ~/.config/recmeet/config.yaml.
+void save_config(const Config& cfg, const fs::path& config_path = {});
 
 } // namespace recmeet

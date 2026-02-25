@@ -11,9 +11,7 @@
 
 namespace recmeet {
 
-struct ObsidianConfig {
-    fs::path vault_path;           // e.g. ~/obsidian/ObsMeetings/
-    std::string subfolder = "Meetings/%Y/%m/"; // strftime format
+struct NoteConfig {
     std::string domain = "general";
     std::vector<std::string> tags;
 };
@@ -43,9 +41,9 @@ struct MeetingData {
     std::string whisper_model;
 };
 
-/// Write an Obsidian-compatible meeting note to the vault.
+/// Write a formatted meeting note to data.output_dir.
 /// Returns the path to the created note.
-fs::path write_obsidian_note(const ObsidianConfig& config, const MeetingData& data);
+fs::path write_meeting_note(const NoteConfig& config, const MeetingData& data);
 
 /// Extract action items from a summary (lines starting with "- " under "Action Items").
 std::vector<std::string> extract_action_items(const std::string& summary);

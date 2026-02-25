@@ -14,7 +14,7 @@ namespace recmeet {
 struct PipelineResult {
     fs::path transcript_path;
     fs::path summary_path;   // empty if no summary
-    fs::path obsidian_path;  // empty if obsidian disabled
+    fs::path note_path;
     fs::path output_dir;
 };
 
@@ -38,12 +38,12 @@ std::string read_context_file(const fs::path& path);
 PostprocessInput run_recording(const Config& cfg, StopToken& stop,
                                PhaseCallback on_phase = nullptr);
 
-/// Summarize + obsidian output. Runs to completion (no StopToken).
+/// Summarize + note output. Runs to completion (no StopToken).
 /// Phase callbacks emitted: "summarizing", "complete".
 PipelineResult run_postprocessing(const Config& cfg, const PostprocessInput& input,
                                   PhaseCallback on_phase = nullptr);
 
-/// Run the full pipeline: record → validate → mix → transcribe → summarize → obsidian output.
+/// Run the full pipeline: record → validate → mix → transcribe → summarize → note output.
 PipelineResult run_pipeline(const Config& cfg, StopToken& stop, PhaseCallback on_phase = nullptr);
 
 } // namespace recmeet

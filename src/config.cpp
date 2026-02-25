@@ -106,9 +106,9 @@ std::string resolve_api_key(const ProviderInfo& provider, const std::string& fal
     return fallback_key;
 }
 
-Config load_config() {
+Config load_config(const fs::path& config_path) {
     Config cfg;
-    fs::path path = config_dir() / "config.yaml";
+    fs::path path = config_path.empty() ? config_dir() / "config.yaml" : config_path;
 
     // Check for API key in environment (try provider-specific, then XAI_API_KEY for compat)
     for (size_t i = 0; i < NUM_PROVIDERS; ++i) {
@@ -168,22 +168,25 @@ Config load_config() {
     std::string out = get_val(entries, "output", "directory", "");
     if (!out.empty()) cfg.output_dir = out;
 
-    // Obsidian section
-    std::string vault = get_val(entries, "obsidian", "vault", "");
-    if (!vault.empty()) {
-        cfg.obsidian_enabled = true;
-        cfg.obsidian.vault_path = vault;
-    }
-    cfg.obsidian.subfolder = get_val(entries, "obsidian", "subfolder", cfg.obsidian.subfolder);
-    cfg.obsidian.domain = get_val(entries, "obsidian", "domain", cfg.obsidian.domain);
+    // Notes section (read "notes" first, fall back to legacy "obsidian")
+    std::string note_domain = get_val(entries, "notes", "domain", "");
+    if (note_domain.empty())
+        note_domain = get_val(entries, "obsidian", "domain", cfg.note.domain);
+    cfg.note.domain = note_domain;
 
     return cfg;
 }
 
-void save_config(const Config& cfg) {
-    fs::path dir = config_dir();
-    fs::create_directories(dir);
-    fs::path path = dir / "config.yaml";
+void save_config(const Config& cfg, const fs::path& config_path) {
+    fs::path path;
+    if (config_path.empty()) {
+        fs::path dir = config_dir();
+        fs::create_directories(dir);
+        path = dir / "config.yaml";
+    } else {
+        fs::create_directories(config_path.parent_path());
+        path = config_path;
+    }
 
     std::ofstream out(path);
     if (!out)
@@ -239,12 +242,8 @@ void save_config(const Config& cfg) {
             out << "  directory: \"" << cfg.log_dir.string() << "\"\n";
     }
 
-    if (cfg.obsidian_enabled) {
-        out << "\nobsidian:\n"
-            << "  vault: \"" << cfg.obsidian.vault_path.string() << "\"\n"
-            << "  subfolder: \"" << cfg.obsidian.subfolder << "\"\n"
-            << "  domain: " << cfg.obsidian.domain << "\n";
-    }
+    out << "\nnotes:\n"
+        << "  domain: " << cfg.note.domain << "\n";
 }
 
 } // namespace recmeet

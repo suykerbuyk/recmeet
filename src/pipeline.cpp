@@ -13,7 +13,7 @@
 #include "model_manager.h"
 #include "transcribe.h"
 #include "summarize.h"
-#include "obsidian.h"
+#include "note.h"
 #include "notify.h"
 
 #include <chrono>
@@ -318,48 +318,46 @@ PipelineResult run_postprocessing(const Config& cfg, const PostprocessInput& inp
 
         if (!summary_text.empty()) {  // NOLINT(readability-misleading-indentation)
             metadata = extract_meeting_metadata(summary_text);
-            summary_text = strip_metadata_block(summary_text);
             write_text_file(input.summary_path, summary_text);
             pipe_result.summary_path = input.summary_path;
             log_info("Summary saved: %s", input.summary_path.c_str());
+            summary_text = strip_metadata_block(summary_text);
         }
     } else {
         log_info("Summary skipped (--no-summary).");
     }
 
-    // --- Obsidian output ---
-    if (cfg.obsidian_enabled && !cfg.obsidian.vault_path.empty()) {
-        try {
-            // Get current date/time
-            auto now = std::chrono::system_clock::now();
-            auto time_t = std::chrono::system_clock::to_time_t(now);
-            std::tm tm{};
-            localtime_r(&time_t, &tm);
+    // --- Meeting note output ---
+    try {
+        // Get current date/time
+        auto now = std::chrono::system_clock::now();
+        auto time_t = std::chrono::system_clock::to_time_t(now);
+        std::tm tm{};
+        localtime_r(&time_t, &tm);
 
-            char date_buf[16], time_buf[8];
-            strftime(date_buf, sizeof(date_buf), "%Y-%m-%d", &tm);
-            strftime(time_buf, sizeof(time_buf), "%H:%M", &tm);
+        char date_buf[16], time_buf[8];
+        strftime(date_buf, sizeof(date_buf), "%Y-%m-%d", &tm);
+        strftime(time_buf, sizeof(time_buf), "%H:%M", &tm);
 
-            MeetingData md;
-            md.date = date_buf;
-            md.time = time_buf;
-            md.summary_text = summary_text;
-            md.transcript_text = input.transcript_text;
-            md.context_text = context_text;
-            md.output_dir = input.out_dir;
+        MeetingData md;
+        md.date = date_buf;
+        md.time = time_buf;
+        md.summary_text = summary_text;
+        md.transcript_text = input.transcript_text;
+        md.context_text = context_text;
+        md.output_dir = input.out_dir;
 
-            // AI-derived metadata
-            md.title = metadata.title;
-            md.description = metadata.description;
-            md.ai_tags = metadata.tags;
-            md.participants = metadata.participants;
-            md.duration_seconds = get_audio_duration_seconds(input.audio_path);
-            md.whisper_model = cfg.whisper_model;
+        // AI-derived metadata
+        md.title = metadata.title;
+        md.description = metadata.description;
+        md.ai_tags = metadata.tags;
+        md.participants = metadata.participants;
+        md.duration_seconds = get_audio_duration_seconds(input.audio_path);
+        md.whisper_model = cfg.whisper_model;
 
-            pipe_result.obsidian_path = write_obsidian_note(cfg.obsidian, md);
-        } catch (const std::exception& e) {
-            log_warn("Obsidian note failed: %s", e.what());
-        }
+        pipe_result.note_path = write_meeting_note(cfg.note, md);
+    } catch (const std::exception& e) {
+        log_warn("Meeting note failed: %s", e.what());
     }
 
     // --- Done ---

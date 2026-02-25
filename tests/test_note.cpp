@@ -3,7 +3,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/matchers/catch_matchers_string.hpp>
-#include "obsidian.h"
+#include "note.h"
 
 #include <fstream>
 #include <sstream>
@@ -11,7 +11,7 @@
 using namespace recmeet;
 
 static fs::path tmp_dir() {
-    fs::path dir = fs::temp_directory_path() / "recmeet_test_obsidian";
+    fs::path dir = fs::temp_directory_path() / "recmeet_test_note";
     fs::create_directories(dir);
     return dir;
 }
@@ -23,7 +23,7 @@ static std::string read_file(const fs::path& path) {
     return buf.str();
 }
 
-TEST_CASE("extract_action_items: parses bullet list under Action Items heading", "[obsidian]") {
+TEST_CASE("extract_action_items: parses bullet list under Action Items heading", "[note]") {
     std::string summary =
         "### Overview\nSome overview.\n\n"
         "### Action Items\n"
@@ -40,13 +40,13 @@ TEST_CASE("extract_action_items: parses bullet list under Action Items heading",
     CHECK(items[2] == "**Carol** — schedule follow-up meeting");
 }
 
-TEST_CASE("extract_action_items: empty when no Action Items section", "[obsidian]") {
+TEST_CASE("extract_action_items: empty when no Action Items section", "[note]") {
     std::string summary = "### Overview\nJust an overview.\n### Key Points\n- Point 1\n";
     auto items = extract_action_items(summary);
     CHECK(items.empty());
 }
 
-TEST_CASE("extract_action_items: handles ## heading variant", "[obsidian]") {
+TEST_CASE("extract_action_items: handles ## heading variant", "[note]") {
     std::string summary =
         "## Action Items\n"
         "- Do thing one\n"
@@ -56,7 +56,7 @@ TEST_CASE("extract_action_items: handles ## heading variant", "[obsidian]") {
     REQUIRE(items.size() == 2);
 }
 
-TEST_CASE("extract_action_items: stops at next heading", "[obsidian]") {
+TEST_CASE("extract_action_items: stops at next heading", "[note]") {
     std::string summary =
         "### Action Items\n"
         "- Item A\n"
@@ -69,12 +69,10 @@ TEST_CASE("extract_action_items: stops at next heading", "[obsidian]") {
     CHECK(items[0] == "Item A");
 }
 
-TEST_CASE("write_obsidian_note: creates note with frontmatter and sections", "[obsidian]") {
+TEST_CASE("write_meeting_note: creates note with frontmatter and sections", "[note]") {
     auto dir = tmp_dir();
 
-    ObsidianConfig config;
-    config.vault_path = dir;
-    config.subfolder = "";  // flat directory for testing
+    NoteConfig config;
     config.domain = "engineering";
     config.tags = {"weekly", "team-alpha"};
 
@@ -87,10 +85,11 @@ TEST_CASE("write_obsidian_note: creates note with frontmatter and sections", "[o
         "- **Alice** — update specs\n";
     data.transcript_text = "[00:00 - 00:05] Hello everyone.";
     data.context_text = "Agenda: Q1 planning";
-    data.output_dir = "/tmp/meetings/2026-02-20_14-30";
+    data.output_dir = dir;
 
-    fs::path note = write_obsidian_note(config, data);
+    fs::path note = write_meeting_note(config, data);
     REQUIRE(fs::exists(note));
+    CHECK(note.parent_path() == dir);
 
     std::string content = read_file(note);
 
@@ -127,38 +126,16 @@ TEST_CASE("write_obsidian_note: creates note with frontmatter and sections", "[o
     }
 
     SECTION("raw files link") {
-        CHECK(content.find("/tmp/meetings/2026-02-20_14-30") != std::string::npos);
+        CHECK(content.find(dir.string()) != std::string::npos);
     }
 
     // Cleanup
     fs::remove_all(dir);
 }
 
-TEST_CASE("write_obsidian_note: subfolder creates dated directories", "[obsidian]") {
-    auto dir = tmp_dir();
-
-    ObsidianConfig config;
-    config.vault_path = dir;
-    config.subfolder = "Meetings/%Y/";
-
-    MeetingData data;
-    data.date = "2026-02-21";
-    data.time = "09:00";
-    data.transcript_text = "[00:00 - 00:01] Test.";
-
-    fs::path note = write_obsidian_note(config, data);
-    REQUIRE(fs::exists(note));
-
-    // The path should contain "Meetings/2026/" (current year)
-    std::string note_str = note.string();
-    CHECK(note_str.find("Meetings/") != std::string::npos);
-
-    fs::remove_all(dir);
-}
-
 // --- Metadata extraction tests ---
 
-TEST_CASE("extract_meeting_metadata: full metadata block", "[obsidian]") {
+TEST_CASE("extract_meeting_metadata: full metadata block", "[note]") {
     std::string summary =
         "Title: Q1 Roadmap Planning Session\n"
         "Tags: roadmap, planning, q1-goals, engineering\n"
@@ -187,7 +164,7 @@ TEST_CASE("extract_meeting_metadata: full metadata block", "[obsidian]") {
     CHECK(meta.participants[2] == "Carol");
 }
 
-TEST_CASE("extract_meeting_metadata: missing metadata block", "[obsidian]") {
+TEST_CASE("extract_meeting_metadata: missing metadata block", "[note]") {
     std::string summary =
         "### Overview\nJust an overview.\n### Key Points\n- Point 1\n";
 
@@ -199,7 +176,7 @@ TEST_CASE("extract_meeting_metadata: missing metadata block", "[obsidian]") {
     CHECK(meta.participants.empty());
 }
 
-TEST_CASE("extract_meeting_metadata: partial metadata (title only)", "[obsidian]") {
+TEST_CASE("extract_meeting_metadata: partial metadata (title only)", "[note]") {
     std::string summary =
         "Title: Weekly Standup\n\n"
         "### Overview\nDiscussed blockers.\n";
@@ -211,7 +188,7 @@ TEST_CASE("extract_meeting_metadata: partial metadata (title only)", "[obsidian]
     CHECK(meta.tags.empty());
 }
 
-TEST_CASE("extract_meeting_metadata: tags trimmed and lowercased", "[obsidian]") {
+TEST_CASE("extract_meeting_metadata: tags trimmed and lowercased", "[note]") {
     std::string summary =
         "Tags:  Frontend , BACKEND , DevOps-CI \n"
         "### Overview\nStuff.\n";
@@ -224,7 +201,7 @@ TEST_CASE("extract_meeting_metadata: tags trimmed and lowercased", "[obsidian]")
     CHECK(meta.tags[2] == "devops-ci");
 }
 
-TEST_CASE("strip_metadata_block: removes metadata lines, preserves rest", "[obsidian]") {
+TEST_CASE("strip_metadata_block: removes metadata lines, preserves rest", "[note]") {
     std::string summary =
         "Title: Some Meeting\n"
         "Tags: a, b\n"
@@ -246,7 +223,7 @@ TEST_CASE("strip_metadata_block: removes metadata lines, preserves rest", "[obsi
     CHECK(stripped.find("### Key Points") != std::string::npos);
 }
 
-TEST_CASE("strip_metadata_block: no metadata returns content unchanged", "[obsidian]") {
+TEST_CASE("strip_metadata_block: no metadata returns content unchanged", "[note]") {
     std::string summary =
         "### Overview\n"
         "Just an overview.\n";
@@ -257,7 +234,7 @@ TEST_CASE("strip_metadata_block: no metadata returns content unchanged", "[obsid
     CHECK(stripped.find("Just an overview.") != std::string::npos);
 }
 
-TEST_CASE("extract_action_items: stops before next heading with different level", "[obsidian]") {
+TEST_CASE("extract_action_items: stops before next heading with different level", "[note]") {
     std::string summary =
         "### Action Items\n"
         "- Task one\n"
@@ -272,12 +249,10 @@ TEST_CASE("extract_action_items: stops before next heading with different level"
     CHECK(items[1] == "Task two");
 }
 
-TEST_CASE("write_obsidian_note: extracts one-liner for frontmatter", "[obsidian]") {
+TEST_CASE("write_meeting_note: extracts one-liner for frontmatter", "[note]") {
     auto dir = tmp_dir();
 
-    ObsidianConfig config;
-    config.vault_path = dir;
-    config.subfolder = "";
+    NoteConfig config;
 
     MeetingData data;
     data.date = "2026-02-21";
@@ -288,8 +263,9 @@ TEST_CASE("write_obsidian_note: extracts one-liner for frontmatter", "[obsidian]
         "### Key Points\n"
         "- Point 1\n";
     data.transcript_text = "[00:00 - 00:05] Hello.";
+    data.output_dir = dir;
 
-    fs::path note = write_obsidian_note(config, data);
+    fs::path note = write_meeting_note(config, data);
     REQUIRE(fs::exists(note));
 
     std::string content = read_file(note);
@@ -299,12 +275,10 @@ TEST_CASE("write_obsidian_note: extracts one-liner for frontmatter", "[obsidian]
     fs::remove_all(dir);
 }
 
-TEST_CASE("write_obsidian_note: enriched frontmatter with all fields", "[obsidian]") {
+TEST_CASE("write_meeting_note: enriched frontmatter with all fields", "[note]") {
     auto dir = tmp_dir();
 
-    ObsidianConfig config;
-    config.vault_path = dir;
-    config.subfolder = "";
+    NoteConfig config;
     config.domain = "engineering";
     config.tags = {"weekly"};
 
@@ -313,7 +287,7 @@ TEST_CASE("write_obsidian_note: enriched frontmatter with all fields", "[obsidia
     data.time = "10:00";
     data.summary_text = "### Overview\nOverview text.\n";
     data.transcript_text = "[00:00 - 00:05] Hello.";
-    data.output_dir = "/tmp/meetings/2026-02-24_10-00";
+    data.output_dir = dir;
 
     // Enriched fields
     data.title = "Q1 Roadmap Review";
@@ -323,7 +297,7 @@ TEST_CASE("write_obsidian_note: enriched frontmatter with all fields", "[obsidia
     data.duration_seconds = 3725;  // 1:02:05
     data.whisper_model = "large-v3";
 
-    fs::path note = write_obsidian_note(config, data);
+    fs::path note = write_meeting_note(config, data);
     REQUIRE(fs::exists(note));
 
     std::string content = read_file(note);
@@ -342,18 +316,15 @@ TEST_CASE("write_obsidian_note: enriched frontmatter with all fields", "[obsidia
     CHECK(content.find("  - \"[[Bob]]\"") != std::string::npos);
     // Duration formatted as H:MM:SS
     CHECK(content.find("duration: \"1:02:05\"") != std::string::npos);
-    CHECK(content.find("source: \"/tmp/meetings/2026-02-24_10-00\"") != std::string::npos);
     CHECK(content.find("whisper_model: large-v3") != std::string::npos);
 
     fs::remove_all(dir);
 }
 
-TEST_CASE("write_obsidian_note: empty metadata falls back gracefully", "[obsidian]") {
+TEST_CASE("write_meeting_note: empty metadata falls back gracefully", "[note]") {
     auto dir = tmp_dir();
 
-    ObsidianConfig config;
-    config.vault_path = dir;
-    config.subfolder = "";
+    NoteConfig config;
 
     MeetingData data;
     data.date = "2026-02-24";
@@ -362,8 +333,9 @@ TEST_CASE("write_obsidian_note: empty metadata falls back gracefully", "[obsidia
         "### Overview\nThe team met to discuss progress.\n\n"
         "### Key Points\n- A point\n";
     data.transcript_text = "[00:00 - 00:05] Hi.";
+    data.output_dir = dir;
 
-    fs::path note = write_obsidian_note(config, data);
+    fs::path note = write_meeting_note(config, data);
     REQUIRE(fs::exists(note));
 
     std::string content = read_file(note);
@@ -380,19 +352,18 @@ TEST_CASE("write_obsidian_note: empty metadata falls back gracefully", "[obsidia
     fs::remove_all(dir);
 }
 
-TEST_CASE("write_obsidian_note: handles empty summary gracefully", "[obsidian]") {
+TEST_CASE("write_meeting_note: handles empty summary gracefully", "[note]") {
     auto dir = tmp_dir();
 
-    ObsidianConfig config;
-    config.vault_path = dir;
-    config.subfolder = "";
+    NoteConfig config;
 
     MeetingData data;
     data.date = "2026-02-20";
     data.time = "10:00";
     data.transcript_text = "[00:00 - 00:10] Just a test.";
+    data.output_dir = dir;
 
-    fs::path note = write_obsidian_note(config, data);
+    fs::path note = write_meeting_note(config, data);
     REQUIRE(fs::exists(note));
 
     std::string content = read_file(note);

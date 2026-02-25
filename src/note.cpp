@@ -1,7 +1,7 @@
 // Copyright (c) 2026 John Suykerbuyk and SykeTech LTD
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-#include "obsidian.h"
+#include "note.h"
 #include "log.h"
 
 #include <algorithm>
@@ -139,29 +139,29 @@ std::string strip_metadata_block(const std::string& summary) {
     return result;
 }
 
-fs::path write_obsidian_note(const ObsidianConfig& config, const MeetingData& data) {
-    // Build subfolder path using strftime
-    auto now = std::chrono::system_clock::now();
-    auto time = std::chrono::system_clock::to_time_t(now);
-    std::tm tm{};
-    localtime_r(&time, &tm);
-
-    char subfolder_buf[256];
-    strftime(subfolder_buf, sizeof(subfolder_buf), config.subfolder.c_str(), &tm);
-
-    fs::path note_dir = config.vault_path / subfolder_buf;
-    fs::create_directories(note_dir);
-
-    // Note filename: Meeting_YYYY-MM-DD_HH-MM.md
+fs::path write_meeting_note(const NoteConfig& config, const MeetingData& data) {
+    // Note filename: Meeting_YYYY-MM-DD_HH-MM[_Title_Words].md
     std::string safe_time = data.time;
     for (auto& c : safe_time)
         if (c == ':') c = '-';
-    std::string filename = "Meeting_" + data.date + "_" + safe_time + ".md";
-    fs::path note_path = note_dir / filename;
+    std::string filename = "Meeting_" + data.date + "_" + safe_time;
+    if (!data.title.empty()) {
+        std::string safe_title;
+        for (char c : data.title) {
+            if (c == ' ')
+                safe_title += '_';
+            else if (std::isalnum(static_cast<unsigned char>(c)) || c == '-' || c == '_')
+                safe_title += c;
+        }
+        if (!safe_title.empty())
+            filename += "_" + safe_title;
+    }
+    filename += ".md";
+    fs::path note_path = data.output_dir / filename;
 
     std::ofstream out(note_path);
     if (!out)
-        throw RecmeetError("Cannot write Obsidian note: " + note_path.string());
+        throw RecmeetError("Cannot write meeting note: " + note_path.string());
 
     // Build one-line summary fallback from Overview section
     std::string one_liner;
@@ -285,7 +285,7 @@ fs::path write_obsidian_note(const ObsidianConfig& config, const MeetingData& da
     }
 
     out.close();
-    log_info("Obsidian note: %s", note_path.c_str());
+    log_info("Meeting note: %s", note_path.c_str());
     return note_path;
 }
 

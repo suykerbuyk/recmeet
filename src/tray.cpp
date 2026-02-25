@@ -458,16 +458,6 @@ static void on_set_output_dir(GtkMenuItem*, gpointer) {
     }
 }
 
-static void on_set_obsidian_vault(GtkMenuItem*, gpointer) {
-    std::string path = run_folder_chooser("Select Obsidian Vault");
-    if (!path.empty()) {
-        g_tray.cfg.obsidian.vault_path = path;
-        g_tray.cfg.obsidian_enabled = true;
-        save_config(g_tray.cfg);
-        build_menu();
-    }
-}
-
 static void on_set_llm_model(GtkMenuItem*, gpointer) {
     choose_gguf_model();
 }
@@ -827,26 +817,12 @@ static void build_menu() {
         gtk_widget_set_sensitive(out_info, FALSE);
         gtk_menu_shell_append(GTK_MENU_SHELL(submenu), out_info);
 
-        // Current obsidian vault label
-        std::string vault_label = "Obsidian Vault: ";
-        if (g_tray.cfg.obsidian_enabled && !g_tray.cfg.obsidian.vault_path.empty())
-            vault_label += g_tray.cfg.obsidian.vault_path.string();
-        else
-            vault_label += "(not configured)";
-        auto* vault_info = gtk_menu_item_new_with_label(vault_label.c_str());
-        gtk_widget_set_sensitive(vault_info, FALSE);
-        gtk_menu_shell_append(GTK_MENU_SHELL(submenu), vault_info);
-
         gtk_menu_shell_append(GTK_MENU_SHELL(submenu), gtk_separator_menu_item_new());
 
         // Chooser actions
         auto* set_out = gtk_menu_item_new_with_label("Set Output Dir...");
         g_signal_connect(set_out, "activate", G_CALLBACK(on_set_output_dir), nullptr);
         gtk_menu_shell_append(GTK_MENU_SHELL(submenu), set_out);
-
-        auto* set_vault = gtk_menu_item_new_with_label("Set Obsidian Vault...");
-        g_signal_connect(set_vault, "activate", G_CALLBACK(on_set_obsidian_vault), nullptr);
-        gtk_menu_shell_append(GTK_MENU_SHELL(submenu), set_vault);
 
         auto* set_llm = gtk_menu_item_new_with_label("Set LLM Model...");
         g_signal_connect(set_llm, "activate", G_CALLBACK(on_set_llm_model), nullptr);

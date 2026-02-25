@@ -67,12 +67,6 @@ TEST_CASE("parse_cli: --api-key sets api_key", "[cli]") {
     CHECK(cli.cfg.api_key == "sk-test-key-123");
 }
 
-TEST_CASE("parse_cli: --obsidian-vault sets obsidian config", "[cli]") {
-    auto cli = run_cli({"recmeet", "--obsidian-vault", "/home/user/vault"});
-    CHECK(cli.cfg.obsidian.vault_path == "/home/user/vault");
-    CHECK(cli.cfg.obsidian_enabled == true);
-}
-
 TEST_CASE("parse_cli: --list-sources sets flag", "[cli]") {
     auto cli = run_cli({"recmeet", "--list-sources"});
     CHECK(cli.list_sources == true);
