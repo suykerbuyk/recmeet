@@ -52,7 +52,7 @@ void display_elapsed(StopToken& stop) {
 
 } // anonymous namespace
 
-PipelineResult run_pipeline(const Config& cfg, StopToken& stop, PhaseCallback on_phase) {
+PostprocessInput run_recording(const Config& cfg, StopToken& stop, PhaseCallback on_phase) {
     auto phase = [&](const std::string& name) {
         if (on_phase) on_phase(name);
     };
@@ -60,47 +60,43 @@ PipelineResult run_pipeline(const Config& cfg, StopToken& stop, PhaseCallback on
     int threads = cfg.threads > 0 ? cfg.threads : default_thread_count();
     log_info("Using %d threads for inference.", threads);
 
-    fs::path out_dir;
-    fs::path audio_path;
-    fs::path transcript_path;
-    fs::path summary_path;
-    std::string transcript_text;
+    PostprocessInput pp;
 
     if (!cfg.reprocess_dir.empty()) {
         // --- Reprocess existing recording from audio.wav ---
-        out_dir = cfg.reprocess_dir;
-        if (!fs::is_directory(out_dir))
-            throw RecmeetError("Reprocess directory does not exist: " + out_dir.string());
+        pp.out_dir = cfg.reprocess_dir;
+        if (!fs::is_directory(pp.out_dir))
+            throw RecmeetError("Reprocess directory does not exist: " + pp.out_dir.string());
 
-        audio_path = out_dir / "audio.wav";
-        transcript_path = out_dir / "transcript.txt";
-        summary_path = out_dir / "summary.md";
+        pp.audio_path = pp.out_dir / "audio.wav";
+        pp.transcript_path = pp.out_dir / "transcript.txt";
+        pp.summary_path = pp.out_dir / "summary.md";
 
-        if (!fs::exists(audio_path))
-            throw RecmeetError("No audio.wav in reprocess directory: " + out_dir.string());
+        if (!fs::exists(pp.audio_path))
+            throw RecmeetError("No audio.wav in reprocess directory: " + pp.out_dir.string());
 
-        log_info("Reprocessing: %s", out_dir.c_str());
+        log_info("Reprocessing: %s", pp.out_dir.c_str());
 
         // Transcribe from source audio
         phase("transcribing");
         notify("Transcribing...", "Model: " + cfg.whisper_model);
         fs::path model_path = ensure_whisper_model(cfg.whisper_model);
-        auto result = transcribe(model_path, audio_path, cfg.language, threads);
+        auto result = transcribe(model_path, pp.audio_path, cfg.language, threads);
 
 #if RECMEET_USE_SHERPA
         if (cfg.diarize) {
             phase("diarizing");
             notify("Diarizing...", "Identifying speakers");
-            auto diar = diarize(audio_path, cfg.num_speakers, threads, cfg.cluster_threshold);
+            auto diar = diarize(pp.audio_path, cfg.num_speakers, threads, cfg.cluster_threshold);
             result.segments = merge_speakers(result.segments, diar);
         }
 #endif
 
-        transcript_text = result.to_string();
-        if (transcript_text.empty())
+        pp.transcript_text = result.to_string();
+        if (pp.transcript_text.empty())
             throw RecmeetError("Transcription produced no text.");
-        write_text_file(transcript_path, transcript_text);
-        log_info("Transcript saved: %s", transcript_path.c_str());
+        write_text_file(pp.transcript_path, pp.transcript_text);
+        log_info("Transcript saved: %s", pp.transcript_path.c_str());
     } else {
         // --- Normal mode: detect sources, record, transcribe ---
 
@@ -141,12 +137,12 @@ PipelineResult run_pipeline(const Config& cfg, StopToken& stop, PhaseCallback on
         }
 
         // --- Create output directory ---
-        out_dir = create_output_dir(cfg.output_dir);
-        log_info("Output directory: %s", out_dir.c_str());
+        pp.out_dir = create_output_dir(cfg.output_dir);
+        log_info("Output directory: %s", pp.out_dir.c_str());
 
-        audio_path = out_dir / "audio.wav";
-        transcript_path = out_dir / "transcript.txt";
-        summary_path = out_dir / "summary.md";
+        pp.audio_path = pp.out_dir / "audio.wav";
+        pp.transcript_path = pp.out_dir / "transcript.txt";
+        pp.summary_path = pp.out_dir / "summary.md";
 
         // --- Record ---
         phase("recording");
@@ -201,8 +197,8 @@ PipelineResult run_pipeline(const Config& cfg, StopToken& stop, PhaseCallback on
             auto mic_samples = mic_cap.drain();
             auto mon_samples = mon_pw ? mon_pw->drain() : mon_pa->drain();
 
-            fs::path mic_path = out_dir / "mic.wav";
-            fs::path mon_path = out_dir / "monitor.wav";
+            fs::path mic_path = pp.out_dir / "mic.wav";
+            fs::path mon_path = pp.out_dir / "monitor.wav";
             write_wav(mic_path, mic_samples);
             write_wav(mon_path, mon_samples);
 
@@ -214,11 +210,11 @@ PipelineResult run_pipeline(const Config& cfg, StopToken& stop, PhaseCallback on
                 validate_audio(mon_path, 1.0, "Monitor audio");
                 // Mix
                 auto mixed = mix_audio(mic_samples, mon_samples);
-                write_wav(audio_path, mixed);
-                log_info("Mixed audio saved: %s", audio_path.c_str());
+                write_wav(pp.audio_path, mixed);
+                log_info("Mixed audio saved: %s", pp.audio_path.c_str());
             } catch (const AudioValidationError& e) {
                 log_warn("Monitor audio unusable (%s). Using mic only.", e.what());
-                write_wav(audio_path, mic_samples);
+                write_wav(pp.audio_path, mic_samples);
             }
         } else {
             notify("Recording started", "Source: " + mic_source);
@@ -238,8 +234,8 @@ PipelineResult run_pipeline(const Config& cfg, StopToken& stop, PhaseCallback on
 
             cap.stop();
             auto samples = cap.drain();
-            write_wav(audio_path, samples);
-            validate_audio(audio_path);
+            write_wav(pp.audio_path, samples);
+            validate_audio(pp.audio_path);
         }
 
         // --- Transcribe ---
@@ -247,29 +243,40 @@ PipelineResult run_pipeline(const Config& cfg, StopToken& stop, PhaseCallback on
         notify("Transcribing...", "Model: " + cfg.whisper_model);
 
         fs::path model_path = ensure_whisper_model(cfg.whisper_model);
-        auto result = transcribe(model_path, audio_path, cfg.language, threads);
+        auto result = transcribe(model_path, pp.audio_path, cfg.language, threads);
 
 #if RECMEET_USE_SHERPA
         if (cfg.diarize) {
             phase("diarizing");
             notify("Diarizing...", "Identifying speakers");
-            auto diar = diarize(audio_path, cfg.num_speakers, threads, cfg.cluster_threshold);
+            auto diar = diarize(pp.audio_path, cfg.num_speakers, threads, cfg.cluster_threshold);
             result.segments = merge_speakers(result.segments, diar);
         }
 #endif
 
-        transcript_text = result.to_string();
-        if (transcript_text.empty())
+        pp.transcript_text = result.to_string();
+        if (pp.transcript_text.empty())
             throw RecmeetError("Transcription produced no text.");
 
-        write_text_file(transcript_path, transcript_text);
-        log_info("Transcript saved: %s", transcript_path.c_str());
+        write_text_file(pp.transcript_path, pp.transcript_text);
+        log_info("Transcript saved: %s", pp.transcript_path.c_str());
     }
+
+    return pp;
+}
+
+PipelineResult run_postprocessing(const Config& cfg, const PostprocessInput& input,
+                                  PhaseCallback on_phase) {
+    auto phase = [&](const std::string& name) {
+        if (on_phase) on_phase(name);
+    };
+
+    int threads = cfg.threads > 0 ? cfg.threads : default_thread_count();
 
     // --- Summarize ---
     PipelineResult pipe_result;
-    pipe_result.transcript_path = transcript_path;
-    pipe_result.output_dir = out_dir;
+    pipe_result.transcript_path = input.transcript_path;
+    pipe_result.output_dir = input.out_dir;
 
     std::string summary_text;
     std::string context_text = read_context_file(cfg.context_file);
@@ -283,7 +290,7 @@ PipelineResult run_pipeline(const Config& cfg, StopToken& stop, PhaseCallback on
             notify("Summarizing...", "Local LLM");
             try {
                 fs::path llm_path = ensure_llama_model(cfg.llm_model);
-                summary_text = summarize_local(transcript_text, llm_path, context_text, threads);
+                summary_text = summarize_local(input.transcript_text, llm_path, context_text, threads);
             } catch (const std::exception& e) {
                 log_warn("Local summary failed: %s", e.what());
             }
@@ -298,7 +305,7 @@ PipelineResult run_pipeline(const Config& cfg, StopToken& stop, PhaseCallback on
             }
             notify("Summarizing...", "Sending to " + cfg.api_model);
             try {
-                summary_text = summarize_http(transcript_text, url,
+                summary_text = summarize_http(input.transcript_text, url,
                                                cfg.api_key, cfg.api_model, context_text);
             } catch (const std::exception& e) {
                 log_warn("Summary failed: %s", e.what());
@@ -309,9 +316,9 @@ PipelineResult run_pipeline(const Config& cfg, StopToken& stop, PhaseCallback on
         }
 
         if (!summary_text.empty()) {
-            write_text_file(summary_path, summary_text);
-            pipe_result.summary_path = summary_path;
-            log_info("Summary saved: %s", summary_path.c_str());
+            write_text_file(input.summary_path, summary_text);
+            pipe_result.summary_path = input.summary_path;
+            log_info("Summary saved: %s", input.summary_path.c_str());
         }
     } else {
         log_info("Summary skipped (--no-summary).");
@@ -334,9 +341,9 @@ PipelineResult run_pipeline(const Config& cfg, StopToken& stop, PhaseCallback on
             md.date = date_buf;
             md.time = time_buf;
             md.summary_text = summary_text;
-            md.transcript_text = transcript_text;
+            md.transcript_text = input.transcript_text;
             md.context_text = context_text;
-            md.output_dir = out_dir;
+            md.output_dir = input.out_dir;
 
             pipe_result.obsidian_path = write_obsidian_note(cfg.obsidian, md);
         } catch (const std::exception& e) {
@@ -346,9 +353,14 @@ PipelineResult run_pipeline(const Config& cfg, StopToken& stop, PhaseCallback on
 
     // --- Done ---
     phase("complete");
-    notify("Meeting complete", out_dir.string());
-    fprintf(stderr, "\nDone! Files in: %s\n", out_dir.c_str());
+    notify("Meeting complete", input.out_dir.string());
+    fprintf(stderr, "\nDone! Files in: %s\n", input.out_dir.c_str());
     return pipe_result;
+}
+
+PipelineResult run_pipeline(const Config& cfg, StopToken& stop, PhaseCallback on_phase) {
+    auto input = run_recording(cfg, stop, on_phase);
+    return run_postprocessing(cfg, input, on_phase);
 }
 
 } // namespace recmeet

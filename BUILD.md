@@ -430,6 +430,14 @@ runs.
 | libnotify | `libnotify` | `libnotify-dev` | `libnotify-devel` |
 | AppIndicator | `libayatana-appindicator` | `libayatana-appindicator3-dev` | `libayatana-appindicator-gtk3-devel` |
 | GTK3 | `gtk3` | `libgtk-3-dev` | `gtk3-devel` |
+| onnxruntime ¹ | `onnxruntime-cpu` | `libonnxruntime-dev` | `onnxruntime-devel` |
+
+¹ **Recommended** when diarization is enabled (`RECMEET_USE_SHERPA=ON`, the
+default). sherpa-onnx bundles a pre-built static `libonnxruntime.a` compiled
+with GCC 11, whose `std::regex` ABI is incompatible with GCC 12+. Installing
+the system onnxruntime package (built with your host GCC) avoids a SIGABRT
+crash during speaker diarization. The build succeeds without it, but
+diarization will crash at runtime on GCC 12+ systems.
 
 ---
 
@@ -452,15 +460,15 @@ ninja -C build
 **CMake can't find a library** — Install the missing system dependency:
 ```bash
 # Arch
-sudo pacman -S pipewire libpulse libsndfile curl libnotify libayatana-appindicator gtk3
+sudo pacman -S pipewire libpulse libsndfile curl libnotify libayatana-appindicator gtk3 onnxruntime-cpu
 
 # Debian / Ubuntu
 sudo apt install libpipewire-0.3-dev libpulse-dev libsndfile1-dev libcurl4-openssl-dev \
-    libnotify-dev libayatana-appindicator3-dev libgtk-3-dev
+    libnotify-dev libayatana-appindicator3-dev libgtk-3-dev libonnxruntime-dev
 
 # Fedora / RHEL
 sudo dnf install pipewire-devel pulseaudio-libs-devel libsndfile-devel libcurl-devel \
-    libnotify-devel libayatana-appindicator-gtk3-devel gtk3-devel
+    libnotify-devel libayatana-appindicator-gtk3-devel gtk3-devel onnxruntime-devel
 ```
 
 **Tests fail with "[integration]" errors** — Those tests need a running

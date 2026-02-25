@@ -20,6 +20,8 @@
 #include <llama.h>
 #endif
 
+#include <algorithm>
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <mutex>
@@ -30,7 +32,6 @@ using namespace recmeet;
 // Icon names (standard icon theme)
 static const char* ICON_IDLE       = "audio-input-microphone";
 static const char* ICON_RECORDING  = "media-record";
-static const char* ICON_PROCESSING = "document-edit-symbolic";
 
 static const char* WHISPER_MODELS[] = {"tiny", "base", "small", "medium", "large-v3"};
 
@@ -52,6 +53,11 @@ static const LangEntry LANGUAGES[] = {
     {"it", "Italian"},
 };
 
+struct BackgroundJob {
+    int id;
+    std::string out_dir;  // for display
+};
+
 struct TrayState {
     AppIndicator* indicator = nullptr;
 
@@ -59,7 +65,10 @@ struct TrayState {
     StopToken stop;
     std::thread pipeline_thread;
 
-    enum State { IDLE, RECORDING, PROCESSING } state = IDLE;
+    enum State { IDLE, RECORDING } state = IDLE;
+
+    std::atomic<int> next_job_id{1};  // monotonic counter
+    std::vector<BackgroundJob> bg_jobs;  // GTK main thread only
 
     // Cached sources
     std::vector<AudioSource> mics;
@@ -102,25 +111,45 @@ static std::string source_label(const AudioSource& s) {
 
 static void set_state(TrayState::State new_state) {
     g_tray.state = new_state;
-    const char* icon = ICON_IDLE;
-    if (new_state == TrayState::RECORDING) icon = ICON_RECORDING;
-    else if (new_state == TrayState::PROCESSING) icon = ICON_PROCESSING;
+    const char* icon = (new_state == TrayState::RECORDING) ? ICON_RECORDING : ICON_IDLE;
     app_indicator_set_icon_full(g_tray.indicator, icon,
-        new_state == TrayState::RECORDING ? "Recording" :
-        new_state == TrayState::PROCESSING ? "Processing" : "Idle");
+        new_state == TrayState::RECORDING ? "Recording" : "Idle");
     build_menu();
 }
 
 // --- Pipeline callbacks (must be called from GTK main thread via g_idle_add) ---
 
-static gboolean on_pipeline_done(gpointer) {
-    set_state(TrayState::IDLE);
+struct RecordingDoneData {
+    int job_id;
+    std::string out_dir;
+};
+
+static gboolean on_recording_done(gpointer data) {
+    auto* d = static_cast<RecordingDoneData*>(data);
+    if (d) {
+        g_tray.bg_jobs.push_back({d->job_id, d->out_dir});
+        delete d;
+    }
+    set_state(TrayState::IDLE);  // calls build_menu()
     return G_SOURCE_REMOVE;
 }
 
-static gboolean on_pipeline_processing(gpointer) {
-    if (g_tray.state == TrayState::RECORDING)
-        set_state(TrayState::PROCESSING);
+struct PostprocessDoneData {
+    int job_id;
+    bool success;
+    std::string error_msg;
+    std::string out_dir;
+};
+
+static gboolean on_postprocess_done(gpointer data) {
+    auto* d = static_cast<PostprocessDoneData*>(data);
+    auto& jobs = g_tray.bg_jobs;
+    jobs.erase(std::remove_if(jobs.begin(), jobs.end(),
+        [&](const BackgroundJob& j) { return j.id == d->job_id; }), jobs.end());
+    if (!d->success)
+        notify("Processing failed", d->out_dir + ": " + d->error_msg);
+    build_menu();
+    delete d;
     return G_SOURCE_REMOVE;
 }
 
@@ -186,17 +215,39 @@ static void on_record(GtkMenuItem*, gpointer) {
             }
 #endif
 
-            auto on_phase = [](const std::string& phase) {
+            // Phase 1: Record + transcribe (blocks until stop)
+            auto on_rec_phase = [](const std::string& phase) {
                 log_info("[tray] Phase: %s", phase.c_str());
-                if (phase == "transcribing" || phase == "diarizing" || phase == "summarizing")
-                    g_idle_add(on_pipeline_processing, nullptr);
             };
-            run_pipeline(g_tray.cfg, g_tray.stop, on_phase);
+            auto pp_input = run_recording(g_tray.cfg, g_tray.stop, on_rec_phase);
+
+            // Snapshot config for background work (user may change settings)
+            Config cfg_copy = g_tray.cfg;
+            int job_id = g_tray.next_job_id++;
+
+            // Return tray to IDLE + register background job
+            g_idle_add(on_recording_done,
+                       new RecordingDoneData{job_id, pp_input.out_dir.string()});
+
+            // Phase 2: This thread becomes the background post-processing thread
+            auto* done = new PostprocessDoneData{job_id, true, "", pp_input.out_dir.string()};
+            try {
+                auto on_pp_phase = [](const std::string& phase) {
+                    log_info("[tray] BG Phase: %s", phase.c_str());
+                };
+                run_postprocessing(cfg_copy, pp_input, on_pp_phase);
+            } catch (const std::exception& e) {
+                done->success = false;
+                done->error_msg = e.what();
+            }
+            g_idle_add(on_postprocess_done, done);
+
         } catch (const std::exception& e) {
-            log_error("[tray] Pipeline error: %s", e.what());
+            // Recording failed — no background job to spawn
+            log_error("[tray] Recording error: %s", e.what());
             notify("Recording failed", e.what());
+            g_idle_add(on_recording_done, nullptr);  // nullptr = no job to register
         }
-        g_idle_add(on_pipeline_done, nullptr);
     });
     g_tray.pipeline_thread.detach();
 }
@@ -480,6 +531,10 @@ static void on_quit(GtkMenuItem*, gpointer) {
         g_tray.stop.request();
         std::this_thread::sleep_for(std::chrono::seconds(2));
     }
+    if (!g_tray.bg_jobs.empty())
+        log_warn("[tray] Quitting with %zu background job(s) still running. "
+                 "Use 'recmeet --reprocess <dir>' to retry.",
+                 g_tray.bg_jobs.size());
     gtk_main_quit();
 }
 
@@ -545,9 +600,10 @@ static void build_menu() {
     bool is_recording = (g_tray.state == TrayState::RECORDING);
 
     // --- Status label ---
-    const char* status_text = is_idle ? "Status: Idle" :
-        is_recording ? "Status: Recording..." : "Status: Processing...";
-    auto* status_item = gtk_menu_item_new_with_label(status_text);
+    std::string status = is_recording ? "Status: Recording..." : "Status: Idle";
+    if (!g_tray.bg_jobs.empty())
+        status += "  (" + std::to_string(g_tray.bg_jobs.size()) + " processing)";
+    auto* status_item = gtk_menu_item_new_with_label(status.c_str());
     gtk_widget_set_sensitive(status_item, FALSE);
     gtk_menu_shell_append(GTK_MENU_SHELL(menu), status_item);
 
@@ -558,13 +614,9 @@ static void build_menu() {
         auto* item = gtk_menu_item_new_with_label("Record");
         g_signal_connect(item, "activate", G_CALLBACK(on_record), nullptr);
         gtk_menu_shell_append(GTK_MENU_SHELL(menu), item);
-    } else if (is_recording) {
+    } else {
         auto* item = gtk_menu_item_new_with_label("Stop Recording");
         g_signal_connect(item, "activate", G_CALLBACK(on_stop), nullptr);
-        gtk_menu_shell_append(GTK_MENU_SHELL(menu), item);
-    } else {
-        auto* item = gtk_menu_item_new_with_label("Processing...");
-        gtk_widget_set_sensitive(item, FALSE);
         gtk_menu_shell_append(GTK_MENU_SHELL(menu), item);
     }
 

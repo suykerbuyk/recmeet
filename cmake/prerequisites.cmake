@@ -83,6 +83,11 @@ set(_RECMEET_PKG_arch_ayatana-appindicator3-0.1    "libayatana-appindicator")
 set(_RECMEET_PKG_debian_ayatana-appindicator3-0.1  "libayatana-appindicator3-dev")
 set(_RECMEET_PKG_fedora_ayatana-appindicator3-0.1  "libayatana-appindicator-gtk3-devel")
 
+# onnxruntime (not pkg-config; found via find_library by sherpa-onnx)
+set(_RECMEET_PKG_arch_onnxruntime     "onnxruntime-cpu")
+set(_RECMEET_PKG_debian_onnxruntime   "libonnxruntime-dev")
+set(_RECMEET_PKG_fedora_onnxruntime   "onnxruntime-devel")
+
 # ---------------------------------------------------------------------------
 # 3. recmeet_check_submodules() — fail early if git submodules are missing
 # ---------------------------------------------------------------------------
@@ -148,3 +153,28 @@ macro(recmeet_pkg_check _rm_prefix _rm_module)
             "Required library '${_rm_module}' not found (looked up via pkg-config).${_hint}")
     endif()
 endmacro()
+
+# ---------------------------------------------------------------------------
+# 6. recmeet_check_onnxruntime() — warn if system onnxruntime is missing
+# ---------------------------------------------------------------------------
+# sherpa-onnx's pre-built static libonnxruntime.a was compiled with GCC 11.
+# On GCC 12+ the std::regex ABI changed, causing SIGABRT in onnxruntime's
+# ParseSemVerVersion(). A system-installed onnxruntime (built with the host
+# GCC) avoids this. The build still succeeds without it — sherpa-onnx falls
+# back to the pre-built download — but diarization will crash at runtime.
+function(recmeet_check_onnxruntime)
+    find_library(_onnxrt_lib onnxruntime)
+    if(_onnxrt_lib)
+        message(STATUS "System onnxruntime found: ${_onnxrt_lib}")
+    else()
+        set(_hint "")
+        if(DEFINED _RECMEET_PKG_${RECMEET_DISTRO}_onnxruntime)
+            set(_pkg "${_RECMEET_PKG_${RECMEET_DISTRO}_onnxruntime}")
+            set(_hint "\n  Install it:\n    ${_RECMEET_INSTALL_CMD_${RECMEET_DISTRO}} ${_pkg}\n")
+        endif()
+        message(WARNING
+            "System onnxruntime not found. sherpa-onnx will use its pre-built "
+            "static library, which was compiled with GCC 11 and may crash "
+            "(SIGABRT in std::regex) on GCC 12+ due to ABI incompatibility.${_hint}")
+    endif()
+endfunction()

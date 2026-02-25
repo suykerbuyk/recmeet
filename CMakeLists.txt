@@ -81,6 +81,7 @@ endif()
 
 # Vendor: sherpa-onnx (speaker diarization)
 if(RECMEET_USE_SHERPA)
+    recmeet_check_onnxruntime()
     include(FetchContent)
     FetchContent_Declare(sherpa-onnx
         GIT_REPOSITORY https://github.com/suykerbuyk/sherpa-onnx.git
@@ -90,6 +91,12 @@ if(RECMEET_USE_SHERPA)
     set(SHERPA_ONNX_ENABLE_WEBSOCKET OFF CACHE BOOL "" FORCE)
     set(SHERPA_ONNX_ENABLE_BINARY OFF CACHE BOOL "" FORCE)
     set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
+    # Use system onnxruntime if available (e.g. Arch: pacman -S onnxruntime-cpu).
+    # The pre-built static libonnxruntime.a was compiled with GCC 11.2.1 (Red Hat),
+    # which has an ABI-incompatible std::regex with GCC 12+. Using the system
+    # package (built with the host GCC) avoids the SIGABRT in ParseSemVerVersion().
+    set(SHERPA_ONNX_USE_PRE_INSTALLED_ONNXRUNTIME_IF_AVAILABLE ON CACHE BOOL "" FORCE)
+    set(SHERPA_ONNX_LINK_LIBSTDCPP_STATICALLY OFF CACHE BOOL "" FORCE)
     # Suppress dev warnings from sherpa-onnx's cmake files:
     # CMP0169: FetchContent_Populate() deprecated in CMake 3.30 (used by onnxruntime, kaldi-* downloads)
     # CMP0177: install() DESTINATION "./" normalization in CMake 3.31 (sherpa-onnx.pc install)
