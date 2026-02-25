@@ -150,6 +150,92 @@ The `&&` ensures tests only run if the build succeeded.
 
 ---
 
+## Downloading models
+
+Unit tests require no models — they pass on a fresh checkout. Benchmark tests
+and normal operation need inference models downloaded to
+`~/.local/share/recmeet/models/`. recmeet downloads models on-demand when you
+run it, but you can also pre-download them manually.
+
+### Whisper models (transcription)
+
+The `base` model is the default and is required for benchmark tests. The `tiny`
+model is useful for quick smoke tests.
+
+```bash
+# Download whisper base model (142 MB) — needed for benchmarks
+mkdir -p ~/.local/share/recmeet/models/whisper
+curl -L -o ~/.local/share/recmeet/models/whisper/ggml-base.bin \
+    https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.bin
+
+# Download whisper tiny model (75 MB) — useful for quick tests
+curl -L -o ~/.local/share/recmeet/models/whisper/ggml-tiny.bin \
+    https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-tiny.bin
+```
+
+Available models: `tiny` (75 MB), `base` (142 MB), `small` (466 MB),
+`medium` (1.5 GB), `large-v3` (3.1 GB). Larger models are more accurate
+but slower.
+
+### Sherpa models (speaker diarization)
+
+Two models are needed for diarization — a Pyannote segmentation model and a
+3D-Speaker embedding model. Both are required for the diarization benchmark.
+
+```bash
+# Download segmentation model (5.8 MB, distributed as tarball)
+mkdir -p ~/.local/share/recmeet/models/sherpa/segmentation
+curl -L https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-segmentation-models/sherpa-onnx-pyannote-segmentation-3-0.tar.bz2 \
+    | tar xj -C ~/.local/share/recmeet/models/sherpa/segmentation --strip-components=1
+
+# Download embedding model (38 MB)
+mkdir -p ~/.local/share/recmeet/models/sherpa/embedding
+curl -L -o ~/.local/share/recmeet/models/sherpa/embedding/3dspeaker_speech_eres2net_base_sv_zh-cn_3dspeaker_16k.onnx \
+    https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/3dspeaker_speech_eres2net_base_sv_zh-cn_3dspeaker_16k.onnx
+```
+
+### LLM model (local summarization)
+
+Local summarization via llama.cpp requires a GGUF model file. There is no
+automatic download — you provide your own. Any instruction-tuned GGUF model
+works. For example, Qwen2.5-7B-Instruct Q4_K_M (~4.7 GB):
+
+```bash
+mkdir -p ~/.local/share/recmeet/models/llama
+curl -L -o ~/.local/share/recmeet/models/llama/Qwen2.5-7B-Instruct-Q4_K_M.gguf \
+    https://huggingface.co/Qwen/Qwen2.5-7B-Instruct-GGUF/resolve/main/qwen2.5-7b-instruct-q4_k_m.gguf
+```
+
+The local LLM benchmark test auto-discovers any `.gguf` file in the llama
+directory. If no GGUF file is present, that benchmark is skipped.
+
+### All-in-one: download everything for benchmarks
+
+```bash
+# Whisper base + sherpa models (needed for 3 of 5 benchmarks)
+mkdir -p ~/.local/share/recmeet/models/{whisper,sherpa/segmentation,sherpa/embedding}
+curl -L -o ~/.local/share/recmeet/models/whisper/ggml-base.bin \
+    https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.bin
+curl -L https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-segmentation-models/sherpa-onnx-pyannote-segmentation-3-0.tar.bz2 \
+    | tar xj -C ~/.local/share/recmeet/models/sherpa/segmentation --strip-components=1
+curl -L -o ~/.local/share/recmeet/models/sherpa/embedding/3dspeaker_speech_eres2net_base_sv_zh-cn_3dspeaker_16k.onnx \
+    https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/3dspeaker_speech_eres2net_base_sv_zh-cn_3dspeaker_16k.onnx
+```
+
+The remaining 2 benchmarks need a local LLM GGUF (see above) and an API key
+(`XAI_API_KEY` for the Grok API benchmark).
+
+### Verify models are in place
+
+```bash
+ls -lh ~/.local/share/recmeet/models/whisper/
+ls -lh ~/.local/share/recmeet/models/sherpa/segmentation/model.onnx
+ls -lh ~/.local/share/recmeet/models/sherpa/embedding/
+ls -lh ~/.local/share/recmeet/models/llama/   # optional
+```
+
+---
+
 ## CMake options
 
 recmeet has four build options you can toggle at configure time. All features
