@@ -84,8 +84,8 @@ if(RECMEET_USE_SHERPA)
     recmeet_check_onnxruntime()
     include(FetchContent)
     FetchContent_Declare(sherpa-onnx
-        GIT_REPOSITORY https://github.com/suykerbuyk/sherpa-onnx.git
-        GIT_TAG fix/gcc15-deprecation-warnings
+        GIT_REPOSITORY https://github.com/k2-fsa/sherpa-onnx.git
+        GIT_TAG v1.12.27
     )
     set(SHERPA_ONNX_ENABLE_TTS OFF CACHE BOOL "" FORCE)
     set(SHERPA_ONNX_ENABLE_WEBSOCKET OFF CACHE BOOL "" FORCE)

@@ -571,18 +571,3 @@ sudo pacman -S ccache
 ```
 
 ---
-
-## Upstream dependency note
-
-sherpa-onnx is currently fetched from a fork (`suykerbuyk/sherpa-onnx`, branch
-`fix/gcc15-deprecation-warnings`) rather than the upstream `k2-fsa/sherpa-onnx`
-repository. This fork carries a GCC 15 deprecation warning fix submitted as
-upstream PR [#3216](https://github.com/k2-fsa/sherpa-onnx/pull/3216).
-
-Once that PR merges, update `CMakeLists.txt`:
-- Change `GIT_REPOSITORY` from the fork URL to `https://github.com/k2-fsa/sherpa-onnx.git`
-- Change `GIT_TAG` from `fix/gcc15-deprecation-warnings` to a release tag or commit on upstream
-
-The recmeet-side CMake workarounds (`CMP0169`, `CMP0177`, `CMAKE_WARN_DEPRECATED`)
-were added to suppress policy warnings from sherpa-onnx's build system. Once
-upstream adopts modern CMake policies, these may be removable.
