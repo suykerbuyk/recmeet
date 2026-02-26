@@ -20,7 +20,7 @@ struct PipelineResult {
 struct PostprocessInput {
     fs::path out_dir;
     fs::path audio_path;
-    std::string transcript_text;
+    std::string transcript_text;  ///< If empty, postprocessing will transcribe from audio_path.
 };
 
 /// Phase callback — called with phase name: "recording", "transcribing", "diarizing", "summarizing", "complete".
@@ -29,13 +29,12 @@ using PhaseCallback = std::function<void(const std::string&)>;
 /// Read entire file as string. Returns empty if missing or unreadable.
 std::string read_context_file(const fs::path& path);
 
-/// Record + transcribe + diarize. Returns populated PostprocessInput.
-/// Phase callbacks emitted: "recording", "transcribing", "diarizing".
+/// Record audio. Phase: "recording". For --reprocess, resolves paths only.
 PostprocessInput run_recording(const Config& cfg, StopToken& stop,
                                PhaseCallback on_phase = nullptr);
 
-/// Summarize + note output. Runs to completion (no StopToken).
-/// Phase callbacks emitted: "summarizing", "complete".
+/// Transcribe + diarize + summarize + note. Runs to completion (no StopToken).
+/// Phases: "transcribing", "diarizing", "summarizing", "complete".
 PipelineResult run_postprocessing(const Config& cfg, const PostprocessInput& input,
                                   PhaseCallback on_phase = nullptr);
 

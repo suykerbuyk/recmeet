@@ -56,9 +56,6 @@ PostprocessInput run_recording(const Config& cfg, StopToken& stop, PhaseCallback
         if (on_phase) on_phase(name);
     };
 
-    int threads = cfg.threads > 0 ? cfg.threads : default_thread_count();
-    log_info("Using %d threads for inference.", threads);
-
     PostprocessInput pp;
 
     if (!cfg.reprocess_dir.empty()) {
@@ -79,27 +76,8 @@ PostprocessInput run_recording(const Config& cfg, StopToken& stop, PhaseCallback
             pp.out_dir = source_dir;
         }
         log_info("Reprocessing: %s", pp.out_dir.c_str());
-
-        // Transcribe from source audio
-        phase("transcribing");
-        notify("Transcribing...", "Model: " + cfg.whisper_model);
-        fs::path model_path = ensure_whisper_model(cfg.whisper_model);
-        auto result = transcribe(model_path, pp.audio_path, cfg.language, threads);
-
-#if RECMEET_USE_SHERPA
-        if (cfg.diarize) {
-            phase("diarizing");
-            notify("Diarizing...", "Identifying speakers");
-            auto diar = diarize(pp.audio_path, cfg.num_speakers, threads, cfg.cluster_threshold);
-            result.segments = merge_speakers(result.segments, diar);
-        }
-#endif
-
-        pp.transcript_text = result.to_string();
-        if (pp.transcript_text.empty())
-            throw RecmeetError("Transcription produced no text.");
     } else {
-        // --- Normal mode: detect sources, record, transcribe ---
+        // --- Normal mode: detect sources, record audio ---
 
         // --- Detect sources ---
         std::string mic_source = cfg.mic_source;
@@ -243,25 +221,6 @@ PostprocessInput run_recording(const Config& cfg, StopToken& stop, PhaseCallback
             validate_audio(pp.audio_path);
         }
 
-        // --- Transcribe ---
-        phase("transcribing");
-        notify("Transcribing...", "Model: " + cfg.whisper_model);
-
-        fs::path model_path = ensure_whisper_model(cfg.whisper_model);
-        auto result = transcribe(model_path, pp.audio_path, cfg.language, threads);
-
-#if RECMEET_USE_SHERPA
-        if (cfg.diarize) {
-            phase("diarizing");
-            notify("Diarizing...", "Identifying speakers");
-            auto diar = diarize(pp.audio_path, cfg.num_speakers, threads, cfg.cluster_threshold);
-            result.segments = merge_speakers(result.segments, diar);
-        }
-#endif
-
-        pp.transcript_text = result.to_string();
-        if (pp.transcript_text.empty())
-            throw RecmeetError("Transcription produced no text.");
     }
 
     return pp;
@@ -274,6 +233,31 @@ PipelineResult run_postprocessing(const Config& cfg, const PostprocessInput& inp
     };
 
     int threads = cfg.threads > 0 ? cfg.threads : default_thread_count();
+
+    // --- Transcribe + Diarize (if not pre-computed) ---
+    std::string transcript_text = input.transcript_text;
+
+    if (transcript_text.empty()) {
+        phase("transcribing");
+        notify("Transcribing...", "Model: " + cfg.whisper_model);
+        log_info("Using %d threads for inference.", threads);
+
+        fs::path model_path = ensure_whisper_model(cfg.whisper_model);
+        auto result = transcribe(model_path, input.audio_path, cfg.language, threads);
+
+#if RECMEET_USE_SHERPA
+        if (cfg.diarize) {
+            phase("diarizing");
+            notify("Diarizing...", "Identifying speakers");
+            auto diar = diarize(input.audio_path, cfg.num_speakers, threads, cfg.cluster_threshold);
+            result.segments = merge_speakers(result.segments, diar);
+        }
+#endif
+
+        transcript_text = result.to_string();
+        if (transcript_text.empty())
+            throw RecmeetError("Transcription produced no text.");
+    }
 
     // --- Summarize ---
     PipelineResult pipe_result;
@@ -293,7 +277,7 @@ PipelineResult run_postprocessing(const Config& cfg, const PostprocessInput& inp
             notify("Summarizing...", "Local LLM");
             try {
                 fs::path llm_path = ensure_llama_model(cfg.llm_model);
-                summary_text = summarize_local(input.transcript_text, llm_path, context_text, threads);
+                summary_text = summarize_local(transcript_text, llm_path, context_text, threads);
             } catch (const std::exception& e) {
                 log_warn("Local summary failed: %s", e.what());
             }
@@ -308,7 +292,7 @@ PipelineResult run_postprocessing(const Config& cfg, const PostprocessInput& inp
             }
             notify("Summarizing...", "Sending to " + cfg.api_model);
             try {
-                summary_text = summarize_http(input.transcript_text, url,
+                summary_text = summarize_http(transcript_text, url,
                                                cfg.api_key, cfg.api_model, context_text);
             } catch (const std::exception& e) {
                 log_warn("Summary failed: %s", e.what());
@@ -342,7 +326,7 @@ PipelineResult run_postprocessing(const Config& cfg, const PostprocessInput& inp
         md.date = date_buf;
         md.time = time_buf;
         md.summary_text = summary_text;
-        md.transcript_text = input.transcript_text;
+        md.transcript_text = transcript_text;
         md.context_text = context_text;
         md.output_dir = input.out_dir;
 
