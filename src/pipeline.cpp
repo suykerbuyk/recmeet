@@ -78,9 +78,6 @@ PostprocessInput run_recording(const Config& cfg, StopToken& stop, PhaseCallback
         } else {
             pp.out_dir = source_dir;
         }
-        pp.transcript_path = pp.out_dir / "transcript.txt";
-        pp.summary_path = pp.out_dir / "summary.md";
-
         log_info("Reprocessing: %s", pp.out_dir.c_str());
 
         // Transcribe from source audio
@@ -101,8 +98,6 @@ PostprocessInput run_recording(const Config& cfg, StopToken& stop, PhaseCallback
         pp.transcript_text = result.to_string();
         if (pp.transcript_text.empty())
             throw RecmeetError("Transcription produced no text.");
-        write_text_file(pp.transcript_path, pp.transcript_text);
-        log_info("Transcript saved: %s", pp.transcript_path.c_str());
     } else {
         // --- Normal mode: detect sources, record, transcribe ---
 
@@ -147,8 +142,6 @@ PostprocessInput run_recording(const Config& cfg, StopToken& stop, PhaseCallback
         log_info("Output directory: %s", pp.out_dir.c_str());
 
         pp.audio_path = pp.out_dir / "audio.wav";
-        pp.transcript_path = pp.out_dir / "transcript.txt";
-        pp.summary_path = pp.out_dir / "summary.md";
 
         // --- Record ---
         phase("recording");
@@ -222,6 +215,12 @@ PostprocessInput run_recording(const Config& cfg, StopToken& stop, PhaseCallback
                 log_warn("Monitor audio unusable (%s). Using mic only.", e.what());
                 write_wav(pp.audio_path, mic_samples);
             }
+
+            // Clean up source files unless --keep-sources
+            if (!cfg.keep_sources) {
+                fs::remove(mic_path);
+                fs::remove(mon_path);
+            }
         } else {
             notify("Recording started", "Source: " + mic_source);
 
@@ -263,9 +262,6 @@ PostprocessInput run_recording(const Config& cfg, StopToken& stop, PhaseCallback
         pp.transcript_text = result.to_string();
         if (pp.transcript_text.empty())
             throw RecmeetError("Transcription produced no text.");
-
-        write_text_file(pp.transcript_path, pp.transcript_text);
-        log_info("Transcript saved: %s", pp.transcript_path.c_str());
     }
 
     return pp;
@@ -281,7 +277,6 @@ PipelineResult run_postprocessing(const Config& cfg, const PostprocessInput& inp
 
     // --- Summarize ---
     PipelineResult pipe_result;
-    pipe_result.transcript_path = input.transcript_path;
     pipe_result.output_dir = input.out_dir;
 
     std::string summary_text;
@@ -325,9 +320,6 @@ PipelineResult run_postprocessing(const Config& cfg, const PostprocessInput& inp
 
         if (!summary_text.empty()) {  // NOLINT(readability-misleading-indentation)
             metadata = extract_meeting_metadata(summary_text);
-            write_text_file(input.summary_path, summary_text);
-            pipe_result.summary_path = input.summary_path;
-            log_info("Summary saved: %s", input.summary_path.c_str());
             summary_text = strip_metadata_block(summary_text);
         }
     } else {

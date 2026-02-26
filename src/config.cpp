@@ -133,6 +133,7 @@ Config load_config(const fs::path& config_path) {
     cfg.mic_source = get_val(entries, "audio", "mic_source", "");
     cfg.monitor_source = get_val(entries, "audio", "monitor_source", "");
     cfg.mic_only = get_bool(entries, "audio", "mic_only", false);
+    cfg.keep_sources = get_bool(entries, "audio", "keep_sources", false);
 
     // Transcription section
     cfg.whisper_model = get_val(entries, "transcription", "model", cfg.whisper_model);
@@ -201,6 +202,8 @@ void save_config(const Config& cfg, const fs::path& config_path) {
         out << "  monitor_source: \"" << cfg.monitor_source << "\"\n";
     if (cfg.mic_only)
         out << "  mic_only: true\n";
+    if (cfg.keep_sources)
+        out << "  keep_sources: true\n";
 
     out << "\ntranscription:\n"
         << "  model: " << cfg.whisper_model << "\n";

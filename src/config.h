@@ -32,6 +32,7 @@ struct Config {
     std::string mic_source;     // empty = auto-detect
     std::string monitor_source; // empty = auto-detect
     bool mic_only = false;
+    bool keep_sources = false;  // Keep mic.wav and monitor.wav after mixing
 
     // Transcription
     std::string whisper_model = "base";

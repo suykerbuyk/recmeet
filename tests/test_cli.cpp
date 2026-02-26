@@ -158,6 +158,16 @@ TEST_CASE("parse_cli: default threads is 0", "[cli]") {
     CHECK(cli.cfg.threads == 0);
 }
 
+TEST_CASE("parse_cli: --keep-sources sets keep_sources", "[cli]") {
+    auto cli = run_cli({"recmeet", "--keep-sources"});
+    CHECK(cli.cfg.keep_sources == true);
+}
+
+TEST_CASE("parse_cli: default keep_sources is false", "[cli]") {
+    auto cli = run_cli({"recmeet"});
+    CHECK(cli.cfg.keep_sources == false);
+}
+
 TEST_CASE("parse_cli: --log-level sets log level", "[cli]") {
     auto cli = run_cli({"recmeet", "--log-level", "info"});
     CHECK(cli.cfg.log_level_str == "info");

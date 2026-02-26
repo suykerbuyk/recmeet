@@ -32,6 +32,7 @@ static void print_usage() {
         "  --source NAME        PipeWire/PulseAudio mic source (auto-detect if omitted)\n"
         "  --monitor NAME       Monitor/speaker source (auto-detect if omitted)\n"
         "  --mic-only           Record mic only (skip monitor capture)\n"
+        "  --keep-sources       Keep separate mic.wav and monitor.wav after mixing\n"
         "  --model NAME         Whisper model: tiny/base/small/medium/large-v3 (default: base)\n"
         "  --language CODE      Force whisper language (e.g. en, de, ja; default: auto-detect)\n"
         "  --output-dir DIR     Base directory for outputs (default: ./meetings)\n"

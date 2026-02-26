@@ -12,8 +12,6 @@
 namespace recmeet {
 
 struct PipelineResult {
-    fs::path transcript_path;
-    fs::path summary_path;   // empty if no summary
     fs::path note_path;
     fs::path output_dir;
 };
@@ -22,8 +20,6 @@ struct PipelineResult {
 struct PostprocessInput {
     fs::path out_dir;
     fs::path audio_path;
-    fs::path transcript_path;
-    fs::path summary_path;
     std::string transcript_text;
 };
 

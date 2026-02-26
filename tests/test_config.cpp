@@ -23,6 +23,7 @@ TEST_CASE("save_config + load_config round-trip", "[config]") {
     cfg.mic_source = "alsa_input.test";
     cfg.monitor_source = "alsa_output.test.monitor";
     cfg.mic_only = true;
+    cfg.keep_sources = true;
     cfg.whisper_model = "small";
     cfg.language = "en";
     cfg.provider = "openai";
@@ -49,6 +50,7 @@ TEST_CASE("save_config + load_config round-trip", "[config]") {
     CHECK(content.find("mic_source: \"alsa_input.test\"") != std::string::npos);
     CHECK(content.find("monitor_source: \"alsa_output.test.monitor\"") != std::string::npos);
     CHECK(content.find("mic_only: true") != std::string::npos);
+    CHECK(content.find("keep_sources: true") != std::string::npos);
     CHECK(content.find("model: small") != std::string::npos);
     CHECK(content.find("language: en") != std::string::npos);
     CHECK(content.find("provider: openai") != std::string::npos);
@@ -69,6 +71,7 @@ TEST_CASE("save_config + load_config round-trip", "[config]") {
     CHECK(loaded.mic_source == "alsa_input.test");
     CHECK(loaded.monitor_source == "alsa_output.test.monitor");
     CHECK(loaded.mic_only == true);
+    CHECK(loaded.keep_sources == true);
     CHECK(loaded.whisper_model == "small");
     CHECK(loaded.language == "en");
     CHECK(loaded.provider == "openai");
@@ -96,6 +99,7 @@ TEST_CASE("load_config: returns defaults when no file exists", "[config]") {
     CHECK(cfg.api_url.empty());
     CHECK(cfg.api_model == "grok-3");
     CHECK(cfg.mic_only == false);
+    CHECK(cfg.keep_sources == false);
     CHECK(cfg.no_summary == false);
     CHECK(cfg.diarize == true);
     CHECK(cfg.num_speakers == 0);

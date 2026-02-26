@@ -13,6 +13,7 @@ CliResult parse_cli(int argc, char* argv[]) {
         {"source",         required_argument, nullptr, 's'},
         {"monitor",        required_argument, nullptr, 'm'},
         {"mic-only",       no_argument,       nullptr, 'M'},
+        {"keep-sources",   no_argument,       nullptr, 'K'},
         {"model",          required_argument, nullptr, 'W'},
         {"output-dir",     required_argument, nullptr, 'o'},
         {"api-key",        required_argument, nullptr, 'k'},
@@ -46,6 +47,7 @@ CliResult parse_cli(int argc, char* argv[]) {
             case 's': result.cfg.mic_source = optarg; break;
             case 'm': result.cfg.monitor_source = optarg; break;
             case 'M': result.cfg.mic_only = true; break;
+            case 'K': result.cfg.keep_sources = true; break;
             case 'W': result.cfg.whisper_model = optarg; break;
             case 'o': result.cfg.output_dir = optarg; result.cfg.output_dir_explicit = true; break;
             case 'k': result.cfg.api_key = optarg; break;
