@@ -213,6 +213,15 @@ static void on_record(GtkMenuItem*, gpointer) {
                 notify("Models ready",
                        "Speaker diarization models downloaded.");
             }
+
+            // Pre-check: download VAD model if enabled
+            if (g_tray.cfg.vad && !is_vad_model_cached()) {
+                notify("Downloading model",
+                       "Silero VAD model — please wait...");
+                ensure_vad_model();
+                notify("Model ready",
+                       "VAD model downloaded.");
+            }
 #endif
 
             // Phase 1: Record + transcribe (blocks until stop)
@@ -300,6 +309,11 @@ static void on_no_summary_toggled(GtkCheckMenuItem* item, gpointer) {
 #if RECMEET_USE_SHERPA
 static void on_diarize_toggled(GtkCheckMenuItem* item, gpointer) {
     g_tray.cfg.diarize = gtk_check_menu_item_get_active(item);
+    save_config(g_tray.cfg);
+}
+
+static void on_vad_toggled(GtkCheckMenuItem* item, gpointer) {
+    g_tray.cfg.vad = gtk_check_menu_item_get_active(item);
     save_config(g_tray.cfg);
 }
 #endif
@@ -728,6 +742,13 @@ static void build_menu() {
         auto* item = gtk_check_menu_item_new_with_label("Speaker Diarization");
         gtk_check_menu_item_set_active(GTK_CHECK_MENU_ITEM(item), g_tray.cfg.diarize);
         g_signal_connect(item, "toggled", G_CALLBACK(on_diarize_toggled), nullptr);
+        if (!is_idle) gtk_widget_set_sensitive(item, FALSE);
+        gtk_menu_shell_append(GTK_MENU_SHELL(menu), item);
+    }
+    {
+        auto* item = gtk_check_menu_item_new_with_label("VAD Segmentation");
+        gtk_check_menu_item_set_active(GTK_CHECK_MENU_ITEM(item), g_tray.cfg.vad);
+        g_signal_connect(item, "toggled", G_CALLBACK(on_vad_toggled), nullptr);
         if (!is_idle) gtk_widget_set_sensitive(item, FALSE);
         gtk_menu_shell_append(GTK_MENU_SHELL(menu), item);
     }

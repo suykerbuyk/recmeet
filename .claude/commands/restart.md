@@ -6,6 +6,7 @@ references in referenced order to restore full project context:
 1. `RESUME.md` — project purpose, architecture, design decisions, test results
 2. `BUILD.md` — build system tutorial (CMake/Ninja)
 3. `tasks/*.md` — open bugs and planned improvements
+4. `HISTORY.md` — iteration narratives and completed plans (read on demand, not required for routine work)
 
 After reading, briefly confirm what you loaded and note the current state:
 test count, open tasks, and what was last worked on based on recent git history.

@@ -29,6 +29,8 @@ CliResult parse_cli(int argc, char* argv[]) {
         {"no-diarize",     no_argument,       nullptr, 'D'},
         {"num-speakers",   required_argument, nullptr, 'S'},
         {"cluster-threshold", required_argument, nullptr, 'C'},
+        {"no-vad",         no_argument,       nullptr, 'V'},
+        {"vad-threshold",  required_argument, nullptr, 'B'},
         {"threads",        required_argument, nullptr, 'T'},
         {"log-level",      required_argument, nullptr, 'E'},
         {"log-dir",        required_argument, nullptr, 'F'},
@@ -63,6 +65,8 @@ CliResult parse_cli(int argc, char* argv[]) {
             case 'D': result.cfg.diarize = false; break;
             case 'S': result.cfg.num_speakers = std::atoi(optarg); break;
             case 'C': result.cfg.cluster_threshold = std::atof(optarg); break;
+            case 'V': result.cfg.vad = false; break;
+            case 'B': result.cfg.vad_threshold = std::atof(optarg); break;
             case 'T': result.cfg.threads = std::atoi(optarg); break;
             case 'E': result.cfg.log_level_str = optarg; break;
             case 'F': result.cfg.log_dir = optarg; break;

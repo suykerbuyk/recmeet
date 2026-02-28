@@ -127,6 +127,7 @@ set(CORE_SOURCES
     src/pipeline.cpp
     src/cli.cpp
     src/diarize.cpp
+    src/vad.cpp
 )
 
 add_library(recmeet_core STATIC ${CORE_SOURCES})
@@ -204,6 +205,7 @@ if(RECMEET_BUILD_TESTS)
         tests/test_cli.cpp
         tests/test_benchmark.cpp
         tests/test_diarize.cpp
+        tests/test_vad.cpp
     )
     target_link_libraries(recmeet_tests PRIVATE recmeet_core Catch2::Catch2WithMain)
     catch_discover_tests(recmeet_tests)

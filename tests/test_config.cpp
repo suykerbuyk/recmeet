@@ -105,6 +105,11 @@ TEST_CASE("load_config: returns defaults when no file exists", "[config]") {
     CHECK(cfg.num_speakers == 0);
     CHECK(cfg.cluster_threshold == 1.18f);
     CHECK(cfg.threads == 0);
+    CHECK(cfg.vad == true);
+    CHECK(cfg.vad_threshold == 0.5f);
+    CHECK(cfg.vad_min_silence == 0.5f);
+    CHECK(cfg.vad_min_speech == 0.25f);
+    CHECK(cfg.vad_max_speech == 30.0f);
 }
 
 TEST_CASE("load_config: handles malformed YAML gracefully", "[config]") {

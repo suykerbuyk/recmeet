@@ -35,6 +35,13 @@ bool is_sherpa_model_cached();
 /// Ensure sherpa diarization models are available, downloading if needed.
 /// Returns paths to the segmentation and embedding model files.
 SherpaModelPaths ensure_sherpa_models();
+
+/// Check whether the Silero VAD model is cached locally.
+bool is_vad_model_cached();
+
+/// Ensure the Silero VAD model is available, downloading if needed.
+/// Returns the path to silero_vad.onnx.
+fs::path ensure_vad_model();
 #endif
 
 } // namespace recmeet

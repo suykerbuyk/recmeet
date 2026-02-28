@@ -7,6 +7,11 @@ Specifically:
 - Compare against the actual codebase state (files, tests, architecture)
 - Update all sections that are stale: file inventory, test counts, module
   descriptions, architecture diagrams, design decisions, and test results
+- Append a new iteration narrative to HISTORY.md describing what changed
+  in this session and why (past tense, technical detail)
+- Add a corresponding summary row to the Project History table in RESUME.md
+- Move any completed plans from RESUME.md to the Completed Plans section
+  in HISTORY.md, replacing them with a single-line pointer
 - Retire completed tasks: check each file in tasks/ (not tasks/done/) against
   the session's work and RESUME.md history — if a task has been implemented and
   committed, update its status to "Done", move it to tasks/done/, and update

@@ -162,6 +162,35 @@ SherpaModelPaths ensure_sherpa_models() {
 
     return {seg, emb};
 }
+
+// --- VAD (Silero) ---
+
+namespace {
+
+const char* SILERO_VAD_URL =
+    "https://github.com/k2-fsa/sherpa-onnx/releases/download/"
+    "asr-models/silero_vad.onnx";
+
+fs::path vad_model_path() {
+    return models_dir() / "sherpa" / "vad" / "silero_vad.onnx";
+}
+
+} // anonymous namespace
+
+bool is_vad_model_cached() {
+    auto p = vad_model_path();
+    return fs::exists(p) && fs::file_size(p) > 0;
+}
+
+fs::path ensure_vad_model() {
+    auto p = vad_model_path();
+    if (fs::exists(p) && fs::file_size(p) > 0)
+        return p;
+
+    fs::create_directories(p.parent_path());
+    download_file(SILERO_VAD_URL, p);
+    return p;
+}
 #endif
 
 } // namespace recmeet

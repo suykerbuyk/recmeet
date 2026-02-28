@@ -74,19 +74,16 @@ WhisperModel& WhisperModel::operator=(WhisperModel&& other) noexcept {
 // Transcription
 // ---------------------------------------------------------------------------
 
-TranscriptResult transcribe(WhisperModel& model, const fs::path& audio_path,
+TranscriptResult transcribe(WhisperModel& model, const float* samples,
+                            size_t num_samples, double offset_seconds,
                             const std::string& language, int threads) {
     whisper_context* ctx = model.get();
-
-    // Read audio as float32 [-1, 1]
-    auto samples = read_wav_float(audio_path);
-    log_info("Audio: %.1fs (%zu samples)",
-            samples.size() / (float)SAMPLE_RATE, samples.size());
 
     // Set up whisper params
     whisper_full_params wparams = whisper_full_default_params(WHISPER_SAMPLING_GREEDY);
     wparams.n_threads = threads > 0 ? threads : default_thread_count();
-    wparams.print_progress = isatty(STDERR_FILENO);
+    // Suppress progress for buffer-based calls (too noisy for many VAD segments)
+    wparams.print_progress = (offset_seconds == 0.0) && isatty(STDERR_FILENO);
     wparams.print_timestamps = false;
 
     // Relax no-speech suppression — default logprob_thold (-1.0) can be too
@@ -100,14 +97,12 @@ TranscriptResult transcribe(WhisperModel& model, const fs::path& audio_path,
             throw RecmeetError("Unknown language code: " + language);
         wparams.language = language.c_str();
         wparams.detect_language = false;
-        log_info("Language forced: %s", language.c_str());
     } else {
         wparams.language = nullptr;
         wparams.detect_language = false;
     }
 
-    log_info("Transcribing...");
-    int ret = whisper_full(ctx, wparams, samples.data(), samples.size());
+    int ret = whisper_full(ctx, wparams, samples, static_cast<int>(num_samples));
     if (ret != 0)
         throw RecmeetError("Whisper transcription failed (code " + std::to_string(ret) + ")");
 
@@ -116,8 +111,8 @@ TranscriptResult transcribe(WhisperModel& model, const fs::path& audio_path,
     int n_segments = whisper_full_n_segments(ctx);
     for (int i = 0; i < n_segments; ++i) {
         TranscriptSegment seg;
-        seg.start = whisper_full_get_segment_t0(ctx, i) / 100.0;
-        seg.end   = whisper_full_get_segment_t1(ctx, i) / 100.0;
+        seg.start = whisper_full_get_segment_t0(ctx, i) / 100.0 + offset_seconds;
+        seg.end   = whisper_full_get_segment_t1(ctx, i) / 100.0 + offset_seconds;
         seg.text  = whisper_full_get_segment_text(ctx, i);
 
         // Trim leading/trailing whitespace
@@ -136,6 +131,22 @@ TranscriptResult transcribe(WhisperModel& model, const fs::path& audio_path,
     int lang_id = whisper_full_lang_id(ctx);
     result.language = whisper_lang_str(lang_id);
     result.language_prob = 0.0f; // whisper.cpp doesn't expose per-segment lang probs easily
+
+    return result;
+}
+
+TranscriptResult transcribe(WhisperModel& model, const fs::path& audio_path,
+                            const std::string& language, int threads) {
+    // Read audio as float32 [-1, 1]
+    auto samples = read_wav_float(audio_path);
+    log_info("Audio: %.1fs (%zu samples)",
+            samples.size() / (float)SAMPLE_RATE, samples.size());
+
+    if (!language.empty())
+        log_info("Language forced: %s", language.c_str());
+
+    log_info("Transcribing...");
+    auto result = transcribe(model, samples.data(), samples.size(), 0.0, language, threads);
 
     log_info("Transcribed %d segments (language: %s)",
             (int)result.segments.size(), result.language.c_str());

@@ -168,6 +168,26 @@ TEST_CASE("parse_cli: default keep_sources is false", "[cli]") {
     CHECK(cli.cfg.keep_sources == false);
 }
 
+TEST_CASE("parse_cli: --no-vad disables vad", "[cli]") {
+    auto cli = run_cli({"recmeet", "--no-vad"});
+    CHECK(cli.cfg.vad == false);
+}
+
+TEST_CASE("parse_cli: default vad is true", "[cli]") {
+    auto cli = run_cli({"recmeet"});
+    CHECK(cli.cfg.vad == true);
+}
+
+TEST_CASE("parse_cli: --vad-threshold sets vad_threshold", "[cli]") {
+    auto cli = run_cli({"recmeet", "--vad-threshold", "0.3"});
+    CHECK(cli.cfg.vad_threshold == 0.3f);
+}
+
+TEST_CASE("parse_cli: default vad_threshold is 0.5", "[cli]") {
+    auto cli = run_cli({"recmeet"});
+    CHECK(cli.cfg.vad_threshold == 0.5f);
+}
+
 TEST_CASE("parse_cli: --log-level sets log level", "[cli]") {
     auto cli = run_cli({"recmeet", "--log-level", "info"});
     CHECK(cli.cfg.log_level_str == "info");

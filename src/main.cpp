@@ -47,6 +47,8 @@ static void print_usage() {
         "  --no-diarize         Disable speaker diarization\n"
         "  --num-speakers N     Number of speakers (0 = auto-detect, default: 0)\n"
         "  --cluster-threshold F  Clustering distance threshold (default: 1.18, higher = fewer speakers)\n"
+        "  --no-vad             Disable VAD segmentation (transcribe full audio)\n"
+        "  --vad-threshold F    VAD speech detection threshold (default: 0.5)\n"
         "  --threads N          Number of CPU threads for inference (0 = auto-detect, default: 0)\n"
         "  --reprocess DIR      Reprocess existing recording from audio.wav\n"
         "  --log-level LEVEL    Log level: none, error, warn, info (default: none)\n"
@@ -182,6 +184,34 @@ int main(int argc, char* argv[]) {
         fprintf(stderr, "Warning: Diarization requires sherpa-onnx support (not compiled in).\n");
         fprintf(stderr, "Rebuild with: cmake -DRECMEET_USE_SHERPA=ON, or use --no-diarize to suppress.\n");
         cfg.diarize = false;
+#endif
+    }
+
+    // Pre-check: VAD model
+    if (cfg.vad) {
+#if RECMEET_USE_SHERPA
+        if (!is_vad_model_cached()) {
+            fprintf(stderr, "VAD model (Silero) not found locally.\n");
+            fprintf(stderr, "Download now? (~2 MB) [Y/n] ");
+            int ch = getchar();
+            if (ch == 'n' || ch == 'N') {
+                fprintf(stderr, "VAD disabled.\n");
+                cfg.vad = false;
+            } else {
+                try {
+                    ensure_vad_model();
+                    fprintf(stderr, "VAD model ready.\n\n");
+                } catch (const RecmeetError& e) {
+                    fprintf(stderr, "Error downloading VAD model: %s\n", e.what());
+                    fprintf(stderr, "VAD disabled.\n");
+                    cfg.vad = false;
+                }
+            }
+        }
+#else
+        fprintf(stderr, "Warning: VAD requires sherpa-onnx support (not compiled in).\n");
+        fprintf(stderr, "Rebuild with: cmake -DRECMEET_USE_SHERPA=ON, or use --no-vad to suppress.\n");
+        cfg.vad = false;
 #endif
     }
 

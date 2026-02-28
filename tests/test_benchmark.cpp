@@ -4,8 +4,10 @@
 #include <catch2/catch_test_macros.hpp>
 #include "diarize.h"
 #include "transcribe.h"
+#include "vad.h"
 #include "summarize.h"
 #include "model_manager.h"
+#include "audio_file.h"
 #include "util.h"
 
 #include <algorithm>
@@ -350,6 +352,110 @@ TEST_CASE("Diarize debate audio with sherpa-onnx", "[benchmark]") {
     CHECK(result.num_speakers >= 2);
     CHECK(result.num_speakers <= 5);
     CHECK(!result.segments.empty());
+}
+#endif
+
+#if RECMEET_USE_SHERPA
+TEST_CASE("VAD+Whisper vs plain Whisper transcription", "[benchmark]") {
+    fs::path root = find_project_root();
+    if (root.empty())
+        SKIP("Project root with assets/ not found");
+
+    fs::path audio_path = root / "assets" / "biden_trump_debate_2020.wav";
+    fs::path ref_path   = root / "assets" / "biden_trump_debate_2020.md";
+
+    if (!fs::exists(audio_path))
+        SKIP("Reference audio not found: " + audio_path.string());
+    if (!fs::exists(ref_path))
+        SKIP("Reference transcript not found: " + ref_path.string());
+    if (!is_whisper_model_cached("base"))
+        SKIP("Whisper base model not cached");
+    if (!is_vad_model_cached())
+        SKIP("Silero VAD model not cached");
+
+    // Load reference transcript
+    std::ifstream ref_file(ref_path);
+    std::string ref_md((std::istreambuf_iterator<char>(ref_file)),
+                        std::istreambuf_iterator<char>());
+    std::string ref_text = strip_reference_transcript(ref_md);
+    auto ref_words = tokenize_words(ref_text);
+    REQUIRE(!ref_words.empty());
+
+    // Load audio once
+    auto samples = read_wav_float(audio_path);
+    REQUIRE(!samples.empty());
+
+    fs::path model_path = ensure_whisper_model("base");
+    WhisperModel model(model_path);
+
+    // --- Plain whisper (no VAD) ---
+    auto t0 = std::chrono::steady_clock::now();
+    auto plain_result = transcribe(model, samples.data(), samples.size(), 0.0, "en");
+    auto t1 = std::chrono::steady_clock::now();
+    double plain_secs = std::chrono::duration<double>(t1 - t0).count();
+
+    std::string plain_text;
+    for (const auto& seg : plain_result.segments)
+        plain_text += seg.text + " ";
+    auto plain_words = tokenize_words(plain_text);
+    double plain_wer = compute_wer(ref_words, plain_words);
+
+    // --- VAD + whisper ---
+    auto t2 = std::chrono::steady_clock::now();
+    VadConfig vad_cfg;
+    auto vad_result = detect_speech(samples, vad_cfg);
+    auto t3 = std::chrono::steady_clock::now();
+    double vad_secs = std::chrono::duration<double>(t3 - t2).count();
+
+    TranscriptResult vad_transcript;
+    auto t4 = std::chrono::steady_clock::now();
+    for (const auto& seg : vad_result.segments) {
+        size_t n = static_cast<size_t>(seg.end_sample - seg.start_sample);
+        auto seg_result = transcribe(model, samples.data() + seg.start_sample,
+                                     n, seg.start, "en");
+        for (auto& s : seg_result.segments)
+            vad_transcript.segments.push_back(std::move(s));
+    }
+    auto t5 = std::chrono::steady_clock::now();
+    double vad_transcribe_secs = std::chrono::duration<double>(t5 - t4).count();
+
+    std::string vad_text;
+    for (const auto& seg : vad_transcript.segments)
+        vad_text += seg.text + " ";
+    auto vad_words = tokenize_words(vad_text);
+    double vad_wer = compute_wer(ref_words, vad_words);
+
+    fprintf(stderr, "\n[benchmark] VAD+Whisper vs Plain Whisper (base):\n");
+    fprintf(stderr, "  Plain:  WER=%.1f%%, time=%.1fs, segments=%zu\n",
+            plain_wer * 100.0, plain_secs, plain_result.segments.size());
+    fprintf(stderr, "  VAD:    WER=%.1f%%, time=%.1fs (vad=%.1fs + transcribe=%.1fs), "
+            "segments=%zu, speech=%.1fs/%.1fs (%.0f%%)\n",
+            vad_wer * 100.0, vad_secs + vad_transcribe_secs, vad_secs, vad_transcribe_secs,
+            vad_transcript.segments.size(),
+            vad_result.total_speech_duration, vad_result.total_audio_duration,
+            100.0 * vad_result.total_speech_duration / vad_result.total_audio_duration);
+
+    char buf[1024];
+    snprintf(buf, sizeof(buf),
+        "\n      \"test\": \"vad_vs_plain_whisper\","
+        "\n      \"model\": \"base\","
+        "\n      \"plain_wer\": %.4f,"
+        "\n      \"plain_time_secs\": %.1f,"
+        "\n      \"plain_segments\": %zu,"
+        "\n      \"vad_wer\": %.4f,"
+        "\n      \"vad_time_secs\": %.1f,"
+        "\n      \"vad_detect_secs\": %.1f,"
+        "\n      \"vad_transcribe_secs\": %.1f,"
+        "\n      \"vad_segments\": %zu,"
+        "\n      \"speech_ratio\": %.2f",
+        plain_wer, plain_secs, plain_result.segments.size(),
+        vad_wer, vad_secs + vad_transcribe_secs, vad_secs, vad_transcribe_secs,
+        vad_transcript.segments.size(),
+        vad_result.total_speech_duration / vad_result.total_audio_duration);
+    BenchmarkResults::add(buf);
+
+    // VAD should not significantly degrade WER
+    CHECK(vad_wer < 0.50);
 }
 #endif
 

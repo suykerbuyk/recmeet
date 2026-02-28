@@ -64,6 +64,12 @@ struct TranscriptResult {
 TranscriptResult transcribe(WhisperModel& model, const fs::path& audio_path,
                             const std::string& language = "", int threads = 0);
 
+/// Transcribe from a float buffer using a pre-loaded whisper model.
+/// offset_seconds is added to all segment timestamps (for VAD-segmented transcription).
+TranscriptResult transcribe(WhisperModel& model, const float* samples,
+                            size_t num_samples, double offset_seconds = 0.0,
+                            const std::string& language = "", int threads = 0);
+
 /// Convenience: load the model, transcribe, then free.
 /// Equivalent to constructing a temporary WhisperModel and calling the above.
 TranscriptResult transcribe(const fs::path& model_path, const fs::path& audio_path,

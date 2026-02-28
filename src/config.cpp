@@ -156,6 +156,17 @@ Config load_config(const fs::path& config_path) {
     std::string ct = get_val(entries, "diarization", "cluster_threshold", "");
     if (!ct.empty()) cfg.cluster_threshold = std::atof(ct.c_str());
 
+    // VAD section
+    cfg.vad = get_bool(entries, "vad", "enabled", true);
+    std::string vt = get_val(entries, "vad", "threshold", "");
+    if (!vt.empty()) cfg.vad_threshold = std::atof(vt.c_str());
+    std::string vms = get_val(entries, "vad", "min_silence", "");
+    if (!vms.empty()) cfg.vad_min_silence = std::atof(vms.c_str());
+    std::string vmsp = get_val(entries, "vad", "min_speech", "");
+    if (!vmsp.empty()) cfg.vad_min_speech = std::atof(vmsp.c_str());
+    std::string vmxs = get_val(entries, "vad", "max_speech", "");
+    if (!vmxs.empty()) cfg.vad_max_speech = std::atof(vmxs.c_str());
+
     // General section
     std::string threads_str = get_val(entries, "general", "threads", "0");
     cfg.threads = std::atoi(threads_str.c_str());
@@ -228,6 +239,21 @@ void save_config(const Config& cfg, const fs::path& config_path) {
             out << "  num_speakers: " << cfg.num_speakers << "\n";
         if (cfg.cluster_threshold != 1.18f)
             out << "  cluster_threshold: " << cfg.cluster_threshold << "\n";
+    }
+
+    if (!cfg.vad || cfg.vad_threshold != 0.5f || cfg.vad_min_silence != 0.5f ||
+        cfg.vad_min_speech != 0.25f || cfg.vad_max_speech != 30.0f) {
+        out << "\nvad:\n";
+        if (!cfg.vad)
+            out << "  enabled: false\n";
+        if (cfg.vad_threshold != 0.5f)
+            out << "  threshold: " << cfg.vad_threshold << "\n";
+        if (cfg.vad_min_silence != 0.5f)
+            out << "  min_silence: " << cfg.vad_min_silence << "\n";
+        if (cfg.vad_min_speech != 0.25f)
+            out << "  min_speech: " << cfg.vad_min_speech << "\n";
+        if (cfg.vad_max_speech != 30.0f)
+            out << "  max_speech: " << cfg.vad_max_speech << "\n";
     }
 
     out << "\noutput:\n"

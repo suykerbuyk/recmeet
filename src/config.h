@@ -53,6 +53,13 @@ struct Config {
     int num_speakers = 0;  // 0 = auto-detect
     float cluster_threshold = 1.18f;  // clustering distance threshold (lower = more splitting)
 
+    // VAD (on by default when built with RECMEET_USE_SHERPA)
+    bool vad = true;
+    float vad_threshold = 0.5f;
+    float vad_min_silence = 0.5f;
+    float vad_min_speech = 0.25f;
+    float vad_max_speech = 30.0f;
+
     // Performance
     int threads = 0;  // 0 = auto-detect (hardware_concurrency - 1)
 
