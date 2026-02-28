@@ -51,11 +51,10 @@ sudo dnf install gcc-c++ cmake ninja-build pkgconf-pkg-config \
 ```bash
 git clone --recurse-submodules https://github.com/syketech/recmeet.git
 cd recmeet
+make
 
-cmake -B build -G Ninja
-ninja -C build
-# Speaker diarization is ON by default. To disable:
-# cmake -B build -G Ninja -DRECMEET_USE_SHERPA=OFF
+# Or manually:
+# cmake -B build -G Ninja && ninja -C build
 ```
 
 ### Run
@@ -204,39 +203,47 @@ general:
 
 ```bash
 # Example: headless build without tray or diarization
-cmake -B build -G Ninja -DRECMEET_BUILD_TRAY=OFF -DRECMEET_USE_SHERPA=OFF
+make RECMEET_BUILD_TRAY=OFF RECMEET_USE_SHERPA=OFF
+
+# Or manually:
+# cmake -B build -G Ninja -DRECMEET_BUILD_TRAY=OFF -DRECMEET_USE_SHERPA=OFF
 ```
 
 ## Testing
 
-143 unit tests, 576 assertions across 14 modules, plus integration and benchmark suites.
+155 unit tests, 603 assertions across 15 modules, plus integration and benchmark suites.
 
 ```bash
-# Unit tests (no hardware needed)
-./build/recmeet_tests "~[integration]~[benchmark]"
+make test                # unit tests (no hardware needed)
+make benchmark           # benchmark tests (needs whisper models + assets/)
 
-# Integration tests (needs running PipeWire session)
-./build/recmeet_tests "[integration]"
-
-# Benchmark tests (needs whisper models + assets/)
-./build/recmeet_tests "[benchmark]"
-
-# Single module
-./build/recmeet_tests "[cli]"
-./build/recmeet_tests "[diarize]"
-./build/recmeet_tests "[note]"
+# Or run directly for more control:
+./build/recmeet_tests "~[integration]~[benchmark]"   # unit tests
+./build/recmeet_tests "[integration]"                 # needs running PipeWire session
+./build/recmeet_tests "[benchmark]"                   # needs whisper models + assets/
+./build/recmeet_tests "[cli]"                         # single module
 ```
 
 ## Installing
 
 ```bash
-sudo cmake --install build                       # install to /usr/local
-cmake --install build --prefix /tmp/test-install  # or a custom prefix
+sudo make install                                    # install to /usr/local
+make install PREFIX=/tmp/test-install                # or a custom prefix
+
+# Or manually:
+# sudo cmake --install build
+# cmake --install build --prefix /tmp/test-install
 ```
 
 ### Packages
 
-Pre-built packages for Arch Linux (PKGBUILD), Debian/Ubuntu (`.deb` via CPack), and Fedora/RHEL (`.rpm` via CPack) are supported. See [BUILD.md](BUILD.md) for packaging instructions and per-distro build dependencies.
+```bash
+make package-arch       # Arch Linux (PKGBUILD)
+make package-deb        # Debian/Ubuntu (.deb via CPack)
+make package-rpm        # Fedora/RHEL (.rpm via CPack)
+```
+
+See [BUILD.md](BUILD.md) for packaging details and per-distro build dependencies.
 
 ### Autostart via systemd
 
