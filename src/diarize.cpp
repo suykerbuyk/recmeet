@@ -51,11 +51,10 @@ std::vector<TranscriptSegment> merge_speakers(
 }
 
 #if RECMEET_USE_SHERPA
-DiarizeResult diarize(const fs::path& audio_path, int num_speakers, int threads,
-                      float threshold) {
-    auto samples = read_wav_float(audio_path);
-    if (samples.empty())
-        throw RecmeetError("Cannot read audio for diarization: " + audio_path.string());
+DiarizeResult diarize(const float* samples, size_t num_samples,
+                      int num_speakers, int threads, float threshold) {
+    if (!samples || num_samples == 0)
+        throw RecmeetError("Cannot diarize: empty audio buffer");
 
     auto model_paths = ensure_sherpa_models();
 
@@ -95,10 +94,10 @@ DiarizeResult diarize(const fs::path& audio_path, int num_speakers, int threads,
         throw RecmeetError("Failed to create sherpa-onnx speaker diarization");
 
     log_info("Diarizing %zu samples (%.1fs)...",
-            samples.size(), samples.size() / 16000.0);
+            num_samples, num_samples / 16000.0);
 
     const auto* raw_result = SherpaOnnxOfflineSpeakerDiarizationProcess(
-        sd, samples.data(), static_cast<int32_t>(samples.size()));
+        sd, samples, static_cast<int32_t>(num_samples));
 
     if (!raw_result) {
         SherpaOnnxDestroyOfflineSpeakerDiarization(sd);
@@ -130,6 +129,14 @@ DiarizeResult diarize(const fs::path& audio_path, int num_speakers, int threads,
             result.num_speakers, result.segments.size());
 
     return result;
+}
+
+DiarizeResult diarize(const fs::path& audio_path, int num_speakers, int threads,
+                      float threshold) {
+    auto samples = read_wav_float(audio_path);
+    if (samples.empty())
+        throw RecmeetError("Cannot read audio for diarization: " + audio_path.string());
+    return diarize(samples.data(), samples.size(), num_speakers, threads, threshold);
 }
 #endif
 

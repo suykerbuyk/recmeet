@@ -353,6 +353,52 @@ TEST_CASE("Diarize debate audio with sherpa-onnx", "[benchmark]") {
     CHECK(result.num_speakers <= 5);
     CHECK(!result.segments.empty());
 }
+
+TEST_CASE("Diarize debate audio with buffer overload", "[benchmark]") {
+    fs::path root = find_project_root();
+    if (root.empty())
+        SKIP("Project root with assets/ not found");
+
+    fs::path audio_path = root / "assets" / "biden_trump_debate_2020.wav";
+    if (!fs::exists(audio_path))
+        SKIP("Reference audio not found: " + audio_path.string());
+    if (!is_sherpa_model_cached())
+        SKIP("Sherpa diarization models not cached");
+
+    auto samples = read_wav_float(audio_path);
+    REQUIRE(!samples.empty());
+
+    auto t0 = std::chrono::steady_clock::now();
+    auto result = diarize(samples.data(), samples.size(), 3);
+    auto t1 = std::chrono::steady_clock::now();
+    double secs = std::chrono::duration<double>(t1 - t0).count();
+
+    // Also run file-based for comparison
+    auto file_result = diarize(audio_path, 3);
+
+    fprintf(stderr, "\n[benchmark] Sherpa-onnx buffer diarization:\n");
+    fprintf(stderr, "  Speakers detected: %d\n", result.num_speakers);
+    fprintf(stderr, "  Segments: %zu\n", result.segments.size());
+    fprintf(stderr, "  Time: %.1fs\n", secs);
+
+    char buf[512];
+    snprintf(buf, sizeof(buf),
+        "\n      \"test\": \"sherpa_diarization_buffer\","
+        "\n      \"num_speakers_requested\": 3,"
+        "\n      \"num_speakers_detected\": %d,"
+        "\n      \"segments\": %zu,"
+        "\n      \"time_secs\": %.1f",
+        result.num_speakers, result.segments.size(), secs);
+    BenchmarkResults::add(buf);
+
+    CHECK(result.num_speakers >= 2);
+    CHECK(result.num_speakers <= 5);
+    CHECK(!result.segments.empty());
+
+    // Buffer and file overloads should produce identical results
+    CHECK(result.num_speakers == file_result.num_speakers);
+    CHECK(result.segments.size() == file_result.segments.size());
+}
 #endif
 
 #if RECMEET_USE_SHERPA

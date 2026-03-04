@@ -23,9 +23,15 @@ struct DiarizeResult {
 };
 
 #if RECMEET_USE_SHERPA
-/// Run speaker diarization on a WAV file using sherpa-onnx.
+/// Run speaker diarization on a pre-loaded audio buffer (16kHz float32 mono).
 /// num_speakers: 0 = auto-detect, >0 = force N clusters.
 /// threads: number of CPU threads (0 = use default_thread_count()).
+DiarizeResult diarize(const float* samples, size_t num_samples,
+                      int num_speakers = 0, int threads = 0,
+                      float threshold = 1.18f);
+
+/// Run speaker diarization on a WAV file using sherpa-onnx.
+/// Convenience wrapper — reads the file and delegates to the buffer overload.
 DiarizeResult diarize(const fs::path& audio_path, int num_speakers = 0, int threads = 0,
                       float threshold = 1.18f);
 #endif

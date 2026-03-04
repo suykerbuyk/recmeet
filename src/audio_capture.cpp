@@ -78,7 +78,7 @@ static const pw_stream_events stream_events = {
 struct PipeWireCapture::Impl : PwCaptureImpl {};
 
 PipeWireCapture::PipeWireCapture(const std::string& target, bool capture_sink)
-    : impl_(new Impl) {
+    : impl_(std::make_unique<Impl>()) {
     impl_->target = target;
     impl_->capture_sink = capture_sink;
     pw_init(nullptr, nullptr);
@@ -86,7 +86,6 @@ PipeWireCapture::PipeWireCapture(const std::string& target, bool capture_sink)
 
 PipeWireCapture::~PipeWireCapture() {
     stop();
-    delete impl_;
 }
 
 void PipeWireCapture::start() {
@@ -112,7 +111,7 @@ void PipeWireCapture::start() {
         "recmeet-audio",
         props,
         &stream_events,
-        static_cast<PwCaptureImpl*>(impl_));
+        static_cast<PwCaptureImpl*>(impl_.get()));
 
     if (!impl_->stream) {
         pw_thread_loop_destroy(impl_->loop);

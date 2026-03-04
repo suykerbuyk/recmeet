@@ -241,66 +241,70 @@ PipelineResult run_postprocessing(const Config& cfg, const PostprocessInput& inp
     if (transcript_text.empty()) {
         log_info("Using %d threads for inference.", threads);
 
-        // Load audio once for VAD + transcription
-        auto samples = read_wav_float(input.audio_path);
-        log_info("Audio: %.1fs (%zu samples)",
-                samples.size() / (float)SAMPLE_RATE, samples.size());
-
-        fs::path model_path = ensure_whisper_model(cfg.whisper_model);
-        WhisperModel model(model_path);
         TranscriptResult result;
+        {   // --- audio buffer scope --- freed after diarization, before summarization
+            auto samples = read_wav_float(input.audio_path);
+            log_info("Audio: %.1fs (%zu samples)",
+                    samples.size() / (float)SAMPLE_RATE, samples.size());
+
+            {   // --- whisper model scope --- freed before diarization
+                fs::path model_path = ensure_whisper_model(cfg.whisper_model);
+                WhisperModel model(model_path);
 
 #if RECMEET_USE_SHERPA
-        if (cfg.vad) {
-            phase("detecting speech");
-            notify("Detecting speech...", "VAD segmentation");
+                if (cfg.vad) {
+                    phase("detecting speech");
+                    notify("Detecting speech...", "VAD segmentation");
 
-            VadConfig vad_cfg;
-            vad_cfg.threshold = cfg.vad_threshold;
-            vad_cfg.min_silence_duration = cfg.vad_min_silence;
-            vad_cfg.min_speech_duration = cfg.vad_min_speech;
-            vad_cfg.max_speech_duration = cfg.vad_max_speech;
+                    VadConfig vad_cfg;
+                    vad_cfg.threshold = cfg.vad_threshold;
+                    vad_cfg.min_silence_duration = cfg.vad_min_silence;
+                    vad_cfg.min_speech_duration = cfg.vad_min_speech;
+                    vad_cfg.max_speech_duration = cfg.vad_max_speech;
 
-            auto vad_result = detect_speech(samples, vad_cfg, threads);
+                    auto vad_result = detect_speech(samples, vad_cfg, threads);
 
-            if (!vad_result.segments.empty()) {
-                phase("transcribing");
-                notify("Transcribing...", "Model: " + cfg.whisper_model +
-                       " (" + std::to_string(vad_result.segments.size()) + " segments)");
+                    if (!vad_result.segments.empty()) {
+                        phase("transcribing");
+                        notify("Transcribing...", "Model: " + cfg.whisper_model +
+                               " (" + std::to_string(vad_result.segments.size()) + " segments)");
 
-                for (const auto& seg : vad_result.segments) {
-                    size_t n = static_cast<size_t>(seg.end_sample - seg.start_sample);
-                    auto seg_result = transcribe(model, samples.data() + seg.start_sample,
-                                                 n, seg.start, cfg.language, threads);
-                    for (auto& s : seg_result.segments)
-                        result.segments.push_back(std::move(s));
-                    if (result.language.empty())
-                        result.language = seg_result.language;
+                        for (const auto& seg : vad_result.segments) {
+                            size_t n = static_cast<size_t>(seg.end_sample - seg.start_sample);
+                            auto seg_result = transcribe(model, samples.data() + seg.start_sample,
+                                                         n, seg.start, cfg.language, threads);
+                            for (auto& s : seg_result.segments)
+                                result.segments.push_back(std::move(s));
+                            if (result.language.empty())
+                                result.language = seg_result.language;
+                        }
+                        log_info("Transcribed %zu segments across %zu VAD regions",
+                                result.segments.size(), vad_result.segments.size());
+                    } else {
+                        log_info("VAD found no speech — skipping transcription.");
+                    }
+                } else
+#endif
+                {
+                    phase("transcribing");
+                    notify("Transcribing...", "Model: " + cfg.whisper_model);
+                    result = transcribe(model, samples.data(), samples.size(), 0.0,
+                                        cfg.language, threads);
+                    log_info("Transcribed %d segments (language: %s)",
+                            (int)result.segments.size(), result.language.c_str());
                 }
-                log_info("Transcribed %zu segments across %zu VAD regions",
-                        result.segments.size(), vad_result.segments.size());
-            } else {
-                log_info("VAD found no speech — skipping transcription.");
-            }
-        } else
-#endif
-        {
-            phase("transcribing");
-            notify("Transcribing...", "Model: " + cfg.whisper_model);
-            result = transcribe(model, samples.data(), samples.size(), 0.0,
-                                cfg.language, threads);
-            log_info("Transcribed %d segments (language: %s)",
-                    (int)result.segments.size(), result.language.c_str());
-        }
+            }   // whisper model freed
 
 #if RECMEET_USE_SHERPA
-        if (cfg.diarize && !result.segments.empty()) {
-            phase("diarizing");
-            notify("Diarizing...", "Identifying speakers");
-            auto diar = diarize(input.audio_path, cfg.num_speakers, threads, cfg.cluster_threshold);
-            result.segments = merge_speakers(result.segments, diar);
-        }
+            if (cfg.diarize && !result.segments.empty()) {
+                phase("diarizing");
+                notify("Diarizing...", "Identifying speakers");
+                auto diar = diarize(samples.data(), samples.size(),
+                                    cfg.num_speakers, threads, cfg.cluster_threshold);
+                result.segments = merge_speakers(result.segments, diar);
+            }
 #endif
+        }   // audio buffer freed
 
         transcript_text = result.to_string();
         if (transcript_text.empty())

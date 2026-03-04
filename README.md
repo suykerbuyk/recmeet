@@ -104,15 +104,15 @@ Record ──► Transcribe ──► Diarize ──► Summarize ──► Outp
 
 ```
 meetings/2026-02-20_14-30/
-  mic.wav          # Raw mic recording
-  monitor.wav      # Raw speaker/monitor recording
-  audio.wav        # Mixed — used for transcription
-  transcript.txt   # Timestamped transcript with speaker labels
-  summary.md       # Structured summary
+  audio.wav        # Mixed mic + monitor (16kHz mono S16LE)
   Meeting_2026-02-20_14-30_Project_Kickoff.md  # Meeting note
 ```
 
+Two files per meeting. The meeting note contains the transcript, summary, and action items — no separate `transcript.txt` or `summary.md`. Source WAVs (`mic.wav`, `monitor.wav`) are deleted after mixing; use `--keep-sources` to retain them.
+
 ### Transcript format
+
+Embedded in the meeting note as a foldable section:
 
 ```
 [00:00 - 00:05] Speaker_01: Hello everyone, thanks for joining.
@@ -122,7 +122,7 @@ meetings/2026-02-20_14-30/
 
 ### Meeting note
 
-Written alongside the transcript in the output directory. Filename includes an AI-derived title (e.g. `Meeting_2026-02-20_14-30_Project_Kickoff.md`). Contains YAML frontmatter with enriched metadata (date, time, type, domain, status, tags, summary), a summary callout, action item checkboxes, and a foldable transcript section. Compatible with Obsidian Dataview.
+Filename includes an AI-derived title (e.g. `Meeting_2026-02-20_14-30_Project_Kickoff.md`). Contains YAML frontmatter with enriched metadata (date, time, type, domain, status, tags, participants, duration), a summary callout, action item checkboxes, and a foldable transcript section. Compatible with Obsidian Dataview.
 
 ## CLI reference
 

@@ -6,6 +6,7 @@
 #include "util.h"
 
 #include <cstdint>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -37,7 +38,7 @@ public:
 
 private:
     struct Impl;
-    Impl* impl_;
+    std::unique_ptr<Impl> impl_;
 };
 
 } // namespace recmeet
