@@ -36,7 +36,8 @@ VadResult detect_speech(const std::vector<float>& samples,
     vad_cfg.provider = "cpu";
     vad_cfg.debug = 0;
 
-    const auto* vad = SherpaOnnxCreateVoiceActivityDetector(&vad_cfg, 30.0f);
+    float buf_secs = static_cast<float>(samples.size()) / SAMPLE_RATE + 1.0f;
+    const auto* vad = SherpaOnnxCreateVoiceActivityDetector(&vad_cfg, buf_secs);
     if (!vad)
         throw RecmeetError("Failed to create sherpa-onnx VAD");
 
