@@ -372,8 +372,7 @@ cmake --install build --prefix /tmp/test-install
 | `recmeet-tray` | `<prefix>/bin/` (only when `RECMEET_BUILD_TRAY=ON`) |
 | `recmeet-tray.desktop` | `<prefix>/share/applications/` (only when `RECMEET_BUILD_TRAY=ON`) |
 | `recmeet-tray.service` | `<prefix>/lib/systemd/user/` (only when `RECMEET_BUILD_TRAY=ON`) |
-| `LICENSE-MIT` | `<prefix>/share/doc/recmeet/` |
-| `LICENSE-APACHE` | `<prefix>/share/doc/recmeet/` |
+| `LICENSE` | `<prefix>/share/doc/recmeet/` |
 | `AUTHORS` | `<prefix>/share/doc/recmeet/` |
 
 The `.desktop` file registers `recmeet-tray` with freedesktop-compliant desktop

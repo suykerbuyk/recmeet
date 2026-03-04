@@ -231,7 +231,7 @@ if(RECMEET_BUILD_TRAY)
         DESTINATION lib/systemd/user)
 endif()
 
-install(FILES LICENSE-MIT LICENSE-APACHE AUTHORS
+install(FILES LICENSE AUTHORS
     DESTINATION ${CMAKE_INSTALL_DOCDIR})
 
 # --- CPack DEB packaging ---

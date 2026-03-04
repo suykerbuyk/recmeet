@@ -283,6 +283,6 @@ See [BUILD.md](BUILD.md) for a detailed build system tutorial.
 
 ## License
 
-Dual-licensed under [MIT](LICENSE-MIT) and [Apache 2.0](LICENSE-APACHE), at your option.
+Dual-licensed under [MIT and Apache 2.0](LICENSE), at your option.
 
 Copyright (c) 2026 John Suykerbuyk and SykeTech LTD

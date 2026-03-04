@@ -542,7 +542,7 @@ static void on_about(GtkMenuItem*, gpointer) {
         "Copyright \xC2\xA9 2026 John Suykerbuyk and SykeTech LTD");
     gtk_about_dialog_set_license(GTK_ABOUT_DIALOG(dialog),
         "Dual-licensed under the MIT License and Apache License 2.0.\n\n"
-        "See LICENSE-MIT and LICENSE-APACHE for full text.");
+        "See LICENSE for full text.");
     gtk_about_dialog_set_wrap_license(GTK_ABOUT_DIALOG(dialog), TRUE);
     const char* authors[] = {"John Suykerbuyk (SykeTech LTD)", nullptr};
     gtk_about_dialog_set_authors(GTK_ABOUT_DIALOG(dialog), authors);
