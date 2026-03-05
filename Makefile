@@ -1,12 +1,15 @@
 # recmeet — convenience wrapper around CMake + Ninja
 #
 # Usage:
-#   make                          # configure + build (Release)
+#   make                          # show help (safe default)
+#   make build                    # configure + build (Release)
 #   make test                     # build + run unit tests
 #   make install                  # build + install to PREFIX
-#   make BUILD_TYPE=Debug         # debug build
-#   make RECMEET_USE_LLAMA=OFF    # disable llama.cpp support
+#   make BUILD_TYPE=Debug build   # debug build
+#   make RECMEET_USE_LLAMA=OFF build  # disable llama.cpp support
 #   make help                     # list all targets
+
+.DEFAULT_GOAL := help
 
 # ── Dependency checks ───────────────────────────────────────────────
 CMAKE := $(shell command -v cmake 2>/dev/null)
@@ -22,7 +25,7 @@ endif
 # ── Overridable variables ───────────────────────────────────────────
 BUILD_DIR  ?= build
 BUILD_TYPE ?= Release
-PREFIX     ?= /usr/local
+PREFIX     ?= $(HOME)/.local
 DESTDIR    ?=
 
 # ── CMake options accumulator ───────────────────────────────────────
@@ -45,9 +48,9 @@ CMAKE_OPTS += -DRECMEET_BUILD_TESTS=$(RECMEET_BUILD_TESTS)
 endif
 
 # ── Targets ─────────────────────────────────────────────────────────
-.PHONY: all test benchmark install package-deb package-rpm package-arch clean help
+.PHONY: build test integration benchmark install package-deb package-rpm package-arch clean help
 
-all:
+build:
 	cmake -B $(BUILD_DIR) -G Ninja $(CMAKE_OPTS)
 	ninja -C $(BUILD_DIR)
 
@@ -56,18 +59,23 @@ test:
 	ninja -C $(BUILD_DIR)
 	./$(BUILD_DIR)/recmeet_tests "~[integration]~[benchmark]"
 
+integration:
+	cmake -B $(BUILD_DIR) -G Ninja $(CMAKE_OPTS) -DRECMEET_BUILD_TESTS=ON
+	ninja -C $(BUILD_DIR)
+	./$(BUILD_DIR)/recmeet_tests "[integration]"
+
 benchmark:
 	cmake -B $(BUILD_DIR) -G Ninja $(CMAKE_OPTS) -DRECMEET_BUILD_TESTS=ON
 	ninja -C $(BUILD_DIR)
 	./$(BUILD_DIR)/recmeet_tests "[benchmark]"
 
-install: all
+install: build
 	DESTDIR=$(DESTDIR) cmake --install $(BUILD_DIR)
 
-package-deb: all
+package-deb: build
 	cd $(BUILD_DIR) && cpack -G DEB
 
-package-rpm: all
+package-rpm: build
 	cd $(BUILD_DIR) && cpack -G RPM
 
 package-arch:
@@ -79,21 +87,24 @@ clean:
 help:
 	@echo "recmeet build targets:"
 	@echo ""
-	@echo "  make              Build (Release)"
-	@echo "  make test         Build + run unit tests"
-	@echo "  make benchmark    Build + run benchmark tests"
-	@echo "  make install      Build + install to PREFIX (default: /usr/local)"
-	@echo "  make package-deb  Build + create .deb package"
-	@echo "  make package-rpm  Build + create .rpm package"
-	@echo "  make package-arch Build Arch package via makepkg"
-	@echo "  make clean        Remove build directory"
-	@echo "  make help         Show this message"
+	@echo "  make build         Configure + build (Release)"
+	@echo "  make test          Build + run unit tests"
+	@echo "  make integration   Build + run integration tests"
+	@echo "  make benchmark     Build + run benchmark tests"
+	@echo "  make install       Build + install to PREFIX (default: ~/.local)"
+	@echo "  make package-deb   Build + create .deb package"
+	@echo "  make package-rpm   Build + create .rpm package"
+	@echo "  make package-arch  Build Arch package via makepkg"
+	@echo "  make clean         Remove build directory"
+	@echo "  make help          Show this message"
+	@echo ""
+	@echo "Quick start:  make build && make test"
 	@echo ""
 	@echo "Variables (override via make VAR=value):"
 	@echo ""
 	@echo "  BUILD_DIR          Build directory      (default: build)"
 	@echo "  BUILD_TYPE         Release|Debug|...    (default: Release)"
-	@echo "  PREFIX             Install prefix       (default: /usr/local)"
+	@echo "  PREFIX             Install prefix       (default: ~/.local)"
 	@echo "  DESTDIR            Staging root         (default: empty)"
 	@echo "  RECMEET_BUILD_TRAY ON|OFF               (default: ON)"
 	@echo "  RECMEET_USE_LLAMA  ON|OFF               (default: ON)"

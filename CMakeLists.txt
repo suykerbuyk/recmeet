@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.20)
+cmake_minimum_required(VERSION 3.28)
 project(recmeet VERSION 0.9.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
@@ -86,6 +86,7 @@ if(RECMEET_USE_SHERPA)
     FetchContent_Declare(sherpa-onnx
         GIT_REPOSITORY https://github.com/k2-fsa/sherpa-onnx.git
         GIT_TAG v1.12.27
+        EXCLUDE_FROM_ALL
     )
     set(SHERPA_ONNX_ENABLE_TTS OFF CACHE BOOL "" FORCE)
     set(SHERPA_ONNX_ENABLE_WEBSOCKET OFF CACHE BOOL "" FORCE)

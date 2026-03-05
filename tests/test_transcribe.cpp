@@ -55,10 +55,12 @@ TEST_CASE("to_string: fractional seconds truncated", "[transcribe]") {
 // ---------------------------------------------------------------------------
 
 TEST_CASE("WhisperModel: invalid path throws RecmeetError", "[transcribe]") {
+    fprintf(stderr, "-- Testing graceful failure on invalid model path (whisper errors below are expected)\n");
     CHECK_THROWS_AS(WhisperModel("/no/such/model.gguf"), RecmeetError);
 }
 
 TEST_CASE("WhisperModel: error message includes model path", "[transcribe]") {
+    fprintf(stderr, "-- Testing error message content on invalid model path (whisper errors below are expected)\n");
     try {
         WhisperModel("/no/such/model.gguf");
         FAIL("Expected RecmeetError");
