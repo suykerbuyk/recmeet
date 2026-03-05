@@ -14,6 +14,7 @@ void notify_init() {
 }
 
 void notify(const std::string& title, const std::string& body) {
+    if (!notify_is_initted()) return;
     try {
         NotifyNotification* n = notify_notification_new(
             title.c_str(), body.empty() ? nullptr : body.c_str(), nullptr);
