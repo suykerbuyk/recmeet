@@ -22,10 +22,8 @@ compile_commands.json
 
 # AI session context (local-only, never committed)
 CLAUDE.md
-RESUME.md
-HISTORY.md
 commit.msg
-tasks/
+.claude/
 
 # makepkg artifacts
 dist/arch/src/
