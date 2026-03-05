@@ -3,7 +3,10 @@
 
 #include "cli.h"
 #include "config.h"
+#include "config_json.h"
 #include "device_enum.h"
+#include "ipc_client.h"
+#include "ipc_protocol.h"
 #include "log.h"
 #include "model_manager.h"
 #include "notify.h"
@@ -94,6 +97,12 @@ static void print_usage() {
         "  --log-level LEVEL    Log level: none, error, warn, info (default: none)\n"
         "  --log-dir DIR        Log file directory (default: ~/.local/share/recmeet/logs/)\n"
         "  --list-sources       List available audio sources and exit\n"
+        "  --download-models    Download required models and exit\n"
+        "  --update-models      Re-download all cached models and exit\n"
+        "  --daemon             Force client mode (require running daemon)\n"
+        "  --no-daemon          Force standalone mode (skip daemon detection)\n"
+        "  --status             Query daemon status and exit\n"
+        "  --stop               Stop daemon recording and exit\n"
         "  -h, --help           Show this help\n"
         "  -v, --version        Show version\n"
     );
@@ -103,10 +112,195 @@ static void print_version() {
     printf("recmeet %s\n", RECMEET_VERSION);
 }
 
+// ---------------------------------------------------------------------------
+// Client mode — talk to the daemon via IPC
+// ---------------------------------------------------------------------------
+
+static int client_status() {
+    IpcClient client;
+    if (!client.connect()) {
+        printf("Daemon: not running\n");
+        return 1;
+    }
+    IpcResponse resp;
+    IpcError err;
+    if (!client.call("status.get", resp, err)) {
+        fprintf(stderr, "Error: %s\n", err.message.c_str());
+        return 1;
+    }
+    printf("Daemon: running\nState: %s\n", json_val_as_string(resp.result["state"], "unknown").c_str());
+    return 0;
+}
+
+static int client_stop() {
+    IpcClient client;
+    if (!client.connect()) {
+        fprintf(stderr, "Daemon not running.\n");
+        return 1;
+    }
+    IpcResponse resp;
+    IpcError err;
+    if (!client.call("record.stop", resp, err)) {
+        fprintf(stderr, "Error: %s\n", err.message.c_str());
+        return 1;
+    }
+    printf("Stop signal sent.\n");
+    return 0;
+}
+
+static int client_record(const Config& cfg) {
+    IpcClient client;
+    if (!client.connect()) {
+        fprintf(stderr, "Error: daemon not running. Start with: recmeet-daemon\n");
+        return 1;
+    }
+
+    // Build params from config overrides
+    JsonMap params = config_to_map(cfg);
+
+    client.set_event_callback([](const IpcEvent& ev) {
+        if (ev.event == "phase") {
+            std::string name = json_val_as_string(ev.data.at("name"));
+            fprintf(stderr, "Phase: %s\n", name.c_str());
+        } else if (ev.event == "state.changed") {
+            std::string state = json_val_as_string(ev.data.at("state"));
+            auto err_it = ev.data.find("error");
+            if (err_it != ev.data.end()) {
+                std::string error = json_val_as_string(err_it->second);
+                if (!error.empty())
+                    fprintf(stderr, "Error: %s\n", error.c_str());
+            }
+        } else if (ev.event == "job.complete") {
+            std::string note = json_val_as_string(ev.data.at("note_path"));
+            std::string dir = json_val_as_string(ev.data.at("output_dir"));
+            if (!note.empty())
+                printf("Note: %s\n", note.c_str());
+            printf("Output: %s\n", dir.c_str());
+        }
+    });
+
+    IpcResponse resp;
+    IpcError err;
+    if (!client.call("record.start", params, resp, err)) {
+        fprintf(stderr, "Error: %s\n", err.message.c_str());
+        return 1;
+    }
+
+    fprintf(stderr, "Recording started. Press Ctrl+C to stop.\n");
+
+    // Install signal handler to send stop on Ctrl+C
+    static IpcClient* g_client = &client;
+    struct sigaction sa{};
+    sa.sa_handler = [](int) {
+        if (g_client && g_client->connected()) {
+            IpcResponse r; IpcError e;
+            g_client->call("record.stop", r, e, 5000);
+        }
+    };
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGINT, &sa, nullptr);
+    sigaction(SIGTERM, &sa, nullptr);
+
+    // Wait for job completion or disconnect
+    client.read_events("job.complete");
+
+    g_client = nullptr;
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Standalone mode — run the pipeline directly (original behavior)
+// ---------------------------------------------------------------------------
+
+static int standalone_main(CliResult& cli);
+
 int main(int argc, char* argv[]) {
     auto cli = recmeet::parse_cli(argc, argv);
     if (cli.show_version) { print_version(); return 0; }
     if (cli.show_help) { print_usage(); return 0; }
+
+    // Status/stop commands always use client mode
+    if (cli.show_status) return client_status();
+    if (cli.send_stop) return client_stop();
+
+    // Model management commands — always standalone, no daemon needed
+    if (cli.download_models) {
+        Config cfg = cli.cfg;
+        fprintf(stderr, "Downloading models...\n");
+        bool ok = true;
+        try {
+            fprintf(stderr, "  Whisper model '%s'... ", cfg.whisper_model.c_str());
+            ensure_whisper_model(cfg.whisper_model);
+            fprintf(stderr, "ready\n");
+        } catch (const std::exception& e) {
+            fprintf(stderr, "FAILED: %s\n", e.what());
+            ok = false;
+        }
+#if RECMEET_USE_SHERPA
+        if (cfg.diarize) {
+            try {
+                fprintf(stderr, "  Diarization models... ");
+                ensure_sherpa_models();
+                fprintf(stderr, "ready\n");
+            } catch (const std::exception& e) {
+                fprintf(stderr, "FAILED: %s\n", e.what());
+            }
+        }
+        if (cfg.vad) {
+            try {
+                fprintf(stderr, "  VAD model... ");
+                ensure_vad_model();
+                fprintf(stderr, "ready\n");
+            } catch (const std::exception& e) {
+                fprintf(stderr, "FAILED: %s\n", e.what());
+            }
+        }
+#endif
+        fprintf(stderr, ok ? "Done.\n" : "Done (with errors).\n");
+        return ok ? 0 : 1;
+    }
+
+    if (cli.update_models) {
+        fprintf(stderr, "Updating cached models...\n");
+        auto models = list_cached_models();
+        bool any_error = false;
+        bool sherpa_updated = false;
+
+        for (const auto& m : models) {
+            if (!m.cached) continue;
+
+            fprintf(stderr, "  %s/%s... ", m.category.c_str(), m.name.c_str());
+            try {
+                if (m.category == "whisper") {
+                    download_whisper_model(m.name);
+                }
+#if RECMEET_USE_SHERPA
+                else if (m.category == "sherpa" && !sherpa_updated) {
+                    download_sherpa_models();
+                    sherpa_updated = true;
+                } else if (m.category == "sherpa") {
+                    fprintf(stderr, "(already updated)\n");
+                    continue;
+                } else if (m.category == "vad") {
+                    download_vad_model();
+                }
+#endif
+                fprintf(stderr, "updated\n");
+            } catch (const std::exception& e) {
+                fprintf(stderr, "FAILED: %s\n", e.what());
+                any_error = true;
+            }
+        }
+
+        bool any_cached = false;
+        for (const auto& m : models) { if (m.cached) { any_cached = true; break; } }
+        if (!any_cached)
+            fprintf(stderr, "  No cached models found.\n");
+
+        fprintf(stderr, any_error ? "Done (with errors).\n" : "Done.\n");
+        return any_error ? 1 : 0;
+    }
+
     Config cfg = cli.cfg;
     bool list_sources = cli.list_sources;
 
@@ -114,8 +308,33 @@ int main(int argc, char* argv[]) {
     auto log_level = parse_log_level(cfg.log_level_str);
     log_init(log_level, cfg.log_dir);
 
+    // Determine whether to use daemon
+    bool use_daemon = false;
+    if (cli.daemon_mode == DaemonMode::Force) {
+        use_daemon = true;
+    } else if (cli.daemon_mode == DaemonMode::Disable) {
+        use_daemon = false;
+    } else {
+        // Auto: use daemon if it's running
+        use_daemon = daemon_running();
+    }
+
+    if (use_daemon && !list_sources) {
+        log_info("Using daemon mode");
+        int rc = client_record(cfg);
+        log_shutdown();
+        return rc;
+    }
+
+    // Fall through to standalone mode
+    return standalone_main(cli);
+}
+
+static int standalone_main(CliResult& cli) {
+    Config cfg = cli.cfg;
+
     // List sources mode
-    if (list_sources) {
+    if (cli.list_sources) {
         try {
             auto sources = recmeet::list_sources();
             printf("Available audio sources:\n");

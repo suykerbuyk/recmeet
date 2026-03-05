@@ -129,6 +129,10 @@ set(CORE_SOURCES
     src/cli.cpp
     src/diarize.cpp
     src/vad.cpp
+    src/ipc_protocol.cpp
+    src/config_json.cpp
+    src/ipc_server.cpp
+    src/ipc_client.cpp
 )
 
 add_library(recmeet_core STATIC ${CORE_SOURCES})
@@ -165,6 +169,10 @@ endif()
 # CLI binary
 add_executable(recmeet src/main.cpp)
 target_link_libraries(recmeet PRIVATE recmeet_core)
+
+# Daemon binary
+add_executable(recmeet-daemon src/daemon.cpp)
+target_link_libraries(recmeet-daemon PRIVATE recmeet_core)
 
 # Tray binary
 if(RECMEET_BUILD_TRAY)
@@ -207,6 +215,10 @@ if(RECMEET_BUILD_TESTS)
         tests/test_benchmark.cpp
         tests/test_diarize.cpp
         tests/test_vad.cpp
+        tests/test_ipc_protocol.cpp
+        tests/test_config_json.cpp
+        tests/test_ipc_server.cpp
+        tests/test_ipc_client.cpp
     )
     target_link_libraries(recmeet_tests PRIVATE recmeet_core Catch2::Catch2WithMain)
     catch_discover_tests(recmeet_tests)
@@ -218,6 +230,16 @@ install(CODE "set(CMAKE_INSTALL_DO_STRIP ON)")
 include(GNUInstallDirs)
 
 install(TARGETS recmeet RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+install(TARGETS recmeet-daemon RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+
+# systemd user service for daemon
+set(RECMEET_DAEMON_EXEC "${CMAKE_INSTALL_FULL_BINDIR}/recmeet-daemon")
+configure_file(dist/recmeet-daemon.service.in
+    ${CMAKE_BINARY_DIR}/recmeet-daemon.service @ONLY)
+install(FILES ${CMAKE_BINARY_DIR}/recmeet-daemon.service
+    DESTINATION lib/systemd/user)
+install(FILES dist/recmeet-daemon.socket
+    DESTINATION lib/systemd/user)
 
 if(RECMEET_BUILD_TRAY)
     install(TARGETS recmeet-tray RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})

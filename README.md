@@ -20,6 +20,7 @@ The result: full transcriptions with speaker labels, professionally structured s
 - **Summarizes** via cloud API (xAI/OpenAI/Anthropic — all OpenAI-compatible) or a local GGUF model via llama.cpp — your choice
 - **Outputs** timestamped transcripts, structured summaries, and meeting notes with YAML frontmatter (Obsidian-compatible)
 - **System tray applet** for point-and-click control from swaybar or any system tray
+- **Daemon architecture** — a background daemon owns all pipeline logic; the CLI and tray are thin IPC clients
 
 ## Quick start
 
@@ -60,19 +61,25 @@ make
 ### Run
 
 ```bash
-# Quick test — mic only, no summary, no API key needed
-./build/recmeet --mic-only --no-summary --no-diarize --model tiny
+# Quick test — standalone mode, mic only, no summary, no API key needed
+./build/recmeet --no-daemon --mic-only --no-summary --no-diarize --model tiny
 
-# Full pipeline with cloud summarization
+# Full pipeline with cloud summarization (standalone)
 export XAI_API_KEY=your-key-here
 ./build/recmeet --model base
+
+# Or use the daemon for persistent background operation
+./build/recmeet-daemon &              # start the daemon
+./build/recmeet --model base          # CLI auto-detects daemon and uses it
+./build/recmeet --status              # check daemon state
+./build/recmeet --stop                # stop a recording in progress
+
+# System tray applet (connects to daemon automatically)
+./build/recmeet-tray
 
 # Full pipeline with local LLM (no API key, no network)
 ./build/recmeet --model base \
     --llm-model ~/.local/share/recmeet/models/llama/Qwen2.5-7B-Instruct-Q4_K_M.gguf
-
-# System tray applet
-./build/recmeet-tray
 
 # Reprocess an old recording with speaker diarization
 ./build/recmeet --reprocess meetings/2026-02-21_17-34/ --num-speakers 2
@@ -80,6 +87,8 @@ export XAI_API_KEY=your-key-here
 # List available audio sources
 ./build/recmeet --list-sources
 ```
+
+See [QUICKSTART.md](QUICKSTART.md) for a step-by-step installation and usage guide.
 
 ## How it works
 
@@ -126,6 +135,8 @@ Filename includes an AI-derived title (e.g. `Meeting_2026-02-20_14-30_Project_Ki
 
 ## CLI reference
 
+### recmeet (CLI)
+
 ```
 Usage: recmeet [OPTIONS]
 
@@ -135,9 +146,11 @@ Options:
   --source NAME        PipeWire/PulseAudio mic source (auto-detect if omitted)
   --monitor NAME       Monitor/speaker source (auto-detect if omitted)
   --mic-only           Record mic only (skip monitor capture)
+  --keep-sources       Keep separate mic.wav and monitor.wav after mixing
   --model NAME         Whisper model: tiny/base/small/medium/large-v3 (default: base)
   --language CODE      Force whisper language (e.g. en, de, ja; default: auto-detect)
   --output-dir DIR     Base directory for outputs (default: ./meetings)
+  --note-dir DIR       Directory for meeting notes (default: same as audio)
   --provider NAME      API provider: xai, openai, anthropic (default: xai)
   --api-key KEY        API key (default: from provider env var or config)
   --api-url URL        API endpoint override (default: derived from provider)
@@ -149,13 +162,36 @@ Options:
   --no-diarize         Disable speaker diarization
   --num-speakers N     Number of speakers (0 = auto-detect, default: 0)
   --cluster-threshold F  Clustering distance threshold (default: 1.18, higher = fewer speakers)
+  --no-vad             Disable VAD segmentation (transcribe full audio)
+  --vad-threshold F    VAD speech detection threshold (default: 0.5)
   --threads N          Number of CPU threads for inference (0 = auto-detect, default: 0)
   --reprocess DIR      Reprocess existing recording from audio.wav
   --log-level LEVEL    Log level: none, error, warn, info (default: none)
   --log-dir DIR        Log file directory (default: ~/.local/share/recmeet/logs/)
   --list-sources       List available audio sources and exit
+  --download-models    Download required models and exit
+  --update-models      Re-download all cached models and exit
+  --daemon             Force client mode (require running daemon)
+  --no-daemon          Force standalone mode (skip daemon detection)
+  --status             Query daemon status and exit
+  --stop               Stop daemon recording and exit
   -h, --help           Show this help
   -v, --version        Show version
+```
+
+### recmeet-daemon
+
+```
+Usage: recmeet-daemon [OPTIONS]
+
+Run the recmeet daemon (IPC server for CLI and tray clients).
+
+Options:
+  --socket PATH     Unix socket path (default: $XDG_RUNTIME_DIR/recmeet/daemon.sock)
+  --log-level LEVEL Log level: none, error, warn, info (default: info)
+  --log-dir DIR     Log file directory
+  -h, --help        Show this help
+  -v, --version     Show version
 ```
 
 ## Configuration
@@ -211,7 +247,7 @@ make RECMEET_BUILD_TRAY=OFF RECMEET_USE_SHERPA=OFF
 
 ## Testing
 
-155 unit tests, 603 assertions across 15 modules, plus integration and benchmark suites.
+193 unit tests, 771 assertions across 22 modules, plus integration and benchmark suites.
 
 ```bash
 make test                # unit tests (no hardware needed)
@@ -227,13 +263,16 @@ make benchmark           # benchmark tests (needs whisper models + assets/)
 ## Installing
 
 ```bash
-sudo make install                                    # install to /usr/local
+make install                                         # install to ~/.local (default, no sudo)
+sudo make install PREFIX=/usr/local                  # or system-wide
 make install PREFIX=/tmp/test-install                # or a custom prefix
 
 # Or manually:
+# cmake --install build --prefix ~/.local
 # sudo cmake --install build
-# cmake --install build --prefix /tmp/test-install
 ```
+
+`make install` also downloads default models (whisper, sherpa, VAD) and enables the daemon via systemd. Use `make uninstall` to reverse everything.
 
 ### Packages
 
@@ -247,15 +286,31 @@ See [BUILD.md](BUILD.md) for packaging details and per-distro build dependencies
 
 ### Autostart via systemd
 
-recmeet-tray ships a systemd user service that starts the tray applet automatically with your graphical session:
+The daemon and tray each have a systemd user service. The tray service depends on the daemon — enabling the tray automatically pulls in the daemon.
 
 ```bash
-systemctl --user enable --now recmeet-tray.service   # enable + start immediately
-systemctl --user status recmeet-tray.service          # check status
-systemctl --user disable --now recmeet-tray.service   # disable + stop
+# Daemon only (headless / CLI usage)
+systemctl --user enable --now recmeet-daemon.service
+
+# Daemon + tray (desktop usage — daemon starts automatically)
+systemctl --user enable --now recmeet-tray.service
+
+# Check status
+systemctl --user status recmeet-daemon.service
+systemctl --user status recmeet-tray.service
+
+# Stop and disable
+systemctl --user disable --now recmeet-tray.service
+systemctl --user disable --now recmeet-daemon.service
 ```
 
-The service is tied to `graphical-session.target` and restarts automatically on crash. On Sway, your config must activate that target — see [BUILD.md](BUILD.md) for details.
+Socket activation is also available — `recmeet-daemon.socket` starts the daemon on first connection:
+
+```bash
+systemctl --user enable --now recmeet-daemon.socket
+```
+
+The tray service is tied to `graphical-session.target` and restarts automatically on crash. On Sway, your config must activate that target — see [BUILD.md](BUILD.md) for details.
 
 ## Project history
 
@@ -269,15 +324,36 @@ From there, the project evolved through extensive iteration: doubling test cover
 
 ## Architecture
 
-Three binaries share a common static library:
+Four binaries share a common static library. The daemon owns all pipeline logic (audio capture, transcription, diarization, summarization). The CLI and tray are thin IPC clients that communicate via a Unix domain socket using newline-delimited JSON.
 
 ```
-recmeet_core  (static library — 17 modules)
+recmeet_core  (static library — 22 modules)
     |
-    +-- recmeet        (CLI binary)
-    +-- recmeet-tray   (system tray, GTK3 + AppIndicator)
-    +-- recmeet_tests  (Catch2 test suite)
+    +-- recmeet-daemon  (daemon — pipeline + IPC server)
+    +-- recmeet         (CLI — dual-mode: IPC client or standalone)
+    +-- recmeet-tray    (system tray — IPC client, GTK3 + AppIndicator)
+    +-- recmeet_tests   (Catch2 test suite)
 ```
+
+### Daemon mode (recommended)
+
+```
+recmeet-daemon              recmeet (CLI)           recmeet-tray
+      |                         |                        |
+  [pipeline]  <── IPC ──>  [thin client]  <── IPC ──>  [thin client]
+  [IPC server]             [auto-detect]              [GTK + g_io_watch]
+      |
+  Unix socket: $XDG_RUNTIME_DIR/recmeet/daemon.sock
+```
+
+The CLI auto-detects a running daemon and operates as a client. Use `--no-daemon` to force standalone mode (the CLI runs the full pipeline directly, as in previous versions). The tray connects to the daemon and reconnects automatically with exponential backoff if the daemon restarts.
+
+### IPC protocol
+
+- **Transport**: Unix domain socket
+- **Wire format**: Newline-delimited JSON (NDJSON)
+- **Methods**: `record.start`, `record.stop`, `status.get`, `config.update`, `config.reload`, `sources.list`, `models.list`, `models.ensure`, `models.update`
+- **Events** (server push): `phase`, `state.changed`, `job.complete`, `model.downloading`
 
 See [BUILD.md](BUILD.md) for a detailed build system tutorial.
 

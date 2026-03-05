@@ -36,6 +36,12 @@ CliResult parse_cli(int argc, char* argv[]) {
         {"note-dir",       required_argument, nullptr, 'n'},
         {"log-dir",        required_argument, nullptr, 'F'},
         {"list-sources",   no_argument,       nullptr, 'l'},
+        {"daemon",         no_argument,       nullptr, 1001},
+        {"no-daemon",      no_argument,       nullptr, 1002},
+        {"status",         no_argument,       nullptr, 1003},
+        {"stop",           no_argument,       nullptr, 1004},
+        {"download-models", no_argument,      nullptr, 1005},
+        {"update-models",  no_argument,       nullptr, 1006},
         {"help",           no_argument,       nullptr, 'h'},
         {"version",        no_argument,       nullptr, 'v'},
         {nullptr, 0, nullptr, 0},
@@ -73,6 +79,12 @@ CliResult parse_cli(int argc, char* argv[]) {
             case 'n': result.cfg.note_dir = optarg; break;
             case 'F': result.cfg.log_dir = optarg; break;
             case 'l': result.list_sources = true; break;
+            case 1001: result.daemon_mode = DaemonMode::Force; break;
+            case 1002: result.daemon_mode = DaemonMode::Disable; break;
+            case 1003: result.show_status = true; break;
+            case 1004: result.send_stop = true; break;
+            case 1005: result.download_models = true; break;
+            case 1006: result.update_models = true; break;
             case 'v': result.show_version = true; return result;
             case 'h': result.show_help = true; return result;
             default:  result.show_help = true; return result;

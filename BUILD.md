@@ -61,12 +61,13 @@ cmake -B build -G Ninja
 ninja -C build
 ```
 
-That produces three binaries inside `build/`:
+That produces four binaries inside `build/`:
 
 | Binary | What it is |
 |---|---|
-| `build/recmeet` | CLI tool |
-| `build/recmeet-tray` | System tray applet |
+| `build/recmeet` | CLI tool (standalone or daemon client) |
+| `build/recmeet-daemon` | Background daemon (IPC server + pipeline) |
+| `build/recmeet-tray` | System tray applet (daemon client) |
 | `build/recmeet_tests` | Test runner |
 
 ### Daily workflow
@@ -269,20 +270,21 @@ ninja -C build
 
 ## What the build targets are
 
-`CMakeLists.txt` defines four targets and how they relate:
+`CMakeLists.txt` defines five targets and how they relate:
 
 ```
-recmeet_core  (static library — all the pipeline logic)
+recmeet_core  (static library — all pipeline + IPC logic)
     │
+    ├── recmeet-daemon (daemon binary = daemon.cpp + recmeet_core)
     ├── recmeet        (CLI binary = main.cpp + recmeet_core)
     ├── recmeet-tray   (tray binary = tray.cpp + recmeet_core + GTK3)
     └── recmeet_tests  (test binary = tests/*.cpp + recmeet_core + Catch2)
 ```
 
 `recmeet_core` is compiled once as a static library (`.a` file), then linked
-into all three binaries. This means changing a test file only recompiles that
+into all four binaries. This means changing a test file only recompiles that
 test file and re-links `recmeet_tests` — it doesn't recompile or re-link the
-CLI or tray binaries.
+other binaries.
 
 ---
 

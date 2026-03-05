@@ -2,7 +2,8 @@
 Description=Recmeet Meeting Recorder Tray
 Documentation=https://github.com/suykerbuyk/recmeet
 PartOf=graphical-session.target
-After=graphical-session.target
+Wants=recmeet-daemon.service
+After=graphical-session.target recmeet-daemon.service
 
 [Service]
 Type=simple

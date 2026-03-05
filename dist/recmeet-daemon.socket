@@ -1,0 +1,9 @@
+[Unit]
+Description=Recmeet Daemon Socket
+
+[Socket]
+ListenStream=%t/recmeet/daemon.sock
+SocketMode=0700
+
+[Install]
+WantedBy=sockets.target

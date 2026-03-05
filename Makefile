@@ -48,7 +48,7 @@ CMAKE_OPTS += -DRECMEET_BUILD_TESTS=$(RECMEET_BUILD_TESTS)
 endif
 
 # ── Targets ─────────────────────────────────────────────────────────
-.PHONY: build test integration benchmark install package-deb package-rpm package-arch clean help
+.PHONY: build test integration benchmark install uninstall package-deb package-rpm package-arch clean help daemon-start daemon-stop daemon-status
 
 build:
 	cmake -B $(BUILD_DIR) -G Ninja $(CMAKE_OPTS)
@@ -71,6 +71,47 @@ benchmark:
 
 install: build
 	DESTDIR=$(DESTDIR) cmake --install $(BUILD_DIR)
+ifndef DESTDIR
+	@echo ""
+	@echo "--- Downloading default models ---"
+	./$(BUILD_DIR)/recmeet --no-daemon --download-models || echo "Warning: model download failed (retry with: recmeet --download-models)"
+	@echo ""
+	@echo "--- Enabling recmeet-daemon ---"
+	systemctl --user daemon-reload 2>/dev/null || true
+	systemctl --user enable --now recmeet-daemon.service 2>/dev/null && echo "Daemon enabled and started." || echo "Warning: could not enable daemon (no systemd user session?)"
+	@echo ""
+	@echo "Install complete. Run 'recmeet --status' to verify."
+endif
+
+uninstall:
+	@echo "--- Stopping recmeet services ---"
+	-systemctl --user disable --now recmeet-tray.service 2>/dev/null || true
+	-systemctl --user disable --now recmeet-daemon.service 2>/dev/null || true
+	-systemctl --user disable --now recmeet-daemon.socket 2>/dev/null || true
+	-pkill -f recmeet-tray 2>/dev/null || true
+	-pkill -f recmeet-daemon 2>/dev/null || true
+	systemctl --user daemon-reload 2>/dev/null || true
+	@echo ""
+	@echo "--- Removing installed files from $(DESTDIR)$(PREFIX) ---"
+	rm -fv $(DESTDIR)$(PREFIX)/bin/recmeet
+	rm -fv $(DESTDIR)$(PREFIX)/bin/recmeet-daemon
+	rm -fv $(DESTDIR)$(PREFIX)/bin/recmeet-tray
+	rm -fv $(DESTDIR)$(PREFIX)/share/applications/recmeet-tray.desktop
+	rm -fv $(DESTDIR)$(PREFIX)/lib/systemd/user/recmeet-daemon.service
+	rm -fv $(DESTDIR)$(PREFIX)/lib/systemd/user/recmeet-daemon.socket
+	rm -fv $(DESTDIR)$(PREFIX)/lib/systemd/user/recmeet-tray.service
+	rm -fv $(DESTDIR)$(PREFIX)/share/doc/recmeet/LICENSE
+	rm -fv $(DESTDIR)$(PREFIX)/share/doc/recmeet/AUTHORS
+	-rmdir $(DESTDIR)$(PREFIX)/share/doc/recmeet 2>/dev/null || true
+	@echo ""
+	@echo "--- Removing auto-downloaded models ---"
+	rm -rfv $(HOME)/.local/share/recmeet/models/whisper/
+	rm -rfv $(HOME)/.local/share/recmeet/models/sherpa/
+	@echo ""
+	@echo "Done."
+	@echo "  Preserved: ~/.config/recmeet (config), ~/.local/share/recmeet/logs/ (logs)"
+	@echo "  Preserved: ~/.local/share/recmeet/models/llama/ (user LLM models)"
+	@echo "  Preserved: meetings/ (recordings)"
 
 package-deb: build
 	cd $(BUILD_DIR) && cpack -G DEB
@@ -80,6 +121,16 @@ package-rpm: build
 
 package-arch:
 	cd dist/arch && makepkg -sf
+
+daemon-start: build
+	./$(BUILD_DIR)/recmeet-daemon &
+	@echo "Daemon started (PID $$!)"
+
+daemon-stop:
+	@./$(BUILD_DIR)/recmeet --stop 2>/dev/null || pkill -f recmeet-daemon || echo "Daemon not running"
+
+daemon-status:
+	@./$(BUILD_DIR)/recmeet --status
 
 clean:
 	rm -rf $(BUILD_DIR)
@@ -92,6 +143,10 @@ help:
 	@echo "  make integration   Build + run integration tests"
 	@echo "  make benchmark     Build + run benchmark tests"
 	@echo "  make install       Build + install to PREFIX (default: ~/.local)"
+	@echo "  make uninstall     Remove installed files from PREFIX"
+	@echo "  make daemon-start  Build + start daemon in background"
+	@echo "  make daemon-stop   Stop running daemon"
+	@echo "  make daemon-status Query daemon status"
 	@echo "  make package-deb   Build + create .deb package"
 	@echo "  make package-rpm   Build + create .rpm package"
 	@echo "  make package-arch  Build Arch package via makepkg"

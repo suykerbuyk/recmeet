@@ -2,12 +2,12 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 #include "config.h"
-#include "diarize.h"
+#include "config_json.h"
 #include "device_enum.h"
+#include "ipc_client.h"
+#include "ipc_protocol.h"
 #include "log.h"
-#include "model_manager.h"
 #include "notify.h"
-#include "pipeline.h"
 #include "summarize.h"
 #include "util.h"
 #include "version.h"
@@ -15,13 +15,7 @@
 #include <libayatana-appindicator/app-indicator.h>
 #include <gtk/gtk.h>
 
-#include <whisper.h>
-#ifdef RECMEET_USE_LLAMA
-#include <llama.h>
-#endif
-
 #include <algorithm>
-#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <mutex>
@@ -53,22 +47,23 @@ static const LangEntry LANGUAGES[] = {
     {"it", "Italian"},
 };
 
-struct BackgroundJob {
-    int id;
-    std::string out_dir;  // for display
-};
-
 struct TrayState {
     AppIndicator* indicator = nullptr;
 
     Config cfg;
-    StopToken stop;
-    std::thread pipeline_thread;
+    IpcClient ipc;   // daemon connection
 
-    enum State { IDLE, RECORDING } state = IDLE;
+    enum State { IDLE, RECORDING, POSTPROCESSING, DOWNLOADING } state = IDLE;
+    bool daemon_connected = false;
+    guint reconnect_timer = 0;
+    int reconnect_delay = 1;  // exponential backoff: 1, 2, 4, 8, ... max 30s
 
-    std::atomic<int> next_job_id{1};  // monotonic counter
-    std::vector<BackgroundJob> bg_jobs;  // GTK main thread only
+    // GIOChannel for socket event integration with GTK main loop
+    GIOChannel* ipc_channel = nullptr;
+    guint ipc_watch = 0;
+
+    // Current model download status (for status label)
+    std::string download_model;
 
     // Cached sources
     std::vector<AudioSource> mics;
@@ -107,163 +102,178 @@ static std::string source_label(const AudioSource& s) {
     return s.description + " (" + source_hint(s.name) + ")";
 }
 
-// --- State transitions ---
+// --- Daemon connection ---
+
+static void setup_ipc_watch();
+static void teardown_ipc_watch();
+static gboolean try_reconnect(gpointer);
 
 static void set_state(TrayState::State new_state) {
     g_tray.state = new_state;
     const char* icon = (new_state == TrayState::RECORDING) ? ICON_RECORDING : ICON_IDLE;
-    app_indicator_set_icon_full(g_tray.indicator, icon,
-        new_state == TrayState::RECORDING ? "Recording" : "Idle");
+    const char* desc = "Idle";
+    if (new_state == TrayState::RECORDING) desc = "Recording";
+    else if (new_state == TrayState::POSTPROCESSING) desc = "Processing";
+    else if (new_state == TrayState::DOWNLOADING) desc = "Downloading";
+    app_indicator_set_icon_full(g_tray.indicator, icon, desc);
     build_menu();
 }
 
-// --- Pipeline callbacks (must be called from GTK main thread via g_idle_add) ---
-
-struct RecordingDoneData {
-    int job_id;
-    std::string out_dir;
-};
-
-static gboolean on_recording_done(gpointer data) {
-    auto* d = static_cast<RecordingDoneData*>(data);
-    if (d) {
-        g_tray.bg_jobs.push_back({d->job_id, d->out_dir});
-        delete d;
+static void handle_ipc_event(const IpcEvent& ev) {
+    if (ev.event == "phase") {
+        std::string name = json_val_as_string(ev.data.at("name"));
+        log_info("[tray] Phase: %s", name.c_str());
+    } else if (ev.event == "state.changed") {
+        std::string state = json_val_as_string(ev.data.at("state"));
+        auto err_it = ev.data.find("error");
+        if (err_it != ev.data.end()) {
+            std::string error = json_val_as_string(err_it->second);
+            if (!error.empty())
+                notify("Pipeline error", error);
+        }
+        if (state == "idle") set_state(TrayState::IDLE);
+        else if (state == "recording") set_state(TrayState::RECORDING);
+        else if (state == "postprocessing") set_state(TrayState::POSTPROCESSING);
+        else if (state == "downloading") set_state(TrayState::DOWNLOADING);
+    } else if (ev.event == "job.complete") {
+        std::string note = json_val_as_string(ev.data.at("note_path"));
+        std::string dir = json_val_as_string(ev.data.at("output_dir"));
+        if (!note.empty())
+            notify("Meeting note ready", note);
+        set_state(TrayState::IDLE);
+    } else if (ev.event == "model.downloading") {
+        std::string status = json_val_as_string(ev.data.at("status"));
+        if (status == "downloading") {
+            g_tray.download_model = json_val_as_string(ev.data.at("model"));
+            build_menu();  // update status label
+        } else if (status == "complete") {
+            std::string model = json_val_as_string(ev.data.at("model"));
+            log_info("[tray] Model ready: %s", model.c_str());
+        } else if (status == "error") {
+            auto err_it = ev.data.find("error");
+            std::string error = (err_it != ev.data.end())
+                ? json_val_as_string(err_it->second) : "Unknown error";
+            notify("Model download failed", error);
+        }
     }
-    set_state(TrayState::IDLE);  // calls build_menu()
+}
+
+static gboolean on_ipc_data(GIOChannel*, GIOCondition cond, gpointer) {
+    if (cond & (G_IO_HUP | G_IO_ERR)) {
+        log_warn("[tray] Daemon disconnected");
+        g_tray.daemon_connected = false;
+        teardown_ipc_watch();
+        g_tray.ipc.close_connection();
+        set_state(TrayState::IDLE);
+        // Schedule reconnect with backoff
+        g_tray.reconnect_delay = 1;
+        g_tray.reconnect_timer = g_timeout_add_seconds(1, try_reconnect, nullptr);
+        return G_SOURCE_REMOVE;
+    }
+
+    // Read and dispatch one round of data
+    g_tray.ipc.read_and_dispatch(0);
+    return G_SOURCE_CONTINUE;
+}
+
+static void setup_ipc_watch() {
+    teardown_ipc_watch();
+    if (g_tray.ipc.fd() < 0) return;
+    g_tray.ipc_channel = g_io_channel_unix_new(g_tray.ipc.fd());
+    g_io_channel_set_encoding(g_tray.ipc_channel, nullptr, nullptr);
+    g_tray.ipc_watch = g_io_add_watch(g_tray.ipc_channel,
+        static_cast<GIOCondition>(G_IO_IN | G_IO_HUP | G_IO_ERR),
+        on_ipc_data, nullptr);
+}
+
+static void teardown_ipc_watch() {
+    if (g_tray.ipc_watch) {
+        g_source_remove(g_tray.ipc_watch);
+        g_tray.ipc_watch = 0;
+    }
+    if (g_tray.ipc_channel) {
+        g_io_channel_unref(g_tray.ipc_channel);
+        g_tray.ipc_channel = nullptr;
+    }
+}
+
+static bool connect_to_daemon() {
+    if (g_tray.daemon_connected) return true;
+    if (!g_tray.ipc.connect()) return false;
+
+    g_tray.ipc.set_event_callback(handle_ipc_event);
+    g_tray.daemon_connected = true;
+    setup_ipc_watch();
+
+    // Sync state
+    IpcResponse resp;
+    IpcError err;
+    if (g_tray.ipc.call("status.get", resp, err, 2000)) {
+        std::string state = json_val_as_string(resp.result["state"]);
+        if (state == "recording") set_state(TrayState::RECORDING);
+        else if (state == "postprocessing") set_state(TrayState::POSTPROCESSING);
+        else if (state == "downloading") set_state(TrayState::DOWNLOADING);
+        else set_state(TrayState::IDLE);
+    }
+
+    log_info("[tray] Connected to daemon");
+    return true;
+}
+
+static gboolean try_reconnect(gpointer) {
+    g_tray.reconnect_timer = 0;
+    if (connect_to_daemon()) {
+        g_tray.reconnect_delay = 1;  // reset backoff
+        build_menu();
+        return G_SOURCE_REMOVE;
+    }
+    // Exponential backoff: 1, 2, 4, 8, 16, 30, 30, ...
+    g_tray.reconnect_timer = g_timeout_add_seconds(
+        g_tray.reconnect_delay, try_reconnect, nullptr);
+    g_tray.reconnect_delay = std::min(g_tray.reconnect_delay * 2, 30);
     return G_SOURCE_REMOVE;
 }
 
-struct PostprocessDoneData {
-    int job_id;
-    bool success;
-    std::string error_msg;
-    std::string out_dir;
-};
-
-static gboolean on_postprocess_done(gpointer data) {
-    auto* d = static_cast<PostprocessDoneData*>(data);
-    auto& jobs = g_tray.bg_jobs;
-    jobs.erase(std::remove_if(jobs.begin(), jobs.end(),
-        [&](const BackgroundJob& j) { return j.id == d->job_id; }), jobs.end());
-    if (!d->success)
-        notify("Processing failed", d->out_dir + ": " + d->error_msg);
-    build_menu();
-    delete d;
-    return G_SOURCE_REMOVE;
-}
-
-// --- Recording ---
+// --- Recording (via IPC) ---
 
 static void on_record(GtkMenuItem*, gpointer) {
     if (g_tray.state != TrayState::IDLE) return;
 
-    // Pre-check: verify a mic can be found before flipping to RECORDING
-    if (g_tray.cfg.mic_source.empty()) {
-        try {
-            auto detected = detect_sources(g_tray.cfg.device_pattern);
-            if (detected.mic.empty()) {
-                std::string msg = "No microphone source detected.\n\nAvailable sources:";
-                for (const auto& s : detected.all)
-                    msg += "\n  " + s.description + " (" + s.name + ")";
-                auto* dialog = gtk_message_dialog_new(
-                    nullptr, GTK_DIALOG_MODAL, GTK_MESSAGE_WARNING,
-                    GTK_BUTTONS_OK, "%s", msg.c_str());
-                gtk_dialog_run(GTK_DIALOG(dialog));
-                gtk_widget_destroy(dialog);
-                refresh_sources();
-                build_menu();
-                return;
-            }
-        } catch (const std::exception& e) {
-            auto* dialog = gtk_message_dialog_new(
-                nullptr, GTK_DIALOG_MODAL, GTK_MESSAGE_ERROR,
-                GTK_BUTTONS_OK, "Device detection failed: %s", e.what());
-            gtk_dialog_run(GTK_DIALOG(dialog));
-            gtk_widget_destroy(dialog);
+    if (!g_tray.daemon_connected) {
+        if (!connect_to_daemon()) {
+            notify("Daemon not running",
+                   "Start recmeet-daemon first, or use recmeet CLI in standalone mode.");
             return;
         }
     }
 
+    // Send record.start with current config
+    JsonMap params = config_to_map(g_tray.cfg);
+
+    IpcResponse resp;
+    IpcError err;
+    if (!g_tray.ipc.call("record.start", params, resp, err, 10000)) {
+        std::string msg = err.message.empty() ? "Unknown error" : err.message;
+        notify("Recording failed", msg);
+        log_error("[tray] record.start failed: %s", msg.c_str());
+        return;
+    }
+
     set_state(TrayState::RECORDING);
-    g_tray.stop.reset();
-
-    g_tray.pipeline_thread = std::thread([] {
-        try {
-            // Pre-check: download whisper model if needed
-            if (!is_whisper_model_cached(g_tray.cfg.whisper_model)) {
-                notify("Downloading model",
-                       "Whisper '" + g_tray.cfg.whisper_model + "' — please wait...");
-                ensure_whisper_model(g_tray.cfg.whisper_model);
-                notify("Model ready",
-                       "Whisper '" + g_tray.cfg.whisper_model + "' downloaded.");
-            }
-
-            // Pre-check: validate LLM model if configured
-            if (!g_tray.cfg.no_summary && !g_tray.cfg.llm_model.empty()) {
-                ensure_llama_model(g_tray.cfg.llm_model);
-            }
-
-#if RECMEET_USE_SHERPA
-            // Pre-check: download sherpa models if diarization enabled
-            if (g_tray.cfg.diarize && !is_sherpa_model_cached()) {
-                notify("Downloading models",
-                       "Speaker diarization models — please wait...");
-                ensure_sherpa_models();
-                notify("Models ready",
-                       "Speaker diarization models downloaded.");
-            }
-
-            // Pre-check: download VAD model if enabled
-            if (g_tray.cfg.vad && !is_vad_model_cached()) {
-                notify("Downloading model",
-                       "Silero VAD model — please wait...");
-                ensure_vad_model();
-                notify("Model ready",
-                       "VAD model downloaded.");
-            }
-#endif
-
-            // Phase 1: Record + transcribe (blocks until stop)
-            auto on_rec_phase = [](const std::string& phase) {
-                log_info("[tray] Phase: %s", phase.c_str());
-            };
-            auto pp_input = run_recording(g_tray.cfg, g_tray.stop, on_rec_phase);
-
-            // Snapshot config for background work (user may change settings)
-            Config cfg_copy = g_tray.cfg;
-            int job_id = g_tray.next_job_id++;
-
-            // Return tray to IDLE + register background job
-            g_idle_add(on_recording_done,
-                       new RecordingDoneData{job_id, pp_input.out_dir.string()});
-
-            // Phase 2: This thread becomes the background post-processing thread
-            auto* done = new PostprocessDoneData{job_id, true, "", pp_input.out_dir.string()};
-            try {
-                auto on_pp_phase = [](const std::string& phase) {
-                    log_info("[tray] BG Phase: %s", phase.c_str());
-                };
-                run_postprocessing(cfg_copy, pp_input, on_pp_phase);
-            } catch (const std::exception& e) {
-                done->success = false;
-                done->error_msg = e.what();
-            }
-            g_idle_add(on_postprocess_done, done);
-
-        } catch (const std::exception& e) {
-            // Recording failed — no background job to spawn
-            log_error("[tray] Recording error: %s", e.what());
-            notify("Recording failed", e.what());
-            g_idle_add(on_recording_done, nullptr);  // nullptr = no job to register
-        }
-    });
-    g_tray.pipeline_thread.detach();
 }
 
 static void on_stop(GtkMenuItem*, gpointer) {
     if (g_tray.state != TrayState::RECORDING) return;
-    g_tray.stop.request();
+
+    IpcResponse resp;
+    IpcError err;
+    if (!g_tray.ipc.call("record.stop", resp, err, 5000)) {
+        log_error("[tray] record.stop failed: %s", err.message.c_str());
+        return;
+    }
+
+    // Optimistic UI update — daemon will confirm via state.changed event
+    set_state(TrayState::POSTPROCESSING);
 }
 
 // --- Radio / checkbox callbacks ---
@@ -287,6 +297,15 @@ static void on_model_selected(GtkCheckMenuItem* item, gpointer data) {
     auto* name = static_cast<const char*>(data);
     g_tray.cfg.whisper_model = name;
     save_config(g_tray.cfg);
+
+    // Trigger model download if daemon is connected and idle
+    if (g_tray.daemon_connected && g_tray.state == TrayState::IDLE) {
+        JsonMap params;
+        params["whisper_model"] = std::string(name);
+        IpcResponse resp;
+        IpcError err;
+        g_tray.ipc.call("models.ensure", params, resp, err, 5000);
+    }
 }
 
 static void on_language_selected(GtkCheckMenuItem* item, gpointer data) {
@@ -537,6 +556,20 @@ static void on_refresh_devices(GtkMenuItem*, gpointer) {
     notify("Devices refreshed", msg);
 }
 
+static void on_update_models(GtkMenuItem*, gpointer) {
+    if (!g_tray.daemon_connected) {
+        notify("Daemon not running", "Start recmeet-daemon first.");
+        return;
+    }
+    if (g_tray.state != TrayState::IDLE) return;
+
+    IpcResponse resp;
+    IpcError err;
+    if (!g_tray.ipc.call("models.update", resp, err, 5000)) {
+        notify("Update failed", err.message);
+    }
+}
+
 static void on_about(GtkMenuItem*, gpointer) {
     auto* dialog = gtk_about_dialog_new();
     gtk_about_dialog_set_program_name(GTK_ABOUT_DIALOG(dialog), "recmeet");
@@ -563,14 +596,13 @@ static void on_about(GtkMenuItem*, gpointer) {
 }
 
 static void on_quit(GtkMenuItem*, gpointer) {
-    if (g_tray.state == TrayState::RECORDING) {
-        g_tray.stop.request();
-        std::this_thread::sleep_for(std::chrono::seconds(2));
+    if (g_tray.state == TrayState::RECORDING && g_tray.daemon_connected) {
+        IpcResponse resp;
+        IpcError err;
+        g_tray.ipc.call("record.stop", resp, err, 2000);
     }
-    if (!g_tray.bg_jobs.empty())
-        log_warn("[tray] Quitting with %zu background job(s) still running. "
-                 "Use 'recmeet --reprocess <dir>' to retry.",
-                 g_tray.bg_jobs.size());
+    teardown_ipc_watch();
+    g_tray.ipc.close_connection();
     gtk_main_quit();
 }
 
@@ -636,9 +668,20 @@ static void build_menu() {
     bool is_recording = (g_tray.state == TrayState::RECORDING);
 
     // --- Status label ---
-    std::string status = is_recording ? "Status: Recording..." : "Status: Idle";
-    if (!g_tray.bg_jobs.empty())
-        status += "  (" + std::to_string(g_tray.bg_jobs.size()) + " processing)";
+    std::string status;
+    if (!g_tray.daemon_connected)
+        status = "Status: Disconnected";
+    else if (is_recording)
+        status = "Status: Recording...";
+    else if (g_tray.state == TrayState::POSTPROCESSING)
+        status = "Status: Processing...";
+    else if (g_tray.state == TrayState::DOWNLOADING) {
+        status = "Status: Downloading";
+        if (!g_tray.download_model.empty())
+            status += " " + g_tray.download_model;
+        status += "...";
+    } else
+        status = "Status: Idle";
     auto* status_item = gtk_menu_item_new_with_label(status.c_str());
     gtk_widget_set_sensitive(status_item, FALSE);
     gtk_menu_shell_append(GTK_MENU_SHELL(menu), status_item);
@@ -646,13 +689,14 @@ static void build_menu() {
     gtk_menu_shell_append(GTK_MENU_SHELL(menu), gtk_separator_menu_item_new());
 
     // --- Record / Stop ---
-    if (is_idle) {
-        auto* item = gtk_menu_item_new_with_label("Record");
-        g_signal_connect(item, "activate", G_CALLBACK(on_record), nullptr);
-        gtk_menu_shell_append(GTK_MENU_SHELL(menu), item);
-    } else {
+    if (is_recording) {
         auto* item = gtk_menu_item_new_with_label("Stop Recording");
         g_signal_connect(item, "activate", G_CALLBACK(on_stop), nullptr);
+        gtk_menu_shell_append(GTK_MENU_SHELL(menu), item);
+    } else {
+        auto* item = gtk_menu_item_new_with_label("Record");
+        g_signal_connect(item, "activate", G_CALLBACK(on_record), nullptr);
+        gtk_widget_set_sensitive(item, is_idle && g_tray.daemon_connected);
         gtk_menu_shell_append(GTK_MENU_SHELL(menu), item);
     }
 
@@ -914,6 +958,12 @@ static void build_menu() {
         gtk_menu_shell_append(GTK_MENU_SHELL(menu), item);
     }
     {
+        auto* item = gtk_menu_item_new_with_label("Update Models");
+        g_signal_connect(item, "activate", G_CALLBACK(on_update_models), nullptr);
+        gtk_widget_set_sensitive(item, is_idle && g_tray.daemon_connected);
+        gtk_menu_shell_append(GTK_MENU_SHELL(menu), item);
+    }
+    {
         auto* item = gtk_menu_item_new_with_label("About");
         g_signal_connect(item, "activate", G_CALLBACK(on_about), nullptr);
         gtk_menu_shell_append(GTK_MENU_SHELL(menu), item);
@@ -938,14 +988,6 @@ int main(int argc, char* argv[]) {
     gtk_init(&argc, &argv);
     notify_init();
 
-    // Suppress vendor library log spam — the tray is a GUI app; GGML
-    // debug output on stderr is never useful (and floods journald when
-    // running as a systemd service).
-    whisper_log_set([](enum ggml_log_level, const char*, void*) {}, nullptr);
-#ifdef RECMEET_USE_LLAMA
-    llama_log_set([](enum ggml_log_level, const char*, void*) {}, nullptr);
-#endif
-
     g_tray.cfg = load_config();
 
     // Initialize logging
@@ -962,12 +1004,21 @@ int main(int argc, char* argv[]) {
     app_indicator_set_title(g_tray.indicator, "recmeet");
 
     refresh_sources();
+
+    // Connect to daemon (non-blocking — will retry via timer if not running)
+    if (!connect_to_daemon())
+        g_tray.reconnect_timer = g_timeout_add_seconds(1, try_reconnect, nullptr);
+
     build_menu();
     fetch_provider_models();
 
     log_info("recmeet-tray %s running (%zu mic(s), %zu monitor(s))",
             RECMEET_VERSION, g_tray.mics.size(), g_tray.monitors.size());
     gtk_main();
+
+    teardown_ipc_watch();
+    if (g_tray.reconnect_timer)
+        g_source_remove(g_tray.reconnect_timer);
 
     log_shutdown();
     notify_cleanup();

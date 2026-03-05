@@ -90,6 +90,20 @@ fs::path ensure_whisper_model(const std::string& model_name) {
     return model_path;
 }
 
+fs::path download_whisper_model(const std::string& model_name) {
+    auto it = WHISPER_MODELS.find(model_name);
+    if (it == WHISPER_MODELS.end())
+        throw RecmeetError("Unknown whisper model: " + model_name +
+                           ". Available: tiny, base, small, medium, large-v3");
+
+    fs::path model_dir = models_dir() / "whisper";
+    fs::create_directories(model_dir);
+
+    fs::path model_path = model_dir / it->second.filename;
+    download_file(it->second.url, model_path);
+    return model_path;
+}
+
 #if RECMEET_USE_LLAMA
 fs::path ensure_llama_model(const std::string& model_name) {
     // For now, expect the user to provide a path or a known model name
@@ -163,6 +177,21 @@ SherpaModelPaths ensure_sherpa_models() {
     return {seg, emb};
 }
 
+SherpaModelPaths download_sherpa_models() {
+    auto seg = sherpa_seg_path();
+    auto emb = sherpa_emb_path();
+
+    fs::create_directories(seg.parent_path());
+    fs::create_directories(emb.parent_path());
+
+    download_and_extract_tarball(SHERPA_SEGMENTATION_URL, seg.parent_path());
+    if (!fs::exists(seg))
+        throw RecmeetError("Segmentation model not found after extraction: " + seg.string());
+
+    download_file(SHERPA_EMBEDDING_URL, emb);
+    return {seg, emb};
+}
+
 // --- VAD (Silero) ---
 
 namespace {
@@ -191,6 +220,67 @@ fs::path ensure_vad_model() {
     download_file(SILERO_VAD_URL, p);
     return p;
 }
+
+fs::path download_vad_model() {
+    auto p = vad_model_path();
+    fs::create_directories(p.parent_path());
+    download_file(SILERO_VAD_URL, p);
+    return p;
+}
 #endif
+
+std::vector<ModelStatus> list_cached_models() {
+    std::vector<ModelStatus> result;
+
+    for (const auto& [name, info] : WHISPER_MODELS) {
+        ModelStatus s;
+        s.name = name;
+        s.category = "whisper";
+        s.path = (models_dir() / "whisper" / info.filename).string();
+        if (fs::exists(s.path) && fs::file_size(s.path) > 0) {
+            s.cached = true;
+            s.size_bytes = static_cast<int64_t>(fs::file_size(s.path));
+        }
+        result.push_back(std::move(s));
+    }
+
+#if RECMEET_USE_SHERPA
+    {
+        ModelStatus s;
+        s.name = "segmentation";
+        s.category = "sherpa";
+        s.path = sherpa_seg_path().string();
+        if (fs::exists(s.path) && fs::file_size(s.path) > 0) {
+            s.cached = true;
+            s.size_bytes = static_cast<int64_t>(fs::file_size(s.path));
+        }
+        result.push_back(std::move(s));
+    }
+    {
+        ModelStatus s;
+        s.name = "embedding";
+        s.category = "sherpa";
+        s.path = sherpa_emb_path().string();
+        if (fs::exists(s.path) && fs::file_size(s.path) > 0) {
+            s.cached = true;
+            s.size_bytes = static_cast<int64_t>(fs::file_size(s.path));
+        }
+        result.push_back(std::move(s));
+    }
+    {
+        ModelStatus s;
+        s.name = "vad";
+        s.category = "vad";
+        s.path = vad_model_path().string();
+        if (fs::exists(s.path) && fs::file_size(s.path) > 0) {
+            s.cached = true;
+            s.size_bytes = static_cast<int64_t>(fs::file_size(s.path));
+        }
+        result.push_back(std::move(s));
+    }
+#endif
+
+    return result;
+}
 
 } // namespace recmeet
