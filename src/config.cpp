@@ -186,6 +186,9 @@ Config load_config(const fs::path& config_path) {
         note_domain = get_val(entries, "obsidian", "domain", cfg.note.domain);
     cfg.note.domain = note_domain;
 
+    std::string note_dir_val = get_val(entries, "notes", "directory", "");
+    if (!note_dir_val.empty()) cfg.note_dir = note_dir_val;
+
     return cfg;
 }
 
@@ -273,6 +276,8 @@ void save_config(const Config& cfg, const fs::path& config_path) {
 
     out << "\nnotes:\n"
         << "  domain: " << cfg.note.domain << "\n";
+    if (!cfg.note_dir.empty())
+        out << "  directory: \"" << cfg.note_dir.string() << "\"\n";
 }
 
 } // namespace recmeet

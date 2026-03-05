@@ -37,6 +37,7 @@ TEST_CASE("save_config + load_config round-trip", "[config]") {
     cfg.log_dir = "/tmp/recmeet-test-logs";
     cfg.output_dir = "/tmp/meetings";
     cfg.note.domain = "engineering";
+    cfg.note_dir = "/home/user/obsidian/Meetings";
 
     save_config(cfg, path);
     REQUIRE(fs::exists(path));
@@ -64,6 +65,7 @@ TEST_CASE("save_config + load_config round-trip", "[config]") {
     CHECK(content.find("directory: \"/tmp/recmeet-test-logs\"") != std::string::npos);
     CHECK(content.find("directory: \"/tmp/meetings\"") != std::string::npos);
     CHECK(content.find("domain: engineering") != std::string::npos);
+    CHECK(content.find("directory: \"/home/user/obsidian/Meetings\"") != std::string::npos);
 
     // Load it back and verify
     Config loaded = load_config(path);
@@ -85,6 +87,7 @@ TEST_CASE("save_config + load_config round-trip", "[config]") {
     CHECK(loaded.log_dir == "/tmp/recmeet-test-logs");
     CHECK(loaded.output_dir == "/tmp/meetings");
     CHECK(loaded.note.domain == "engineering");
+    CHECK(loaded.note_dir == "/home/user/obsidian/Meetings");
 
     fs::remove_all(path.parent_path());
 }

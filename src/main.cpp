@@ -36,6 +36,7 @@ static void print_usage() {
         "  --model NAME         Whisper model: tiny/base/small/medium/large-v3 (default: base)\n"
         "  --language CODE      Force whisper language (e.g. en, de, ja; default: auto-detect)\n"
         "  --output-dir DIR     Base directory for outputs (default: ./meetings)\n"
+        "  --note-dir DIR       Directory for meeting notes (default: same as audio)\n"
         "  --provider NAME      API provider: xai, openai, anthropic (default: xai)\n"
         "  --api-key KEY        API key (default: from provider env var or config)\n"
         "  --api-url URL        API endpoint override (default: derived from provider)\n"

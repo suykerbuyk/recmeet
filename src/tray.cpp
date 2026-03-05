@@ -472,6 +472,15 @@ static void on_set_output_dir(GtkMenuItem*, gpointer) {
     }
 }
 
+static void on_set_note_dir(GtkMenuItem*, gpointer) {
+    std::string path = run_folder_chooser("Select Note Directory");
+    if (!path.empty()) {
+        g_tray.cfg.note_dir = path;
+        save_config(g_tray.cfg);
+        build_menu();
+    }
+}
+
 static void on_set_llm_model(GtkMenuItem*, gpointer) {
     choose_gguf_model();
 }
@@ -861,6 +870,13 @@ static void build_menu() {
         gtk_widget_set_sensitive(out_info, FALSE);
         gtk_menu_shell_append(GTK_MENU_SHELL(submenu), out_info);
 
+        // Current note dir label
+        std::string note_label = "Note Dir: " +
+            (g_tray.cfg.note_dir.empty() ? "(same as output)" : g_tray.cfg.note_dir.string());
+        auto* note_info = gtk_menu_item_new_with_label(note_label.c_str());
+        gtk_widget_set_sensitive(note_info, FALSE);
+        gtk_menu_shell_append(GTK_MENU_SHELL(submenu), note_info);
+
         gtk_menu_shell_append(GTK_MENU_SHELL(submenu), gtk_separator_menu_item_new());
 
         auto* open_latest = gtk_menu_item_new_with_label("Open Latest Session");
@@ -871,6 +887,10 @@ static void build_menu() {
         auto* set_out = gtk_menu_item_new_with_label("Set Output Dir...");
         g_signal_connect(set_out, "activate", G_CALLBACK(on_set_output_dir), nullptr);
         gtk_menu_shell_append(GTK_MENU_SHELL(submenu), set_out);
+
+        auto* set_note = gtk_menu_item_new_with_label("Set Note Dir...");
+        g_signal_connect(set_note, "activate", G_CALLBACK(on_set_note_dir), nullptr);
+        gtk_menu_shell_append(GTK_MENU_SHELL(submenu), set_note);
 
         auto* set_llm = gtk_menu_item_new_with_label("Set LLM Model...");
         g_signal_connect(set_llm, "activate", G_CALLBACK(on_set_llm_model), nullptr);

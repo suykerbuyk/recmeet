@@ -381,6 +381,12 @@ PipelineResult run_postprocessing(const Config& cfg, const PostprocessInput& inp
         md.transcript_text = transcript_text;
         md.context_text = context_text;
         md.output_dir = input.out_dir;
+        if (!cfg.note_dir.empty()) {
+            md.note_dir = cfg.note_dir;
+            fs::create_directories(md.note_dir);
+        } else {
+            md.note_dir = input.out_dir;
+        }
 
         // AI-derived metadata
         md.title = metadata.title;

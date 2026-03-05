@@ -352,6 +352,53 @@ TEST_CASE("write_meeting_note: empty metadata falls back gracefully", "[note]") 
     fs::remove_all(dir);
 }
 
+TEST_CASE("write_meeting_note: uses note_dir when set", "[note]") {
+    auto audio_dir = tmp_dir();
+    auto note_dir = fs::temp_directory_path() / "recmeet_test_note_dir";
+    fs::create_directories(note_dir);
+
+    NoteConfig config;
+
+    MeetingData data;
+    data.date = "2026-03-04";
+    data.time = "09:15";
+    data.summary_text = "### Overview\nTest meeting.\n";
+    data.transcript_text = "[00:00 - 00:05] Hello.";
+    data.output_dir = audio_dir;
+    data.note_dir = note_dir;
+
+    fs::path note = write_meeting_note(config, data);
+    REQUIRE(fs::exists(note));
+    CHECK(note.parent_path() == note_dir);
+    // Note should NOT be in audio_dir
+    CHECK_FALSE(fs::exists(audio_dir / note.filename()));
+    // Source field in frontmatter should still reference audio_dir
+    std::string content = read_file(note);
+    CHECK(content.find(audio_dir.string()) != std::string::npos);
+
+    fs::remove_all(audio_dir);
+    fs::remove_all(note_dir);
+}
+
+TEST_CASE("write_meeting_note: defaults to output_dir when note_dir empty", "[note]") {
+    auto dir = tmp_dir();
+
+    NoteConfig config;
+
+    MeetingData data;
+    data.date = "2026-03-04";
+    data.time = "09:30";
+    data.transcript_text = "[00:00 - 00:05] Hi.";
+    data.output_dir = dir;
+    // note_dir intentionally left empty
+
+    fs::path note = write_meeting_note(config, data);
+    REQUIRE(fs::exists(note));
+    CHECK(note.parent_path() == dir);
+
+    fs::remove_all(dir);
+}
+
 TEST_CASE("write_meeting_note: handles empty summary gracefully", "[note]") {
     auto dir = tmp_dir();
 

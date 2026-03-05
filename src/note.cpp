@@ -157,7 +157,8 @@ fs::path write_meeting_note(const NoteConfig& config, const MeetingData& data) {
             filename += "_" + safe_title;
     }
     filename += ".md";
-    fs::path note_path = data.output_dir / filename;
+    fs::path note_parent = data.note_dir.empty() ? data.output_dir : data.note_dir;
+    fs::path note_path = note_parent / filename;
 
     std::ofstream out(note_path);
     if (!out)

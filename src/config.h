@@ -70,6 +70,7 @@ struct Config {
     // Output
     fs::path output_dir = "./meetings";
     bool output_dir_explicit = false;  // true when --output-dir passed on CLI
+    fs::path note_dir;  // empty = use output_dir (same as audio)
 
     // Meeting notes
     NoteConfig note;

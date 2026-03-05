@@ -188,6 +188,16 @@ TEST_CASE("parse_cli: default vad_threshold is 0.5", "[cli]") {
     CHECK(cli.cfg.vad_threshold == 0.5f);
 }
 
+TEST_CASE("parse_cli: --note-dir sets note_dir", "[cli]") {
+    auto cli = run_cli({"recmeet", "--note-dir", "/tmp/obsidian/meetings"});
+    CHECK(cli.cfg.note_dir == "/tmp/obsidian/meetings");
+}
+
+TEST_CASE("parse_cli: default note_dir is empty", "[cli]") {
+    auto cli = run_cli({"recmeet"});
+    CHECK(cli.cfg.note_dir.empty());
+}
+
 TEST_CASE("parse_cli: --log-level sets log level", "[cli]") {
     auto cli = run_cli({"recmeet", "--log-level", "info"});
     CHECK(cli.cfg.log_level_str == "info");

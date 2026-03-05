@@ -30,6 +30,7 @@ struct MeetingData {
     std::string transcript_text;   // Full timestamped transcript
     std::string context_text;      // Pre-meeting notes (optional)
     fs::path output_dir;           // Path to raw files
+    fs::path note_dir;             // Where to write the note (defaults to output_dir)
     std::vector<std::string> action_items; // Extracted from summary
 
     // AI-derived metadata
