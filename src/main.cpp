@@ -11,8 +11,12 @@
 #include "util.h"
 #include "version.h"
 
+#include <whisper.h>
+
 #include <csignal>
+#include <cstring>
 #include <cstdio>
+#include <unistd.h>
 
 using namespace recmeet;
 
@@ -20,6 +24,41 @@ static StopToken g_stop;
 
 static void signal_handler(int) {
     g_stop.request();
+}
+
+// Whisper log callback for interactive CLI use.
+// On a TTY, INFO-level messages (model loading, "auto-detected language", etc.)
+// overwrite in place via \r so they don't scroll the terminal.  WARN/ERROR
+// messages print normally so they remain visible.
+static bool g_whisper_overwrote = false;
+
+static void whisper_cli_log(enum ggml_log_level level, const char* text, void*) {
+    if (!text || !*text) return;
+    static const bool is_tty = isatty(STDERR_FILENO);
+
+    if (is_tty && (level <= GGML_LOG_LEVEL_INFO || level == GGML_LOG_LEVEL_CONT)) {
+        size_t len = std::strlen(text);
+        while (len > 0 && (text[len - 1] == '\n' || text[len - 1] == '\r'))
+            --len;
+        if (len > 0) {
+            fprintf(stderr, "\r\033[K%.*s", (int)len, text);
+            g_whisper_overwrote = true;
+        }
+    } else {
+        if (g_whisper_overwrote) {
+            fprintf(stderr, "\n");
+            g_whisper_overwrote = false;
+        }
+        fprintf(stderr, "%s", text);
+    }
+}
+
+// Clear any pending in-place whisper line before printing other output.
+static void whisper_flush_line() {
+    if (g_whisper_overwrote) {
+        fprintf(stderr, "\r\033[K");
+        g_whisper_overwrote = false;
+    }
 }
 
 static void print_usage() {
@@ -219,15 +258,21 @@ int main(int argc, char* argv[]) {
     if (cfg.reprocess_dir.empty())
         fprintf(stderr, "Press Ctrl+C to stop recording.\n\n");
 
+    // On a TTY, whisper INFO messages overwrite in place instead of scrolling
+    whisper_log_set(whisper_cli_log, nullptr);
+
     try {
         auto result = run_pipeline(cfg, g_stop);
+        whisper_flush_line();
         (void)result;
     } catch (const RecmeetError& e) {
+        whisper_flush_line();
         fprintf(stderr, "Error: %s\n", e.what());
         log_shutdown();
         notify_cleanup();
         return 1;
     } catch (const std::exception& e) {
+        whisper_flush_line();
         fprintf(stderr, "Unexpected error: %s\n", e.what());
         log_shutdown();
         notify_cleanup();
