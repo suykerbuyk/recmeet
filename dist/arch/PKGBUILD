@@ -1,6 +1,6 @@
 # Maintainer: recmeet contributors
 pkgname=recmeet-git
-pkgver=0.1.0
+pkgver=0.0.0.r0.0000000
 pkgrel=1
 pkgdesc="Record, transcribe, and summarize meetings locally"
 arch=('x86_64')
@@ -29,9 +29,9 @@ sha256sums=('SKIP')
 
 pkgver() {
     cd "${pkgname}"
-    git describe --tags --match 'v[0-9]*' --long 2>/dev/null \
-        | sed 's/^v//; s/-/.r/; s/-/./' \
-        || printf "0.1.0.r%s.g%s" "$(git rev-list --count HEAD)" "$(git rev-parse --short HEAD)"
+    git describe --tags --match 'v[0-9]*' --long 2>/dev/null |
+        sed 's/^v//; s/-/.r/; s/-/./' ||
+        printf "0.1.0.r%s.g%s" "$(git rev-list --count HEAD)" "$(git rev-parse --short HEAD)"
 }
 
 prepare() {

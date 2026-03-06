@@ -172,7 +172,16 @@ static gboolean on_ipc_data(GIOChannel*, GIOCondition cond, gpointer) {
     }
 
     // Read and dispatch one round of data
-    g_tray.ipc.read_and_dispatch(0);
+    if (!g_tray.ipc.read_and_dispatch(0)) {
+        log_warn("[tray] Daemon connection lost");
+        g_tray.daemon_connected = false;
+        teardown_ipc_watch();
+        g_tray.ipc.close_connection();
+        set_state(TrayState::IDLE);
+        g_tray.reconnect_delay = 1;
+        g_tray.reconnect_timer = g_timeout_add_seconds(1, try_reconnect, nullptr);
+        return G_SOURCE_REMOVE;
+    }
     return G_SOURCE_CONTINUE;
 }
 
@@ -524,7 +533,8 @@ static void on_open_latest_session(GtkMenuItem*, gpointer) {
 
     std::sort(sessions.begin(), sessions.end());
     std::string cmd = "xdg-open '" + sessions.back().string() + "' &";
-    std::system(cmd.c_str());
+    if (std::system(cmd.c_str()) != 0)
+        log_warn("[tray] xdg-open failed for: %s", sessions.back().c_str());
 }
 
 // --- Utility actions ---

@@ -4,12 +4,15 @@
 #include <catch2/catch_test_macros.hpp>
 #include "cli.h"
 
+#include <cstdlib>
 #include <getopt.h>
 
 using namespace recmeet;
 
 // Helper to build argv and call parse_cli.
 // getopt state must be reset between calls.
+// Redirects XDG_CONFIG_HOME to an empty temp dir so load_config()
+// returns pure defaults instead of reading the user's real config.
 static CliResult run_cli(std::initializer_list<const char*> args) {
     // Build argv (must be non-const char* for getopt)
     std::vector<char*> argv;
@@ -19,7 +22,19 @@ static CliResult run_cli(std::initializer_list<const char*> args) {
 
     optind = 0; // Reset getopt state
 
-    return parse_cli(static_cast<int>(argv.size() - 1), argv.data());
+    // Isolate from host config
+    const char* old_xdg = std::getenv("XDG_CONFIG_HOME");
+    setenv("XDG_CONFIG_HOME", "/tmp/recmeet_test_cli_no_config", 1);
+
+    auto result = parse_cli(static_cast<int>(argv.size() - 1), argv.data());
+
+    // Restore
+    if (old_xdg)
+        setenv("XDG_CONFIG_HOME", old_xdg, 1);
+    else
+        unsetenv("XDG_CONFIG_HOME");
+
+    return result;
 }
 
 TEST_CASE("parse_cli: defaults from config when no flags", "[cli]") {

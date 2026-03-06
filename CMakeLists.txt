@@ -219,6 +219,7 @@ if(RECMEET_BUILD_TESTS)
         tests/test_config_json.cpp
         tests/test_ipc_server.cpp
         tests/test_ipc_client.cpp
+        tests/test_ipc_integration.cpp
     )
     target_link_libraries(recmeet_tests PRIVATE recmeet_core Catch2::Catch2WithMain)
     catch_discover_tests(recmeet_tests)

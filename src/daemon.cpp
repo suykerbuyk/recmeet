@@ -184,9 +184,11 @@ int main(int argc, char* argv[]) {
             close(pid_fd);
             return 1;
         }
-        ftruncate(pid_fd, 0);
+        if (ftruncate(pid_fd, 0) < 0)
+            fprintf(stderr, "warning: ftruncate pid file: %s\n", strerror(errno));
         std::string pid_str = std::to_string(getpid()) + "\n";
-        (void)write(pid_fd, pid_str.data(), pid_str.size());
+        if (write(pid_fd, pid_str.data(), pid_str.size()) < 0)
+            fprintf(stderr, "warning: write pid file: %s\n", strerror(errno));
         // Keep fd open (holds the lock until process exits)
     }
 
@@ -296,6 +298,14 @@ int main(int argc, char* argv[]) {
             err.code = static_cast<int>(IpcErrorCode::InternalError);
             err.message = "Model setup failed";
             return false;
+        }
+
+        // Broadcast state change so all clients (including other trays) learn about it
+        {
+            IpcEvent ev;
+            ev.event = "state.changed";
+            ev.data["state"] = std::string("recording");
+            server.broadcast(ev);
         }
 
         g_stop.reset();

@@ -149,14 +149,14 @@ bool IpcClient::read_events(const std::string& until_event, int timeout_ms) {
 }
 
 bool IpcClient::read_and_dispatch(int timeout_ms) {
-    // First, process any complete lines already in the buffer
+    // First, process ALL complete lines already in the buffer
     size_t nl;
     while ((nl = read_buf_.find('\n')) != std::string::npos) {
         std::string line = read_buf_.substr(0, nl);
         read_buf_.erase(0, nl + 1);
         if (!line.empty()) process_line(line);
-        if (pending_done_) return true;
     }
+    if (pending_done_) return true;
 
     struct pollfd pfd;
     pfd.fd = fd_;
@@ -180,8 +180,8 @@ bool IpcClient::read_and_dispatch(int timeout_ms) {
         std::string line = read_buf_.substr(0, nl);
         read_buf_.erase(0, nl + 1);
         if (!line.empty()) process_line(line);
-        if (pending_done_) return true;
     }
+    if (pending_done_) return true;
 
     return true;
 }
