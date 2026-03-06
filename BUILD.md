@@ -371,9 +371,12 @@ cmake --install build --prefix /tmp/test-install
 | File | Destination |
 |---|---|
 | `recmeet` | `<prefix>/bin/` |
+| `recmeet-daemon` | `<prefix>/bin/` |
 | `recmeet-tray` | `<prefix>/bin/` (only when `RECMEET_BUILD_TRAY=ON`) |
 | `recmeet-tray.desktop` | `<prefix>/share/applications/` (only when `RECMEET_BUILD_TRAY=ON`) |
-| `recmeet-tray.service` | `<prefix>/lib/systemd/user/` (only when `RECMEET_BUILD_TRAY=ON`) |
+| `recmeet-daemon.service` | `<prefix>/share/systemd/user/` |
+| `recmeet-daemon.socket` | `<prefix>/share/systemd/user/` |
+| `recmeet-tray.service` | `<prefix>/share/systemd/user/` (only when `RECMEET_BUILD_TRAY=ON`) |
 | `LICENSE` | `<prefix>/share/doc/recmeet/` |
 | `AUTHORS` | `<prefix>/share/doc/recmeet/` |
 

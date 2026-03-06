@@ -3,6 +3,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 #include "vad.h"
+#include "model_manager.h"
 
 #include <cmath>
 
@@ -63,8 +64,7 @@ TEST_CASE("detect_speech: throws on empty audio", "[vad]") {
 }
 
 TEST_CASE("detect_speech: silence produces no segments", "[vad][integration]") {
-    if (!is_vad_model_cached())
-        SKIP("Silero VAD model not cached");
+    ensure_vad_model();
 
     // 5 seconds of silence
     std::vector<float> silence(SAMPLE_RATE * 5, 0.0f);
@@ -76,8 +76,7 @@ TEST_CASE("detect_speech: silence produces no segments", "[vad][integration]") {
 }
 
 TEST_CASE("detect_speech: pure tone is not detected as speech", "[vad][integration]") {
-    if (!is_vad_model_cached())
-        SKIP("Silero VAD model not cached");
+    ensure_vad_model();
 
     // 3 seconds of 440Hz sine wave — Silero VAD is speech-trained,
     // so a pure tone should not trigger speech detection.
@@ -92,8 +91,7 @@ TEST_CASE("detect_speech: pure tone is not detected as speech", "[vad][integrati
 }
 
 TEST_CASE("detect_speech: real audio produces speech segments", "[vad][integration]") {
-    if (!is_vad_model_cached())
-        SKIP("Silero VAD model not cached");
+    ensure_vad_model();
 
     // Find the benchmark audio file
     fs::path dir = fs::current_path();

@@ -53,8 +53,7 @@ TEST_CASE("read_context_file: returns empty for empty file", "[pipeline]") {
 }
 
 TEST_CASE("run_postprocessing: transcribe minimal WAV with no summary/diarize", "[integration]") {
-    if (!is_whisper_model_cached("base"))
-        SKIP("Whisper base model not cached");
+    ensure_whisper_model("tiny");
 
     // Create a minimal 1-second silent WAV (16kHz S16LE mono)
     auto dir = tmp_dir();
@@ -63,7 +62,7 @@ TEST_CASE("run_postprocessing: transcribe minimal WAV with no summary/diarize", 
     write_wav(audio, silence);
 
     Config cfg;
-    cfg.whisper_model = "base";
+    cfg.whisper_model = "tiny";
     cfg.no_summary = true;
     cfg.diarize = false;
     cfg.vad = false;

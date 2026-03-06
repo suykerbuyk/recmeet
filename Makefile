@@ -97,9 +97,9 @@ uninstall:
 	rm -fv $(DESTDIR)$(PREFIX)/bin/recmeet-daemon
 	rm -fv $(DESTDIR)$(PREFIX)/bin/recmeet-tray
 	rm -fv $(DESTDIR)$(PREFIX)/share/applications/recmeet-tray.desktop
-	rm -fv $(DESTDIR)$(PREFIX)/lib/systemd/user/recmeet-daemon.service
-	rm -fv $(DESTDIR)$(PREFIX)/lib/systemd/user/recmeet-daemon.socket
-	rm -fv $(DESTDIR)$(PREFIX)/lib/systemd/user/recmeet-tray.service
+	rm -fv $(DESTDIR)$(PREFIX)/share/systemd/user/recmeet-daemon.service
+	rm -fv $(DESTDIR)$(PREFIX)/share/systemd/user/recmeet-daemon.socket
+	rm -fv $(DESTDIR)$(PREFIX)/share/systemd/user/recmeet-tray.service
 	rm -fv $(DESTDIR)$(PREFIX)/share/doc/recmeet/LICENSE
 	rm -fv $(DESTDIR)$(PREFIX)/share/doc/recmeet/AUTHORS
 	-rmdir $(DESTDIR)$(PREFIX)/share/doc/recmeet 2>/dev/null || true

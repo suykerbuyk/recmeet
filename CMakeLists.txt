@@ -237,9 +237,9 @@ set(RECMEET_DAEMON_EXEC "${CMAKE_INSTALL_FULL_BINDIR}/recmeet-daemon")
 configure_file(dist/recmeet-daemon.service.in
     ${CMAKE_BINARY_DIR}/recmeet-daemon.service @ONLY)
 install(FILES ${CMAKE_BINARY_DIR}/recmeet-daemon.service
-    DESTINATION lib/systemd/user)
+    DESTINATION ${CMAKE_INSTALL_DATADIR}/systemd/user)
 install(FILES dist/recmeet-daemon.socket
-    DESTINATION lib/systemd/user)
+    DESTINATION ${CMAKE_INSTALL_DATADIR}/systemd/user)
 
 if(RECMEET_BUILD_TRAY)
     install(TARGETS recmeet-tray RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
@@ -251,7 +251,7 @@ if(RECMEET_BUILD_TRAY)
     configure_file(dist/recmeet-tray.service.in
         ${CMAKE_BINARY_DIR}/recmeet-tray.service @ONLY)
     install(FILES ${CMAKE_BINARY_DIR}/recmeet-tray.service
-        DESTINATION lib/systemd/user)
+        DESTINATION ${CMAKE_INSTALL_DATADIR}/systemd/user)
 endif()
 
 install(FILES LICENSE AUTHORS
