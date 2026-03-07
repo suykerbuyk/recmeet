@@ -34,6 +34,7 @@ static Config make_test_config() {
     cfg.log_dir = "/tmp/recmeet-test-logs";
     cfg.output_dir = "/tmp/meetings";
     cfg.note_dir = "/home/user/obsidian/Meetings";
+    cfg.reprocess_dir = "/tmp/meetings/2026-03-06_11-58";
     cfg.note.domain = "engineering";
     return cfg;
 }
@@ -77,6 +78,7 @@ TEST_CASE("config_to_json + config_from_json round-trip", "[config_json]") {
     CHECK(loaded.log_dir == original.log_dir);
     CHECK(loaded.output_dir == original.output_dir);
     CHECK(loaded.note_dir == original.note_dir);
+    CHECK(loaded.reprocess_dir == original.reprocess_dir);
     CHECK(loaded.note.domain == original.note.domain);
 }
 

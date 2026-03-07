@@ -32,7 +32,7 @@ using namespace recmeet;
 // Daemon state
 // ---------------------------------------------------------------------------
 
-enum class DaemonState { Idle, Recording, Postprocessing, Downloading };
+enum class DaemonState { Idle, Recording, Reprocessing, Postprocessing, Downloading };
 
 static std::atomic<DaemonState> g_state{DaemonState::Idle};
 static Config g_config;
@@ -82,6 +82,7 @@ static const char* state_name(DaemonState s) {
     switch (s) {
         case DaemonState::Idle:            return "idle";
         case DaemonState::Recording:       return "recording";
+        case DaemonState::Reprocessing:    return "reprocessing";
         case DaemonState::Postprocessing:  return "postprocessing";
         case DaemonState::Downloading:     return "downloading";
     }
@@ -276,7 +277,19 @@ int main(int argc, char* argv[]) {
 
     server.on("record.start", [&server](const IpcRequest& req, IpcResponse& resp, IpcError& err) {
         DaemonState expected = DaemonState::Idle;
-        if (!g_state.compare_exchange_strong(expected, DaemonState::Recording)) {
+        bool is_reprocess = false;
+
+        // Check if this is a reprocess request (peek at params before full config merge)
+        {
+            auto it = req.params.find("reprocess_dir");
+            if (it != req.params.end()) {
+                std::string val = json_val_as_string(it->second);
+                is_reprocess = !val.empty();
+            }
+        }
+
+        DaemonState initial = is_reprocess ? DaemonState::Reprocessing : DaemonState::Recording;
+        if (!g_state.compare_exchange_strong(expected, initial)) {
             err.code = static_cast<int>(IpcErrorCode::Busy);
             err.message = std::string("Daemon is busy (") + state_name(expected) + ")";
             return false;
@@ -304,7 +317,7 @@ int main(int argc, char* argv[]) {
         {
             IpcEvent ev;
             ev.event = "state.changed";
-            ev.data["state"] = std::string("recording");
+            ev.data["state"] = std::string(state_name(initial));
             server.broadcast(ev);
         }
 

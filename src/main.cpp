@@ -319,7 +319,7 @@ int main(int argc, char* argv[]) {
         use_daemon = daemon_running();
     }
 
-    if (use_daemon && !list_sources) {
+    if (use_daemon && !list_sources && cfg.reprocess_dir.empty()) {
         log_info("Using daemon mode");
         int rc = client_record(cfg);
         log_shutdown();

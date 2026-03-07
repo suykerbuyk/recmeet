@@ -134,6 +134,9 @@ daemon-status:
 
 clean:
 	rm -rf $(BUILD_DIR)
+	rm -rf dist/arch/src/ dist/arch/pkg/
+	rm -f dist/arch/*.zst
+	git checkout dist/arch/PKGBUILD 2>/dev/null || true
 
 help:
 	@echo "recmeet build targets:"
@@ -150,7 +153,7 @@ help:
 	@echo "  make package-deb   Build + create .deb package"
 	@echo "  make package-rpm   Build + create .rpm package"
 	@echo "  make package-arch  Build Arch package via makepkg"
-	@echo "  make clean         Remove build directory"
+	@echo "  make clean         Remove build + packaging artifacts"
 	@echo "  make help          Show this message"
 	@echo ""
 	@echo "Quick start:  make build && make test"

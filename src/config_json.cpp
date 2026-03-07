@@ -52,6 +52,7 @@ JsonMap config_to_map(const Config& cfg) {
     // Output
     m["output_dir"]       = cfg.output_dir.string();
     m["note_dir"]         = cfg.note_dir.string();
+    m["reprocess_dir"]    = cfg.reprocess_dir.string();
 
     // Notes
     m["note_domain"]      = cfg.note.domain;
@@ -130,6 +131,7 @@ Config config_from_map(const JsonMap& m) {
 
     path("output_dir", cfg.output_dir);
     path("note_dir", cfg.note_dir);
+    path("reprocess_dir", cfg.reprocess_dir);
 
     str("note_domain", cfg.note.domain);
 

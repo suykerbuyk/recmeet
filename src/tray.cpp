@@ -53,7 +53,7 @@ struct TrayState {
     Config cfg;
     IpcClient ipc;   // daemon connection
 
-    enum State { IDLE, RECORDING, POSTPROCESSING, DOWNLOADING } state = IDLE;
+    enum State { IDLE, RECORDING, REPROCESSING, POSTPROCESSING, DOWNLOADING } state = IDLE;
     bool daemon_connected = false;
     guint reconnect_timer = 0;
     int reconnect_delay = 1;  // exponential backoff: 1, 2, 4, 8, ... max 30s
@@ -113,6 +113,7 @@ static void set_state(TrayState::State new_state) {
     const char* icon = (new_state == TrayState::RECORDING) ? ICON_RECORDING : ICON_IDLE;
     const char* desc = "Idle";
     if (new_state == TrayState::RECORDING) desc = "Recording";
+    else if (new_state == TrayState::REPROCESSING) desc = "Reprocessing";
     else if (new_state == TrayState::POSTPROCESSING) desc = "Processing";
     else if (new_state == TrayState::DOWNLOADING) desc = "Downloading";
     app_indicator_set_icon_full(g_tray.indicator, icon, desc);
@@ -133,6 +134,7 @@ static void handle_ipc_event(const IpcEvent& ev) {
         }
         if (state == "idle") set_state(TrayState::IDLE);
         else if (state == "recording") set_state(TrayState::RECORDING);
+        else if (state == "reprocessing") set_state(TrayState::REPROCESSING);
         else if (state == "postprocessing") set_state(TrayState::POSTPROCESSING);
         else if (state == "downloading") set_state(TrayState::DOWNLOADING);
     } else if (ev.event == "job.complete") {
@@ -220,6 +222,7 @@ static bool connect_to_daemon() {
     if (g_tray.ipc.call("status.get", resp, err, 2000)) {
         std::string state = json_val_as_string(resp.result["state"]);
         if (state == "recording") set_state(TrayState::RECORDING);
+        else if (state == "reprocessing") set_state(TrayState::REPROCESSING);
         else if (state == "postprocessing") set_state(TrayState::POSTPROCESSING);
         else if (state == "downloading") set_state(TrayState::DOWNLOADING);
         else set_state(TrayState::IDLE);
@@ -683,6 +686,8 @@ static void build_menu() {
         status = "Status: Disconnected";
     else if (is_recording)
         status = "Status: Recording...";
+    else if (g_tray.state == TrayState::REPROCESSING)
+        status = "Status: Reprocessing...";
     else if (g_tray.state == TrayState::POSTPROCESSING)
         status = "Status: Processing...";
     else if (g_tray.state == TrayState::DOWNLOADING) {
