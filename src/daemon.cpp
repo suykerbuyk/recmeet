@@ -306,6 +306,12 @@ int main(int argc, char* argv[]) {
             merged[k] = v;
         cfg = config_from_map(merged);
 
+        // Re-inject daemon's API key — not serialized via IPC for security
+        if (cfg.api_key.empty()) {
+            std::lock_guard<std::mutex> lock2(g_config_mu);
+            cfg.api_key = g_config.api_key;
+        }
+
         if (!ensure_models(cfg)) {
             g_state.store(DaemonState::Idle);
             err.code = static_cast<int>(IpcErrorCode::InternalError);
@@ -381,7 +387,7 @@ int main(int argc, char* argv[]) {
 
     server.on("record.stop", [](const IpcRequest& req, IpcResponse& resp, IpcError& err) {
         DaemonState cur = g_state.load();
-        if (cur != DaemonState::Recording) {
+        if (cur != DaemonState::Recording && cur != DaemonState::Reprocessing) {
             err.code = static_cast<int>(IpcErrorCode::NotRecording);
             err.message = "Not recording";
             return false;

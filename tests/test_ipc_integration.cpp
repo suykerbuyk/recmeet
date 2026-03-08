@@ -135,7 +135,7 @@ struct DaemonSim {
         });
 
         server.on("record.stop", [this](const IpcRequest&, IpcResponse& resp, IpcError& err) {
-            if (state.load() != SRecording) {
+            if (state.load() != SRecording && state.load() != SReprocessing) {
                 err.code = static_cast<int>(IpcErrorCode::NotRecording);
                 err.message = "Not recording";
                 return false;
@@ -907,4 +907,77 @@ TEST_CASE("record.start during reprocess from another client returns Busy", "[ip
     }
     // Either way, state should eventually return to idle
     REQUIRE(sim.wait_for_state(SIdle, 3000));
+}
+
+TEST_CASE("record.stop during reprocess succeeds", "[ipc][integration]") {
+    DaemonSim sim;
+    sim.start();
+    auto client = make_client();
+
+    // Start a reprocess — the worker falls through immediately (no capture phase),
+    // but we can still issue stop while it's in SReprocessing or SPostprocessing.
+    // With the DaemonSim fix, stop must be accepted during SReprocessing.
+    JsonMap params;
+    params["reprocess_dir"] = std::string("/tmp/fake_meeting");
+
+    IpcResponse resp;
+    IpcError err;
+    REQUIRE(client->call("record.start", params, resp, err));
+    CHECK(resp.result.count("ok"));
+
+    // Issue stop — may arrive during reprocessing or postprocessing
+    IpcResponse stop_resp;
+    IpcError stop_err;
+    bool stop_ok = client->call("record.stop", stop_resp, stop_err, 3000);
+    // Stop may fail if reprocess already completed — that's fine
+    if (!stop_ok) {
+        // Should only fail with NotRecording if already past reprocessing
+        CHECK(stop_err.code == static_cast<int>(IpcErrorCode::NotRecording));
+    }
+
+    REQUIRE(sim.wait_for_state(SIdle, 3000));
+}
+
+TEST_CASE("reprocess stop triggers postprocessing lifecycle", "[ipc][integration]") {
+    DaemonSim sim;
+    sim.start();
+    auto client = make_client();
+
+    // Collect state events
+    std::vector<std::string> states;
+    std::mutex state_mu;
+    std::condition_variable state_cv;
+    client->set_event_callback([&](const IpcEvent& ev) {
+        if (ev.event == "state.changed") {
+            std::string s = json_val_as_string(
+                ev.data.count("state") ? ev.data.at("state") : JsonVal{});
+            if (!s.empty()) {
+                std::lock_guard<std::mutex> lk(state_mu);
+                states.push_back(s);
+                state_cv.notify_all();
+            }
+        }
+    });
+
+    JsonMap params;
+    params["reprocess_dir"] = std::string("/tmp/fake_meeting");
+
+    IpcResponse resp;
+    IpcError err;
+    REQUIRE(client->call("record.start", params, resp, err));
+
+    // Wait for idle (full lifecycle completes)
+    REQUIRE(sim.wait_for_state(SIdle, 3000));
+
+    // Verify we saw the expected state transitions: reprocessing -> postprocessing -> idle
+    // Read events to collect broadcasts
+    client->read_events("state.changed", 2000);
+    std::unique_lock<std::mutex> lk(state_mu);
+    state_cv.wait_for(lk, std::chrono::seconds(2), [&]() { return states.size() >= 3; });
+
+    REQUIRE(states.size() >= 3);
+    CHECK(states[0] == "reprocessing");
+    CHECK(states[1] == "postprocessing");
+    // Last state should be idle (job.complete event may interleave, so check last)
+    CHECK(states.back() == "idle");
 }

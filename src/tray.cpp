@@ -18,14 +18,16 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
+#include <filesystem>
 #include <mutex>
 #include <thread>
 
 using namespace recmeet;
 
-// Icon names (standard icon theme)
-static const char* ICON_IDLE       = "audio-input-microphone";
-static const char* ICON_RECORDING  = "media-record";
+// Icon names (custom recmeet theme under share/icons/hicolor)
+static const char* ICON_IDLE       = "recmeet-idle";
+static const char* ICON_RECORDING  = "recmeet-recording";
+static const char* ICON_PROCESSING = "recmeet-processing";
 
 static const char* WHISPER_MODELS[] = {"tiny", "base", "small", "medium", "large-v3"};
 
@@ -110,12 +112,21 @@ static gboolean try_reconnect(gpointer);
 
 static void set_state(TrayState::State new_state) {
     g_tray.state = new_state;
-    const char* icon = (new_state == TrayState::RECORDING) ? ICON_RECORDING : ICON_IDLE;
+    const char* icon = ICON_IDLE;
     const char* desc = "Idle";
-    if (new_state == TrayState::RECORDING) desc = "Recording";
-    else if (new_state == TrayState::REPROCESSING) desc = "Reprocessing";
-    else if (new_state == TrayState::POSTPROCESSING) desc = "Processing";
-    else if (new_state == TrayState::DOWNLOADING) desc = "Downloading";
+    if (new_state == TrayState::RECORDING) {
+        icon = ICON_RECORDING;
+        desc = "Recording";
+    } else if (new_state == TrayState::REPROCESSING) {
+        icon = ICON_PROCESSING;
+        desc = "Reprocessing";
+    } else if (new_state == TrayState::POSTPROCESSING) {
+        icon = ICON_PROCESSING;
+        desc = "Processing";
+    } else if (new_state == TrayState::DOWNLOADING) {
+        icon = ICON_PROCESSING;
+        desc = "Downloading";
+    }
     app_indicator_set_icon_full(g_tray.indicator, icon, desc);
     build_menu();
 }
@@ -271,11 +282,11 @@ static void on_record(GtkMenuItem*, gpointer) {
         return;
     }
 
-    set_state(TrayState::RECORDING);
+    set_state(g_tray.cfg.reprocess_dir.empty() ? TrayState::RECORDING : TrayState::REPROCESSING);
 }
 
 static void on_stop(GtkMenuItem*, gpointer) {
-    if (g_tray.state != TrayState::RECORDING) return;
+    if (g_tray.state != TrayState::RECORDING && g_tray.state != TrayState::REPROCESSING) return;
 
     IpcResponse resp;
     IpcError err;
@@ -1015,6 +1026,20 @@ int main(int argc, char* argv[]) {
         "recmeet-tray", ICON_IDLE,
         APP_INDICATOR_CATEGORY_APPLICATION_STATUS);
     G_GNUC_END_IGNORE_DEPRECATIONS
+
+    // Set custom icon theme path — check relative to binary first (dev build),
+    // then fall back to installed location
+    {
+        std::error_code ec;
+        auto bin = std::filesystem::read_symlink("/proc/self/exe", ec);
+        if (!ec) {
+            auto base = bin.parent_path().parent_path() / "share" / "icons";
+            if (!std::filesystem::is_directory(base, ec))
+                base = std::filesystem::path(RECMEET_ICON_DIR);
+            app_indicator_set_icon_theme_path(g_tray.indicator, base.c_str());
+        }
+    }
+
     app_indicator_set_status(g_tray.indicator, APP_INDICATOR_STATUS_ACTIVE);
     app_indicator_set_title(g_tray.indicator, "recmeet");
 

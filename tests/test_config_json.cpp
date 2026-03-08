@@ -118,6 +118,21 @@ TEST_CASE("config_to_json: handles special characters in paths", "[config_json]"
     CHECK(loaded.device_pattern == cfg.device_pattern);
 }
 
+TEST_CASE("config_to_map excludes api_key for IPC security", "[config_json]") {
+    Config cfg;
+    cfg.api_key = "sk-secret-key-12345";
+    cfg.provider = "openai";
+
+    JsonMap map = config_to_map(cfg);
+
+    // api_key must NOT appear in the serialized map (security: don't send over IPC)
+    CHECK(map.find("api_key") == map.end());
+
+    // Round-tripping through map loses the key — consumers must re-inject it
+    Config loaded = config_from_map(map);
+    CHECK(loaded.api_key.empty());
+}
+
 TEST_CASE("config_to_json: default config round-trips", "[config_json]") {
     Config original;
     std::string json = config_to_json(original);

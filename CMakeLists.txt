@@ -182,6 +182,9 @@ if(RECMEET_BUILD_TRAY)
         PkgConfig::GTK3
         PkgConfig::APPINDICATOR
     )
+    target_compile_definitions(recmeet-tray PRIVATE
+        RECMEET_ICON_DIR="${CMAKE_INSTALL_FULL_DATADIR}/icons"
+    )
 endif()
 
 # Tests
@@ -246,6 +249,8 @@ if(RECMEET_BUILD_TRAY)
     install(TARGETS recmeet-tray RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
     install(FILES dist/recmeet-tray.desktop
         DESTINATION ${CMAKE_INSTALL_DATADIR}/applications)
+    install(DIRECTORY share/icons/hicolor
+        DESTINATION ${CMAKE_INSTALL_DATADIR}/icons)
 
     # systemd user service (prefix-aware ExecStart path)
     set(RECMEET_TRAY_EXEC "${CMAKE_INSTALL_FULL_BINDIR}/recmeet-tray")
