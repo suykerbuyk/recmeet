@@ -171,6 +171,8 @@ All CLI options can be set in `~/.config/recmeet/config.yaml`:
 ```yaml
 audio:
   mic_only: false
+  # mic_source: ""       # PipeWire/PulseAudio mic (auto-detect if omitted)
+  # monitor_source: ""   # monitor/speaker source (auto-detect if omitted)
 
 transcription:
   model: base
@@ -180,6 +182,13 @@ diarization:
   enabled: true
   num_speakers: 0        # 0 = auto-detect
   cluster_threshold: 1.18
+
+vad:
+  enabled: true
+  threshold: 0.5
+  min_silence: 0.5       # seconds of silence to end a speech segment
+  min_speech: 0.25       # minimum speech duration (seconds)
+  max_speech: 30.0       # maximum speech segment length (seconds)
 
 summary:
   provider: xai

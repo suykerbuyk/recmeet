@@ -28,7 +28,7 @@ The result: full transcriptions with speaker labels, professionally structured s
 
 ```bash
 sudo pacman -S pipewire libpulse libsndfile curl libnotify \
-               libayatana-appindicator gtk3 cmake ninja gcc
+               libayatana-appindicator gtk3 onnxruntime-cpu cmake ninja gcc
 ```
 
 ### Dependencies (Debian / Ubuntu)
@@ -199,6 +199,10 @@ Options:
 `~/.config/recmeet/config.yaml` — all fields are optional, CLI flags override.
 
 ```yaml
+audio:
+  # mic_source: ""       # PipeWire/PulseAudio mic (auto-detect if omitted)
+  # monitor_source: ""   # monitor/speaker source (auto-detect if omitted)
+
 transcription:
   model: base
   language: "" # empty = auto-detect
@@ -207,6 +211,13 @@ diarization:
   enabled: true
   num_speakers: 0 # 0 = auto-detect
   cluster_threshold: 1.18
+
+vad:
+  enabled: true
+  threshold: 0.5
+  min_silence: 0.5      # seconds of silence to end a speech segment
+  min_speech: 0.25      # minimum speech duration (seconds)
+  max_speech: 30.0      # maximum speech segment length (seconds)
 
 summary:
   provider: xai
@@ -247,7 +258,7 @@ make RECMEET_BUILD_TRAY=OFF RECMEET_USE_SHERPA=OFF
 
 ## Testing
 
-193 unit tests, 771 assertions across 22 modules, plus integration and benchmark suites.
+194 unit tests, 774 assertions across 22 modules, plus integration and benchmark suites.
 
 ```bash
 make test                # unit tests (no hardware needed)
