@@ -168,6 +168,67 @@ TEST_CASE("write_text_file: handles empty content", "[util]") {
     fs::remove_all(dir);
 }
 
+// ---------------------------------------------------------------------------
+// resolve_meeting_time tests
+// ---------------------------------------------------------------------------
+
+TEST_CASE("resolve_meeting_time: parses YYYY-MM-DD_HH-MM from directory name", "[util]") {
+    auto base = fs::temp_directory_path() / "recmeet_test_rmt";
+    fs::path dir = base / "2026-02-15_14-30";
+    fs::create_directories(dir);
+    fs::path audio = dir / "audio.wav";
+    // Audio file doesn't need to exist for dir-name parsing
+    std::ofstream(audio) << "fake";
+
+    auto [date, time] = resolve_meeting_time(dir, audio);
+    CHECK(date == "2026-02-15");
+    CHECK(time == "14:30");
+
+    fs::remove_all(base);
+}
+
+TEST_CASE("resolve_meeting_time: handles dir name with collision suffix", "[util]") {
+    auto base = fs::temp_directory_path() / "recmeet_test_rmt2";
+    fs::path dir = base / "2026-03-08_09-15_2";
+    fs::create_directories(dir);
+    fs::path audio = dir / "audio.wav";
+    std::ofstream(audio) << "fake";
+
+    auto [date, time] = resolve_meeting_time(dir, audio);
+    CHECK(date == "2026-03-08");
+    CHECK(time == "09:15");
+
+    fs::remove_all(base);
+}
+
+TEST_CASE("resolve_meeting_time: falls back to audio mtime when dir name doesn't match", "[util]") {
+    auto base = fs::temp_directory_path() / "recmeet_test_rmt3";
+    fs::path dir = base / "random_dir_name";
+    fs::create_directories(dir);
+    fs::path audio = dir / "audio.wav";
+    std::ofstream(audio) << "fake";
+
+    auto [date, time] = resolve_meeting_time(dir, audio);
+    // Should return something valid (from mtime) — at least non-empty
+    CHECK(date.size() == 10);  // YYYY-MM-DD
+    CHECK(time.size() == 5);   // HH:MM
+    CHECK(date[4] == '-');
+    CHECK(date[7] == '-');
+    CHECK(time[2] == ':');
+
+    fs::remove_all(base);
+}
+
+TEST_CASE("resolve_meeting_time: falls back to now when audio doesn't exist", "[util]") {
+    fs::path dir = "/tmp/recmeet_test_nonexistent_dir";
+    fs::path audio = dir / "audio.wav";
+
+    auto [date, time] = resolve_meeting_time(dir, audio);
+    // Should return current time — at least valid format
+    CHECK(date.size() == 10);
+    CHECK(time.size() == 5);
+}
+
 TEST_CASE("audio constants are consistent", "[util]") {
     CHECK(SAMPLE_RATE == 16000);
     CHECK(CHANNELS == 1);

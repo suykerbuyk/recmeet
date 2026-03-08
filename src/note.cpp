@@ -158,6 +158,13 @@ fs::path write_meeting_note(const NoteConfig& config, const MeetingData& data) {
     }
     filename += ".md";
     fs::path note_parent = data.note_dir.empty() ? data.output_dir : data.note_dir;
+    // Add year/month subdirectories when using a separate note_dir
+    if (!data.note_dir.empty() && data.date.size() >= 7) {
+        std::string year = data.date.substr(0, 4);
+        std::string month = data.date.substr(5, 2);
+        note_parent = note_parent / year / month;
+        fs::create_directories(note_parent);
+    }
     fs::path note_path = note_parent / filename;
 
     std::ofstream out(note_path);

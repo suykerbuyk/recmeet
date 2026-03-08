@@ -88,4 +88,10 @@ void write_text_file(const fs::path& path, const std::string& content);
 /// Default thread count for inference engines: hardware_concurrency() - 1, minimum 1.
 int default_thread_count();
 
+/// Extract date/time from a directory name matching "YYYY-MM-DD_HH-MM" pattern.
+/// Falls back to file mtime of audio_path, then to current time.
+/// Returns {date_str, time_str} like {"2026-02-15", "14:30"}.
+std::pair<std::string, std::string> resolve_meeting_time(
+    const fs::path& out_dir, const fs::path& audio_path);
+
 } // namespace recmeet

@@ -2,10 +2,13 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 #include "util.h"
+#include "log.h"
 
 #include <chrono>
 #include <cstdlib>
+#include <cstring>
 #include <fstream>
+#include <sys/stat.h>
 #include <iomanip>
 #include <sstream>
 #include <thread>
@@ -63,6 +66,48 @@ void write_text_file(const fs::path& path, const std::string& content) {
 int default_thread_count() {
     unsigned n = std::thread::hardware_concurrency();
     return (n > 1) ? static_cast<int>(n - 1) : 1;
+}
+
+std::pair<std::string, std::string> resolve_meeting_time(
+    const fs::path& out_dir, const fs::path& audio_path) {
+
+    // Try to parse directory name: YYYY-MM-DD_HH-MM (possibly with _N suffix)
+    std::string dirname = out_dir.filename().string();
+    if (dirname.size() >= 16) {
+        int y, mo, d, h, mi;
+        if (std::sscanf(dirname.c_str(), "%4d-%2d-%2d_%2d-%2d", &y, &mo, &d, &h, &mi) == 5 &&
+            y >= 1970 && y <= 9999 && mo >= 1 && mo <= 12 &&
+            d >= 1 && d <= 31 && h >= 0 && h <= 23 && mi >= 0 && mi <= 59) {
+            char date_buf[16], time_buf[8];
+            std::snprintf(date_buf, sizeof(date_buf), "%04d-%02d-%02d", y, mo, d);
+            std::snprintf(time_buf, sizeof(time_buf), "%02d:%02d", h, mi);
+            return {date_buf, time_buf};
+        }
+    }
+
+    // Fallback: audio file modification time (use stat for C++17 compatibility)
+    if (fs::exists(audio_path)) {
+        struct stat st;
+        if (::stat(audio_path.c_str(), &st) == 0) {
+            std::tm tm{};
+            localtime_r(&st.st_mtime, &tm);
+            char date_buf[16], time_buf[8];
+            std::strftime(date_buf, sizeof(date_buf), "%Y-%m-%d", &tm);
+            std::strftime(time_buf, sizeof(time_buf), "%H:%M", &tm);
+            log_info("Meeting time from audio mtime: %s %s", date_buf, time_buf);
+            return {date_buf, time_buf};
+        }
+    }
+
+    // Final fallback: current time
+    auto now = std::chrono::system_clock::now();
+    auto time_t = std::chrono::system_clock::to_time_t(now);
+    std::tm tm{};
+    localtime_r(&time_t, &tm);
+    char date_buf[16], time_buf[8];
+    std::strftime(date_buf, sizeof(date_buf), "%Y-%m-%d", &tm);
+    std::strftime(time_buf, sizeof(time_buf), "%H:%M", &tm);
+    return {date_buf, time_buf};
 }
 
 } // namespace recmeet

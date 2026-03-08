@@ -24,6 +24,7 @@ compile_commands.json
 CLAUDE.md
 commit.msg
 .claude/
+agentctx
 
 # makepkg artifacts
 dist/arch/src/

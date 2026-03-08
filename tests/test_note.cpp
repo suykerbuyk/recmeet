@@ -352,7 +352,7 @@ TEST_CASE("write_meeting_note: empty metadata falls back gracefully", "[note]") 
     fs::remove_all(dir);
 }
 
-TEST_CASE("write_meeting_note: uses note_dir when set", "[note]") {
+TEST_CASE("write_meeting_note: uses note_dir with year/month subdirectories", "[note]") {
     auto audio_dir = tmp_dir();
     auto note_dir = fs::temp_directory_path() / "recmeet_test_note_dir";
     fs::create_directories(note_dir);
@@ -369,7 +369,8 @@ TEST_CASE("write_meeting_note: uses note_dir when set", "[note]") {
 
     fs::path note = write_meeting_note(config, data);
     REQUIRE(fs::exists(note));
-    CHECK(note.parent_path() == note_dir);
+    // Note should be in note_dir/2026/03/
+    CHECK(note.parent_path() == note_dir / "2026" / "03");
     // Note should NOT be in audio_dir
     CHECK_FALSE(fs::exists(audio_dir / note.filename()));
     // Source field in frontmatter should still reference audio_dir
@@ -397,6 +398,28 @@ TEST_CASE("write_meeting_note: defaults to output_dir when note_dir empty", "[no
     CHECK(note.parent_path() == dir);
 
     fs::remove_all(dir);
+}
+
+TEST_CASE("write_meeting_note: note_dir creates year/month for different dates", "[note]") {
+    auto audio_dir = tmp_dir();
+    auto note_dir = fs::temp_directory_path() / "recmeet_test_note_ym";
+    fs::create_directories(note_dir);
+
+    NoteConfig config;
+
+    MeetingData data;
+    data.date = "2025-11-20";
+    data.time = "16:45";
+    data.transcript_text = "[00:00 - 00:05] Hi.";
+    data.output_dir = audio_dir;
+    data.note_dir = note_dir;
+
+    fs::path note = write_meeting_note(config, data);
+    REQUIRE(fs::exists(note));
+    CHECK(note.parent_path() == note_dir / "2025" / "11");
+
+    fs::remove_all(audio_dir);
+    fs::remove_all(note_dir);
 }
 
 TEST_CASE("write_meeting_note: handles empty summary gracefully", "[note]") {

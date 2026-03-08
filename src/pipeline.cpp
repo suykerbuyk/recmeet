@@ -71,10 +71,10 @@ PostprocessInput run_recording(const Config& cfg, StopToken& stop, PhaseCallback
 
         // Output goes to --output-dir if explicitly set, otherwise back to source dir
         if (cfg.output_dir_explicit) {
-            pp.out_dir = cfg.output_dir;
+            pp.out_dir = fs::weakly_canonical(cfg.output_dir);
             fs::create_directories(pp.out_dir);
         } else {
-            pp.out_dir = source_dir;
+            pp.out_dir = fs::canonical(source_dir);
         }
         log_info("Reprocessing: %s", pp.out_dir.c_str());
     } else {
@@ -117,7 +117,7 @@ PostprocessInput run_recording(const Config& cfg, StopToken& stop, PhaseCallback
         }
 
         // --- Create output directory ---
-        pp.out_dir = create_output_dir(cfg.output_dir);
+        pp.out_dir = fs::weakly_canonical(create_output_dir(cfg.output_dir));
         log_info("Output directory: %s", pp.out_dir.c_str());
 
         pp.audio_path = pp.out_dir / "audio.wav";
@@ -364,19 +364,11 @@ PipelineResult run_postprocessing(const Config& cfg, const PostprocessInput& inp
 
     // --- Meeting note output ---
     try {
-        // Get current date/time
-        auto now = std::chrono::system_clock::now();
-        auto time_t = std::chrono::system_clock::to_time_t(now);
-        std::tm tm{};
-        localtime_r(&time_t, &tm);
-
-        char date_buf[16], time_buf[8];
-        strftime(date_buf, sizeof(date_buf), "%Y-%m-%d", &tm);
-        strftime(time_buf, sizeof(time_buf), "%H:%M", &tm);
+        auto [date_str, time_str] = resolve_meeting_time(input.out_dir, input.audio_path);
 
         MeetingData md;
-        md.date = date_buf;
-        md.time = time_buf;
+        md.date = date_str;
+        md.time = time_str;
         md.summary_text = summary_text;
         md.transcript_text = transcript_text;
         md.context_text = context_text;
