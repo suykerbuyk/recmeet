@@ -303,20 +303,61 @@ PipelineResult run_postprocessing(const Config& cfg, const PostprocessInput& inp
                 auto diar = diarize(samples.data(), samples.size(),
                                     cfg.num_speakers, threads, cfg.cluster_threshold);
 
-                // Speaker identification: match clusters against enrolled voiceprints
+                // Speaker identification + embedding extraction
                 std::map<int, std::string> speaker_names;
-                if (cfg.speaker_id) {
+                {
                     fs::path db_dir = cfg.speaker_db.empty()
                         ? default_speaker_db_dir() : cfg.speaker_db;
-                    auto db = load_speaker_db(db_dir);
+                    auto db = cfg.speaker_id ? load_speaker_db(db_dir)
+                                             : std::vector<SpeakerProfile>{};
+
+                    // Always extract embeddings for speakers.json; match only if DB non-empty
+                    auto model_paths = ensure_sherpa_models();
                     if (!db.empty()) {
-                        auto model_paths = ensure_sherpa_models();
                         phase("identifying speakers");
                         notify("Identifying speakers...",
                                std::to_string(db.size()) + " enrolled");
-                        speaker_names = identify_speakers(
-                            samples.data(), samples.size(), diar, db,
-                            model_paths.embedding, cfg.speaker_threshold, threads);
+                    }
+                    auto id_result = identify_speakers(
+                        samples.data(), samples.size(), diar, db,
+                        model_paths.embedding, cfg.speaker_threshold, threads);
+                    speaker_names = id_result.names;
+
+                    // Build and save speakers.json
+                    std::vector<MeetingSpeaker> meeting_speakers;
+                    for (const auto& [sid, emb] : id_result.embeddings) {
+                        MeetingSpeaker ms{};
+                        ms.cluster_id = sid;
+                        ms.embedding = emb;
+
+                        // Compute duration from diarization segments
+                        for (const auto& seg : diar.segments)
+                            if (seg.speaker == sid)
+                                ms.duration_sec += static_cast<float>(seg.end - seg.start);
+
+                        auto name_it = id_result.names.find(sid);
+                        if (name_it != id_result.names.end()) {
+                            ms.label = name_it->second;
+                            ms.identified = true;
+                            ms.confidence = id_result.scores[sid];
+                        } else {
+                            char buf[16];
+                            std::snprintf(buf, sizeof(buf), "Speaker_%02d", sid + 1);
+                            ms.label = buf;
+                            ms.identified = false;
+                            ms.confidence = 0.0f;
+                        }
+                        meeting_speakers.push_back(std::move(ms));
+                    }
+
+                    if (!meeting_speakers.empty()) {
+                        try {
+                            save_meeting_speakers(input.out_dir, meeting_speakers);
+                            log_info("Saved speakers.json with %zu speaker(s)",
+                                     meeting_speakers.size());
+                        } catch (const std::exception& e) {
+                            log_warn("Failed to save speakers.json: %s", e.what());
+                        }
                     }
                 }
 

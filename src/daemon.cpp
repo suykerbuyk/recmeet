@@ -6,6 +6,7 @@
 #include "device_enum.h"
 #include "ipc_protocol.h"
 #include "ipc_server.h"
+#include "speaker_id.h"
 #include "summarize.h"
 #include "log.h"
 #include "model_manager.h"
@@ -395,6 +396,80 @@ int main(int argc, char* argv[]) {
         g_stop.request();
         resp.result["ok"] = true;
         return true;
+    });
+
+    // --- Speaker management handlers ---
+
+    server.on("speakers.list", [](const IpcRequest&, IpcResponse& resp, IpcError& err) {
+        try {
+            fs::path db_dir;
+            {
+                std::lock_guard<std::mutex> lock(g_config_mu);
+                db_dir = g_config.speaker_db.empty()
+                    ? default_speaker_db_dir() : g_config.speaker_db;
+            }
+            auto profiles = load_speaker_db(db_dir);
+            std::string arr = "[";
+            for (size_t i = 0; i < profiles.size(); ++i) {
+                if (i > 0) arr += ",";
+                arr += "{\"name\":\"" + json_escape(profiles[i].name)
+                    + "\",\"enrollments\":" + std::to_string(profiles[i].embeddings.size())
+                    + ",\"created\":\"" + json_escape(profiles[i].created)
+                    + "\",\"updated\":\"" + json_escape(profiles[i].updated) + "\"}";
+            }
+            arr += "]";
+            resp.result["speakers"] = arr;
+            resp.result["count"] = static_cast<int64_t>(profiles.size());
+            return true;
+        } catch (const std::exception& e) {
+            err.code = static_cast<int>(IpcErrorCode::InternalError);
+            err.message = e.what();
+            return false;
+        }
+    });
+
+    server.on("speakers.remove", [](const IpcRequest& req, IpcResponse& resp, IpcError& err) {
+        auto it = req.params.find("name");
+        if (it == req.params.end() || json_val_as_string(it->second).empty()) {
+            err.code = static_cast<int>(IpcErrorCode::InvalidParams);
+            err.message = "Missing 'name' parameter";
+            return false;
+        }
+        std::string name = json_val_as_string(it->second);
+        fs::path db_dir;
+        {
+            std::lock_guard<std::mutex> lock(g_config_mu);
+            db_dir = g_config.speaker_db.empty()
+                ? default_speaker_db_dir() : g_config.speaker_db;
+        }
+        if (remove_speaker(db_dir, name)) {
+            resp.result["ok"] = true;
+            resp.result["name"] = name;
+            return true;
+        } else {
+            err.code = static_cast<int>(IpcErrorCode::InvalidParams);
+            err.message = "Speaker '" + name + "' not found";
+            return false;
+        }
+    });
+
+    server.on("speakers.reset", [](const IpcRequest&, IpcResponse& resp, IpcError& err) {
+        try {
+            fs::path db_dir;
+            {
+                std::lock_guard<std::mutex> lock(g_config_mu);
+                db_dir = g_config.speaker_db.empty()
+                    ? default_speaker_db_dir() : g_config.speaker_db;
+            }
+            int count = reset_speakers(db_dir);
+            resp.result["ok"] = true;
+            resp.result["removed"] = static_cast<int64_t>(count);
+            return true;
+        } catch (const std::exception& e) {
+            err.code = static_cast<int>(IpcErrorCode::InternalError);
+            err.message = e.what();
+            return false;
+        }
     });
 
     // --- Model management handlers ---

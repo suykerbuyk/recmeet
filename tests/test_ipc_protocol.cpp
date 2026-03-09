@@ -217,6 +217,50 @@ TEST_CASE("json_val_as_bool: returns default for non-bool", "[ipc]") {
 }
 
 // ---------------------------------------------------------------------------
+// Speaker IPC message round-trips
+// ---------------------------------------------------------------------------
+
+TEST_CASE("IPC: speakers.list request round-trip", "[ipc]") {
+    IpcRequest req;
+    req.id = 100;
+    req.method = "speakers.list";
+
+    std::string wire = serialize(req);
+    IpcMessage msg;
+    REQUIRE(parse_ipc_message(wire, msg));
+    CHECK(msg.type == IpcMessageType::Request);
+    CHECK(msg.request.method == "speakers.list");
+}
+
+TEST_CASE("IPC: speakers.remove request round-trip", "[ipc]") {
+    IpcRequest req;
+    req.id = 101;
+    req.method = "speakers.remove";
+    req.params["name"] = std::string("Alice");
+
+    std::string wire = serialize(req);
+    IpcMessage msg;
+    REQUIRE(parse_ipc_message(wire, msg));
+    CHECK(msg.type == IpcMessageType::Request);
+    CHECK(msg.request.method == "speakers.remove");
+    CHECK(json_val_as_string(msg.request.params["name"]) == "Alice");
+}
+
+TEST_CASE("IPC: speakers.reset response round-trip", "[ipc]") {
+    IpcResponse resp;
+    resp.id = 102;
+    resp.result["ok"] = true;
+    resp.result["removed"] = int64_t(3);
+
+    std::string wire = serialize(resp);
+    IpcMessage msg;
+    REQUIRE(parse_ipc_message(wire, msg));
+    CHECK(msg.type == IpcMessageType::Response);
+    CHECK(json_val_as_bool(msg.response.result["ok"]) == true);
+    CHECK(json_val_as_int(msg.response.result["removed"]) == 3);
+}
+
+// ---------------------------------------------------------------------------
 // Socket path
 // ---------------------------------------------------------------------------
 

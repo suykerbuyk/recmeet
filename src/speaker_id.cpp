@@ -170,6 +170,18 @@ bool remove_speaker(const fs::path& db_dir, const std::string& name) {
     return fs::remove(path);
 }
 
+int reset_speakers(const fs::path& db_dir) {
+    if (!fs::is_directory(db_dir)) return 0;
+    int count = 0;
+    for (const auto& entry : fs::directory_iterator(db_dir)) {
+        if (entry.path().extension() == ".json") {
+            fs::remove(entry.path());
+            ++count;
+        }
+    }
+    return count;
+}
+
 std::vector<std::string> list_speakers(const fs::path& db_dir) {
     std::vector<std::string> names;
     if (!fs::is_directory(db_dir)) return names;
@@ -180,6 +192,165 @@ std::vector<std::string> list_speakers(const fs::path& db_dir) {
     }
     std::sort(names.begin(), names.end());
     return names;
+}
+
+// ---------------------------------------------------------------------------
+// Per-meeting speaker data (speakers.json)
+// ---------------------------------------------------------------------------
+
+static std::string serialize_meeting_speakers(const std::vector<MeetingSpeaker>& speakers) {
+    std::ostringstream out;
+    out << "{\n  \"speakers\": [\n";
+    for (size_t i = 0; i < speakers.size(); ++i) {
+        const auto& s = speakers[i];
+        out << "    {\n";
+        out << "      \"cluster_id\": " << s.cluster_id << ",\n";
+        out << "      \"label\": \"" << escape_json(s.label) << "\",\n";
+        out << "      \"identified\": " << (s.identified ? "true" : "false") << ",\n";
+        out << "      \"duration_sec\": " << s.duration_sec << ",\n";
+        out << "      \"confidence\": " << s.confidence << ",\n";
+        out << "      \"embedding\": [";
+        for (size_t j = 0; j < s.embedding.size(); ++j) {
+            if (j > 0) out << ", ";
+            out << s.embedding[j];
+        }
+        out << "]\n    }";
+        if (i + 1 < speakers.size()) out << ",";
+        out << "\n";
+    }
+    out << "  ]\n}\n";
+    return out.str();
+}
+
+static bool parse_meeting_speakers(const std::string& json, std::vector<MeetingSpeaker>& out) {
+    out.clear();
+
+    // Find "speakers": [ array
+    auto arr_pos = json.find("\"speakers\":");
+    if (arr_pos == std::string::npos) return false;
+
+    auto outer_start = json.find('[', arr_pos);
+    if (outer_start == std::string::npos) return false;
+
+    // Find matching outer ]
+    int depth = 1;
+    size_t outer_end = outer_start + 1;
+    while (outer_end < json.size() && depth > 0) {
+        if (json[outer_end] == '[') ++depth;
+        else if (json[outer_end] == ']') --depth;
+        ++outer_end;
+    }
+    if (depth != 0) return false;
+    --outer_end; // point at the ]
+
+    // Parse each object between { and }
+    size_t pos = outer_start + 1;
+    while (pos < outer_end) {
+        auto obj_start = json.find('{', pos);
+        if (obj_start == std::string::npos || obj_start >= outer_end) break;
+
+        // Find matching }
+        int od = 1;
+        size_t obj_end = obj_start + 1;
+        while (obj_end < json.size() && od > 0) {
+            if (json[obj_end] == '{') ++od;
+            else if (json[obj_end] == '}') --od;
+            ++obj_end;
+        }
+        --obj_end;
+
+        std::string obj = json.substr(obj_start, obj_end - obj_start + 1);
+
+        MeetingSpeaker s{};
+
+        // Parse cluster_id
+        auto cid_pos = obj.find("\"cluster_id\":");
+        if (cid_pos != std::string::npos) {
+            auto val_start = cid_pos + 13;
+            while (val_start < obj.size() && (obj[val_start] == ' ' || obj[val_start] == '\t'))
+                ++val_start;
+            s.cluster_id = std::atoi(obj.c_str() + val_start);
+        }
+
+        // Parse label
+        auto lbl_pos = obj.find("\"label\": \"");
+        if (lbl_pos != std::string::npos) {
+            auto val_start = lbl_pos + 10;
+            auto val_end = obj.find('"', val_start);
+            if (val_end != std::string::npos)
+                s.label = obj.substr(val_start, val_end - val_start);
+        }
+
+        // Parse identified
+        auto id_pos = obj.find("\"identified\":");
+        if (id_pos != std::string::npos)
+            s.identified = obj.find("true", id_pos) < obj.find("false", id_pos);
+
+        // Parse duration_sec
+        auto dur_pos = obj.find("\"duration_sec\":");
+        if (dur_pos != std::string::npos) {
+            auto val_start = dur_pos + 15;
+            while (val_start < obj.size() && (obj[val_start] == ' ' || obj[val_start] == '\t'))
+                ++val_start;
+            s.duration_sec = std::strtof(obj.c_str() + val_start, nullptr);
+        }
+
+        // Parse confidence
+        auto conf_pos = obj.find("\"confidence\":");
+        if (conf_pos != std::string::npos) {
+            auto val_start = conf_pos + 13;
+            while (val_start < obj.size() && (obj[val_start] == ' ' || obj[val_start] == '\t'))
+                ++val_start;
+            s.confidence = std::strtof(obj.c_str() + val_start, nullptr);
+        }
+
+        // Parse embedding array
+        auto emb_pos = obj.find("\"embedding\":");
+        if (emb_pos != std::string::npos) {
+            auto emb_start = obj.find('[', emb_pos);
+            auto emb_end = obj.find(']', emb_start);
+            if (emb_start != std::string::npos && emb_end != std::string::npos) {
+                std::string emb_str = obj.substr(emb_start + 1, emb_end - emb_start - 1);
+                std::istringstream ss(emb_str);
+                std::string token;
+                while (std::getline(ss, token, ',')) {
+                    try {
+                        s.embedding.push_back(std::stof(token));
+                    } catch (...) {}
+                }
+            }
+        }
+
+        out.push_back(std::move(s));
+        pos = obj_end + 1;
+    }
+
+    return true;
+}
+
+void save_meeting_speakers(const fs::path& meeting_dir,
+                           const std::vector<MeetingSpeaker>& speakers) {
+    fs::create_directories(meeting_dir);
+    fs::path path = meeting_dir / "speakers.json";
+    std::ofstream out(path);
+    if (!out)
+        throw RecmeetError("Cannot write speakers.json: " + path.string());
+    out << serialize_meeting_speakers(speakers);
+}
+
+std::vector<MeetingSpeaker> load_meeting_speakers(const fs::path& meeting_dir) {
+    fs::path path = meeting_dir / "speakers.json";
+    if (!fs::exists(path)) return {};
+
+    std::ifstream in(path);
+    if (!in) return {};
+
+    std::ostringstream buf;
+    buf << in.rdbuf();
+
+    std::vector<MeetingSpeaker> speakers;
+    parse_meeting_speakers(buf.str(), speakers);
+    return speakers;
 }
 
 // ---------------------------------------------------------------------------
@@ -246,15 +417,15 @@ std::vector<float> extract_speaker_embedding(
     return embedding;
 }
 
-std::map<int, std::string> identify_speakers(
+IdentifyResult identify_speakers(
     const float* samples, size_t num_samples,
     const DiarizeResult& diar,
     const std::vector<SpeakerProfile>& db,
     const fs::path& model_path,
     float threshold, int threads) {
 
-    std::map<int, std::string> result;
-    if (db.empty() || diar.segments.empty()) return result;
+    IdentifyResult result;
+    if (diar.segments.empty()) return result;
 
     int t = threads > 0 ? threads : default_thread_count();
 
@@ -273,19 +444,22 @@ std::map<int, std::string> identify_speakers(
 
     int dim = SherpaOnnxSpeakerEmbeddingExtractorDim(extractor);
 
-    // Create speaker embedding manager and register enrolled speakers
-    const auto* mgr = SherpaOnnxCreateSpeakerEmbeddingManager(dim);
-    if (!mgr) {
-        SherpaOnnxDestroySpeakerEmbeddingExtractor(extractor);
-        log_warn("Failed to create speaker embedding manager");
-        return result;
-    }
+    // Create speaker embedding manager and register enrolled speakers (if any)
+    const SherpaOnnxSpeakerEmbeddingManager* mgr = nullptr;
+    if (!db.empty()) {
+        mgr = SherpaOnnxCreateSpeakerEmbeddingManager(dim);
+        if (!mgr) {
+            SherpaOnnxDestroySpeakerEmbeddingExtractor(extractor);
+            log_warn("Failed to create speaker embedding manager");
+            return result;
+        }
 
-    for (const auto& profile : db) {
-        for (const auto& emb : profile.embeddings) {
-            if (static_cast<int>(emb.size()) == dim) {
-                SherpaOnnxSpeakerEmbeddingManagerAdd(mgr, profile.name.c_str(),
-                                                      emb.data());
+        for (const auto& profile : db) {
+            for (const auto& emb : profile.embeddings) {
+                if (static_cast<int>(emb.size()) == dim) {
+                    SherpaOnnxSpeakerEmbeddingManagerAdd(mgr, profile.name.c_str(),
+                                                          emb.data());
+                }
             }
         }
     }
@@ -298,12 +472,11 @@ std::map<int, std::string> identify_speakers(
             speaker_ids.push_back(seg.speaker);
     }
 
-    // Track which enrolled names have already been matched to prevent
-    // two clusters from being assigned the same identity.
+    // Track candidates for conflict resolution
     std::vector<std::pair<int, std::string>> candidates;  // {speaker_id, name}
-    std::vector<float> scores;
+    std::vector<float> candidate_scores;
 
-    // Extract embedding for each cluster and search
+    // Extract embedding for each cluster and optionally match
     for (int sid : speaker_ids) {
         auto* stream = SherpaOnnxSpeakerEmbeddingExtractorCreateStream(extractor);
         if (!stream) continue;
@@ -325,14 +498,22 @@ std::map<int, std::string> identify_speakers(
             const float* emb = SherpaOnnxSpeakerEmbeddingExtractorComputeEmbedding(
                 extractor, stream);
             if (emb) {
-                const auto* best = SherpaOnnxSpeakerEmbeddingManagerGetBestMatches(
-                    mgr, emb, threshold, 1);
-                if (best && best->count > 0 && best->matches[0].name) {
-                    candidates.push_back({sid, best->matches[0].name});
-                    scores.push_back(best->matches[0].score);
+                // Preserve embedding before destroying the raw pointer
+                result.embeddings[sid] = std::vector<float>(emb, emb + dim);
+                result.scores[sid] = 0.0f;
+
+                // Match against enrolled speakers if DB is available
+                if (mgr) {
+                    const auto* best = SherpaOnnxSpeakerEmbeddingManagerGetBestMatches(
+                        mgr, emb, threshold, 1);
+                    if (best && best->count > 0 && best->matches[0].name) {
+                        candidates.push_back({sid, best->matches[0].name});
+                        candidate_scores.push_back(best->matches[0].score);
+                    }
+                    if (best)
+                        SherpaOnnxSpeakerEmbeddingManagerFreeBestMatches(best);
                 }
-                if (best)
-                    SherpaOnnxSpeakerEmbeddingManagerFreeBestMatches(best);
+
                 SherpaOnnxSpeakerEmbeddingExtractorDestroyEmbedding(emb);
             }
         }
@@ -341,24 +522,26 @@ std::map<int, std::string> identify_speakers(
     }
 
     // Resolve conflicts: if multiple clusters match the same name, pick highest score
-    // Sort by score descending so highest-confidence matches win
     std::vector<size_t> order(candidates.size());
     for (size_t i = 0; i < order.size(); ++i) order[i] = i;
     std::sort(order.begin(), order.end(), [&](size_t a, size_t b) {
-        return scores[a] > scores[b];
+        return candidate_scores[a] > candidate_scores[b];
     });
 
     std::map<std::string, bool> used_names;
     for (size_t idx : order) {
         const auto& name = candidates[idx].second;
-        if (used_names.count(name)) continue;  // already assigned to higher-scoring cluster
-        result[candidates[idx].first] = name;
+        if (used_names.count(name)) continue;
+        int sid = candidates[idx].first;
+        result.names[sid] = name;
+        result.scores[sid] = candidate_scores[idx];
         used_names[name] = true;
         log_info("Speaker %d identified as '%s' (score: %.3f)",
-                 candidates[idx].first, name.c_str(), scores[idx]);
+                 sid, name.c_str(), candidate_scores[idx]);
     }
 
-    SherpaOnnxDestroySpeakerEmbeddingManager(mgr);
+    if (mgr)
+        SherpaOnnxDestroySpeakerEmbeddingManager(mgr);
     SherpaOnnxDestroySpeakerEmbeddingExtractor(extractor);
 
     return result;

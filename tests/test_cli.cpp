@@ -213,6 +213,16 @@ TEST_CASE("parse_cli: default note_dir is empty", "[cli]") {
     CHECK(cli.cfg.note_dir.empty());
 }
 
+TEST_CASE("parse_cli: --reset-speakers sets flag", "[cli]") {
+    auto cli = run_cli({"recmeet", "--reset-speakers"});
+    CHECK(cli.reset_speakers == true);
+}
+
+TEST_CASE("parse_cli: default reset_speakers is false", "[cli]") {
+    auto cli = run_cli({"recmeet"});
+    CHECK(cli.reset_speakers == false);
+}
+
 TEST_CASE("parse_cli: --log-level sets log level", "[cli]") {
     auto cli = run_cli({"recmeet", "--log-level", "info"});
     CHECK(cli.cfg.log_level_str == "info");

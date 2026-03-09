@@ -51,6 +51,7 @@ CliResult parse_cli(int argc, char* argv[]) {
         {"no-speaker-id",  no_argument,       nullptr, 1013},
         {"speaker-threshold", required_argument, nullptr, 1014},
         {"speaker-db",     required_argument, nullptr, 1015},
+        {"reset-speakers", no_argument,       nullptr, 1016},
         {"help",           no_argument,       nullptr, 'h'},
         {"version",        no_argument,       nullptr, 'v'},
         {nullptr, 0, nullptr, 0},
@@ -103,6 +104,7 @@ CliResult parse_cli(int argc, char* argv[]) {
             case 1013: result.cfg.speaker_id = false; break;
             case 1014: result.cfg.speaker_threshold = std::atof(optarg); break;
             case 1015: result.cfg.speaker_db = optarg; break;
+            case 1016: result.reset_speakers = true; break;
             case 'v': result.show_version = true; return result;
             case 'h': result.show_help = true; return result;
             default:  result.show_help = true; return result;

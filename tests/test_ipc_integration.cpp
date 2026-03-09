@@ -5,6 +5,7 @@
 #include "ipc_server.h"
 #include "ipc_client.h"
 #include "ipc_protocol.h"
+#include "speaker_id.h"
 
 #include <atomic>
 #include <chrono>
@@ -980,4 +981,151 @@ TEST_CASE("reprocess stop triggers postprocessing lifecycle", "[ipc][integration
     CHECK(states[1] == "postprocessing");
     // Last state should be idle (job.complete event may interleave, so check last)
     CHECK(states.back() == "idle");
+}
+
+// ===========================================================================
+// Category 7: Speaker Management IPC
+// ===========================================================================
+
+TEST_CASE("speakers.list round-trip via IPC", "[ipc][integration]") {
+    const char* sock = "/tmp/recmeet_test_spk_list.sock";
+    unlink(sock);
+
+    auto tmp = fs::temp_directory_path() / "recmeet_ipc_spk_list";
+    fs::remove_all(tmp);
+
+    // Seed DB with a speaker
+    SpeakerProfile p;
+    p.name = "TestUser";
+    p.created = p.updated = "2026-01-01T00:00:00Z";
+    p.embeddings = {{1.0f, 2.0f}};
+    save_speaker(tmp, p);
+
+    IpcServer server(sock);
+    server.on("speakers.list", [&tmp](const IpcRequest&, IpcResponse& resp, IpcError&) {
+        auto profiles = load_speaker_db(tmp);
+        std::string arr = "[";
+        for (size_t i = 0; i < profiles.size(); ++i) {
+            if (i > 0) arr += ",";
+            arr += "{\"name\":\"" + profiles[i].name
+                + "\",\"enrollments\":" + std::to_string(profiles[i].embeddings.size()) + "}";
+        }
+        arr += "]";
+        resp.result["speakers"] = arr;
+        resp.result["count"] = static_cast<int64_t>(profiles.size());
+        return true;
+    });
+    REQUIRE(server.start());
+    std::thread srv([&server]() { server.run(); });
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+    IpcClient client(sock);
+    REQUIRE(client.connect());
+
+    IpcResponse resp;
+    IpcError err;
+    REQUIRE(client.call("speakers.list", resp, err));
+    CHECK(json_val_as_int(resp.result["count"]) == 1);
+    CHECK(json_val_as_string(resp.result["speakers"]).find("TestUser") != std::string::npos);
+
+    server.stop();
+    srv.join();
+    fs::remove_all(tmp);
+}
+
+TEST_CASE("speakers.remove round-trip via IPC", "[ipc][integration]") {
+    const char* sock = "/tmp/recmeet_test_spk_remove.sock";
+    unlink(sock);
+
+    auto tmp = fs::temp_directory_path() / "recmeet_ipc_spk_remove";
+    fs::remove_all(tmp);
+
+    SpeakerProfile p;
+    p.name = "Removable";
+    p.created = p.updated = "2026-01-01T00:00:00Z";
+    p.embeddings = {{1.0f}};
+    save_speaker(tmp, p);
+
+    IpcServer server(sock);
+    server.on("speakers.remove", [&tmp](const IpcRequest& req, IpcResponse& resp, IpcError& err) {
+        auto it = req.params.find("name");
+        if (it == req.params.end()) {
+            err.code = static_cast<int>(IpcErrorCode::InvalidParams);
+            err.message = "Missing name";
+            return false;
+        }
+        std::string name = json_val_as_string(it->second);
+        if (remove_speaker(tmp, name)) {
+            resp.result["ok"] = true;
+            return true;
+        }
+        err.code = static_cast<int>(IpcErrorCode::InvalidParams);
+        err.message = "Not found";
+        return false;
+    });
+    REQUIRE(server.start());
+    std::thread srv([&server]() { server.run(); });
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+    IpcClient client(sock);
+    REQUIRE(client.connect());
+
+    IpcResponse resp;
+    IpcError err;
+    JsonMap params;
+    params["name"] = std::string("Removable");
+    REQUIRE(client.call("speakers.remove", params, resp, err));
+    CHECK(json_val_as_bool(resp.result["ok"]) == true);
+
+    // Verify removed
+    CHECK(load_speaker_db(tmp).empty());
+
+    // Second remove should fail
+    IpcResponse r2;
+    IpcError e2;
+    CHECK_FALSE(client.call("speakers.remove", params, r2, e2));
+
+    server.stop();
+    srv.join();
+    fs::remove_all(tmp);
+}
+
+TEST_CASE("speakers.reset round-trip via IPC", "[ipc][integration]") {
+    const char* sock = "/tmp/recmeet_test_spk_reset.sock";
+    unlink(sock);
+
+    auto tmp = fs::temp_directory_path() / "recmeet_ipc_spk_reset";
+    fs::remove_all(tmp);
+
+    SpeakerProfile p1, p2;
+    p1.name = "A"; p1.created = p1.updated = "2026-01-01T00:00:00Z"; p1.embeddings = {{1.0f}};
+    p2.name = "B"; p2.created = p2.updated = "2026-01-01T00:00:00Z"; p2.embeddings = {{2.0f}};
+    save_speaker(tmp, p1);
+    save_speaker(tmp, p2);
+
+    IpcServer server(sock);
+    server.on("speakers.reset", [&tmp](const IpcRequest&, IpcResponse& resp, IpcError&) {
+        int count = reset_speakers(tmp);
+        resp.result["ok"] = true;
+        resp.result["removed"] = static_cast<int64_t>(count);
+        return true;
+    });
+    REQUIRE(server.start());
+    std::thread srv([&server]() { server.run(); });
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+    IpcClient client(sock);
+    REQUIRE(client.connect());
+
+    IpcResponse resp;
+    IpcError err;
+    REQUIRE(client.call("speakers.reset", resp, err));
+    CHECK(json_val_as_bool(resp.result["ok"]) == true);
+    CHECK(json_val_as_int(resp.result["removed"]) == 2);
+
+    CHECK(load_speaker_db(tmp).empty());
+
+    server.stop();
+    srv.join();
+    fs::remove_all(tmp);
 }

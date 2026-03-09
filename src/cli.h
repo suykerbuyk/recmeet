@@ -27,6 +27,7 @@ struct CliResult {
     bool list_speakers = false;  // --speakers
     std::string remove_speaker;  // --remove-speaker "Name"
     std::string identify_dir;    // --identify <meeting_dir>
+    bool reset_speakers = false;  // --reset-speakers
 };
 
 /// Parse command-line arguments. Loads config file as defaults, then applies flag overrides.

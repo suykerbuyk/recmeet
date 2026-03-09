@@ -28,10 +28,38 @@ void save_speaker(const fs::path& db_dir, const SpeakerProfile& profile);
 /// Remove a speaker profile from the database.
 bool remove_speaker(const fs::path& db_dir, const std::string& name);
 
+/// Remove all speaker profiles from the database. Returns count removed.
+int reset_speakers(const fs::path& db_dir);
+
 /// List enrolled speaker names.
 std::vector<std::string> list_speakers(const fs::path& db_dir);
 
 #if RECMEET_USE_SHERPA
+
+/// Per-meeting speaker data persisted as speakers.json alongside audio artifacts.
+struct MeetingSpeaker {
+    int cluster_id;                         // diarization cluster index
+    std::string label;                      // "John" (known) or "Speaker_01" (unknown)
+    bool identified;                        // true if matched from speaker DB
+    std::vector<float> embedding;           // embedding vector
+    float duration_sec;                     // total speaking time (summed from segments)
+    float confidence;                       // identification confidence (0 if unknown)
+};
+
+/// Save per-meeting speaker data to <meeting_dir>/speakers.json.
+void save_meeting_speakers(const fs::path& meeting_dir,
+                           const std::vector<MeetingSpeaker>& speakers);
+
+/// Load per-meeting speaker data from <meeting_dir>/speakers.json.
+std::vector<MeetingSpeaker> load_meeting_speakers(const fs::path& meeting_dir);
+
+/// Result of speaker identification with preserved embeddings.
+struct IdentifyResult {
+    std::map<int, std::string> names;             // cluster_id → enrolled name (empty if unmatched)
+    std::map<int, std::vector<float>> embeddings; // cluster_id → embedding vector
+    std::map<int, float> scores;                  // cluster_id → confidence (0.0 if unmatched)
+};
+
 /// Extract a speaker embedding from audio segments belonging to a specific
 /// diarization cluster. Returns a single averaged embedding vector.
 std::vector<float> extract_speaker_embedding(
@@ -40,9 +68,9 @@ std::vector<float> extract_speaker_embedding(
     const fs::path& model_path, int threads = 0);
 
 /// Match diarization clusters against enrolled speakers.
-/// Returns a map from cluster ID to enrolled speaker name.
-/// Clusters with no match above the threshold are omitted.
-std::map<int, std::string> identify_speakers(
+/// Returns IdentifyResult with names, embeddings, and scores for all clusters.
+/// Embeddings are always extracted; matching is skipped when db is empty.
+IdentifyResult identify_speakers(
     const float* samples, size_t num_samples,
     const DiarizeResult& diar,
     const std::vector<SpeakerProfile>& db,

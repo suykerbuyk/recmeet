@@ -109,6 +109,7 @@ static void print_usage() {
         "  --speaker N          Speaker number to enroll (1-based; omit for interactive)\n"
         "  --speakers           List enrolled speakers and exit\n"
         "  --remove-speaker NAME  Remove an enrolled speaker and exit\n"
+        "  --reset-speakers     Remove all enrolled speakers and exit\n"
         "  --identify DIR       Identify speakers in a recording (dry-run) and exit\n"
         "  --daemon             Force client mode (require running daemon)\n"
         "  --no-daemon          Force standalone mode (skip daemon detection)\n"
@@ -335,6 +336,14 @@ int main(int argc, char* argv[]) {
         return 0;
     }
 
+    if (cli.reset_speakers) {
+        fs::path db_dir = cli.cfg.speaker_db.empty()
+            ? default_speaker_db_dir() : cli.cfg.speaker_db;
+        int count = reset_speakers(db_dir);
+        printf("Removed %d speaker profile(s).\n", count);
+        return 0;
+    }
+
     if (!cli.remove_speaker.empty()) {
         fs::path db_dir = cli.cfg.speaker_db.empty()
             ? default_speaker_db_dir() : cli.cfg.speaker_db;
@@ -476,7 +485,7 @@ int main(int argc, char* argv[]) {
         }
 
         fprintf(stderr, "Identifying speakers...\n");
-        auto names = identify_speakers(
+        auto id_result = identify_speakers(
             samples.data(), samples.size(), diar, db,
             model_paths.embedding, cli.cfg.speaker_threshold);
 
@@ -485,9 +494,10 @@ int main(int argc, char* argv[]) {
             double duration = 0;
             for (const auto& seg : diar.segments)
                 if (seg.speaker == i) duration += seg.end - seg.start;
-            auto it = names.find(i);
-            if (it != names.end())
-                printf("  Speaker_%02d → %s  (%.1fs)\n", i + 1, it->second.c_str(), duration);
+            auto it = id_result.names.find(i);
+            if (it != id_result.names.end())
+                printf("  Speaker_%02d → %s  (%.1fs, score: %.3f)\n",
+                       i + 1, it->second.c_str(), duration, id_result.scores[i]);
             else
                 printf("  Speaker_%02d → (unknown)  (%.1fs)\n", i + 1, duration);
         }

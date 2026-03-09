@@ -203,6 +203,145 @@ TEST_CASE("speaker_id: load skips malformed json", "[speaker_id]") {
 }
 
 // ---------------------------------------------------------------------------
+// MeetingSpeaker save/load tests (speakers.json)
+// ---------------------------------------------------------------------------
+
+TEST_CASE("speaker_id: save/load meeting speakers round-trip", "[speaker_id]") {
+    auto tmp = fs::temp_directory_path() / "recmeet_test_meeting_spk_rt";
+    fs::remove_all(tmp);
+
+    std::vector<MeetingSpeaker> speakers = {
+        {0, "Alice", true, {0.1f, 0.2f, -0.3f}, 45.5f, 0.87f},
+        {1, "Speaker_02", false, {0.4f, 0.5f, -0.6f}, 23.1f, 0.0f},
+    };
+
+    save_meeting_speakers(tmp, speakers);
+    CHECK(fs::exists(tmp / "speakers.json"));
+
+    auto loaded = load_meeting_speakers(tmp);
+    REQUIRE(loaded.size() == 2);
+
+    CHECK(loaded[0].cluster_id == 0);
+    CHECK(loaded[0].label == "Alice");
+    CHECK(loaded[0].identified == true);
+    CHECK(loaded[0].duration_sec == Catch::Approx(45.5f));
+    CHECK(loaded[0].confidence == Catch::Approx(0.87f));
+    REQUIRE(loaded[0].embedding.size() == 3);
+    CHECK(loaded[0].embedding[0] == Catch::Approx(0.1f));
+    CHECK(loaded[0].embedding[2] == Catch::Approx(-0.3f));
+
+    CHECK(loaded[1].cluster_id == 1);
+    CHECK(loaded[1].label == "Speaker_02");
+    CHECK(loaded[1].identified == false);
+    CHECK(loaded[1].duration_sec == Catch::Approx(23.1f));
+    CHECK(loaded[1].confidence == Catch::Approx(0.0f));
+    REQUIRE(loaded[1].embedding.size() == 3);
+
+    fs::remove_all(tmp);
+}
+
+TEST_CASE("speaker_id: load meeting speakers from nonexistent dir returns empty", "[speaker_id]") {
+    auto loaded = load_meeting_speakers("/tmp/recmeet_no_such_meeting_dir_xyz");
+    CHECK(loaded.empty());
+}
+
+TEST_CASE("speaker_id: meeting speakers embedding data preserved exactly", "[speaker_id]") {
+    auto tmp = fs::temp_directory_path() / "recmeet_test_meeting_spk_emb";
+    fs::remove_all(tmp);
+
+    // Use a longer embedding to test preservation
+    std::vector<float> emb(192);
+    for (int i = 0; i < 192; ++i) emb[i] = static_cast<float>(i) * 0.001f - 0.1f;
+
+    std::vector<MeetingSpeaker> speakers = {
+        {0, "Test", true, emb, 10.0f, 0.95f},
+    };
+
+    save_meeting_speakers(tmp, speakers);
+    auto loaded = load_meeting_speakers(tmp);
+    REQUIRE(loaded.size() == 1);
+    REQUIRE(loaded[0].embedding.size() == 192);
+    for (int i = 0; i < 192; ++i)
+        CHECK(loaded[0].embedding[i] == Catch::Approx(emb[i]).margin(1e-4));
+
+    fs::remove_all(tmp);
+}
+
+TEST_CASE("speaker_id: save meeting speakers to empty vector writes valid file", "[speaker_id]") {
+    auto tmp = fs::temp_directory_path() / "recmeet_test_meeting_spk_empty";
+    fs::remove_all(tmp);
+
+    save_meeting_speakers(tmp, {});
+    auto loaded = load_meeting_speakers(tmp);
+    CHECK(loaded.empty());
+
+    fs::remove_all(tmp);
+}
+
+// ---------------------------------------------------------------------------
+// reset_speakers tests
+// ---------------------------------------------------------------------------
+
+TEST_CASE("speaker_id: reset removes all profiles", "[speaker_id]") {
+    auto tmp = fs::temp_directory_path() / "recmeet_test_spk_reset";
+    fs::remove_all(tmp);
+
+    SpeakerProfile p1, p2;
+    p1.name = "Alice";
+    p1.created = p1.updated = "2026-01-01T00:00:00Z";
+    p1.embeddings = {{1.0f}};
+    p2.name = "Bob";
+    p2.created = p2.updated = "2026-01-01T00:00:00Z";
+    p2.embeddings = {{2.0f}};
+
+    save_speaker(tmp, p1);
+    save_speaker(tmp, p2);
+    CHECK(load_speaker_db(tmp).size() == 2);
+
+    int removed = reset_speakers(tmp);
+    CHECK(removed == 2);
+    CHECK(load_speaker_db(tmp).empty());
+
+    fs::remove_all(tmp);
+}
+
+TEST_CASE("speaker_id: reset on empty dir returns 0", "[speaker_id]") {
+    auto tmp = fs::temp_directory_path() / "recmeet_test_spk_reset_empty";
+    fs::remove_all(tmp);
+    fs::create_directories(tmp);
+
+    CHECK(reset_speakers(tmp) == 0);
+
+    fs::remove_all(tmp);
+}
+
+TEST_CASE("speaker_id: reset on nonexistent dir returns 0", "[speaker_id]") {
+    CHECK(reset_speakers("/tmp/recmeet_no_such_dir_reset_xyz") == 0);
+}
+
+TEST_CASE("speaker_id: reset preserves non-json files", "[speaker_id]") {
+    auto tmp = fs::temp_directory_path() / "recmeet_test_spk_reset_preserve";
+    fs::remove_all(tmp);
+    fs::create_directories(tmp);
+
+    // Create a non-json file
+    std::ofstream(tmp / "notes.txt") << "keep me";
+
+    SpeakerProfile p;
+    p.name = "Eve";
+    p.created = p.updated = "2026-01-01T00:00:00Z";
+    p.embeddings = {{1.0f}};
+    save_speaker(tmp, p);
+
+    int removed = reset_speakers(tmp);
+    CHECK(removed == 1);
+    CHECK(fs::exists(tmp / "notes.txt"));
+    CHECK(load_speaker_db(tmp).empty());
+
+    fs::remove_all(tmp);
+}
+
+// ---------------------------------------------------------------------------
 // merge_speakers with name map tests
 // ---------------------------------------------------------------------------
 
