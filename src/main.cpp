@@ -95,7 +95,7 @@ static void print_usage() {
         "  --no-vad             Disable VAD segmentation (transcribe full audio)\n"
         "  --vad-threshold F    VAD speech detection threshold (default: 0.5)\n"
         "  --threads N          Number of CPU threads for inference (0 = auto-detect, default: 0)\n"
-        "  --reprocess DIR      Reprocess existing recording directory\n"
+        "  --reprocess PATH     Reprocess audio file or directory containing audio\n"
         "  --log-level LEVEL    Log level: none, error, warn, info (default: none)\n"
         "  --log-dir DIR        Log file directory (default: ~/.local/share/recmeet/logs/)\n"
         "  --list-sources       List available audio sources and exit\n"

@@ -104,4 +104,46 @@ int get_audio_duration_seconds(const fs::path& path) {
     return duration;
 }
 
+fs::path validate_reprocess_input(const fs::path& input) {
+    if (!fs::exists(input))
+        throw RecmeetError("File not found: " + input.string());
+
+    if (fs::is_directory(input)) {
+        fs::path audio = find_audio_file(input);
+        if (audio.empty())
+            throw RecmeetError("No audio file in reprocess directory: " + input.string());
+        return audio;
+    }
+
+    if (!fs::is_regular_file(input))
+        throw RecmeetError("Not a file or directory: " + input.string());
+
+    // Try opening with libsndfile
+    SF_INFO info = {};
+    SNDFILE* sf = sf_open(input.c_str(), SFM_READ, &info);
+    if (sf) {
+        sf_close(sf);
+        return input;
+    }
+
+    // sf_open failed — provide format-specific guidance
+    std::string ext = input.extension().string();
+    // Lowercase the extension for comparison
+    for (auto& c : ext) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+
+    if (ext == ".mp3" || ext == ".m4a" || ext == ".aac" ||
+        ext == ".wma" || ext == ".opus") {
+        std::string stem = input.stem().string();
+        throw RecmeetError(
+            "Unsupported audio format: " + ext.substr(1) + "\n"
+            "Convert with: ffmpeg -i " + input.filename().string() +
+            " -ar 16000 -ac 1 " + stem + ".wav");
+    }
+
+    throw RecmeetError(
+        "Cannot read audio file: " + input.string() + "\n"
+        "Supported formats: WAV, FLAC, OGG, AIFF\n"
+        "For MP3/M4A/AAC, convert with: ffmpeg -i <file> -ar 16000 -ac 1 <output>.wav");
+}
+
 } // namespace recmeet

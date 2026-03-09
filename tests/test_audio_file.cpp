@@ -3,6 +3,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/matchers/catch_matchers_floating_point.hpp>
+#include <catch2/matchers/catch_matchers_string.hpp>
 #include "audio_file.h"
 
 #include <cmath>
@@ -154,4 +155,74 @@ TEST_CASE("write_wav: empty samples creates valid header-only file", "[audio_fil
     CHECK(fs::file_size(wav) > 0);
 
     fs::remove(wav);
+}
+
+// ---------------------------------------------------------------------------
+// validate_reprocess_input tests
+// ---------------------------------------------------------------------------
+
+using Catch::Matchers::ContainsSubstring;
+
+TEST_CASE("validate_reprocess_input: valid WAV file", "[audio_file]") {
+    auto dir = tmp_dir();
+    fs::path wav = dir / "reprocess_test.wav";
+
+    std::vector<int16_t> samples(SAMPLE_RATE, 0);
+    write_wav(wav, samples);
+
+    auto result = validate_reprocess_input(wav);
+    CHECK(result == wav);
+
+    fs::remove(wav);
+}
+
+TEST_CASE("validate_reprocess_input: directory with audio file", "[audio_file]") {
+    auto dir = tmp_dir() / "reprocess_dir_test";
+    fs::create_directories(dir);
+    fs::path wav = dir / "audio_2026-03-09_14-30.wav";
+
+    std::vector<int16_t> samples(SAMPLE_RATE, 0);
+    write_wav(wav, samples);
+
+    auto result = validate_reprocess_input(dir);
+    CHECK(result == wav);
+
+    fs::remove_all(dir);
+}
+
+TEST_CASE("validate_reprocess_input: directory without audio", "[audio_file]") {
+    auto dir = tmp_dir() / "reprocess_empty_test";
+    fs::create_directories(dir);
+
+    CHECK_THROWS_WITH(validate_reprocess_input(dir),
+                      ContainsSubstring("No audio file"));
+
+    fs::remove_all(dir);
+}
+
+TEST_CASE("validate_reprocess_input: non-existent path", "[audio_file]") {
+    CHECK_THROWS_WITH(validate_reprocess_input("/nonexistent/path/file.wav"),
+                      ContainsSubstring("not found"));
+}
+
+TEST_CASE("validate_reprocess_input: MP3 file gives ffmpeg hint", "[audio_file]") {
+    auto dir = tmp_dir();
+    fs::path mp3 = dir / "test.mp3";
+    { std::ofstream{mp3} << "fake mp3 data"; }
+
+    CHECK_THROWS_WITH(validate_reprocess_input(mp3),
+                      ContainsSubstring("ffmpeg"));
+
+    fs::remove(mp3);
+}
+
+TEST_CASE("validate_reprocess_input: unsupported format", "[audio_file]") {
+    auto dir = tmp_dir();
+    fs::path bad = dir / "test.xyz";
+    { std::ofstream{bad} << "not audio"; }
+
+    CHECK_THROWS_WITH(validate_reprocess_input(bad),
+                      ContainsSubstring("Cannot read audio"));
+
+    fs::remove(bad);
 }
