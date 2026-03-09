@@ -67,6 +67,11 @@ struct TrayState {
     // Current model download status (for status label)
     std::string download_model;
 
+    // Progress tracking
+    int progress_percent = -1;
+    std::string current_phase;
+    GtkWidget* status_menu_item = nullptr;
+
     // Cached sources
     std::vector<AudioSource> mics;
     std::vector<AudioSource> monitors;
@@ -112,6 +117,10 @@ static gboolean try_reconnect(gpointer);
 
 static void set_state(TrayState::State new_state) {
     g_tray.state = new_state;
+    if (new_state == TrayState::IDLE) {
+        g_tray.progress_percent = -1;
+        g_tray.current_phase.clear();
+    }
     const char* icon = ICON_IDLE;
     const char* desc = "Idle";
     if (new_state == TrayState::RECORDING) {
@@ -135,6 +144,29 @@ static void handle_ipc_event(const IpcEvent& ev) {
     if (ev.event == "phase") {
         std::string name = json_val_as_string(ev.data.at("name"));
         log_info("[tray] Phase: %s", name.c_str());
+        // Reset progress on phase change and update status label
+        g_tray.current_phase = name;
+        g_tray.progress_percent = -1;
+        if (g_tray.status_menu_item) {
+            std::string label = "Status: " + name + "...";
+            // Capitalize first letter
+            if (!label.empty() && label.size() > 8)
+                label[8] = static_cast<char>(toupper(static_cast<unsigned char>(label[8])));
+            gtk_menu_item_set_label(GTK_MENU_ITEM(g_tray.status_menu_item), label.c_str());
+        }
+    } else if (ev.event == "progress") {
+        std::string phase = json_val_as_string(ev.data.at("phase"));
+        int percent = static_cast<int>(json_val_as_int(ev.data.at("percent")));
+        g_tray.current_phase = phase;
+        g_tray.progress_percent = percent;
+        // Update status label in-place (no full menu rebuild)
+        if (g_tray.status_menu_item) {
+            std::string label = "Status: " + phase + "... " + std::to_string(percent) + "%";
+            // Capitalize first letter of phase
+            if (!label.empty() && label.size() > 8)
+                label[8] = static_cast<char>(toupper(static_cast<unsigned char>(label[8])));
+            gtk_menu_item_set_label(GTK_MENU_ITEM(g_tray.status_menu_item), label.c_str());
+        }
     } else if (ev.event == "state.changed") {
         std::string state = json_val_as_string(ev.data.at("state"));
         auto err_it = ev.data.find("error");
@@ -286,7 +318,8 @@ static void on_record(GtkMenuItem*, gpointer) {
 }
 
 static void on_stop(GtkMenuItem*, gpointer) {
-    if (g_tray.state != TrayState::RECORDING && g_tray.state != TrayState::REPROCESSING) return;
+    if (g_tray.state != TrayState::RECORDING && g_tray.state != TrayState::REPROCESSING
+        && g_tray.state != TrayState::POSTPROCESSING) return;
 
     IpcResponse resp;
     IpcError err;
@@ -296,7 +329,9 @@ static void on_stop(GtkMenuItem*, gpointer) {
     }
 
     // Optimistic UI update — daemon will confirm via state.changed event
-    set_state(TrayState::POSTPROCESSING);
+    // Skip if already postprocessing (cancel case — wait for daemon to confirm idle)
+    if (g_tray.state != TrayState::POSTPROCESSING)
+        set_state(TrayState::POSTPROCESSING);
 }
 
 // --- Radio / checkbox callbacks ---
@@ -620,7 +655,8 @@ static void on_about(GtkMenuItem*, gpointer) {
 }
 
 static void on_quit(GtkMenuItem*, gpointer) {
-    if (g_tray.state == TrayState::RECORDING && g_tray.daemon_connected) {
+    if (g_tray.state != TrayState::IDLE && g_tray.state != TrayState::DOWNLOADING
+        && g_tray.daemon_connected) {
         IpcResponse resp;
         IpcError err;
         g_tray.ipc.call("record.stop", resp, err, 2000);
@@ -689,19 +725,26 @@ static GtkWidget* build_source_submenu(const std::string& current_name,
 static void build_menu() {
     auto* menu = gtk_menu_new();
     bool is_idle = (g_tray.state == TrayState::IDLE);
-    bool is_recording = (g_tray.state == TrayState::RECORDING);
+    bool is_active = (g_tray.state != TrayState::IDLE && g_tray.state != TrayState::DOWNLOADING);
 
     // --- Status label ---
     std::string status;
     if (!g_tray.daemon_connected)
         status = "Status: Disconnected";
-    else if (is_recording)
+    else if (g_tray.state == TrayState::RECORDING)
         status = "Status: Recording...";
     else if (g_tray.state == TrayState::REPROCESSING)
         status = "Status: Reprocessing...";
-    else if (g_tray.state == TrayState::POSTPROCESSING)
+    else if (g_tray.state == TrayState::POSTPROCESSING) {
         status = "Status: Processing...";
-    else if (g_tray.state == TrayState::DOWNLOADING) {
+        if (g_tray.progress_percent >= 0 && !g_tray.current_phase.empty()) {
+            status = "Status: " + g_tray.current_phase + "... "
+                     + std::to_string(g_tray.progress_percent) + "%";
+            // Capitalize first letter of phase
+            if (status.size() > 8)
+                status[8] = static_cast<char>(toupper(static_cast<unsigned char>(status[8])));
+        }
+    } else if (g_tray.state == TrayState::DOWNLOADING) {
         status = "Status: Downloading";
         if (!g_tray.download_model.empty())
             status += " " + g_tray.download_model;
@@ -711,12 +754,14 @@ static void build_menu() {
     auto* status_item = gtk_menu_item_new_with_label(status.c_str());
     gtk_widget_set_sensitive(status_item, FALSE);
     gtk_menu_shell_append(GTK_MENU_SHELL(menu), status_item);
+    g_tray.status_menu_item = status_item;
 
     gtk_menu_shell_append(GTK_MENU_SHELL(menu), gtk_separator_menu_item_new());
 
-    // --- Record / Stop ---
-    if (is_recording) {
-        auto* item = gtk_menu_item_new_with_label("Stop Recording");
+    // --- Record / Stop / Cancel ---
+    if (is_active) {
+        const char* label = (g_tray.state == TrayState::RECORDING) ? "Stop Recording" : "Cancel";
+        auto* item = gtk_menu_item_new_with_label(label);
         g_signal_connect(item, "activate", G_CALLBACK(on_stop), nullptr);
         gtk_menu_shell_append(GTK_MENU_SHELL(menu), item);
     } else {

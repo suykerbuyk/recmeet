@@ -18,6 +18,7 @@
 #include <whisper.h>
 
 #include <atomic>
+#include <chrono>
 #include <csignal>
 #include <cstdio>
 #include <cstring>
@@ -354,7 +355,31 @@ int main(int argc, char* argv[]) {
                     server.broadcast(ev);
                 });
 
-                auto result = run_postprocessing(cfg, input, on_phase);
+                auto on_progress = [&server](const std::string& phase, int percent) {
+                    using clock = std::chrono::steady_clock;
+                    static auto last_broadcast = clock::time_point{};
+                    static int last_percent = -1;
+
+                    auto now = clock::now();
+                    int elapsed_sec = std::chrono::duration_cast<std::chrono::seconds>(
+                        now - last_broadcast).count();
+                    int jump = percent - last_percent;
+
+                    // Throttle: broadcast every 120s or on ≥10% jump
+                    if (last_percent < 0 || elapsed_sec >= 120 || jump >= 10) {
+                        last_broadcast = now;
+                        last_percent = percent;
+                        server.post([&server, phase, percent]() {
+                            IpcEvent ev;
+                            ev.event = "progress";
+                            ev.data["phase"] = phase;
+                            ev.data["percent"] = static_cast<int64_t>(percent);
+                            server.broadcast(ev);
+                        });
+                    }
+                };
+
+                auto result = run_postprocessing(cfg, input, on_phase, on_progress, &g_stop);
 
                 server.post([&server, result]() {
                     g_state.store(DaemonState::Idle);
@@ -388,7 +413,8 @@ int main(int argc, char* argv[]) {
 
     server.on("record.stop", [](const IpcRequest& req, IpcResponse& resp, IpcError& err) {
         DaemonState cur = g_state.load();
-        if (cur != DaemonState::Recording && cur != DaemonState::Reprocessing) {
+        if (cur != DaemonState::Recording && cur != DaemonState::Reprocessing
+            && cur != DaemonState::Postprocessing) {
             err.code = static_cast<int>(IpcErrorCode::NotRecording);
             err.message = "Not recording";
             return false;

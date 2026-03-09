@@ -74,16 +74,39 @@ WhisperModel& WhisperModel::operator=(WhisperModel&& other) noexcept {
 // Transcription
 // ---------------------------------------------------------------------------
 
-TranscriptResult transcribe(WhisperModel& model, const float* samples,
-                            size_t num_samples, double offset_seconds,
-                            const std::string& language, int threads) {
-    whisper_context* ctx = model.get();
+// ---------------------------------------------------------------------------
+// Callback state for whisper C function pointers
+// ---------------------------------------------------------------------------
 
+struct TranscribeCallbackState {
+    std::function<void(int)> on_progress;
+    StopToken* stop = nullptr;
+};
+
+static void whisper_progress_cb(whisper_context*, whisper_state*, int progress, void* user_data) {
+    auto* state = static_cast<TranscribeCallbackState*>(user_data);
+    if (state && state->on_progress)
+        state->on_progress(progress);
+}
+
+static bool whisper_abort_cb(void* user_data) {
+    auto* state = static_cast<TranscribeCallbackState*>(user_data);
+    return state && state->stop && state->stop->stop_requested();
+}
+
+// ---------------------------------------------------------------------------
+// Core transcription (shared implementation)
+// ---------------------------------------------------------------------------
+
+static TranscriptResult transcribe_impl(whisper_context* ctx, const float* samples,
+                                         size_t num_samples, double offset_seconds,
+                                         const std::string& language, int threads,
+                                         TranscribeCallbackState* cb_state) {
     // Set up whisper params
     whisper_full_params wparams = whisper_full_default_params(WHISPER_SAMPLING_GREEDY);
     wparams.n_threads = threads > 0 ? threads : default_thread_count();
-    // Suppress progress for buffer-based calls (too noisy for many VAD segments)
-    wparams.print_progress = (offset_seconds == 0.0) && isatty(STDERR_FILENO);
+    // Suppress built-in progress when we have our own callback
+    wparams.print_progress = !cb_state && (offset_seconds == 0.0) && isatty(STDERR_FILENO);
     wparams.print_timestamps = false;
 
     // Relax no-speech suppression — default logprob_thold (-1.0) can be too
@@ -102,9 +125,25 @@ TranscriptResult transcribe(WhisperModel& model, const float* samples,
         wparams.detect_language = false;
     }
 
+    // Wire up progress + abort callbacks if provided
+    if (cb_state) {
+        if (cb_state->on_progress) {
+            wparams.progress_callback = whisper_progress_cb;
+            wparams.progress_callback_user_data = cb_state;
+        }
+        if (cb_state->stop) {
+            wparams.abort_callback = whisper_abort_cb;
+            wparams.abort_callback_user_data = cb_state;
+        }
+    }
+
     int ret = whisper_full(ctx, wparams, samples, static_cast<int>(num_samples));
-    if (ret != 0)
+    if (ret != 0) {
+        // Distinguish cancellation from real failure
+        if (cb_state && cb_state->stop && cb_state->stop->stop_requested())
+            throw RecmeetError("Cancelled");
         throw RecmeetError("Whisper transcription failed (code " + std::to_string(ret) + ")");
+    }
 
     // Extract segments
     TranscriptResult result;
@@ -133,6 +172,23 @@ TranscriptResult transcribe(WhisperModel& model, const float* samples,
     result.language_prob = 0.0f; // whisper.cpp doesn't expose per-segment lang probs easily
 
     return result;
+}
+
+TranscriptResult transcribe(WhisperModel& model, const float* samples,
+                            size_t num_samples, double offset_seconds,
+                            const std::string& language, int threads) {
+    return transcribe_impl(model.get(), samples, num_samples, offset_seconds,
+                           language, threads, nullptr);
+}
+
+TranscriptResult transcribe(WhisperModel& model, const float* samples,
+                            size_t num_samples, double offset_seconds,
+                            const TranscribeOptions& opts) {
+    TranscribeCallbackState cb_state;
+    cb_state.on_progress = opts.on_progress;
+    cb_state.stop = opts.stop;
+    return transcribe_impl(model.get(), samples, num_samples, offset_seconds,
+                           opts.language, opts.threads, &cb_state);
 }
 
 TranscriptResult transcribe(WhisperModel& model, const fs::path& audio_path,

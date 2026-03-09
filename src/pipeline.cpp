@@ -227,10 +227,33 @@ PostprocessInput run_recording(const Config& cfg, StopToken& stop, PhaseCallback
     return pp;
 }
 
+/// Compute weighted progress across VAD segments.
+/// Returns overall percent (0-100) given current segment index and within-segment percent.
+int vad_weighted_progress(size_t seg_index, int seg_percent, const std::vector<size_t>& seg_samples) {
+    if (seg_samples.empty()) return 0;
+    size_t total = 0;
+    for (auto n : seg_samples) total += n;
+    if (total == 0) return 0;
+
+    size_t done = 0;
+    for (size_t i = 0; i < seg_index && i < seg_samples.size(); ++i)
+        done += seg_samples[i];
+    if (seg_index < seg_samples.size())
+        done += static_cast<size_t>(seg_samples[seg_index] * seg_percent / 100.0);
+
+    return static_cast<int>(done * 100 / total);
+}
+
 PipelineResult run_postprocessing(const Config& cfg, const PostprocessInput& input,
-                                  PhaseCallback on_phase) {
+                                  PhaseCallback on_phase, ProgressCallback on_progress,
+                                  StopToken* stop) {
     auto phase = [&](const std::string& name) {
         if (on_phase) on_phase(name);
+    };
+
+    auto check_cancel = [&]() {
+        if (stop && stop->stop_requested())
+            throw RecmeetError("Cancelled");
     };
 
     int threads = cfg.threads > 0 ? cfg.threads : default_thread_count();
@@ -269,10 +292,29 @@ PipelineResult run_postprocessing(const Config& cfg, const PostprocessInput& inp
                         notify("Transcribing...", "Model: " + cfg.whisper_model +
                                " (" + std::to_string(vad_result.segments.size()) + " segments)");
 
-                        for (const auto& seg : vad_result.segments) {
-                            size_t n = static_cast<size_t>(seg.end_sample - seg.start_sample);
+                        // Build sample counts for weighted progress
+                        std::vector<size_t> seg_samples;
+                        for (const auto& seg : vad_result.segments)
+                            seg_samples.push_back(static_cast<size_t>(seg.end_sample - seg.start_sample));
+
+                        for (size_t si = 0; si < vad_result.segments.size(); ++si) {
+                            check_cancel();
+                            const auto& seg = vad_result.segments[si];
+                            size_t n = seg_samples[si];
+
+                            TranscribeOptions opts;
+                            opts.language = cfg.language;
+                            opts.threads = threads;
+                            opts.stop = stop;
+                            if (on_progress) {
+                                opts.on_progress = [&, si](int pct) {
+                                    int overall = vad_weighted_progress(si, pct, seg_samples);
+                                    on_progress("transcribing", overall);
+                                };
+                            }
+
                             auto seg_result = transcribe(model, samples.data() + seg.start_sample,
-                                                         n, seg.start, cfg.language, threads);
+                                                         n, seg.start, opts);
                             for (auto& s : seg_result.segments)
                                 result.segments.push_back(std::move(s));
                             if (result.language.empty())
@@ -288,14 +330,25 @@ PipelineResult run_postprocessing(const Config& cfg, const PostprocessInput& inp
                 {
                     phase("transcribing");
                     notify("Transcribing...", "Model: " + cfg.whisper_model);
-                    result = transcribe(model, samples.data(), samples.size(), 0.0,
-                                        cfg.language, threads);
+
+                    TranscribeOptions opts;
+                    opts.language = cfg.language;
+                    opts.threads = threads;
+                    opts.stop = stop;
+                    if (on_progress) {
+                        opts.on_progress = [&](int pct) {
+                            on_progress("transcribing", pct);
+                        };
+                    }
+
+                    result = transcribe(model, samples.data(), samples.size(), 0.0, opts);
                     log_info("Transcribed %d segments (language: %s)",
                             (int)result.segments.size(), result.language.c_str());
                 }
             }   // whisper model freed
 
 #if RECMEET_USE_SHERPA
+            check_cancel();
             if (cfg.diarize && !result.segments.empty()) {
                 phase("diarizing");
                 notify("Diarizing...", "Identifying speakers");
@@ -371,6 +424,7 @@ PipelineResult run_postprocessing(const Config& cfg, const PostprocessInput& inp
     }
 
     // --- Summarize ---
+    check_cancel();
     PipelineResult pipe_result;
     pipe_result.output_dir = input.out_dir;
 

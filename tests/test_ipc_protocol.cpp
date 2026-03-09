@@ -261,6 +261,25 @@ TEST_CASE("IPC: speakers.reset response round-trip", "[ipc]") {
 }
 
 // ---------------------------------------------------------------------------
+// Progress event
+// ---------------------------------------------------------------------------
+
+TEST_CASE("IPC: progress event round-trip", "[ipc]") {
+    IpcEvent ev;
+    ev.event = "progress";
+    ev.data["phase"] = std::string("transcribing");
+    ev.data["percent"] = int64_t(42);
+
+    std::string wire = serialize(ev);
+    IpcMessage msg;
+    REQUIRE(parse_ipc_message(wire, msg));
+    REQUIRE(msg.type == IpcMessageType::Event);
+    CHECK(msg.event.event == "progress");
+    CHECK(json_val_as_string(msg.event.data["phase"]) == "transcribing");
+    CHECK(json_val_as_int(msg.event.data["percent"]) == 42);
+}
+
+// ---------------------------------------------------------------------------
 // Socket path
 // ---------------------------------------------------------------------------
 

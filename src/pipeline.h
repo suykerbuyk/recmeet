@@ -8,6 +8,7 @@
 
 #include <functional>
 #include <string>
+#include <vector>
 
 namespace recmeet {
 
@@ -26,6 +27,12 @@ struct PostprocessInput {
 /// Phase callback — called with phase name: "recording", "transcribing", "diarizing", "summarizing", "complete".
 using PhaseCallback = std::function<void(const std::string&)>;
 
+/// Progress callback — called with (phase_name, percent 0-100).
+using ProgressCallback = std::function<void(const std::string&, int)>;
+
+/// Compute weighted progress across VAD segments (for testing).
+int vad_weighted_progress(size_t seg_index, int seg_percent, const std::vector<size_t>& seg_samples);
+
 /// Read entire file as string. Returns empty if missing or unreadable.
 std::string read_context_file(const fs::path& path);
 
@@ -33,10 +40,12 @@ std::string read_context_file(const fs::path& path);
 PostprocessInput run_recording(const Config& cfg, StopToken& stop,
                                PhaseCallback on_phase = nullptr);
 
-/// Transcribe + diarize + summarize + note. Runs to completion (no StopToken).
+/// Transcribe + diarize + summarize + note.
 /// Phases: "transcribing", "diarizing", "summarizing", "complete".
 PipelineResult run_postprocessing(const Config& cfg, const PostprocessInput& input,
-                                  PhaseCallback on_phase = nullptr);
+                                  PhaseCallback on_phase = nullptr,
+                                  ProgressCallback on_progress = nullptr,
+                                  StopToken* stop = nullptr);
 
 /// Run the full pipeline: record → validate → mix → transcribe → summarize → note output.
 PipelineResult run_pipeline(const Config& cfg, StopToken& stop, PhaseCallback on_phase = nullptr);

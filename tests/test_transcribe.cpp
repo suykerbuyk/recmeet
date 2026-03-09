@@ -3,6 +3,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 #include "transcribe.h"
+#include "pipeline.h"
 
 #include <type_traits>
 
@@ -74,4 +75,61 @@ TEST_CASE("WhisperModel: non-copyable, noexcept-movable", "[transcribe]") {
     static_assert(std::is_nothrow_move_assignable_v<WhisperModel>);
     static_assert(!std::is_copy_constructible_v<WhisperModel>);
     static_assert(!std::is_copy_assignable_v<WhisperModel>);
+}
+
+// ---------------------------------------------------------------------------
+// TranscribeOptions
+// ---------------------------------------------------------------------------
+
+TEST_CASE("TranscribeOptions: default-constructed has null callbacks", "[transcribe]") {
+    TranscribeOptions opts;
+    CHECK(opts.language.empty());
+    CHECK(opts.threads == 0);
+    CHECK(!opts.on_progress);
+    CHECK(opts.stop == nullptr);
+}
+
+// ---------------------------------------------------------------------------
+// VAD weighted progress (pure math, no whisper needed)
+// ---------------------------------------------------------------------------
+
+TEST_CASE("vad_weighted_progress: empty segments returns 0", "[transcribe]") {
+    std::vector<size_t> seg_samples;
+    CHECK(vad_weighted_progress(0, 50, seg_samples) == 0);
+}
+
+TEST_CASE("vad_weighted_progress: single segment", "[transcribe]") {
+    std::vector<size_t> seg_samples = {1000};
+    CHECK(vad_weighted_progress(0, 0, seg_samples) == 0);
+    CHECK(vad_weighted_progress(0, 50, seg_samples) == 50);
+    CHECK(vad_weighted_progress(0, 100, seg_samples) == 100);
+}
+
+TEST_CASE("vad_weighted_progress: two equal segments", "[transcribe]") {
+    std::vector<size_t> seg_samples = {1000, 1000};
+    // First segment at 0% → 0% overall
+    CHECK(vad_weighted_progress(0, 0, seg_samples) == 0);
+    // First segment at 100% → 50% overall
+    CHECK(vad_weighted_progress(0, 100, seg_samples) == 50);
+    // Second segment at 0% → 50% overall
+    CHECK(vad_weighted_progress(1, 0, seg_samples) == 50);
+    // Second segment at 50% → 75% overall
+    CHECK(vad_weighted_progress(1, 50, seg_samples) == 75);
+    // Second segment at 100% → 100% overall
+    CHECK(vad_weighted_progress(1, 100, seg_samples) == 100);
+}
+
+TEST_CASE("vad_weighted_progress: unequal segments", "[transcribe]") {
+    // 75% of work in first segment, 25% in second
+    std::vector<size_t> seg_samples = {3000, 1000};
+    // First segment at 50% → 37% overall
+    CHECK(vad_weighted_progress(0, 50, seg_samples) == 37);
+    // Second segment at 0% → 75% overall
+    CHECK(vad_weighted_progress(1, 0, seg_samples) == 75);
+}
+
+TEST_CASE("vad_weighted_progress: past-end segment index", "[transcribe]") {
+    std::vector<size_t> seg_samples = {1000, 1000};
+    // Index past end — all previous done
+    CHECK(vad_weighted_progress(2, 0, seg_samples) == 100);
 }

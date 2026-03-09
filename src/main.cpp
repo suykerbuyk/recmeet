@@ -167,22 +167,48 @@ static int client_record(const Config& cfg) {
         return 1;
     }
 
+    bool is_reprocess = !cfg.reprocess_dir.empty();
+
     // Build params from config overrides
     JsonMap params = config_to_map(cfg);
+
+    static int last_cli_progress = -1;
+    static const bool cli_tty = isatty(STDERR_FILENO);
 
     client.set_event_callback([](const IpcEvent& ev) {
         if (ev.event == "phase") {
             std::string name = json_val_as_string(ev.data.at("name"));
+            if (cli_tty && last_cli_progress >= 0)
+                fprintf(stderr, "\n");  // newline after progress line
+            last_cli_progress = -1;
             fprintf(stderr, "Phase: %s\n", name.c_str());
+        } else if (ev.event == "progress") {
+            std::string phase = json_val_as_string(ev.data.at("phase"));
+            int percent = static_cast<int>(json_val_as_int(ev.data.at("percent")));
+            if (cli_tty) {
+                fprintf(stderr, "\r\033[K%s... %d%%",
+                        phase.c_str(), percent);
+                last_cli_progress = percent;
+            } else if (percent - last_cli_progress >= 10 || last_cli_progress < 0) {
+                fprintf(stderr, "%s... %d%%\n", phase.c_str(), percent);
+                last_cli_progress = percent;
+            }
         } else if (ev.event == "state.changed") {
             std::string state = json_val_as_string(ev.data.at("state"));
             auto err_it = ev.data.find("error");
             if (err_it != ev.data.end()) {
                 std::string error = json_val_as_string(err_it->second);
-                if (!error.empty())
+                if (!error.empty()) {
+                    if (cli_tty && last_cli_progress >= 0)
+                        fprintf(stderr, "\n");
+                    last_cli_progress = -1;
                     fprintf(stderr, "Error: %s\n", error.c_str());
+                }
             }
         } else if (ev.event == "job.complete") {
+            if (cli_tty && last_cli_progress >= 0)
+                fprintf(stderr, "\n");
+            last_cli_progress = -1;
             std::string note = json_val_as_string(ev.data.at("note_path"));
             std::string dir = json_val_as_string(ev.data.at("output_dir"));
             if (!note.empty())
@@ -198,7 +224,10 @@ static int client_record(const Config& cfg) {
         return 1;
     }
 
-    fprintf(stderr, "Recording started. Press Ctrl+C to stop.\n");
+    if (is_reprocess)
+        fprintf(stderr, "Reprocessing %s\n", cfg.reprocess_dir.c_str());
+    else
+        fprintf(stderr, "Recording started. Press Ctrl+C to stop.\n");
 
     // Install signal handler to send stop on Ctrl+C
     static IpcClient* g_client = &client;
@@ -512,6 +541,17 @@ int main(int argc, char* argv[]) {
     auto log_level = parse_log_level(cfg.log_level_str);
     log_init(log_level, cfg.log_dir);
 
+    // Early validation: reject unsupported audio formats before daemon dispatch
+    if (!cfg.reprocess_dir.empty()) {
+        try {
+            validate_reprocess_input(cfg.reprocess_dir);
+        } catch (const RecmeetError& e) {
+            fprintf(stderr, "Error: %s\n", e.what());
+            log_shutdown();
+            return 1;
+        }
+    }
+
     // Determine whether to use daemon
     bool use_daemon = false;
     if (cli.daemon_mode == DaemonMode::Force) {
@@ -523,7 +563,7 @@ int main(int argc, char* argv[]) {
         use_daemon = daemon_running();
     }
 
-    if (use_daemon && !list_sources && cfg.reprocess_dir.empty()) {
+    if (use_daemon && !list_sources) {
         log_info("Using daemon mode");
         int rc = client_record(cfg);
         log_shutdown();

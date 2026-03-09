@@ -5,6 +5,7 @@
 
 #include "util.h"
 
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -56,6 +57,17 @@ struct TranscriptResult {
 };
 
 // ---------------------------------------------------------------------------
+// Transcription options (progress + cancellation)
+// ---------------------------------------------------------------------------
+
+struct TranscribeOptions {
+    std::string language;
+    int threads = 0;
+    std::function<void(int)> on_progress;  // percent 0-100
+    StopToken* stop = nullptr;
+};
+
+// ---------------------------------------------------------------------------
 // Transcription functions
 // ---------------------------------------------------------------------------
 
@@ -69,6 +81,11 @@ TranscriptResult transcribe(WhisperModel& model, const fs::path& audio_path,
 TranscriptResult transcribe(WhisperModel& model, const float* samples,
                             size_t num_samples, double offset_seconds = 0.0,
                             const std::string& language = "", int threads = 0);
+
+/// Transcribe from a float buffer with progress/abort callbacks.
+TranscriptResult transcribe(WhisperModel& model, const float* samples,
+                            size_t num_samples, double offset_seconds,
+                            const TranscribeOptions& opts);
 
 /// Convenience: load the model, transcribe, then free.
 /// Equivalent to constructing a temporary WhisperModel and calling the above.
