@@ -121,6 +121,9 @@ bool IpcClient::call(const std::string& method, IpcResponse& resp, IpcError& err
 }
 
 bool IpcClient::read_events(const std::string& until_event, int timeout_ms) {
+    until_event_ = until_event;
+    event_matched_ = false;
+
     auto deadline = std::chrono::steady_clock::now();
     if (timeout_ms > 0)
         deadline += std::chrono::milliseconds(timeout_ms);
@@ -130,20 +133,17 @@ bool IpcClient::read_events(const std::string& until_event, int timeout_ms) {
         if (timeout_ms > 0) {
             auto now = std::chrono::steady_clock::now();
             remaining = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now).count();
-            if (remaining <= 0) return false;
+            if (remaining <= 0) { until_event_.clear(); return false; }
         }
 
-        if (!read_and_dispatch(remaining))
-            return false;
+        if (!read_and_dispatch(remaining)) {
+            until_event_.clear();
+            return event_matched_;
+        }
 
-        // Check if we saw the target event (set as a side effect in process_line)
-        // We track this via a simple flag
-        if (!until_event.empty()) {
-            // The event callback will have been called; we need a way to detect it.
-            // Simplest: check if pending_done_ was set as a sentinel in process_line
-            // when an event matching until_event is seen. But that's hacky.
-            // Instead, just return true — the caller can check state via callbacks.
-            // Actually, let's do it properly:
+        if (event_matched_) {
+            until_event_.clear();
+            return true;
         }
     }
 }
@@ -191,6 +191,8 @@ void IpcClient::process_line(const std::string& line) {
     if (!parse_ipc_message(line, msg)) return;
 
     if (msg.type == IpcMessageType::Event) {
+        if (!until_event_.empty() && msg.event.event == until_event_)
+            event_matched_ = true;
         if (event_cb_) event_cb_(msg.event);
         return;
     }

@@ -174,8 +174,9 @@ static int client_record(const Config& cfg) {
 
     static int last_cli_progress = -1;
     static const bool cli_tty = isatty(STDERR_FILENO);
+    static int client_exit_code = 0;
 
-    client.set_event_callback([](const IpcEvent& ev) {
+    client.set_event_callback([&client](const IpcEvent& ev) {
         if (ev.event == "phase") {
             std::string name = json_val_as_string(ev.data.at("name"));
             if (cli_tty && last_cli_progress >= 0)
@@ -203,6 +204,9 @@ static int client_record(const Config& cfg) {
                         fprintf(stderr, "\n");
                     last_cli_progress = -1;
                     fprintf(stderr, "Error: %s\n", error.c_str());
+                    client_exit_code = 1;
+                    // Force exit from read_events by closing connection
+                    client.close_connection();
                 }
             }
         } else if (ev.event == "job.complete") {
@@ -242,11 +246,11 @@ static int client_record(const Config& cfg) {
     sigaction(SIGINT, &sa, nullptr);
     sigaction(SIGTERM, &sa, nullptr);
 
-    // Wait for job completion or disconnect
+    // Wait for job completion, error, or disconnect
     client.read_events("job.complete");
 
     g_client = nullptr;
-    return 0;
+    return client_exit_code;
 }
 
 // ---------------------------------------------------------------------------

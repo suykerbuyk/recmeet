@@ -68,6 +68,10 @@ private:
     int64_t pending_id_ = 0;
     IpcMessage pending_result_;
     bool pending_done_ = false;
+
+    // Set when the target event for read_events() is seen.
+    bool event_matched_ = false;
+    std::string until_event_;
 };
 
 // Check whether a daemon is running (socket exists and is connectable).
