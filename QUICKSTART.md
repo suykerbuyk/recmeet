@@ -155,7 +155,7 @@ Each recording creates a directory under `meetings/`:
 
 ```
 meetings/2026-03-05_10-30/
-  audio.wav                                    # Mixed audio (16kHz mono)
+  audio_2026-03-05_10-30.wav                   # Mixed audio (16kHz mono)
   Meeting_2026-03-05_10-30_Sprint_Review.md    # Meeting note
 ```
 

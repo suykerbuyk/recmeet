@@ -95,7 +95,7 @@ static void print_usage() {
         "  --no-vad             Disable VAD segmentation (transcribe full audio)\n"
         "  --vad-threshold F    VAD speech detection threshold (default: 0.5)\n"
         "  --threads N          Number of CPU threads for inference (0 = auto-detect, default: 0)\n"
-        "  --reprocess DIR      Reprocess existing recording from audio.wav\n"
+        "  --reprocess DIR      Reprocess existing recording directory\n"
         "  --log-level LEVEL    Log level: none, error, warn, info (default: none)\n"
         "  --log-dir DIR        Log file directory (default: ~/.local/share/recmeet/logs/)\n"
         "  --list-sources       List available audio sources and exit\n"
@@ -363,9 +363,9 @@ int main(int argc, char* argv[]) {
             return 1;
         }
         fs::path meeting_dir = cli.enroll_from;
-        fs::path audio_path = meeting_dir / "audio.wav";
-        if (!fs::exists(audio_path)) {
-            fprintf(stderr, "Error: No audio.wav in %s\n", meeting_dir.c_str());
+        fs::path audio_path = find_audio_file(meeting_dir);
+        if (audio_path.empty()) {
+            fprintf(stderr, "Error: No audio file in %s\n", meeting_dir.c_str());
             return 1;
         }
 
@@ -458,9 +458,9 @@ int main(int argc, char* argv[]) {
 
     if (!cli.identify_dir.empty()) {
         fs::path meeting_dir = cli.identify_dir;
-        fs::path audio_path = meeting_dir / "audio.wav";
-        if (!fs::exists(audio_path)) {
-            fprintf(stderr, "Error: No audio.wav in %s\n", meeting_dir.c_str());
+        fs::path audio_path = find_audio_file(meeting_dir);
+        if (audio_path.empty()) {
+            fprintf(stderr, "Error: No audio file in %s\n", meeting_dir.c_str());
             return 1;
         }
 

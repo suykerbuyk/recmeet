@@ -187,7 +187,7 @@ struct TestServer {
                 std::vector<std::string> dirs;
                 for (const auto& entry : fs::directory_iterator(output_dir)) {
                     if (!entry.is_directory()) continue;
-                    if (!fs::exists(entry.path() / "audio.wav")) continue;
+                    if (find_audio_file(entry.path()).empty()) continue;
                     dirs.push_back(entry.path().filename().string());
                 }
                 std::sort(dirs.begin(), dirs.end(), std::greater<>());
@@ -597,6 +597,65 @@ TEST_CASE("web: static file serving returns index.html", "[web]") {
     REQUIRE(res);
     CHECK(res->status == 200);
     CHECK(res->body.find("Hello") != std::string::npos);
+
+    fs::remove_all(tmp);
+}
+
+TEST_CASE("web: GET /api/meetings discovers new-format audio files", "[web]") {
+    auto tmp = fs::temp_directory_path() / "recmeet_test_web_meetings_newformat";
+    fs::remove_all(tmp);
+    fs::create_directories(tmp / "speakers");
+
+    // Meeting with new-format audio (no legacy audio.wav)
+    fs::create_directories(tmp / "meetings" / "2026-03-09_10-00");
+    std::ofstream(tmp / "meetings" / "2026-03-09_10-00" / "audio_2026-03-09_10-00.wav") << "RIFF";
+
+    // Meeting with legacy audio.wav
+    fs::create_directories(tmp / "meetings" / "2026-03-08_14-30");
+    std::ofstream(tmp / "meetings" / "2026-03-08_14-30" / "audio.wav") << "RIFF";
+
+    // Meeting with no audio (should be excluded)
+    fs::create_directories(tmp / "meetings" / "2026-03-07_09-00");
+
+    TestServer srv;
+    srv.speaker_db_dir = tmp / "speakers";
+    srv.output_dir = tmp / "meetings";
+    srv.start();
+
+    auto cli = srv.client();
+    auto res = cli.Get("/api/meetings");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+
+    // Both meeting formats should appear
+    CHECK(res->body.find("2026-03-09_10-00") != std::string::npos);
+    CHECK(res->body.find("2026-03-08_14-30") != std::string::npos);
+    // No-audio meeting excluded
+    CHECK(res->body.find("2026-03-07_09-00") == std::string::npos);
+
+    fs::remove_all(tmp);
+}
+
+TEST_CASE("web: GET /api/meetings discovers meeting with both audio formats", "[web]") {
+    auto tmp = fs::temp_directory_path() / "recmeet_test_web_meetings_both";
+    fs::remove_all(tmp);
+    fs::create_directories(tmp / "speakers");
+
+    // Meeting with both new and legacy format
+    fs::create_directories(tmp / "meetings" / "2026-03-09_15-00");
+    std::ofstream(tmp / "meetings" / "2026-03-09_15-00" / "audio_2026-03-09_15-00.wav") << "RIFF";
+    std::ofstream(tmp / "meetings" / "2026-03-09_15-00" / "audio.wav") << "RIFF";
+
+    TestServer srv;
+    srv.speaker_db_dir = tmp / "speakers";
+    srv.output_dir = tmp / "meetings";
+    srv.start();
+
+    auto cli = srv.client();
+    auto res = cli.Get("/api/meetings");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(res->body.find("2026-03-09_15-00") != std::string::npos);
 
     fs::remove_all(tmp);
 }

@@ -115,7 +115,7 @@ Record ──► Transcribe ──► Diarize ──► Identify ──► Summa
 
 ```
 meetings/2026-02-20_14-30/
-  audio.wav        # Mixed mic + monitor (16kHz mono S16LE)
+  audio_2026-02-20_14-30.wav  # Mixed mic + monitor (16kHz mono S16LE)
   Meeting_2026-02-20_14-30_Project_Kickoff.md  # Meeting note
 ```
 
@@ -170,7 +170,7 @@ Options:
   --speaker-threshold F  Speaker identification similarity threshold (default: 0.6)
   --speaker-db DIR     Speaker database directory (default: ~/.local/share/recmeet/speakers/)
   --enroll NAME        Enroll a speaker from an existing recording (use with --from)
-  --from DIR           Meeting directory containing audio.wav for enrollment
+  --from DIR           Meeting directory for enrollment (use with --enroll)
   --speaker N          Speaker number to enroll (1-based; omit for interactive prompt)
   --speakers           List enrolled speakers and exit
   --remove-speaker NAME  Remove an enrolled speaker and exit
@@ -178,7 +178,7 @@ Options:
   --no-vad             Disable VAD segmentation (transcribe full audio)
   --vad-threshold F    VAD speech detection threshold (default: 0.5)
   --threads N          Number of CPU threads for inference (0 = auto-detect, default: 0)
-  --reprocess DIR      Reprocess existing recording from audio.wav
+  --reprocess DIR      Reprocess existing recording directory
   --log-level LEVEL    Log level: none, error, warn, info (default: none)
   --log-dir DIR        Log file directory (default: ~/.local/share/recmeet/logs/)
   --list-sources       List available audio sources and exit

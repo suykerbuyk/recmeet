@@ -172,8 +172,8 @@ static std::vector<MeetingInfo> discover_meetings(const fs::path& output_dir) {
     for (const auto& entry : fs::directory_iterator(output_dir)) {
         if (!entry.is_directory()) continue;
 
-        auto audio_path = entry.path() / "audio.wav";
-        if (!fs::exists(audio_path)) continue;
+        auto audio_path = find_audio_file(entry.path());
+        if (audio_path.empty()) continue;
 
         MeetingInfo info;
         info.name = entry.path().filename().string();

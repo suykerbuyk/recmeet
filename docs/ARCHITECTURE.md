@@ -211,7 +211,7 @@ flowchart TD
     end
 
     subgraph "Phase 2: run_postprocessing()"
-        LOAD_AUDIO["Load audio.wav → float[]"]
+        LOAD_AUDIO["Load audio file → float[]"]
         VAD["VAD segmentation<br/>(sherpa-onnx, optional)"]
         TRANSCRIBE["Whisper transcription"]
         DIARIZE["Speaker diarization<br/>(sherpa-onnx, optional)"]
@@ -272,7 +272,7 @@ sequenceDiagram
     participant DB as Speaker DB
 
     U->>CLI: --enroll "John" --from meetings/DIR/
-    CLI->>CLI: Load audio.wav
+    CLI->>CLI: Load audio file
     CLI->>D: diarize(samples)
     D-->>CLI: DiarizeResult (N speakers)
 

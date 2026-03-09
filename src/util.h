@@ -65,8 +65,31 @@ fs::path data_dir();
 /// ~/.local/share/recmeet/models/
 fs::path models_dir();
 
+// ---------------------------------------------------------------------------
+// Audio file naming
+// ---------------------------------------------------------------------------
+
+constexpr const char* AUDIO_PREFIX = "audio_";
+constexpr const char* LEGACY_AUDIO_NAME = "audio.wav";
+
+/// Find the audio file in a meeting directory.
+/// Prefers audio_YYYY-MM-DD_HH-MM.wav, falls back to audio.wav.
+/// Returns empty path if dir doesn't exist or no audio file found.
+fs::path find_audio_file(const fs::path& dir);
+
+// ---------------------------------------------------------------------------
+// Output directory creation
+// ---------------------------------------------------------------------------
+
+/// Result of create_output_dir: the directory path and the clean timestamp
+/// (without any collision suffix).
+struct OutputDir {
+    fs::path path;
+    std::string timestamp;  // Always "YYYY-MM-DD_HH-MM" (no collision suffix)
+};
+
 /// Create timestamped output directory under base_dir, e.g. meetings/2026-02-20_14-30/
-fs::path create_output_dir(const fs::path& base_dir);
+OutputDir create_output_dir(const fs::path& base_dir);
 
 // ---------------------------------------------------------------------------
 // Default device pattern

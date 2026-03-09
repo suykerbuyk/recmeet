@@ -27,7 +27,29 @@ fs::path config_dir() { return xdg_dir("XDG_CONFIG_HOME", ".config"); }
 fs::path data_dir()   { return xdg_dir("XDG_DATA_HOME", ".local/share"); }
 fs::path models_dir() { return data_dir() / "models"; }
 
-fs::path create_output_dir(const fs::path& base_dir) {
+fs::path find_audio_file(const fs::path& dir) {
+    if (!fs::is_directory(dir)) return {};
+
+    // Prefer timestamped audio_YYYY-MM-DD_HH-MM.wav
+    for (const auto& entry : fs::directory_iterator(dir)) {
+        if (!entry.is_regular_file()) continue;
+        const auto& name = entry.path().filename().string();
+        if (name.size() > 6 &&
+            name.compare(0, 6, AUDIO_PREFIX) == 0 &&
+            name.size() >= 4 &&
+            name.compare(name.size() - 4, 4, ".wav") == 0) {
+            return entry.path();
+        }
+    }
+
+    // Fall back to legacy audio.wav
+    fs::path legacy = dir / LEGACY_AUDIO_NAME;
+    if (fs::exists(legacy)) return legacy;
+
+    return {};
+}
+
+OutputDir create_output_dir(const fs::path& base_dir) {
     auto now = std::chrono::system_clock::now();
     auto time = std::chrono::system_clock::to_time_t(now);
     std::tm tm{};
@@ -40,15 +62,15 @@ fs::path create_output_dir(const fs::path& base_dir) {
     fs::path dir = base_dir / timestamp;
     if (!fs::exists(dir)) {
         fs::create_directories(dir);
-        return dir;
+        return {dir, timestamp};
     }
 
-    // Handle collision
+    // Handle collision — suffix only on directory name, timestamp stays clean
     for (int i = 2; i < 100; ++i) {
         fs::path candidate = base_dir / (timestamp + "_" + std::to_string(i));
         if (!fs::exists(candidate)) {
             fs::create_directories(candidate);
-            return candidate;
+            return {candidate, timestamp};
         }
     }
     throw RecmeetError("Too many sessions in the same minute.");
@@ -71,7 +93,21 @@ int default_thread_count() {
 std::pair<std::string, std::string> resolve_meeting_time(
     const fs::path& out_dir, const fs::path& audio_path) {
 
-    // Try to parse directory name: YYYY-MM-DD_HH-MM (possibly with _N suffix)
+    // Priority 1: parse audio filename — audio_YYYY-MM-DD_HH-MM.wav
+    std::string stem = audio_path.stem().string();
+    if (stem.size() >= 22 && stem.compare(0, 6, AUDIO_PREFIX) == 0) {
+        int y, mo, d, h, mi;
+        if (std::sscanf(stem.c_str() + 6, "%4d-%2d-%2d_%2d-%2d", &y, &mo, &d, &h, &mi) == 5 &&
+            y >= 1970 && y <= 9999 && mo >= 1 && mo <= 12 &&
+            d >= 1 && d <= 31 && h >= 0 && h <= 23 && mi >= 0 && mi <= 59) {
+            char date_buf[16], time_buf[8];
+            std::snprintf(date_buf, sizeof(date_buf), "%04d-%02d-%02d", y, mo, d);
+            std::snprintf(time_buf, sizeof(time_buf), "%02d:%02d", h, mi);
+            return {date_buf, time_buf};
+        }
+    }
+
+    // Priority 2: parse directory name — YYYY-MM-DD_HH-MM (possibly with _N suffix)
     std::string dirname = out_dir.filename().string();
     if (dirname.size() >= 16) {
         int y, mo, d, h, mi;

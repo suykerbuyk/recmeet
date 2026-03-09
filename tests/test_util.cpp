@@ -52,18 +52,20 @@ TEST_CASE("create_output_dir: creates timestamped directory", "[util]") {
     auto base = fs::temp_directory_path() / "recmeet_test_output";
     fs::create_directories(base);
 
-    auto dir = create_output_dir(base);
-    CHECK(fs::exists(dir));
-    CHECK(fs::is_directory(dir));
+    auto out = create_output_dir(base);
+    CHECK(fs::exists(out.path));
+    CHECK(fs::is_directory(out.path));
 
     // Directory name should match YYYY-MM-DD_HH-MM pattern
-    std::string name = dir.filename().string();
-    // At minimum: 4 digits - 2 digits - 2 digits _ 2 digits - 2 digits
+    std::string name = out.path.filename().string();
     CHECK(name.size() >= 16);
     CHECK(name[4] == '-');
     CHECK(name[7] == '-');
     CHECK(name[10] == '_');
     CHECK(name[13] == '-');
+
+    // Timestamp should match directory name
+    CHECK(out.timestamp == name);
 
     fs::remove_all(base);
 }
@@ -72,15 +74,18 @@ TEST_CASE("create_output_dir: handles collision", "[util]") {
     auto base = fs::temp_directory_path() / "recmeet_test_collision";
     fs::create_directories(base);
 
-    auto dir1 = create_output_dir(base);
+    auto out1 = create_output_dir(base);
     // Create another — same minute, should get _2 suffix
-    auto dir2 = create_output_dir(base);
+    auto out2 = create_output_dir(base);
 
-    CHECK(fs::exists(dir1));
-    CHECK(fs::exists(dir2));
-    CHECK(dir1 != dir2);
-    // Second should have _2 suffix
-    CHECK(dir2.filename().string().find("_2") != std::string::npos);
+    CHECK(fs::exists(out1.path));
+    CHECK(fs::exists(out2.path));
+    CHECK(out1.path != out2.path);
+    // Second directory should have _2 suffix
+    CHECK(out2.path.filename().string().find("_2") != std::string::npos);
+    // But timestamp should be clean (no _2 suffix)
+    CHECK(out2.timestamp == out1.timestamp);
+    CHECK(out2.timestamp.find("_2") == std::string::npos);
 
     fs::remove_all(base);
 }
@@ -227,6 +232,200 @@ TEST_CASE("resolve_meeting_time: falls back to now when audio doesn't exist", "[
     // Should return current time — at least valid format
     CHECK(date.size() == 10);
     CHECK(time.size() == 5);
+}
+
+// ---------------------------------------------------------------------------
+// find_audio_file tests
+// ---------------------------------------------------------------------------
+
+TEST_CASE("find_audio_file: finds timestamped audio file", "[util]") {
+    auto base = fs::temp_directory_path() / "recmeet_test_find_audio_ts";
+    fs::remove_all(base);
+    fs::create_directories(base);
+    std::ofstream(base / "audio_2026-02-21_09-41.wav") << "RIFF";
+
+    auto result = find_audio_file(base);
+    CHECK(result == base / "audio_2026-02-21_09-41.wav");
+
+    fs::remove_all(base);
+}
+
+TEST_CASE("find_audio_file: finds legacy audio.wav", "[util]") {
+    auto base = fs::temp_directory_path() / "recmeet_test_find_audio_legacy";
+    fs::remove_all(base);
+    fs::create_directories(base);
+    std::ofstream(base / "audio.wav") << "RIFF";
+
+    auto result = find_audio_file(base);
+    CHECK(result == base / "audio.wav");
+
+    fs::remove_all(base);
+}
+
+TEST_CASE("find_audio_file: prefers timestamped over legacy", "[util]") {
+    auto base = fs::temp_directory_path() / "recmeet_test_find_audio_both";
+    fs::remove_all(base);
+    fs::create_directories(base);
+    std::ofstream(base / "audio_2026-02-21_09-41.wav") << "RIFF";
+    std::ofstream(base / "audio.wav") << "RIFF";
+
+    auto result = find_audio_file(base);
+    CHECK(result.filename().string().find(AUDIO_PREFIX) == 0);
+    CHECK(result != base / "audio.wav");
+
+    fs::remove_all(base);
+}
+
+TEST_CASE("find_audio_file: empty directory returns empty", "[util]") {
+    auto base = fs::temp_directory_path() / "recmeet_test_find_audio_empty";
+    fs::remove_all(base);
+    fs::create_directories(base);
+
+    auto result = find_audio_file(base);
+    CHECK(result.empty());
+
+    fs::remove_all(base);
+}
+
+TEST_CASE("find_audio_file: non-existent directory returns empty", "[util]") {
+    auto result = find_audio_file("/tmp/recmeet_nonexistent_find_audio");
+    CHECK(result.empty());
+}
+
+TEST_CASE("find_audio_file: directory with non-audio files only returns empty", "[util]") {
+    auto base = fs::temp_directory_path() / "recmeet_test_find_audio_noaudio";
+    fs::remove_all(base);
+    fs::create_directories(base);
+    std::ofstream(base / "transcript.txt") << "hello";
+    std::ofstream(base / "summary.md") << "summary";
+
+    auto result = find_audio_file(base);
+    CHECK(result.empty());
+
+    fs::remove_all(base);
+}
+
+TEST_CASE("find_audio_file: ignores audio_ files without .wav extension", "[util]") {
+    auto base = fs::temp_directory_path() / "recmeet_test_find_audio_notwav";
+    fs::remove_all(base);
+    fs::create_directories(base);
+    std::ofstream(base / "audio_2026-02-21_09-41.mp3") << "data";
+
+    auto result = find_audio_file(base);
+    CHECK(result.empty());
+
+    fs::remove_all(base);
+}
+
+// ---------------------------------------------------------------------------
+// resolve_meeting_time: filename-based timestamp parsing
+// ---------------------------------------------------------------------------
+
+TEST_CASE("resolve_meeting_time: extracts timestamp from audio filename (priority 1)", "[util]") {
+    auto base = fs::temp_directory_path() / "recmeet_test_rmt_fname";
+    fs::path dir = base / "2026-03-08_10-00";
+    fs::create_directories(dir);
+    fs::path audio = dir / "audio_2026-03-08_10-00.wav";
+    std::ofstream(audio) << "RIFF";
+
+    auto [date, time] = resolve_meeting_time(dir, audio);
+    CHECK(date == "2026-03-08");
+    CHECK(time == "10:00");
+
+    fs::remove_all(base);
+}
+
+TEST_CASE("resolve_meeting_time: filename takes precedence over directory name", "[util]") {
+    auto base = fs::temp_directory_path() / "recmeet_test_rmt_fname_prio";
+    // Directory says 09:15, but filename says 14:30
+    fs::path dir = base / "2026-03-08_09-15";
+    fs::create_directories(dir);
+    fs::path audio = dir / "audio_2026-02-21_14-30.wav";
+    std::ofstream(audio) << "RIFF";
+
+    auto [date, time] = resolve_meeting_time(dir, audio);
+    // Filename wins
+    CHECK(date == "2026-02-21");
+    CHECK(time == "14:30");
+
+    fs::remove_all(base);
+}
+
+TEST_CASE("resolve_meeting_time: legacy audio.wav falls through to directory name", "[util]") {
+    auto base = fs::temp_directory_path() / "recmeet_test_rmt_legacy";
+    fs::path dir = base / "2026-02-15_14-30";
+    fs::create_directories(dir);
+    fs::path audio = dir / "audio.wav";
+    std::ofstream(audio) << "RIFF";
+
+    auto [date, time] = resolve_meeting_time(dir, audio);
+    // Falls through to directory name parsing
+    CHECK(date == "2026-02-15");
+    CHECK(time == "14:30");
+
+    fs::remove_all(base);
+}
+
+TEST_CASE("resolve_meeting_time: rejects invalid dates in filename", "[util]") {
+    auto base = fs::temp_directory_path() / "recmeet_test_rmt_invalid";
+    fs::path dir = base / "2026-02-15_14-30";
+    fs::create_directories(dir);
+    // Month 13 is invalid
+    fs::path audio = dir / "audio_2026-13-01_10-00.wav";
+    std::ofstream(audio) << "RIFF";
+
+    auto [date, time] = resolve_meeting_time(dir, audio);
+    // Falls through to directory name
+    CHECK(date == "2026-02-15");
+    CHECK(time == "14:30");
+
+    fs::remove_all(base);
+}
+
+TEST_CASE("resolve_meeting_time: rejects too-short filename stem", "[util]") {
+    auto base = fs::temp_directory_path() / "recmeet_test_rmt_short";
+    fs::path dir = base / "2026-02-15_14-30";
+    fs::create_directories(dir);
+    // "audio_short" has the prefix but stem is too short for timestamp
+    fs::path audio = dir / "audio_short.wav";
+    std::ofstream(audio) << "RIFF";
+
+    auto [date, time] = resolve_meeting_time(dir, audio);
+    // Falls through to directory name
+    CHECK(date == "2026-02-15");
+    CHECK(time == "14:30");
+
+    fs::remove_all(base);
+}
+
+// ---------------------------------------------------------------------------
+// create_output_dir: OutputDir struct tests
+// ---------------------------------------------------------------------------
+
+TEST_CASE("create_output_dir: returns clean timestamp without collision suffix", "[util]") {
+    auto base = fs::temp_directory_path() / "recmeet_test_outdir_struct";
+    fs::remove_all(base);
+    fs::create_directories(base);
+
+    auto out1 = create_output_dir(base);
+    auto out2 = create_output_dir(base);
+
+    // Both timestamps should be identical (clean, no _2)
+    CHECK(out1.timestamp == out2.timestamp);
+    CHECK(out1.timestamp.size() == 16);  // YYYY-MM-DD_HH-MM
+    CHECK(out1.timestamp.find("_2") == std::string::npos);
+
+    // But paths should differ
+    CHECK(out1.path != out2.path);
+    CHECK(out2.path.filename().string().find("_2") != std::string::npos);
+
+    // Timestamp should be valid format
+    CHECK(out1.timestamp[4] == '-');
+    CHECK(out1.timestamp[7] == '-');
+    CHECK(out1.timestamp[10] == '_');
+    CHECK(out1.timestamp[13] == '-');
+
+    fs::remove_all(base);
 }
 
 TEST_CASE("audio constants are consistent", "[util]") {
