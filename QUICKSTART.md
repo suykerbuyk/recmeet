@@ -162,7 +162,7 @@ meetings/2026-03-05_10-30/
 The meeting note contains:
 - YAML frontmatter (date, participants, tags, duration)
 - Summary with action items
-- Full timestamped transcript with speaker labels
+- Full timestamped transcript with speaker labels (enrolled speakers use real names)
 
 ## 8. Configuration file
 
@@ -182,6 +182,11 @@ diarization:
   enabled: true
   num_speakers: 0        # 0 = auto-detect
   cluster_threshold: 1.18
+
+speaker_id:
+  enabled: true            # auto-enabled when speakers are enrolled
+  threshold: 0.6           # cosine similarity (higher = stricter matching)
+  # database: ~/.local/share/recmeet/speakers/
 
 vad:
   enabled: true
@@ -273,7 +278,74 @@ Re-downloads all currently cached models to get the latest versions.
 
 The tray auto-downloads models when you select a new whisper model from the menu. Use the **Update Models** menu item to re-download all cached models.
 
-## 11. Common workflows
+## 11. Speaker identification
+
+recmeet can recognize recurring participants across meetings by matching their voice against enrolled voiceprints. Once enrolled, speakers get their real names in transcripts instead of generic `Speaker_01` labels.
+
+### Enroll a speaker from a past recording
+
+After a meeting, enroll yourself (or anyone) from the recording:
+
+```bash
+# Interactive — recmeet shows speakers with durations, you pick one
+recmeet --enroll "John" --from meetings/2026-03-08_14-30/
+
+# Non-interactive — directly enroll speaker 1
+recmeet --enroll "John" --from meetings/2026-03-08_14-30/ --speaker 1
+```
+
+Each enrollment extracts a voiceprint (neural embedding) from the speaker's audio segments and saves it to `~/.local/share/recmeet/speakers/John.json`. Multiple enrollments from different recordings improve accuracy — the embeddings are averaged.
+
+### List enrolled speakers
+
+```bash
+recmeet --speakers
+# Output:
+#   Enrolled speakers (2):
+#     Alice                 3 enrollment(s)  updated: 2026-03-08T12:00:00Z
+#     John                  2 enrollment(s)  updated: 2026-03-09T10:00:00Z
+```
+
+### Test identification on a recording (dry-run)
+
+```bash
+recmeet --identify meetings/2026-03-09_09-00/
+# Output:
+#   Speaker_01 → John  (45.2s)
+#   Speaker_02 → Alice  (38.7s)
+#   Speaker_03 → (unknown)  (12.1s)
+```
+
+### Remove a speaker
+
+```bash
+recmeet --remove-speaker "John"
+```
+
+### How it works
+
+Speaker identification uses the same 3D-Speaker neural embedding model already used for diarization — no additional models to download. After diarization clusters speakers, recmeet extracts an embedding for each cluster and compares it against enrolled voiceprints using cosine similarity. Matches above the threshold (default: 0.6, configurable via `--speaker-threshold`) get the enrolled name; unmatched speakers keep their `Speaker_XX` labels.
+
+### Configuration
+
+Speaker identification is enabled by default when enrolled speakers exist. Override via config or CLI:
+
+```yaml
+# ~/.config/recmeet/config.yaml
+speaker_id:
+  enabled: true              # set to false to disable
+  threshold: 0.6             # cosine similarity (higher = stricter matching)
+  # database: /custom/path/  # default: ~/.local/share/recmeet/speakers/
+```
+
+```bash
+# CLI overrides
+recmeet --no-speaker-id                    # disable for this run
+recmeet --speaker-threshold 0.7            # stricter matching
+recmeet --speaker-db /path/to/speakers/    # custom database location
+```
+
+## 12. Common workflows
 
 ### Record with specific audio sources
 

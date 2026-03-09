@@ -23,7 +23,8 @@ std::string format_speaker(int speaker_id) {
 
 std::vector<TranscriptSegment> merge_speakers(
     const std::vector<TranscriptSegment>& transcript,
-    const DiarizeResult& diarization) {
+    const DiarizeResult& diarization,
+    const std::map<int, std::string>& speaker_names) {
 
     std::vector<TranscriptSegment> result;
     result.reserve(transcript.size());
@@ -43,7 +44,11 @@ std::vector<TranscriptSegment> merge_speakers(
             }
         }
 
-        out.text = format_speaker(best_speaker) + ": " + seg.text;
+        // Use enrolled name if available, otherwise fall back to Speaker_XX
+        auto it = speaker_names.find(best_speaker);
+        std::string name = (it != speaker_names.end()) ? it->second
+                                                       : format_speaker(best_speaker);
+        out.text = name + ": " + seg.text;
         result.push_back(std::move(out));
     }
 

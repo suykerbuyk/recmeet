@@ -53,6 +53,11 @@ struct Config {
     int num_speakers = 0;  // 0 = auto-detect
     float cluster_threshold = 1.18f;  // clustering distance threshold (lower = more splitting)
 
+    // Speaker identification (cross-session voiceprint matching)
+    bool speaker_id = true;  // enabled when speaker DB exists
+    float speaker_threshold = 0.6f;  // cosine similarity threshold
+    fs::path speaker_db;  // empty = default (~/.local/share/recmeet/speakers/)
+
     // VAD (on by default when built with RECMEET_USE_SHERPA)
     bool vad = true;
     float vad_threshold = 0.5f;

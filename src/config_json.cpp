@@ -35,6 +35,11 @@ JsonMap config_to_map(const Config& cfg) {
     m["num_speakers"]        = static_cast<int64_t>(cfg.num_speakers);
     m["cluster_threshold"]   = static_cast<double>(cfg.cluster_threshold);
 
+    // Speaker identification
+    m["speaker_id"]          = cfg.speaker_id;
+    m["speaker_threshold"]   = static_cast<double>(cfg.speaker_threshold);
+    m["speaker_db"]          = cfg.speaker_db.string();
+
     // VAD
     m["vad"]              = cfg.vad;
     m["vad_threshold"]    = static_cast<double>(cfg.vad_threshold);
@@ -117,6 +122,10 @@ Config config_from_map(const JsonMap& m) {
     b("diarize", cfg.diarize);
     i("num_speakers", cfg.num_speakers);
     f("cluster_threshold", cfg.cluster_threshold);
+
+    b("speaker_id", cfg.speaker_id);
+    f("speaker_threshold", cfg.speaker_threshold);
+    path("speaker_db", cfg.speaker_db);
 
     b("vad", cfg.vad);
     f("vad_threshold", cfg.vad_threshold);

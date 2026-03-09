@@ -1,6 +1,7 @@
 // Copyright (c) 2026 John Suykerbuyk and SykeTech LTD
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+#include "audio_file.h"
 #include "cli.h"
 #include "config.h"
 #include "config_json.h"
@@ -11,6 +12,7 @@
 #include "model_manager.h"
 #include "notify.h"
 #include "pipeline.h"
+#include "speaker_id.h"
 #include "util.h"
 #include "version.h"
 
@@ -99,6 +101,15 @@ static void print_usage() {
         "  --list-sources       List available audio sources and exit\n"
         "  --download-models    Download required models and exit\n"
         "  --update-models      Re-download all cached models and exit\n"
+        "  --no-speaker-id      Disable speaker identification\n"
+        "  --speaker-threshold F  Speaker identification similarity threshold (default: 0.6)\n"
+        "  --speaker-db DIR     Speaker database directory (default: ~/.local/share/recmeet/speakers/)\n"
+        "  --enroll NAME        Enroll a speaker from an existing recording\n"
+        "  --from DIR           Meeting directory for enrollment (use with --enroll)\n"
+        "  --speaker N          Speaker number to enroll (1-based; omit for interactive)\n"
+        "  --speakers           List enrolled speakers and exit\n"
+        "  --remove-speaker NAME  Remove an enrolled speaker and exit\n"
+        "  --identify DIR       Identify speakers in a recording (dry-run) and exit\n"
         "  --daemon             Force client mode (require running daemon)\n"
         "  --no-daemon          Force standalone mode (skip daemon detection)\n"
         "  --status             Query daemon status and exit\n"
@@ -300,6 +311,189 @@ int main(int argc, char* argv[]) {
         fprintf(stderr, any_error ? "Done (with errors).\n" : "Done.\n");
         return any_error ? 1 : 0;
     }
+
+    // Speaker management commands — standalone, no daemon needed
+    if (cli.list_speakers) {
+        fs::path db_dir = cli.cfg.speaker_db.empty()
+            ? default_speaker_db_dir() : cli.cfg.speaker_db;
+        auto names = list_speakers(db_dir);
+        if (names.empty()) {
+            printf("No enrolled speakers. Use --enroll to add one.\n");
+        } else {
+            printf("Enrolled speakers (%zu):\n", names.size());
+            for (const auto& name : names) {
+                auto profiles = load_speaker_db(db_dir);
+                for (const auto& p : profiles) {
+                    if (p.name == name) {
+                        printf("  %-20s  %zu enrollment(s)  updated: %s\n",
+                               p.name.c_str(), p.embeddings.size(), p.updated.c_str());
+                        break;
+                    }
+                }
+            }
+        }
+        return 0;
+    }
+
+    if (!cli.remove_speaker.empty()) {
+        fs::path db_dir = cli.cfg.speaker_db.empty()
+            ? default_speaker_db_dir() : cli.cfg.speaker_db;
+        if (remove_speaker(db_dir, cli.remove_speaker)) {
+            printf("Removed speaker '%s'.\n", cli.remove_speaker.c_str());
+        } else {
+            fprintf(stderr, "Speaker '%s' not found.\n", cli.remove_speaker.c_str());
+            return 1;
+        }
+        return 0;
+    }
+
+#if RECMEET_USE_SHERPA
+    if (!cli.enroll_name.empty()) {
+        if (cli.enroll_from.empty()) {
+            fprintf(stderr, "Error: --enroll requires --from <meeting_dir>\n");
+            return 1;
+        }
+        fs::path meeting_dir = cli.enroll_from;
+        fs::path audio_path = meeting_dir / "audio.wav";
+        if (!fs::exists(audio_path)) {
+            fprintf(stderr, "Error: No audio.wav in %s\n", meeting_dir.c_str());
+            return 1;
+        }
+
+        auto model_paths = ensure_sherpa_models();
+        auto samples = read_wav_float(audio_path);
+        if (samples.empty()) {
+            fprintf(stderr, "Error: Cannot read audio from %s\n", audio_path.c_str());
+            return 1;
+        }
+
+        // Run diarization to identify speaker clusters
+        fprintf(stderr, "Diarizing %s...\n", audio_path.c_str());
+        auto diar = diarize(samples.data(), samples.size(),
+                            cli.cfg.num_speakers, 0, cli.cfg.cluster_threshold);
+
+        if (diar.num_speakers == 0) {
+            fprintf(stderr, "Error: No speakers found in recording.\n");
+            return 1;
+        }
+
+        // Determine which speaker to enroll
+        int target_speaker = -1;
+        if (cli.enroll_speaker > 0) {
+            target_speaker = cli.enroll_speaker - 1;  // 1-based → 0-based
+            if (target_speaker >= diar.num_speakers) {
+                fprintf(stderr, "Error: Speaker %d not found (recording has %d speakers).\n",
+                        cli.enroll_speaker, diar.num_speakers);
+                return 1;
+            }
+        } else {
+            // Interactive: show speakers with durations and ask
+            fprintf(stderr, "\nSpeakers found in recording:\n");
+            for (int i = 0; i < diar.num_speakers; ++i) {
+                double duration = 0;
+                for (const auto& seg : diar.segments)
+                    if (seg.speaker == i) duration += seg.end - seg.start;
+                fprintf(stderr, "  %d. Speaker_%02d  (%.1fs of speech)\n",
+                        i + 1, i + 1, duration);
+            }
+            fprintf(stderr, "\nWhich speaker is '%s'? [1-%d]: ",
+                    cli.enroll_name.c_str(), diar.num_speakers);
+            int choice = 0;
+            if (scanf("%d", &choice) != 1 || choice < 1 || choice > diar.num_speakers) {
+                fprintf(stderr, "Invalid choice.\n");
+                return 1;
+            }
+            target_speaker = choice - 1;
+        }
+
+        // Extract embedding
+        fprintf(stderr, "Extracting voiceprint for '%s' from speaker %d...\n",
+                cli.enroll_name.c_str(), target_speaker + 1);
+        auto embedding = extract_speaker_embedding(
+            samples.data(), samples.size(), diar, target_speaker,
+            model_paths.embedding);
+
+        if (embedding.empty()) {
+            fprintf(stderr, "Error: Could not extract embedding (insufficient audio?).\n");
+            return 1;
+        }
+
+        // Load existing profile or create new one
+        fs::path db_dir = cli.cfg.speaker_db.empty()
+            ? default_speaker_db_dir() : cli.cfg.speaker_db;
+        auto profiles = load_speaker_db(db_dir);
+
+        SpeakerProfile profile;
+        for (const auto& p : profiles) {
+            if (p.name == cli.enroll_name) {
+                profile = p;
+                break;
+            }
+        }
+
+        if (profile.name.empty()) {
+            profile.name = cli.enroll_name;
+            profile.created = profile.updated;
+        }
+
+        profile.embeddings.push_back(std::move(embedding));
+        profile.updated = iso_now();
+        if (profile.created.empty()) profile.created = profile.updated;
+
+        save_speaker(db_dir, profile);
+
+        printf("Enrolled '%s' (%zu embedding(s) total).\n",
+               profile.name.c_str(), profile.embeddings.size());
+        return 0;
+    }
+
+    if (!cli.identify_dir.empty()) {
+        fs::path meeting_dir = cli.identify_dir;
+        fs::path audio_path = meeting_dir / "audio.wav";
+        if (!fs::exists(audio_path)) {
+            fprintf(stderr, "Error: No audio.wav in %s\n", meeting_dir.c_str());
+            return 1;
+        }
+
+        auto model_paths = ensure_sherpa_models();
+        auto samples = read_wav_float(audio_path);
+        if (samples.empty()) {
+            fprintf(stderr, "Error: Cannot read audio from %s\n", audio_path.c_str());
+            return 1;
+        }
+
+        fprintf(stderr, "Diarizing...\n");
+        auto diar = diarize(samples.data(), samples.size(),
+                            cli.cfg.num_speakers, 0, cli.cfg.cluster_threshold);
+
+        fs::path db_dir = cli.cfg.speaker_db.empty()
+            ? default_speaker_db_dir() : cli.cfg.speaker_db;
+        auto db = load_speaker_db(db_dir);
+
+        if (db.empty()) {
+            fprintf(stderr, "No enrolled speakers. Use --enroll to add one.\n");
+            return 1;
+        }
+
+        fprintf(stderr, "Identifying speakers...\n");
+        auto names = identify_speakers(
+            samples.data(), samples.size(), diar, db,
+            model_paths.embedding, cli.cfg.speaker_threshold);
+
+        printf("\nSpeaker identification results:\n");
+        for (int i = 0; i < diar.num_speakers; ++i) {
+            double duration = 0;
+            for (const auto& seg : diar.segments)
+                if (seg.speaker == i) duration += seg.end - seg.start;
+            auto it = names.find(i);
+            if (it != names.end())
+                printf("  Speaker_%02d → %s  (%.1fs)\n", i + 1, it->second.c_str(), duration);
+            else
+                printf("  Speaker_%02d → (unknown)  (%.1fs)\n", i + 1, duration);
+        }
+        return 0;
+    }
+#endif // RECMEET_USE_SHERPA
 
     Config cfg = cli.cfg;
     bool list_sources = cli.list_sources;

@@ -4,6 +4,7 @@
 #include "pipeline.h"
 #include "config.h"
 #include "diarize.h"
+#include "speaker_id.h"
 #include "vad.h"
 #include "device_enum.h"
 #include "audio_capture.h"
@@ -301,7 +302,25 @@ PipelineResult run_postprocessing(const Config& cfg, const PostprocessInput& inp
                 notify("Diarizing...", "Identifying speakers");
                 auto diar = diarize(samples.data(), samples.size(),
                                     cfg.num_speakers, threads, cfg.cluster_threshold);
-                result.segments = merge_speakers(result.segments, diar);
+
+                // Speaker identification: match clusters against enrolled voiceprints
+                std::map<int, std::string> speaker_names;
+                if (cfg.speaker_id) {
+                    fs::path db_dir = cfg.speaker_db.empty()
+                        ? default_speaker_db_dir() : cfg.speaker_db;
+                    auto db = load_speaker_db(db_dir);
+                    if (!db.empty()) {
+                        auto model_paths = ensure_sherpa_models();
+                        phase("identifying speakers");
+                        notify("Identifying speakers...",
+                               std::to_string(db.size()) + " enrolled");
+                        speaker_names = identify_speakers(
+                            samples.data(), samples.size(), diar, db,
+                            model_paths.embedding, cfg.speaker_threshold, threads);
+                    }
+                }
+
+                result.segments = merge_speakers(result.segments, diar, speaker_names);
             }
 #endif
         }   // audio buffer freed

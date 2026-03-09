@@ -16,7 +16,7 @@ The result: full transcriptions with speaker labels, professionally structured s
 
 - **Records** mic input and speaker output simultaneously via PipeWire/PulseAudio — captures both sides of any conversation regardless of platform
 - **Transcribes** with whisper.cpp (tiny through large-v3 models, auto-downloaded on first use)
-- **Identifies speakers** via sherpa-onnx diarization (Pyannote segmentation + 3D-Speaker embeddings)
+- **Identifies speakers** via sherpa-onnx diarization (Pyannote segmentation + 3D-Speaker embeddings), with cross-session speaker identification — enroll voices once, get real names in every transcript
 - **Summarizes** via cloud API (xAI/OpenAI/Anthropic — all OpenAI-compatible) or a local GGUF model via llama.cpp — your choice
 - **Outputs** timestamped transcripts, structured summaries, and meeting notes with YAML frontmatter (Obsidian-compatible)
 - **System tray applet** for point-and-click control from swaybar or any system tray
@@ -93,8 +93,8 @@ See [QUICKSTART.md](QUICKSTART.md) for a step-by-step installation and usage gui
 ## How it works
 
 ```
-Record ──► Transcribe ──► Diarize ──► Summarize ──► Output
-(PipeWire)  (whisper.cpp)  (sherpa-onnx) (API/llama.cpp) (Markdown/Obsidian)
+Record ──► Transcribe ──► Diarize ──► Identify ──► Summarize ──► Output
+(PipeWire)  (whisper.cpp)  (sherpa-onnx) (voiceprint DB) (API/llama.cpp) (Markdown)
 ```
 
 1. **Record**: PipeWire captures the mic via `pw_stream`; PulseAudio's `pa_simple` captures the speaker monitor (`.monitor` sources are a PulseAudio abstraction that PipeWire doesn't reliably handle, especially over Bluetooth). Both streams are mixed in-process into a single WAV.
@@ -103,9 +103,11 @@ Record ──► Transcribe ──► Diarize ──► Summarize ──► Outp
 
 3. **Diarize** (optional, on by default): sherpa-onnx labels each segment with `Speaker_01`, `Speaker_02`, etc. using neural speaker embeddings and clustering. Configurable threshold for tuning speaker count detection.
 
-4. **Summarize**: Either a cloud API call (xAI, OpenAI, or Anthropic — all use the same OpenAI-compatible endpoint) or a local GGUF model via llama.cpp. Same structured prompt for both paths. Dynamic context sizing with token-level truncation for long meetings.
+4. **Identify** (optional, on by default when speakers are enrolled): Matches diarization clusters against enrolled voiceprints using cosine similarity on 3D-Speaker embeddings. Enrolled speakers get their real names (`John`, `Alice`) instead of generic labels. The speaker database lives at `~/.local/share/recmeet/speakers/` — one JSON file per person containing their averaged embedding vectors. Enroll speakers from past recordings with `recmeet --enroll "Name" --from meetings/DIR/`.
 
-5. **Output**: Timestamped transcript, structured Markdown summary with action items, and a meeting note with YAML frontmatter (Obsidian/Dataview-compatible).
+5. **Summarize**: Either a cloud API call (xAI, OpenAI, or Anthropic — all use the same OpenAI-compatible endpoint) or a local GGUF model via llama.cpp. Same structured prompt for both paths. Dynamic context sizing with token-level truncation for long meetings.
+
+6. **Output**: Timestamped transcript, structured Markdown summary with action items, and a meeting note with YAML frontmatter (Obsidian/Dataview-compatible).
 
 ## Output
 
@@ -124,10 +126,12 @@ Two files per meeting. The meeting note contains the transcript, summary, and ac
 Embedded in the meeting note as a foldable section:
 
 ```
-[00:00 - 00:05] Speaker_01: Hello everyone, thanks for joining.
-[00:05 - 00:12] Speaker_02: Thanks. Let's start with the status update.
-[00:12 - 00:30] Speaker_01: Sure. We shipped the new auth flow yesterday.
+[00:00 - 00:05] John: Hello everyone, thanks for joining.
+[00:05 - 00:12] Alice: Thanks. Let's start with the status update.
+[00:12 - 00:30] John: Sure. We shipped the new auth flow yesterday.
 ```
+
+When speakers are enrolled via `--enroll`, their real names replace generic `Speaker_XX` labels. Unenrolled speakers still appear as `Speaker_01`, `Speaker_02`, etc.
 
 ### Meeting note
 
@@ -162,6 +166,15 @@ Options:
   --no-diarize         Disable speaker diarization
   --num-speakers N     Number of speakers (0 = auto-detect, default: 0)
   --cluster-threshold F  Clustering distance threshold (default: 1.18, higher = fewer speakers)
+  --no-speaker-id      Disable speaker identification (voiceprint matching)
+  --speaker-threshold F  Speaker identification similarity threshold (default: 0.6)
+  --speaker-db DIR     Speaker database directory (default: ~/.local/share/recmeet/speakers/)
+  --enroll NAME        Enroll a speaker from an existing recording (use with --from)
+  --from DIR           Meeting directory containing audio.wav for enrollment
+  --speaker N          Speaker number to enroll (1-based; omit for interactive prompt)
+  --speakers           List enrolled speakers and exit
+  --remove-speaker NAME  Remove an enrolled speaker and exit
+  --identify DIR       Identify speakers in a recording (dry-run) and exit
   --no-vad             Disable VAD segmentation (transcribe full audio)
   --vad-threshold F    VAD speech detection threshold (default: 0.5)
   --threads N          Number of CPU threads for inference (0 = auto-detect, default: 0)
@@ -212,6 +225,11 @@ diarization:
   num_speakers: 0 # 0 = auto-detect
   cluster_threshold: 1.18
 
+speaker_id:
+  enabled: true            # auto-enabled when speakers are enrolled
+  threshold: 0.6           # cosine similarity threshold (higher = stricter)
+  # database: ~/.local/share/recmeet/speakers/
+
 vad:
   enabled: true
   threshold: 0.5
@@ -258,7 +276,7 @@ make RECMEET_BUILD_TRAY=OFF RECMEET_USE_SHERPA=OFF
 
 ## Testing
 
-194 unit tests, 774 assertions across 22 modules, plus integration and benchmark suites.
+213 unit tests, 831 assertions across 23 modules, plus integration and benchmark suites.
 
 ```bash
 make test                # unit tests (no hardware needed)
@@ -338,7 +356,7 @@ From there, the project evolved through extensive iteration: doubling test cover
 Four binaries share a common static library. The daemon owns all pipeline logic (audio capture, transcription, diarization, summarization). The CLI and tray are thin IPC clients that communicate via a Unix domain socket using newline-delimited JSON.
 
 ```
-recmeet_core  (static library — 22 modules)
+recmeet_core  (static library — 23 modules)
     |
     +-- recmeet-daemon  (daemon — pipeline + IPC server)
     +-- recmeet         (CLI — dual-mode: IPC client or standalone)

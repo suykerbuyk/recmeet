@@ -156,6 +156,13 @@ Config load_config(const fs::path& config_path) {
     std::string ct = get_val(entries, "diarization", "cluster_threshold", "");
     if (!ct.empty()) cfg.cluster_threshold = std::atof(ct.c_str());
 
+    // Speaker identification section
+    cfg.speaker_id = get_bool(entries, "speaker_id", "enabled", true);
+    std::string st = get_val(entries, "speaker_id", "threshold", "");
+    if (!st.empty()) cfg.speaker_threshold = std::atof(st.c_str());
+    std::string sdb = get_val(entries, "speaker_id", "database", "");
+    if (!sdb.empty()) cfg.speaker_db = sdb;
+
     // VAD section
     cfg.vad = get_bool(entries, "vad", "enabled", true);
     std::string vt = get_val(entries, "vad", "threshold", "");
@@ -242,6 +249,16 @@ void save_config(const Config& cfg, const fs::path& config_path) {
             out << "  num_speakers: " << cfg.num_speakers << "\n";
         if (cfg.cluster_threshold != 1.18f)
             out << "  cluster_threshold: " << cfg.cluster_threshold << "\n";
+    }
+
+    if (!cfg.speaker_id || cfg.speaker_threshold != 0.6f || !cfg.speaker_db.empty()) {
+        out << "\nspeaker_id:\n";
+        if (!cfg.speaker_id)
+            out << "  enabled: false\n";
+        if (cfg.speaker_threshold != 0.6f)
+            out << "  threshold: " << cfg.speaker_threshold << "\n";
+        if (!cfg.speaker_db.empty())
+            out << "  database: \"" << cfg.speaker_db.string() << "\"\n";
     }
 
     if (!cfg.vad || cfg.vad_threshold != 0.5f || cfg.vad_min_silence != 0.5f ||

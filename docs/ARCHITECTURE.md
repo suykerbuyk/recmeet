@@ -2,7 +2,7 @@
 
 ## Purpose
 
-Recmeet records, transcribes, and summarizes meetings entirely on-device. Audio is captured via PipeWire/PulseAudio, transcribed with whisper.cpp, optionally diarized with sherpa-onnx, and summarized either locally (llama.cpp) or through a cloud API. Everything runs on the user's machine — no audio or transcript data leaves the system unless the user explicitly configures a cloud summarization provider.
+Recmeet records, transcribes, and summarizes meetings entirely on-device. Audio is captured via PipeWire/PulseAudio, transcribed with whisper.cpp, optionally diarized with sherpa-onnx, identified against enrolled voiceprints, and summarized either locally (llama.cpp) or through a cloud API. Everything runs on the user's machine — no audio or transcript data leaves the system unless the user explicitly configures a cloud summarization provider.
 
 The system ships as three cooperating binaries connected by a Unix socket IPC layer, plus a static library that contains all shared logic.
 
@@ -195,7 +195,7 @@ The IPC server runs a single-threaded `poll()` loop. All socket reads, writes, a
 The pipeline has two phases, split at the point where audio capture completes:
 
 1. **`run_recording()`** — audio capture (blocking on `StopToken`), WAV output, validation, mixing.
-2. **`run_postprocessing()`** — transcription, diarization, summarization, note output.
+2. **`run_postprocessing()`** — transcription, diarization, speaker identification, summarization, note output.
 
 In standalone mode, `run_pipeline()` calls both sequentially. In daemon mode, the worker thread calls them separately so it can broadcast `state.changed` between phases.
 
@@ -215,6 +215,7 @@ flowchart TD
         VAD["VAD segmentation<br/>(sherpa-onnx, optional)"]
         TRANSCRIBE["Whisper transcription"]
         DIARIZE["Speaker diarization<br/>(sherpa-onnx, optional)"]
+        IDENTIFY["Speaker identification<br/>(voiceprint matching, optional)"]
         FREE_AUDIO["Free audio buffer"]
         SUMMARIZE["Summarize<br/>(llama.cpp or cloud API)"]
         NOTE["Write meeting note"]
@@ -222,7 +223,7 @@ flowchart TD
 
     DETECT --> CAPTURE --> STOP --> DRAIN --> VALIDATE --> MIX
     MIX --> LOAD_AUDIO --> VAD --> TRANSCRIBE --> DIARIZE
-    DIARIZE --> FREE_AUDIO --> SUMMARIZE --> NOTE
+    DIARIZE --> IDENTIFY --> FREE_AUDIO --> SUMMARIZE --> NOTE
 ```
 
 ### Memory scoping strategy
@@ -234,6 +235,123 @@ The postprocessing phase uses nested scopes to minimize peak memory:
 
 This matters because whisper models (75 MB–1.5 GB) and audio buffers (16-bit, 16 kHz) can be large.
 
+## Speaker Identification
+
+Speaker identification matches diarization clusters against a persistent database of enrolled voiceprints, replacing generic `Speaker_XX` labels with real names across sessions.
+
+### Architecture
+
+The feature reuses the same 3D-Speaker embedding model (`eres2net_base`) already downloaded for diarization. No additional models are needed. The identification step runs inside the audio buffer scope, after diarization and before `merge_speakers()`.
+
+**Source:** `src/speaker_id.h`, `src/speaker_id.cpp`
+
+### Data flow
+
+```mermaid
+flowchart LR
+    subgraph "Post-diarization (pipeline.cpp)"
+        DIAR["diarize() returns<br/>DiarizeResult with<br/>N clusters"]
+        LOAD_DB["Load speaker DB<br/>(~/.local/share/recmeet/speakers/)"]
+        EXTRACT["For each cluster:<br/>extract centroid embedding<br/>(SpeakerEmbeddingExtractor)"]
+        MATCH["Search enrolled speakers<br/>(SpeakerEmbeddingManager)<br/>cosine similarity ≥ threshold"]
+        MAP["Build map&lt;int, string&gt;<br/>cluster_id → name"]
+        MERGE["merge_speakers()<br/>uses name map"]
+    end
+
+    DIAR --> LOAD_DB --> EXTRACT --> MATCH --> MAP --> MERGE
+```
+
+### Enrollment flow
+
+```mermaid
+sequenceDiagram
+    participant U as User
+    participant CLI as recmeet --enroll
+    participant D as Diarization
+    participant E as Embedding Extractor
+    participant DB as Speaker DB
+
+    U->>CLI: --enroll "John" --from meetings/DIR/
+    CLI->>CLI: Load audio.wav
+    CLI->>D: diarize(samples)
+    D-->>CLI: DiarizeResult (N speakers)
+
+    alt Interactive mode (no --speaker)
+        CLI-->>U: Show speakers with durations
+        U->>CLI: Pick speaker number
+    end
+
+    CLI->>E: extract_speaker_embedding(samples, diar, speaker_id)
+    E-->>CLI: float[] embedding vector
+
+    CLI->>DB: Load existing profile (if any)
+    CLI->>DB: Append embedding, save JSON
+    CLI-->>U: "Enrolled 'John' (N embeddings total)"
+```
+
+### Speaker database
+
+Each enrolled speaker is stored as a JSON file:
+
+```
+~/.local/share/recmeet/speakers/
+├── John.json
+├── Alice.json
+└── Bob.json
+```
+
+**File format:**
+
+```json
+{
+  "name": "John",
+  "created": "2026-03-08T10:00:00Z",
+  "updated": "2026-03-09T14:30:00Z",
+  "embeddings": [
+    [0.12, -0.34, 0.56, ...],
+    [0.11, -0.32, 0.58, ...]
+  ]
+}
+```
+
+Each embedding is a float vector (typically 192 dimensions for the eres2net model, ~2-4 KB per enrollment). Multiple embeddings per speaker improve accuracy — they are all registered with the sherpa-onnx `SpeakerEmbeddingManager`, which handles averaging internally during search.
+
+### sherpa-onnx API usage
+
+The speaker identification module uses two sherpa-onnx C APIs that are separate from the high-level diarization API:
+
+| API | Purpose | Lifecycle |
+|---|---|---|
+| `SherpaOnnxSpeakerEmbeddingExtractor` | Extract embedding vectors from audio segments | Created per identification run |
+| `SherpaOnnxSpeakerEmbeddingManager` | Register enrolled embeddings and search by cosine similarity | Created per identification run, populated from disk DB |
+
+**Embedding extraction** feeds all audio segments belonging to a diarization cluster into a single `OnlineStream`, then calls `ComputeEmbedding()` to get the centroid vector.
+
+**Speaker search** uses `GetBestMatches(mgr, embedding, threshold, 1)` to find the highest-scoring enrolled speaker above the similarity threshold. Conflict resolution ensures no two clusters are assigned the same enrolled name — the highest-scoring match wins.
+
+### Configuration
+
+| Config field | CLI flag | Default | Description |
+|---|---|---|---|
+| `speaker_id.enabled` | `--no-speaker-id` | `true` | Enable/disable identification |
+| `speaker_id.threshold` | `--speaker-threshold` | `0.6` | Cosine similarity threshold |
+| `speaker_id.database` | `--speaker-db` | `~/.local/share/recmeet/speakers/` | Database directory path |
+
+### Integration with merge_speakers()
+
+`merge_speakers()` accepts an optional `std::map<int, std::string>` mapping cluster IDs to enrolled names. For clusters with no match, it falls back to `format_speaker()` (`Speaker_XX`). This keeps the merge logic clean — identification is fully decoupled from label assignment.
+
+```cpp
+// Without speaker ID (original behavior)
+result.segments = merge_speakers(result.segments, diar);
+// → "Speaker_01: Hello"
+
+// With speaker ID
+auto names = identify_speakers(samples, diar, db, model_path, threshold);
+result.segments = merge_speakers(result.segments, diar, names);
+// → "John: Hello"
+```
+
 ## Dependencies
 
 ### Vendored (compiled from source)
@@ -242,7 +360,7 @@ This matters because whisper models (75 MB–1.5 GB) and audio buffers (16-bit, 
 |---|---|---|
 | whisper.cpp | Speech-to-text transcription | `whisper` |
 | llama.cpp | Local LLM summarization | `llama` (gated by `RECMEET_USE_LLAMA`) |
-| sherpa-onnx | Speaker diarization + VAD | `sherpa-onnx-c-api` (gated by `RECMEET_USE_SHERPA`) |
+| sherpa-onnx | Speaker diarization, identification + VAD | `sherpa-onnx-c-api` (gated by `RECMEET_USE_SHERPA`) |
 
 ### Platform (pkg-config)
 
@@ -332,7 +450,7 @@ sequenceDiagram
     U->>CLI: Ctrl+C (SIGINT)
     CLI->>CLI: StopToken signaled
     Note over CLI: postprocessing phase
-    CLI->>CLI: Transcribe → Diarize → Summarize → Note
+    CLI->>CLI: Transcribe → Diarize → Identify → Summarize → Note
     CLI-->>U: "Done! Files in: ./meetings/..."
 ```
 

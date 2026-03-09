@@ -42,6 +42,15 @@ CliResult parse_cli(int argc, char* argv[]) {
         {"stop",           no_argument,       nullptr, 1004},
         {"download-models", no_argument,      nullptr, 1005},
         {"update-models",  no_argument,       nullptr, 1006},
+        {"enroll",         required_argument, nullptr, 1007},
+        {"from",           required_argument, nullptr, 1008},
+        {"speaker",        required_argument, nullptr, 1009},
+        {"speakers",       no_argument,       nullptr, 1010},
+        {"remove-speaker", required_argument, nullptr, 1011},
+        {"identify",       required_argument, nullptr, 1012},
+        {"no-speaker-id",  no_argument,       nullptr, 1013},
+        {"speaker-threshold", required_argument, nullptr, 1014},
+        {"speaker-db",     required_argument, nullptr, 1015},
         {"help",           no_argument,       nullptr, 'h'},
         {"version",        no_argument,       nullptr, 'v'},
         {nullptr, 0, nullptr, 0},
@@ -85,6 +94,15 @@ CliResult parse_cli(int argc, char* argv[]) {
             case 1004: result.send_stop = true; break;
             case 1005: result.download_models = true; break;
             case 1006: result.update_models = true; break;
+            case 1007: result.enroll_name = optarg; break;
+            case 1008: result.enroll_from = optarg; break;
+            case 1009: result.enroll_speaker = std::atoi(optarg); break;
+            case 1010: result.list_speakers = true; break;
+            case 1011: result.remove_speaker = optarg; break;
+            case 1012: result.identify_dir = optarg; break;
+            case 1013: result.cfg.speaker_id = false; break;
+            case 1014: result.cfg.speaker_threshold = std::atof(optarg); break;
+            case 1015: result.cfg.speaker_db = optarg; break;
             case 'v': result.show_version = true; return result;
             case 'h': result.show_help = true; return result;
             default:  result.show_help = true; return result;

@@ -6,6 +6,7 @@
 #include "transcribe.h"
 #include "util.h"
 
+#include <map>
 #include <string>
 #include <vector>
 
@@ -38,10 +39,13 @@ DiarizeResult diarize(const fs::path& audio_path, int num_speakers = 0, int thre
 
 /// Merge speaker labels into transcript segments by timestamp overlap.
 /// For each transcript segment, finds the diarization segment with maximum
-/// temporal overlap and prepends "Speaker_XX: " to the text.
+/// temporal overlap and prepends the speaker name to the text.
+/// If speaker_names is provided, uses enrolled names for matching clusters;
+/// unmatched clusters fall back to "Speaker_XX" format.
 std::vector<TranscriptSegment> merge_speakers(
     const std::vector<TranscriptSegment>& transcript,
-    const DiarizeResult& diarization);
+    const DiarizeResult& diarization,
+    const std::map<int, std::string>& speaker_names = {});
 
 /// Format a 0-based speaker ID as "Speaker_01", "Speaker_02", etc.
 std::string format_speaker(int speaker_id);

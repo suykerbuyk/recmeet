@@ -128,6 +128,7 @@ set(CORE_SOURCES
     src/pipeline.cpp
     src/cli.cpp
     src/diarize.cpp
+    src/speaker_id.cpp
     src/vad.cpp
     src/ipc_protocol.cpp
     src/config_json.cpp
@@ -217,6 +218,7 @@ if(RECMEET_BUILD_TESTS)
         tests/test_cli.cpp
         tests/test_benchmark.cpp
         tests/test_diarize.cpp
+        tests/test_speaker_id.cpp
         tests/test_vad.cpp
         tests/test_ipc_protocol.cpp
         tests/test_config_json.cpp
