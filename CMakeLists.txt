@@ -263,6 +263,8 @@ install(FILES dist/recmeet-daemon.socket
 
 if(RECMEET_BUILD_WEB)
     install(TARGETS recmeet-web RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+    install(DIRECTORY share/web/
+        DESTINATION ${CMAKE_INSTALL_DATADIR}/recmeet/web)
     set(RECMEET_WEB_EXEC "${CMAKE_INSTALL_FULL_BINDIR}/recmeet-web")
     configure_file(dist/recmeet-web.service.in
         ${CMAKE_BINARY_DIR}/recmeet-web.service @ONLY)
