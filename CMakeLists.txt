@@ -20,6 +20,7 @@ option(RECMEET_USE_LLAMA   "Enable local summarization via llama.cpp" ON)
 option(RECMEET_USE_SHERPA  "Enable speaker diarization via sherpa-onnx" ON)
 option(RECMEET_USE_NOTIFY "Enable desktop notifications via libnotify" ON)
 option(RECMEET_BUILD_TESTS "Build unit tests" ON)
+option(RECMEET_BUILD_WEB   "Build web UI server" ON)
 
 # Version header — regenerated at build time from git describe
 find_package(Git QUIET)
@@ -175,6 +176,15 @@ target_link_libraries(recmeet PRIVATE recmeet_core)
 add_executable(recmeet-daemon src/daemon.cpp)
 target_link_libraries(recmeet-daemon PRIVATE recmeet_core)
 
+# Web server binary
+if(RECMEET_BUILD_WEB)
+    add_executable(recmeet-web src/web.cpp vendor/cpp-httplib/httplib.cpp)
+    target_include_directories(recmeet-web PRIVATE vendor/cpp-httplib)
+    target_link_libraries(recmeet-web PRIVATE recmeet_core)
+    target_compile_definitions(recmeet-web PRIVATE
+        RECMEET_WEB_ROOT="${CMAKE_INSTALL_FULL_DATADIR}/recmeet/web")
+endif()
+
 # Tray binary
 if(RECMEET_BUILD_TRAY)
     add_executable(recmeet-tray src/tray.cpp)
@@ -227,6 +237,10 @@ if(RECMEET_BUILD_TESTS)
         tests/test_ipc_integration.cpp
     )
     target_link_libraries(recmeet_tests PRIVATE recmeet_core Catch2::Catch2WithMain)
+    if(RECMEET_BUILD_WEB)
+        target_sources(recmeet_tests PRIVATE tests/test_web.cpp vendor/cpp-httplib/httplib.cpp)
+        target_include_directories(recmeet_tests PRIVATE vendor/cpp-httplib)
+    endif()
     catch_discover_tests(recmeet_tests)
 endif()
 
@@ -246,6 +260,15 @@ install(FILES ${CMAKE_BINARY_DIR}/recmeet-daemon.service
     DESTINATION ${CMAKE_INSTALL_DATADIR}/systemd/user)
 install(FILES dist/recmeet-daemon.socket
     DESTINATION ${CMAKE_INSTALL_DATADIR}/systemd/user)
+
+if(RECMEET_BUILD_WEB)
+    install(TARGETS recmeet-web RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+    set(RECMEET_WEB_EXEC "${CMAKE_INSTALL_FULL_BINDIR}/recmeet-web")
+    configure_file(dist/recmeet-web.service.in
+        ${CMAKE_BINARY_DIR}/recmeet-web.service @ONLY)
+    install(FILES ${CMAKE_BINARY_DIR}/recmeet-web.service
+        DESTINATION ${CMAKE_INSTALL_DATADIR}/systemd/user)
+endif()
 
 if(RECMEET_BUILD_TRAY)
     install(TARGETS recmeet-tray RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})

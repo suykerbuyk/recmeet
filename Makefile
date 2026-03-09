@@ -46,6 +46,9 @@ endif
 ifdef RECMEET_BUILD_TESTS
 CMAKE_OPTS += -DRECMEET_BUILD_TESTS=$(RECMEET_BUILD_TESTS)
 endif
+ifdef RECMEET_BUILD_WEB
+CMAKE_OPTS += -DRECMEET_BUILD_WEB=$(RECMEET_BUILD_WEB)
+endif
 
 # ── Targets ─────────────────────────────────────────────────────────
 .PHONY: build test integration benchmark install uninstall package-deb package-rpm package-arch clean help daemon-start daemon-stop daemon-status
@@ -169,3 +172,4 @@ help:
 	@echo "  RECMEET_USE_SHERPA ON|OFF               (default: ON)"
 	@echo "  RECMEET_USE_NOTIFY ON|OFF               (default: ON)"
 	@echo "  RECMEET_BUILD_TESTS ON|OFF              (default: ON)"
+	@echo "  RECMEET_BUILD_WEB  ON|OFF               (default: ON)"

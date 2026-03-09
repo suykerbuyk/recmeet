@@ -85,6 +85,10 @@ struct Config {
 
     // Reprocess
     fs::path reprocess_dir;
+
+    // Web server
+    int web_port = 8384;
+    std::string web_bind = "127.0.0.1";
 };
 
 /// Load config. Uses path if provided, otherwise ~/.config/recmeet/config.yaml.

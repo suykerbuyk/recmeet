@@ -1,0 +1,13 @@
+[Unit]
+Description=Recmeet Speaker Management Web Server
+Documentation=https://github.com/suykerbuyk/recmeet
+After=recmeet-daemon.service
+
+[Service]
+Type=simple
+ExecStart=@RECMEET_WEB_EXEC@
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

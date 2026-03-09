@@ -196,6 +196,11 @@ Config load_config(const fs::path& config_path) {
     std::string note_dir_val = get_val(entries, "notes", "directory", "");
     if (!note_dir_val.empty()) cfg.note_dir = note_dir_val;
 
+    // Web server section
+    std::string port_str = get_val(entries, "web", "port", "8384");
+    cfg.web_port = std::atoi(port_str.c_str());
+    cfg.web_bind = get_val(entries, "web", "bind", "127.0.0.1");
+
     return cfg;
 }
 
@@ -295,6 +300,14 @@ void save_config(const Config& cfg, const fs::path& config_path) {
         << "  domain: " << cfg.note.domain << "\n";
     if (!cfg.note_dir.empty())
         out << "  directory: \"" << cfg.note_dir.string() << "\"\n";
+
+    if (cfg.web_port != 8384 || cfg.web_bind != "127.0.0.1") {
+        out << "\nweb:\n";
+        if (cfg.web_port != 8384)
+            out << "  port: " << cfg.web_port << "\n";
+        if (cfg.web_bind != "127.0.0.1")
+            out << "  bind: \"" << cfg.web_bind << "\"\n";
+    }
 }
 
 } // namespace recmeet
