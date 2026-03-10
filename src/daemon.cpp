@@ -347,6 +347,9 @@ int main(int argc, char* argv[]) {
             try {
                 auto input = run_recording(cfg, g_stop, on_phase);
 
+                // Reset stop token so postprocessing isn't immediately cancelled
+                g_stop.reset();
+
                 server.post([&server]() {
                     g_state.store(DaemonState::Postprocessing);
                     IpcEvent ev;
@@ -395,6 +398,7 @@ int main(int argc, char* argv[]) {
                     server.broadcast(state_ev);
                 });
             } catch (const std::exception& e) {
+                fprintf(stderr, "Pipeline error: %s\n", e.what());
                 log_error("daemon: pipeline error: %s", e.what());
                 server.post([&server, what = std::string(e.what())]() {
                     g_state.store(DaemonState::Idle);

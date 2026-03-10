@@ -308,14 +308,21 @@ function renderMeetings() {
   }
 
   for (const mtg of meetings) {
+    const headerRight = html('span', { style: 'display:flex;align-items:center;gap:10px' },
+      html('button', {
+        className: 'btn btn-sm',
+        onclick: () => openMeetingNote(mtg.name)
+      }, 'View Note'),
+      html('span', { className: 'card-date' },
+        mtg.has_speakers_json
+          ? `${mtg.speaker_count} speaker(s)`
+          : 'No speaker data'
+      )
+    );
     const card = html('div', { className: 'card', id: `meeting-${mtg.name}` },
       html('div', { className: 'card-header' },
         html('span', { className: 'card-title' }, mtg.name),
-        html('span', { className: 'card-date' },
-          mtg.has_speakers_json
-            ? `${mtg.speaker_count} speaker(s)`
-            : 'No speaker data'
-        )
+        headerRight
       )
     );
 
@@ -397,6 +404,104 @@ async function loadMeetingSpeakers(dirName, container) {
   } catch (e) {
     container.textContent = 'Failed to load speakers.';
   }
+}
+
+async function openMeetingNote(dirName) {
+  try {
+    const data = await api('GET', `/api/meetings/${encodeURIComponent(dirName)}/note`);
+    const tab = window.open('', '_blank');
+    if (!tab) { toast('Pop-up blocked — allow pop-ups for this site'); return; }
+
+    // Simple markdown-to-HTML: headings, bold, blockquotes, paragraphs
+    const md = data.content;
+    let inFrontmatter = false;
+    let frontmatterDone = false;
+    const lines = md.split('\n');
+    const parts = [];
+
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i];
+
+      // Strip YAML frontmatter
+      if (line.trim() === '---') {
+        if (!frontmatterDone) { inFrontmatter = !inFrontmatter; if (!inFrontmatter) frontmatterDone = true; continue; }
+      }
+      if (inFrontmatter) continue;
+
+      // Headings
+      const hMatch = line.match(/^(#{1,4})\s+(.*)/);
+      if (hMatch) {
+        const level = hMatch[1].length;
+        parts.push(`<h${level}>${esc(hMatch[2])}</h${level}>`);
+        continue;
+      }
+
+      // Blockquote lines (Obsidian callouts and quoted text)
+      if (line.startsWith('> ')) {
+        const inner = line.slice(2);
+        // Callout header: > [!type] Title or > [!type]- Title
+        const callout = inner.match(/^\[!(\w+)\]-?\s*(.*)/);
+        if (callout) {
+          parts.push(`<div class="callout callout-${callout[1]}"><strong>${esc(callout[2] || callout[1])}</strong>`);
+          continue;
+        }
+        parts.push(`<div class="bq">${renderInline(inner)}</div>`);
+        continue;
+      }
+
+      // Blank line — close any open callout
+      if (line.trim() === '') {
+        parts.push('<br>');
+        continue;
+      }
+
+      // Checkbox lines
+      if (line.startsWith('- [ ] ')) {
+        parts.push(`<div class="todo">${renderInline(line.slice(6))}</div>`);
+        continue;
+      }
+
+      // Regular text
+      parts.push(`<p>${renderInline(line)}</p>`);
+    }
+
+    tab.document.write(`<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>${esc(data.path)}</title>
+<style>
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+         max-width: 800px; margin: 40px auto; padding: 0 24px; line-height: 1.6;
+         color: #1a1a2e; background: #fff; }
+  @media (prefers-color-scheme: dark) {
+    body { color: #e2e8f0; background: #1a1a2e; }
+    .callout { background: #16213e; border-color: #334155; }
+    .bq { color: #94a3b8; }
+    .todo { color: #94a3b8; }
+  }
+  h1 { font-size: 1.5rem; margin: 24px 0 8px; }
+  h2 { font-size: 1.25rem; margin: 20px 0 8px; }
+  h3 { font-size: 1.1rem; margin: 16px 0 6px; }
+  p, .bq, .todo { margin: 2px 0; font-size: 0.95rem; }
+  .bq { padding-left: 12px; border-left: 3px solid #6366f1; color: #6c757d; }
+  .callout { padding: 12px 16px; margin: 8px 0; border-radius: 6px;
+             background: #f8f9fa; border-left: 4px solid #6366f1; }
+  .todo::before { content: "\\2610 "; }
+  strong { font-weight: 600; }
+  br { display: block; content: ""; margin: 4px 0; }
+</style></head><body>${parts.join('\n')}</body></html>`);
+    tab.document.close();
+  } catch (e) {
+    toast('Note not found — meeting may not have been summarized yet');
+  }
+}
+
+function esc(s) {
+  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
+function renderInline(s) {
+  // Bold (**text**), then escape HTML in non-bold parts
+  return s.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
+          .replace(/`([^`]+)`/g, '<code>$1</code>');
 }
 
 async function refreshMeetings() {

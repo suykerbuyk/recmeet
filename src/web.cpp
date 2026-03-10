@@ -521,6 +521,83 @@ int main(int argc, char* argv[]) {
 #endif
     });
 
+    // Serve meeting note as rendered HTML page
+    server.Get(R"(/api/meetings/([^/]+)/note)", [&](const httplib::Request& req, httplib::Response& res) {
+        auto dir_name = req.matches[1].str();
+        if (!is_safe_dirname(dir_name)) {
+            res.status = 400;
+            res.set_content(json_error("invalid meeting directory name"), "application/json");
+            return;
+        }
+
+        auto meeting_path = output_dir / dir_name;
+        if (!fs::is_directory(meeting_path)) {
+            res.status = 404;
+            res.set_content(json_error("meeting directory not found"), "application/json");
+            return;
+        }
+
+        // Find Meeting_*.md — check meeting dir first, then note_dir/YYYY/MM/
+        fs::path note_path;
+        auto starts_with = [](const std::string& s, const std::string& prefix) {
+            return s.size() >= prefix.size() && s.compare(0, prefix.size(), prefix) == 0;
+        };
+        auto ends_with = [](const std::string& s, const std::string& suffix) {
+            return s.size() >= suffix.size() &&
+                   s.compare(s.size() - suffix.size(), suffix.size(), suffix) == 0;
+        };
+
+        auto find_note = [&](const fs::path& dir) -> fs::path {
+            if (!fs::is_directory(dir)) return {};
+            for (const auto& entry : fs::directory_iterator(dir)) {
+                auto fname = entry.path().filename().string();
+                if (starts_with(fname, "Meeting_") && ends_with(fname, ".md"))
+                    return entry.path();
+            }
+            return {};
+        };
+
+        note_path = find_note(meeting_path);
+
+        // Try note_dir/YYYY/MM/ if not found in meeting dir
+        // Match on dir_name prefix (e.g. "2026-03-08_09-28") since multiple
+        // meetings may share the same month subdirectory
+        if (note_path.empty() && !cfg.note_dir.empty() && dir_name.size() >= 7) {
+            auto year = dir_name.substr(0, 4);
+            auto month = dir_name.substr(5, 2);
+            auto note_subdir = fs::path(cfg.note_dir) / year / month;
+            if (fs::is_directory(note_subdir)) {
+                for (const auto& entry : fs::directory_iterator(note_subdir)) {
+                    auto fname = entry.path().filename().string();
+                    // Note filename: Meeting_YYYY-MM-DD_HH-MM[_Title].md
+                    if (starts_with(fname, "Meeting_" + dir_name) && ends_with(fname, ".md")) {
+                        note_path = entry.path();
+                        break;
+                    }
+                }
+            }
+        }
+
+        if (note_path.empty()) {
+            res.status = 404;
+            res.set_content(json_error("no meeting note found"), "application/json");
+            return;
+        }
+
+        std::ifstream in(note_path);
+        if (!in) {
+            res.status = 500;
+            res.set_content(json_error("failed to read note file"), "application/json");
+            return;
+        }
+        std::string content((std::istreambuf_iterator<char>(in)),
+                             std::istreambuf_iterator<char>());
+
+        res.set_content("{\"path\":\"" + escape_json(note_path.filename().string()) +
+                        "\",\"content\":\"" + escape_json(content) + "\"}",
+                        "application/json");
+    });
+
     // --- Static file serving (SPA) ---
     if (!web_root_path.empty() && fs::is_directory(web_root_path)) {
         server.set_mount_point("/", web_root_path.string());
