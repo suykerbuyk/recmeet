@@ -15,6 +15,14 @@
 #include <libayatana-appindicator/app-indicator.h>
 #include <gtk/gtk.h>
 
+#include <fcntl.h>
+#include <signal.h>
+#include <sys/socket.h>
+#include <sys/wait.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <unistd.h>
+
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
@@ -81,6 +89,9 @@ struct TrayState {
     std::mutex models_mutex;
     bool models_fetching = false;
     std::string models_provider; // which provider the cache is for
+
+    // Managed web server process
+    pid_t web_server_pid = -1;  // -1 = not managed by us
 };
 
 static TrayState g_tray;
@@ -607,9 +618,101 @@ static void on_edit_config(GtkMenuItem*, gpointer) {
     }
 }
 
+static bool is_port_listening(const std::string& addr, int port) {
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) return false;
+
+    struct sockaddr_in sa{};
+    sa.sin_family = AF_INET;
+    sa.sin_port = htons(static_cast<uint16_t>(port));
+    inet_pton(AF_INET,
+              (addr == "0.0.0.0" || addr.empty()) ? "127.0.0.1" : addr.c_str(),
+              &sa.sin_addr);
+
+    bool ok = (connect(fd, reinterpret_cast<struct sockaddr*>(&sa), sizeof(sa)) == 0);
+    close(fd);
+    return ok;
+}
+
+static void reap_web_server() {
+    if (g_tray.web_server_pid > 0) {
+        int status;
+        pid_t r = waitpid(g_tray.web_server_pid, &status, WNOHANG);
+        if (r == g_tray.web_server_pid || r == -1)
+            g_tray.web_server_pid = -1;
+    }
+}
+
+static bool spawn_web_server() {
+    reap_web_server();
+    if (g_tray.web_server_pid > 0) return true;  // still running
+
+    // Resolve binary: sibling of our own executable first, then PATH
+    std::string web_bin;
+    {
+        std::error_code ec;
+        auto self = std::filesystem::read_symlink("/proc/self/exe", ec);
+        if (!ec) {
+            auto sibling = self.parent_path() / "recmeet-web";
+            if (std::filesystem::exists(sibling, ec))
+                web_bin = sibling.string();
+        }
+    }
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        log_warn("[tray] fork() failed: %s", strerror(errno));
+        return false;
+    }
+    if (pid == 0) {
+        // Child — redirect stdout/stderr to /dev/null to avoid blocking
+        int devnull = open("/dev/null", O_WRONLY);
+        if (devnull >= 0) { dup2(devnull, STDOUT_FILENO); dup2(devnull, STDERR_FILENO); close(devnull); }
+
+        std::string port_arg = std::to_string(g_tray.cfg.web_port);
+        const std::string& bind_arg = g_tray.cfg.web_bind;
+
+        if (!web_bin.empty()) {
+            execl(web_bin.c_str(), "recmeet-web",
+                  "--port", port_arg.c_str(),
+                  "--bind", bind_arg.c_str(),
+                  nullptr);
+        }
+        // Fallback to PATH
+        execlp("recmeet-web", "recmeet-web",
+               "--port", port_arg.c_str(),
+               "--bind", bind_arg.c_str(),
+               nullptr);
+        _exit(127);
+    }
+
+    g_tray.web_server_pid = pid;
+    log_info("[tray] spawned recmeet-web (pid %d) on port %d", pid, g_tray.cfg.web_port);
+    return true;
+}
+
 static void on_open_speaker_ui(GtkMenuItem*, gpointer) {
-    std::string url = "http://" + g_tray.cfg.web_bind + ":" +
-                      std::to_string(g_tray.cfg.web_port);
+    std::string bind = g_tray.cfg.web_bind;
+    int port = g_tray.cfg.web_port;
+
+    if (!is_port_listening(bind, port)) {
+        if (!spawn_web_server()) {
+            notify("Speaker Management", "Failed to start recmeet-web");
+            return;
+        }
+        // Poll for up to 2s
+        for (int i = 0; i < 40; ++i) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            if (is_port_listening(bind, port)) break;
+        }
+        if (!is_port_listening(bind, port)) {
+            notify("Speaker Management", "recmeet-web did not start in time");
+            return;
+        }
+    }
+
+    std::string display_host = (bind == "0.0.0.0" || bind.empty()) ? "127.0.0.1" : bind;
+    std::string url = "http://" + display_host + ":" + std::to_string(port);
     std::string cmd = "xdg-open '" + url + "' &";
     if (std::system(cmd.c_str()) != 0)
         log_warn("[tray] xdg-open failed for: %s", url.c_str());
@@ -671,6 +774,27 @@ static void on_quit(GtkMenuItem*, gpointer) {
     }
     teardown_ipc_watch();
     g_tray.ipc.close_connection();
+
+    // Terminate managed web server
+    if (g_tray.web_server_pid > 0) {
+        log_info("[tray] stopping recmeet-web (pid %d)", g_tray.web_server_pid);
+        kill(g_tray.web_server_pid, SIGTERM);
+        for (int i = 0; i < 10; ++i) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            int status;
+            if (waitpid(g_tray.web_server_pid, &status, WNOHANG) != 0) {
+                g_tray.web_server_pid = -1;
+                break;
+            }
+        }
+        if (g_tray.web_server_pid > 0) {
+            log_warn("[tray] recmeet-web did not exit, sending SIGKILL");
+            kill(g_tray.web_server_pid, SIGKILL);
+            waitpid(g_tray.web_server_pid, nullptr, 0);
+            g_tray.web_server_pid = -1;
+        }
+    }
+
     gtk_main_quit();
 }
 
@@ -1109,6 +1233,16 @@ int main(int argc, char* argv[]) {
 
     build_menu();
     fetch_provider_models();
+
+    // Install SIGCHLD handler to reap zombie processes (e.g. recmeet-web)
+    {
+        struct sigaction sa{};
+        sa.sa_handler = [](int) {
+            while (waitpid(-1, nullptr, WNOHANG) > 0) {}
+        };
+        sa.sa_flags = SA_RESTART | SA_NOCLDSTOP;
+        sigaction(SIGCHLD, &sa, nullptr);
+    }
 
     log_info("recmeet-tray %s running (%zu mic(s), %zu monitor(s))",
             RECMEET_VERSION, g_tray.mics.size(), g_tray.monitors.size());

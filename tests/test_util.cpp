@@ -83,9 +83,9 @@ TEST_CASE("create_output_dir: handles collision", "[util]") {
     CHECK(out1.path != out2.path);
     // Second directory should have _2 suffix
     CHECK(out2.path.filename().string().find("_2") != std::string::npos);
-    // But timestamp should be clean (no _2 suffix)
+    // But timestamp should be clean (no collision suffix)
     CHECK(out2.timestamp == out1.timestamp);
-    CHECK(out2.timestamp.find("_2") == std::string::npos);
+    CHECK(out2.timestamp.size() == 16);  // YYYY-MM-DD_HH-MM, no suffix
 
     fs::remove_all(base);
 }
@@ -410,10 +410,9 @@ TEST_CASE("create_output_dir: returns clean timestamp without collision suffix",
     auto out1 = create_output_dir(base);
     auto out2 = create_output_dir(base);
 
-    // Both timestamps should be identical (clean, no _2)
+    // Both timestamps should be identical (clean, no collision suffix)
     CHECK(out1.timestamp == out2.timestamp);
-    CHECK(out1.timestamp.size() == 16);  // YYYY-MM-DD_HH-MM
-    CHECK(out1.timestamp.find("_2") == std::string::npos);
+    CHECK(out1.timestamp.size() == 16);  // YYYY-MM-DD_HH-MM, no suffix
 
     // But paths should differ
     CHECK(out1.path != out2.path);

@@ -337,6 +337,11 @@ int main(int argc, char* argv[]) {
         res.status = 204;
     });
 
+    // Health check
+    server.Get("/api/health", [](const httplib::Request&, httplib::Response& res) {
+        res.set_content(R"({"status":"ok"})", "application/json");
+    });
+
     // --- Speaker endpoints ---
 
     server.Get("/api/speakers", [&](const httplib::Request&, httplib::Response& res) {
