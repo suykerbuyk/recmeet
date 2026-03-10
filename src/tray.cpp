@@ -607,6 +607,14 @@ static void on_edit_config(GtkMenuItem*, gpointer) {
     }
 }
 
+static void on_open_speaker_ui(GtkMenuItem*, gpointer) {
+    std::string url = "http://" + g_tray.cfg.web_bind + ":" +
+                      std::to_string(g_tray.cfg.web_port);
+    std::string cmd = "xdg-open '" + url + "' &";
+    if (std::system(cmd.c_str()) != 0)
+        log_warn("[tray] xdg-open failed for: %s", url.c_str());
+}
+
 static void on_refresh_devices(GtkMenuItem*, gpointer) {
     refresh_sources();
     build_menu();
@@ -1021,6 +1029,11 @@ static void build_menu() {
     {
         auto* item = gtk_menu_item_new_with_label("Edit Config");
         g_signal_connect(item, "activate", G_CALLBACK(on_edit_config), nullptr);
+        gtk_menu_shell_append(GTK_MENU_SHELL(menu), item);
+    }
+    {
+        auto* item = gtk_menu_item_new_with_label("Speaker Management");
+        g_signal_connect(item, "activate", G_CALLBACK(on_open_speaker_ui), nullptr);
         gtk_menu_shell_append(GTK_MENU_SHELL(menu), item);
     }
     {

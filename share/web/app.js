@@ -165,8 +165,13 @@ function renderSpeakers() {
 
   const tbody = html('tbody');
   for (const spk of speakers) {
+    const nameLink = html('a', {
+      href: '#',
+      className: 'speaker-name-link',
+      onclick: (e) => { e.preventDefault(); showSpeakerDetail(spk.name); }
+    }, spk.name);
     const row = html('tr', null,
-      html('td', null, spk.name),
+      html('td', null, nameLink),
       html('td', null, String(spk.enrollments)),
       html('td', null, formatDate(spk.updated)),
       html('td', { style: 'text-align:right' },
@@ -212,6 +217,71 @@ async function handleResetAll() {
     await refreshSpeakers();
   } catch (e) {
     toast('Reset failed: ' + e.message);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Speaker Detail View
+// ---------------------------------------------------------------------------
+
+async function showSpeakerDetail(name) {
+  const container = $('#content');
+  container.innerHTML = '';
+
+  const toolbar = html('div', { className: 'toolbar' },
+    html('div', { style: 'display:flex;align-items:center;gap:12px' },
+      html('button', { className: 'btn btn-sm', onclick: () => switchView('speakers') }, 'Back'),
+      html('h2', null, name)
+    ),
+    html('button', {
+      className: 'btn btn-danger btn-sm',
+      onclick: async () => {
+        const ok = await confirm('Delete Speaker', `Remove "${name}" and all their enrollments?`);
+        if (!ok) return;
+        try {
+          await deleteSpeaker(name);
+          toast(`Deleted "${name}"`);
+          await fetchSpeakers();
+          switchView('speakers');
+        } catch (e) {
+          toast('Delete failed: ' + e.message);
+        }
+      }
+    }, 'Delete')
+  );
+  container.appendChild(toolbar);
+
+  try {
+    const detail = await api('GET', `/api/speakers/${encodeURIComponent(name)}`);
+
+    const info = html('div', { className: 'card' },
+      html('table', null,
+        html('tbody', null,
+          html('tr', null,
+            html('td', { style: 'font-weight:600;width:140px' }, 'Enrollments'),
+            html('td', null, String(detail.enrollments))
+          ),
+          html('tr', null,
+            html('td', { style: 'font-weight:600' }, 'Embedding Dim'),
+            html('td', null, String(detail.embedding_dim))
+          ),
+          html('tr', null,
+            html('td', { style: 'font-weight:600' }, 'Created'),
+            html('td', null, formatDate(detail.created))
+          ),
+          html('tr', null,
+            html('td', { style: 'font-weight:600' }, 'Last Updated'),
+            html('td', null, formatDate(detail.updated))
+          )
+        )
+      )
+    );
+    container.appendChild(info);
+  } catch (e) {
+    container.appendChild(html('div', { className: 'empty' },
+      html('h3', null, 'Failed to load speaker details'),
+      html('p', null, e.message)
+    ));
   }
 }
 
