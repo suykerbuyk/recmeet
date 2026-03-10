@@ -541,6 +541,18 @@ int main(int argc, char* argv[]) {
     Config cfg = cli.cfg;
     bool list_sources = cli.list_sources;
 
+    // Resolve API key early so both daemon and standalone paths have it
+    if (cfg.llm_model.empty()) {
+        const auto* prov = find_provider(cfg.provider);
+        if (prov) {
+            std::string key = resolve_api_key(*prov, cfg.api_key);
+            if (!key.empty()) {
+                cfg.api_key = key;
+                cli.cfg.api_key = key;  // standalone_main() copies from cli.cfg
+            }
+        }
+    }
+
     // Initialize logging
     auto log_level = parse_log_level(cfg.log_level_str);
     log_init(log_level, cfg.log_dir);
@@ -600,17 +612,8 @@ static int standalone_main(CliResult& cli) {
         return 0;
     }
 
-    // Resolve API key from provider-specific env var
-    if (cfg.llm_model.empty()) {
-        const auto* prov = find_provider(cfg.provider);
-        if (prov) {
-            std::string key = resolve_api_key(*prov, cfg.api_key);
-            if (!key.empty())
-                cfg.api_key = key;
-        }
-    }
-
     // Validate: need API key for summary unless disabled or using local LLM
+    // (API key already resolved in main() before daemon/standalone branch)
     if (!cfg.no_summary && cfg.api_key.empty() && cfg.llm_model.empty()) {
         const auto* prov = find_provider(cfg.provider);
         const char* env_var = prov ? prov->env_var : "XAI_API_KEY";

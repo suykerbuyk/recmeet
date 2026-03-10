@@ -25,6 +25,7 @@ JsonMap config_to_map(const Config& cfg) {
 
     // Summarization
     m["provider"]        = cfg.provider;
+    m["api_key"]         = cfg.api_key;
     m["api_url"]         = cfg.api_url;
     m["api_model"]       = cfg.api_model;
     m["no_summary"]      = cfg.no_summary;
@@ -114,6 +115,7 @@ Config config_from_map(const JsonMap& m) {
     str("language", cfg.language);
 
     str("provider", cfg.provider);
+    str("api_key", cfg.api_key);
     str("api_url", cfg.api_url);
     str("api_model", cfg.api_model);
     b("no_summary", cfg.no_summary);

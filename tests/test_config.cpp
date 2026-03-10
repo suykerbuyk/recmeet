@@ -167,3 +167,24 @@ TEST_CASE("load_config: reads XAI_API_KEY from environment", "[config]") {
     else
         setenv("XAI_API_KEY", saved_key.c_str(), 1);
 }
+
+TEST_CASE("save_config never writes api_key to YAML", "[config]") {
+    fs::path dir = fs::temp_directory_path() / "recmeet_test_save_apikey";
+    fs::remove_all(dir);
+    fs::path path = dir / "config.yaml";
+
+    Config cfg;
+    cfg.api_key = "sk-super-secret-key-99999";
+    cfg.provider = "openai";
+    save_config(cfg, path);
+
+    // Read the file and verify api_key is NOT present
+    std::ifstream in(path);
+    REQUIRE(in.good());
+    std::string contents((std::istreambuf_iterator<char>(in)),
+                          std::istreambuf_iterator<char>());
+    CHECK(contents.find("sk-super-secret-key-99999") == std::string::npos);
+    CHECK(contents.find("api_key") == std::string::npos);
+
+    fs::remove_all(dir);
+}

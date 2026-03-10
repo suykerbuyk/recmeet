@@ -118,19 +118,20 @@ TEST_CASE("config_to_json: handles special characters in paths", "[config_json]"
     CHECK(loaded.device_pattern == cfg.device_pattern);
 }
 
-TEST_CASE("config_to_map excludes api_key for IPC security", "[config_json]") {
+TEST_CASE("config_to_map includes api_key for client-to-daemon IPC", "[config_json]") {
     Config cfg;
     cfg.api_key = "sk-secret-key-12345";
     cfg.provider = "openai";
 
     JsonMap map = config_to_map(cfg);
 
-    // api_key must NOT appear in the serialized map (security: don't send over IPC)
-    CHECK(map.find("api_key") == map.end());
+    // api_key IS included so clients can send credentials to daemon
+    REQUIRE(map.find("api_key") != map.end());
+    CHECK(json_val_as_string(map.at("api_key")) == "sk-secret-key-12345");
 
-    // Round-tripping through map loses the key — consumers must re-inject it
+    // Round-trip preserves api_key
     Config loaded = config_from_map(map);
-    CHECK(loaded.api_key.empty());
+    CHECK(loaded.api_key == "sk-secret-key-12345");
 }
 
 TEST_CASE("config_to_json: default config round-trips", "[config_json]") {

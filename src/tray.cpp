@@ -313,7 +313,16 @@ static void on_record(GtkMenuItem*, gpointer) {
         }
     }
 
-    // Send record.start with current config
+    // Resolve API key from env before sending to daemon
+    if (g_tray.cfg.llm_model.empty()) {
+        const auto* prov = find_provider(g_tray.cfg.provider);
+        if (prov) {
+            std::string key = resolve_api_key(*prov, g_tray.cfg.api_key);
+            if (!key.empty()) g_tray.cfg.api_key = key;
+        }
+    }
+
+    // Send record.start with current config (now includes api_key)
     JsonMap params = config_to_map(g_tray.cfg);
 
     IpcResponse resp;

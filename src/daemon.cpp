@@ -58,6 +58,13 @@ static void signal_handler(int sig) {
             g_server->post([] {
                 try {
                     Config cfg = load_config();
+                    if (cfg.llm_model.empty()) {
+                        const auto* prov = find_provider(cfg.provider);
+                        if (prov) {
+                            std::string key = resolve_api_key(*prov, cfg.api_key);
+                            if (!key.empty()) cfg.api_key = key;
+                        }
+                    }
                     std::lock_guard<std::mutex> lock(g_config_mu);
                     g_config = cfg;
                     log_info("daemon: config reloaded via SIGHUP");
@@ -214,8 +221,8 @@ int main(int argc, char* argv[]) {
             if (!key.empty()) g_config.api_key = key;
         }
     }
-    if (!g_config.no_summary && g_config.api_key.empty() && g_config.llm_model.empty())
-        g_config.no_summary = true;
+    // Note: don't auto-disable no_summary here — the decision is made per-job
+    // based on the merged config (client may send an API key)
 
     notify_init();
 
@@ -255,6 +262,13 @@ int main(int argc, char* argv[]) {
     server.on("config.reload", [](const IpcRequest& req, IpcResponse& resp, IpcError& err) {
         try {
             Config cfg = load_config();
+            if (cfg.llm_model.empty()) {
+                const auto* prov = find_provider(cfg.provider);
+                if (prov) {
+                    std::string key = resolve_api_key(*prov, cfg.api_key);
+                    if (!key.empty()) cfg.api_key = key;
+                }
+            }
             std::lock_guard<std::mutex> lock(g_config_mu);
             g_config = cfg;
             resp.result["ok"] = true;
@@ -308,7 +322,8 @@ int main(int argc, char* argv[]) {
             merged[k] = v;
         cfg = config_from_map(merged);
 
-        // Re-inject daemon's API key — not serialized via IPC for security
+        // Client-sent API key takes precedence (already merged above).
+        // Fall back to daemon's key if client didn't send one.
         if (cfg.api_key.empty()) {
             std::lock_guard<std::mutex> lock2(g_config_mu);
             cfg.api_key = g_config.api_key;

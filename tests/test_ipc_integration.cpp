@@ -44,6 +44,8 @@ struct DaemonSim {
     std::thread worker;
     std::mutex mu;
     std::condition_variable cv;
+    JsonMap last_record_params;  // params from most recent record.start
+    std::mutex params_mu;
 
     explicit DaemonSim(const char* sock = INTEGRATION_SOCK)
         : server(sock)
@@ -56,6 +58,12 @@ struct DaemonSim {
         });
 
         server.on("record.start", [this](const IpcRequest& req, IpcResponse& resp, IpcError& err) {
+            // Capture params for test inspection
+            {
+                std::lock_guard<std::mutex> lk(params_mu);
+                last_record_params = req.params;
+            }
+
             // Check if this is a reprocess request
             bool is_reprocess = false;
             {
@@ -1088,6 +1096,86 @@ TEST_CASE("speakers.remove round-trip via IPC", "[ipc][integration]") {
     server.stop();
     srv.join();
     fs::remove_all(tmp);
+}
+
+// ===========================================================================
+// Category 8: API Key Handling
+// ===========================================================================
+
+TEST_CASE("record.start with api_key param: daemon receives client key", "[ipc][integration]") {
+    DaemonSim sim;
+    sim.start();
+
+    auto client = make_client();
+    IpcResponse resp;
+    IpcError err;
+
+    JsonMap params;
+    params["api_key"] = std::string("sk-client-key-42");
+    REQUIRE(client->call("record.start", params, resp, err));
+
+    // Verify the daemon received the api_key param
+    {
+        std::lock_guard<std::mutex> lk(sim.params_mu);
+        auto it = sim.last_record_params.find("api_key");
+        REQUIRE(it != sim.last_record_params.end());
+        CHECK(json_val_as_string(it->second) == "sk-client-key-42");
+    }
+
+    sim.stop_requested.store(true);
+    sim.cv.notify_all();
+}
+
+TEST_CASE("record.start without api_key: param not present", "[ipc][integration]") {
+    DaemonSim sim;
+    sim.start();
+
+    auto client = make_client();
+    IpcResponse resp;
+    IpcError err;
+
+    // Send record.start with no api_key — just default params
+    REQUIRE(client->call("record.start", resp, err));
+
+    // Verify api_key was sent (config_to_map now includes it) but is empty
+    {
+        std::lock_guard<std::mutex> lk(sim.params_mu);
+        auto it = sim.last_record_params.find("api_key");
+        // config_to_map includes api_key, but with empty default value
+        if (it != sim.last_record_params.end()) {
+            CHECK(json_val_as_string(it->second).empty());
+        }
+    }
+
+    sim.stop_requested.store(true);
+    sim.cv.notify_all();
+}
+
+TEST_CASE("record.start api_key not leaked in state.changed events", "[ipc][integration]") {
+    DaemonSim sim;
+    sim.start();
+
+    auto observer = make_client();
+    EventCollector obs_events;
+    observer->set_event_callback(obs_events.callback());
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+    auto starter = make_client();
+    IpcResponse resp;
+    IpcError err;
+    JsonMap params;
+    params["api_key"] = std::string("sk-secret-must-not-leak");
+    REQUIRE(starter->call("record.start", params, resp, err));
+
+    REQUIRE(starter->call("record.stop", resp, err));
+    REQUIRE(sim.wait_for_state(SIdle, 3000));
+    drain_events(*observer, 300);
+
+    // Verify no event contains api_key
+    auto snap = obs_events.snapshot();
+    for (const auto& ev : snap) {
+        CHECK(ev.data.find("api_key") == ev.data.end());
+    }
 }
 
 TEST_CASE("speakers.reset round-trip via IPC", "[ipc][integration]") {
