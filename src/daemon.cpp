@@ -61,7 +61,7 @@ static void signal_handler(int sig) {
                     if (cfg.llm_model.empty()) {
                         const auto* prov = find_provider(cfg.provider);
                         if (prov) {
-                            std::string key = resolve_api_key(*prov, cfg.api_key);
+                            std::string key = resolve_api_key(*prov, cfg.api_keys, cfg.api_key);
                             if (!key.empty()) cfg.api_key = key;
                         }
                     }
@@ -217,7 +217,7 @@ int main(int argc, char* argv[]) {
     if (g_config.llm_model.empty()) {
         const auto* prov = find_provider(g_config.provider);
         if (prov) {
-            std::string key = resolve_api_key(*prov, g_config.api_key);
+            std::string key = resolve_api_key(*prov, g_config.api_keys, g_config.api_key);
             if (!key.empty()) g_config.api_key = key;
         }
     }
@@ -265,7 +265,7 @@ int main(int argc, char* argv[]) {
             if (cfg.llm_model.empty()) {
                 const auto* prov = find_provider(cfg.provider);
                 if (prov) {
-                    std::string key = resolve_api_key(*prov, cfg.api_key);
+                    std::string key = resolve_api_key(*prov, cfg.api_keys, cfg.api_key);
                     if (!key.empty()) cfg.api_key = key;
                 }
             }

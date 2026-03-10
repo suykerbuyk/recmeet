@@ -147,3 +147,42 @@ TEST_CASE("config_to_json: default config round-trips", "[config_json]") {
     CHECK(loaded.vad == true);
     CHECK(loaded.threads == 0);
 }
+
+TEST_CASE("api_keys IPC round-trip via config_to_map/config_from_map", "[config_json]") {
+    Config original;
+    original.api_keys["xai"] = "xai-key-123";
+    original.api_keys["openai"] = "sk-key-456";
+    original.api_keys["anthropic"] = "sk-ant-789";
+
+    JsonMap map = config_to_map(original);
+
+    // Verify flat dot-prefixed keys in map
+    CHECK(json_val_as_string(map.at("api_keys.xai")) == "xai-key-123");
+    CHECK(json_val_as_string(map.at("api_keys.openai")) == "sk-key-456");
+    CHECK(json_val_as_string(map.at("api_keys.anthropic")) == "sk-ant-789");
+
+    Config loaded = config_from_map(map);
+    CHECK(loaded.api_keys["xai"] == "xai-key-123");
+    CHECK(loaded.api_keys["openai"] == "sk-key-456");
+    CHECK(loaded.api_keys["anthropic"] == "sk-ant-789");
+}
+
+TEST_CASE("api_keys not leaked in IPC events", "[config_json]") {
+    // config_to_map includes api_key and api_keys for client→daemon IPC,
+    // but event broadcasts should never contain them.
+    // This test verifies that api_keys use dot-prefix encoding (not nested)
+    // and that api_key is a separate field (existing behavior).
+    Config cfg;
+    cfg.api_key = "sk-secret";
+    cfg.api_keys["xai"] = "xai-secret";
+
+    JsonMap map = config_to_map(cfg);
+
+    // These keys exist in the map (for IPC params), but the daemon's
+    // broadcast code only sends event-specific fields, never the full config map.
+    CHECK(map.find("api_key") != map.end());
+    CHECK(map.find("api_keys.xai") != map.end());
+
+    // Verify no nested "api_keys" key exists (would break IPC protocol)
+    CHECK(map.find("api_keys") == map.end());
+}

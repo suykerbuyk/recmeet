@@ -300,6 +300,46 @@ static gboolean try_reconnect(gpointer) {
     return G_SOURCE_REMOVE;
 }
 
+// --- API key prompt ---
+
+static std::string prompt_api_key(const ProviderInfo& provider) {
+    GtkWidget* dialog = gtk_dialog_new_with_buttons(
+        "API Key Required", nullptr,
+        static_cast<GtkDialogFlags>(GTK_DIALOG_MODAL | GTK_DIALOG_DESTROY_WITH_PARENT),
+        "_Cancel", GTK_RESPONSE_CANCEL,
+        "_OK", GTK_RESPONSE_OK,
+        nullptr);
+
+    GtkWidget* content = gtk_dialog_get_content_area(GTK_DIALOG(dialog));
+    gtk_container_set_border_width(GTK_CONTAINER(content), 12);
+
+    std::string label_text = std::string("Enter API key for ") + provider.display + ":";
+    GtkWidget* label = gtk_label_new(label_text.c_str());
+    gtk_box_pack_start(GTK_BOX(content), label, FALSE, FALSE, 4);
+
+    GtkWidget* entry = gtk_entry_new();
+    gtk_entry_set_visibility(GTK_ENTRY(entry), FALSE);
+    gtk_entry_set_width_chars(GTK_ENTRY(entry), 50);
+    gtk_box_pack_start(GTK_BOX(content), entry, FALSE, FALSE, 4);
+
+    std::string hint = std::string("Get your key at ") + provider.base_url;
+    GtkWidget* hint_label = gtk_label_new(hint.c_str());
+    gtk_widget_set_opacity(hint_label, 0.6);
+    gtk_box_pack_start(GTK_BOX(content), hint_label, FALSE, FALSE, 4);
+
+    gtk_widget_show_all(dialog);
+
+    std::string result;
+    if (gtk_dialog_run(GTK_DIALOG(dialog)) == GTK_RESPONSE_OK) {
+        const char* text = gtk_entry_get_text(GTK_ENTRY(entry));
+        if (text && *text)
+            result = text;
+    }
+
+    gtk_widget_destroy(dialog);
+    return result;
+}
+
 // --- Recording (via IPC) ---
 
 static void on_record(GtkMenuItem*, gpointer) {
@@ -313,17 +353,33 @@ static void on_record(GtkMenuItem*, gpointer) {
         }
     }
 
-    // Resolve API key from env before sending to daemon
+    // Resolve API key from env / per-provider store / legacy
     if (g_tray.cfg.llm_model.empty()) {
         const auto* prov = find_provider(g_tray.cfg.provider);
         if (prov) {
-            std::string key = resolve_api_key(*prov, g_tray.cfg.api_key);
-            if (!key.empty()) g_tray.cfg.api_key = key;
+            std::string key = resolve_api_key(*prov, g_tray.cfg.api_keys, g_tray.cfg.api_key);
+            if (!key.empty()) {
+                g_tray.cfg.api_key = key;
+            } else if (!g_tray.cfg.no_summary) {
+                // No key found — prompt user
+                std::string entered = prompt_api_key(*prov);
+                if (!entered.empty()) {
+                    g_tray.cfg.api_keys[prov->name] = entered;
+                    g_tray.cfg.api_key = entered;
+                    save_config(g_tray.cfg);
+                }
+                // else: user cancelled — proceed without summary below
+            }
         }
     }
 
+    // Build params — use a copy so we can suppress summary for this run only
+    Config run_cfg = g_tray.cfg;
+    if (!run_cfg.no_summary && run_cfg.api_key.empty() && run_cfg.llm_model.empty())
+        run_cfg.no_summary = true;
+
     // Send record.start with current config (now includes api_key)
-    JsonMap params = config_to_map(g_tray.cfg);
+    JsonMap params = config_to_map(run_cfg);
 
     IpcResponse resp;
     IpcError err;
@@ -441,8 +497,12 @@ static void on_provider_selected(GtkCheckMenuItem* item, gpointer data) {
     g_tray.cfg.llm_model.clear();
 
     const auto* prov = find_provider(name);
-    if (prov)
+    if (prov) {
         g_tray.cfg.api_model = prov->default_model;
+        // Load stored key for this provider
+        auto kit = g_tray.cfg.api_keys.find(name);
+        g_tray.cfg.api_key = (kit != g_tray.cfg.api_keys.end()) ? kit->second : "";
+    }
 
     save_config(g_tray.cfg);
     fetch_provider_models();
@@ -479,12 +539,13 @@ static void fetch_provider_models() {
     std::string provider_name = g_tray.cfg.provider;
     std::string base_url = prov->base_url;
     std::string fallback_key = g_tray.cfg.api_key;
+    auto api_keys = g_tray.cfg.api_keys;
 
-    std::thread([provider_name, base_url, fallback_key]() {
+    std::thread([provider_name, base_url, fallback_key, api_keys]() {
         const auto* prov = find_provider(provider_name);
         if (!prov) return;
 
-        std::string key = resolve_api_key(*prov, fallback_key);
+        std::string key = resolve_api_key(*prov, api_keys, fallback_key);
         if (key.empty()) {
             g_idle_add(on_models_fetched, nullptr);
             return;

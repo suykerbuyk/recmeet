@@ -545,7 +545,7 @@ int main(int argc, char* argv[]) {
     if (cfg.llm_model.empty()) {
         const auto* prov = find_provider(cfg.provider);
         if (prov) {
-            std::string key = resolve_api_key(*prov, cfg.api_key);
+            std::string key = resolve_api_key(*prov, cfg.api_keys, cfg.api_key);
             if (!key.empty()) {
                 cfg.api_key = key;
                 cli.cfg.api_key = key;  // standalone_main() copies from cli.cfg

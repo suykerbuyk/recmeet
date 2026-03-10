@@ -86,18 +86,24 @@ recmeet supports three cloud API providers (xAI, OpenAI, Anthropic) and local LL
 
 ### Cloud API (easiest)
 
-Set an API key in your environment. recmeet checks provider-specific variables in order:
+Set an API key via environment variable or config file. The tray applet will also prompt you for a key on first recording if none is found.
 
 ```bash
-# xAI (default provider)
-export XAI_API_KEY=your-key-here
-
-# Or OpenAI
-export OPENAI_API_KEY=your-key-here
-
-# Or Anthropic
-export ANTHROPIC_API_KEY=your-key-here
+# Option 1: Environment variable (highest priority)
+export XAI_API_KEY=your-key-here       # xAI (default provider)
+export OPENAI_API_KEY=your-key-here    # OpenAI
+export ANTHROPIC_API_KEY=your-key-here # Anthropic
 ```
+
+```yaml
+# Option 2: Config file (~/.config/recmeet/config.yaml)
+api_keys:
+  xai: "xai-..."
+  openai: "sk-..."
+  anthropic: "sk-ant-..."
+```
+
+Environment variables always override config file keys. The tray stores keys entered via its prompt into the config file automatically.
 
 To switch providers:
 
@@ -199,6 +205,12 @@ summary:
   provider: xai
   model: grok-3
   # disabled: true       # uncomment to skip summarization
+
+# Per-provider API keys (env vars always override these)
+# api_keys:
+#   xai: "xai-..."
+#   openai: "sk-..."
+#   anthropic: "sk-ant-..."
 
 output:
   directory: ./meetings
@@ -391,4 +403,4 @@ recmeet --num-speakers 3
 
 **Tray shows "Disconnected"** — The tray reconnects automatically when the daemon starts. Check `systemctl --user status recmeet-daemon.service`.
 
-**Summary skipped / no API key warning** — Set your API key in the environment (`XAI_API_KEY`, `OPENAI_API_KEY`, or `ANTHROPIC_API_KEY`), or use `--llm-model` for local summarization, or `--no-summary` to suppress the warning.
+**Summary skipped / no API key warning** — Set your API key in the environment (`XAI_API_KEY`, `OPENAI_API_KEY`, or `ANTHROPIC_API_KEY`), in `~/.config/recmeet/config.yaml` under `api_keys:`, or enter it when the tray prompts you. Alternatively, use `--llm-model` for local summarization, or `--no-summary` to suppress the warning.

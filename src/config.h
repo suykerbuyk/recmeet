@@ -24,7 +24,9 @@ extern const ProviderInfo PROVIDERS[];
 extern const size_t NUM_PROVIDERS;
 
 const ProviderInfo* find_provider(const std::string& name);
-std::string resolve_api_key(const ProviderInfo& provider, const std::string& fallback_key);
+std::string resolve_api_key(const ProviderInfo& provider,
+                            const std::map<std::string, std::string>& api_keys,
+                            const std::string& legacy_key = "");
 
 struct Config {
     // Audio
@@ -41,9 +43,12 @@ struct Config {
     // Summarization
     std::string provider = "xai";
     std::string api_url; // empty = derived from provider
-    std::string api_key;
+    std::string api_key; // legacy single key (fallback)
     std::string api_model = "grok-3";
     bool no_summary = false;
+
+    // Per-provider API keys (env var > api_keys[provider] > api_key)
+    std::map<std::string, std::string> api_keys;
 
     // Local LLM
     std::string llm_model; // path or name, empty = use HTTP API

@@ -7,6 +7,7 @@
 #include <fstream>
 #include <sstream>
 #include <string>
+#include <sys/stat.h>
 
 namespace recmeet {
 
@@ -100,10 +101,15 @@ const ProviderInfo* find_provider(const std::string& name) {
     return nullptr;
 }
 
-std::string resolve_api_key(const ProviderInfo& provider, const std::string& fallback_key) {
+std::string resolve_api_key(const ProviderInfo& provider,
+                            const std::map<std::string, std::string>& api_keys,
+                            const std::string& legacy_key) {
     if (const char* val = std::getenv(provider.env_var))
         return val;
-    return fallback_key;
+    auto it = api_keys.find(provider.name);
+    if (it != api_keys.end() && !it->second.empty())
+        return it->second;
+    return legacy_key;
 }
 
 Config load_config(const fs::path& config_path) {
@@ -148,6 +154,13 @@ Config load_config(const fs::path& config_path) {
     cfg.api_model = get_val(entries, "summary", "model", cfg.api_model);
     cfg.no_summary = get_bool(entries, "summary", "disabled", false);
     cfg.llm_model = get_val(entries, "summary", "llm_model", "");
+
+    // Per-provider API keys
+    for (size_t i = 0; i < NUM_PROVIDERS; ++i) {
+        std::string k = get_val(entries, "api_keys", PROVIDERS[i].name, "");
+        if (!k.empty())
+            cfg.api_keys[PROVIDERS[i].name] = k;
+    }
 
     // Diarization section
     cfg.diarize = get_bool(entries, "diarization", "enabled", true);
@@ -246,6 +259,21 @@ void save_config(const Config& cfg, const fs::path& config_path) {
     if (!cfg.llm_model.empty())
         out << "  llm_model: \"" << cfg.llm_model << "\"\n";
 
+    // Per-provider API keys (never write legacy api_key)
+    {
+        bool has_keys = false;
+        for (const auto& [name, key] : cfg.api_keys) {
+            if (!key.empty()) { has_keys = true; break; }
+        }
+        if (has_keys) {
+            out << "\napi_keys:\n";
+            for (const auto& [name, key] : cfg.api_keys) {
+                if (!key.empty())
+                    out << "  " << name << ": \"" << key << "\"\n";
+            }
+        }
+    }
+
     if (!cfg.diarize || cfg.num_speakers > 0 || cfg.cluster_threshold != 1.18f) {
         out << "\ndiarization:\n";
         if (!cfg.diarize)
@@ -308,6 +336,9 @@ void save_config(const Config& cfg, const fs::path& config_path) {
         if (cfg.web_bind != "127.0.0.1")
             out << "  bind: \"" << cfg.web_bind << "\"\n";
     }
+
+    out.close();
+    chmod(path.c_str(), 0600);
 }
 
 } // namespace recmeet

@@ -6,6 +6,7 @@
 
 #include <cstdlib>
 #include <fstream>
+#include <sys/stat.h>
 
 using namespace recmeet;
 
@@ -168,7 +169,7 @@ TEST_CASE("load_config: reads XAI_API_KEY from environment", "[config]") {
         setenv("XAI_API_KEY", saved_key.c_str(), 1);
 }
 
-TEST_CASE("save_config never writes api_key to YAML", "[config]") {
+TEST_CASE("save_config never writes legacy api_key to YAML", "[config]") {
     fs::path dir = fs::temp_directory_path() / "recmeet_test_save_apikey";
     fs::remove_all(dir);
     fs::path path = dir / "config.yaml";
@@ -178,13 +179,128 @@ TEST_CASE("save_config never writes api_key to YAML", "[config]") {
     cfg.provider = "openai";
     save_config(cfg, path);
 
-    // Read the file and verify api_key is NOT present
+    // Read the file and verify legacy api_key is NOT present
     std::ifstream in(path);
     REQUIRE(in.good());
     std::string contents((std::istreambuf_iterator<char>(in)),
                           std::istreambuf_iterator<char>());
     CHECK(contents.find("sk-super-secret-key-99999") == std::string::npos);
-    CHECK(contents.find("api_key") == std::string::npos);
+    // "api_key:" should not appear (only "api_keys:" is allowed)
+    CHECK(contents.find("  api_key:") == std::string::npos);
+
+    fs::remove_all(dir);
+}
+
+TEST_CASE("api_keys round-trip via save_config + load_config", "[config]") {
+    fs::path dir = fs::temp_directory_path() / "recmeet_test_api_keys_rt";
+    fs::remove_all(dir);
+    fs::path path = dir / "config.yaml";
+
+    Config cfg;
+    cfg.api_keys["xai"] = "xai-test-key-123";
+    cfg.api_keys["openai"] = "sk-test-key-456";
+    cfg.api_keys["anthropic"] = "sk-ant-test-key-789";
+    save_config(cfg, path);
+
+    Config loaded = load_config(path);
+    CHECK(loaded.api_keys["xai"] == "xai-test-key-123");
+    CHECK(loaded.api_keys["openai"] == "sk-test-key-456");
+    CHECK(loaded.api_keys["anthropic"] == "sk-ant-test-key-789");
+
+    fs::remove_all(dir);
+}
+
+TEST_CASE("api_keys section format in YAML", "[config]") {
+    fs::path dir = fs::temp_directory_path() / "recmeet_test_api_keys_fmt";
+    fs::remove_all(dir);
+    fs::path path = dir / "config.yaml";
+
+    Config cfg;
+    cfg.api_keys["xai"] = "xai-key";
+    cfg.api_keys["openai"] = "sk-key";
+    save_config(cfg, path);
+
+    std::ifstream in(path);
+    std::string contents((std::istreambuf_iterator<char>(in)),
+                          std::istreambuf_iterator<char>());
+
+    CHECK(contents.find("api_keys:\n") != std::string::npos);
+    CHECK(contents.find("  openai: \"sk-key\"") != std::string::npos);
+    CHECK(contents.find("  xai: \"xai-key\"") != std::string::npos);
+
+    fs::remove_all(dir);
+}
+
+TEST_CASE("save_config sets file permissions to 0600", "[config]") {
+    fs::path dir = fs::temp_directory_path() / "recmeet_test_perms";
+    fs::remove_all(dir);
+    fs::path path = dir / "config.yaml";
+
+    Config cfg;
+    cfg.api_keys["xai"] = "xai-secret";
+    save_config(cfg, path);
+
+    struct stat st;
+    REQUIRE(stat(path.c_str(), &st) == 0);
+    CHECK((st.st_mode & 0777) == 0600);
+
+    fs::remove_all(dir);
+}
+
+TEST_CASE("resolve_api_key priority: env > api_keys > legacy > empty", "[config]") {
+    const auto* prov = find_provider("xai");
+    REQUIRE(prov != nullptr);
+
+    // Save and clear env
+    const char* old = std::getenv("XAI_API_KEY");
+    std::string saved = old ? old : "";
+    unsetenv("XAI_API_KEY");
+
+    // Empty everything → empty
+    {
+        std::map<std::string, std::string> keys;
+        CHECK(resolve_api_key(*prov, keys, "").empty());
+    }
+
+    // Legacy only
+    {
+        std::map<std::string, std::string> keys;
+        CHECK(resolve_api_key(*prov, keys, "legacy-key") == "legacy-key");
+    }
+
+    // api_keys beats legacy
+    {
+        std::map<std::string, std::string> keys = {{"xai", "map-key"}};
+        CHECK(resolve_api_key(*prov, keys, "legacy-key") == "map-key");
+    }
+
+    // env beats api_keys
+    {
+        setenv("XAI_API_KEY", "env-key", 1);
+        std::map<std::string, std::string> keys = {{"xai", "map-key"}};
+        CHECK(resolve_api_key(*prov, keys, "legacy-key") == "env-key");
+        unsetenv("XAI_API_KEY");
+    }
+
+    // Restore env
+    if (!saved.empty())
+        setenv("XAI_API_KEY", saved.c_str(), 1);
+}
+
+TEST_CASE("backward compat: legacy api_key in config used as fallback", "[config]") {
+    fs::path dir = fs::temp_directory_path() / "recmeet_test_legacy_compat";
+    fs::remove_all(dir);
+    fs::path path = dir / "config.yaml";
+
+    {
+        fs::create_directories(dir);
+        std::ofstream out(path);
+        out << "summary:\n  provider: openai\n  api_key: \"sk-legacy-fallback\"\n";
+    }
+
+    Config cfg = load_config(path);
+    CHECK(cfg.api_key == "sk-legacy-fallback");
+    CHECK(cfg.api_keys.empty());  // No api_keys section → empty map
 
     fs::remove_all(dir);
 }

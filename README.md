@@ -240,7 +240,12 @@ vad:
 summary:
   provider: xai
   model: grok-3
-  # api_key: ...         # prefer env vars instead
+
+# Per-provider API keys (env vars always override these)
+# api_keys:
+#   xai: "xai-..."
+#   openai: "sk-..."
+#   anthropic: "sk-ant-..."
 
 output:
   directory: ./meetings
@@ -276,7 +281,7 @@ make RECMEET_BUILD_TRAY=OFF RECMEET_USE_SHERPA=OFF
 
 ## Testing
 
-213 unit tests, 831 assertions across 23 modules, plus integration and benchmark suites.
+275 unit tests, 1206 assertions across 23 modules, plus integration and benchmark suites.
 
 ```bash
 make test                # unit tests (no hardware needed)
