@@ -62,17 +62,22 @@ PostprocessInput run_recording(const Config& cfg, StopToken& stop, PhaseCallback
 
     if (!cfg.reprocess_dir.empty()) {
         // --- Reprocess existing recording (file or directory) ---
-        pp.audio_path = validate_reprocess_input(cfg.reprocess_dir);
+        // Resolve relative paths: try as-is first, then relative to output_dir
+        fs::path reprocess_path = cfg.reprocess_dir;
+        if (!fs::exists(reprocess_path) && reprocess_path.is_relative()) {
+            fs::path candidate = cfg.output_dir / reprocess_path;
+            if (fs::exists(candidate))
+                reprocess_path = candidate;
+        }
+
+        pp.audio_path = validate_reprocess_input(reprocess_path);
 
         // Determine output directory
         if (cfg.output_dir_explicit) {
             pp.out_dir = fs::weakly_canonical(cfg.output_dir);
-        } else if (fs::is_directory(cfg.reprocess_dir)) {
-            pp.out_dir = fs::canonical(cfg.reprocess_dir);
         } else {
-            // File input: create timestamped output dir under default output location
-            auto out = create_output_dir(cfg.output_dir);
-            pp.out_dir = fs::weakly_canonical(out.path);
+            // Use the directory containing the audio file as output dir
+            pp.out_dir = fs::canonical(pp.audio_path.parent_path());
         }
         fs::create_directories(pp.out_dir);
         log_info("Reprocessing: %s", pp.out_dir.c_str());
