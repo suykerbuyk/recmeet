@@ -109,6 +109,85 @@ Record ──► Transcribe ──► Diarize ──► Identify ──► Summa
 
 6. **Output**: Timestamped transcript, structured Markdown summary with action items, and a meeting note with YAML frontmatter (Obsidian/Dataview-compatible).
 
+## Summarization
+
+recmeet supports two summarization backends — a cloud API or a local LLM. Both use the same structured prompt and produce identical output format.
+
+### Cloud API (default)
+
+Uses any OpenAI-compatible endpoint. Three providers are built in:
+
+| Provider | Env var | Default model |
+|----------|---------|---------------|
+| xai | `XAI_API_KEY` | grok-3 |
+| openai | `OPENAI_API_KEY` | gpt-4o |
+| anthropic | `ANTHROPIC_API_KEY` | claude-sonnet-4-6 |
+
+```bash
+# Set an API key (env var, config file, or --api-key flag)
+export XAI_API_KEY=your-key-here
+./build/recmeet --model base --provider xai
+
+# Switch providers
+./build/recmeet --model base --provider openai
+```
+
+API keys are resolved in priority order: environment variable > per-provider entry in `config.yaml` > legacy `api_key` field.
+
+### Local LLM (fully offline)
+
+Uses llama.cpp to run a GGUF model on CPU. No API key, no network, no data leaves your machine.
+
+```bash
+# Download a GGUF model (e.g. from Hugging Face)
+mkdir -p ~/.local/share/recmeet/models/llama/
+# Place your .gguf file there, or use any path
+
+# Run with local summarization
+./build/recmeet --model base \
+    --llm-model ~/.local/share/recmeet/models/llama/Qwen2.5-7B-Instruct-Q4_K_M.gguf
+```
+
+Or set it permanently in `~/.config/recmeet/config.yaml`:
+
+```yaml
+summary:
+  llm_model: "~/.local/share/recmeet/models/llama/Qwen2.5-7B-Instruct-Q4_K_M.gguf"
+```
+
+The tray applet also has a "Local LLM" radio button that opens a file chooser.
+
+**Recommended models** for meeting summarization on CPU:
+
+| Model | Size | Notes |
+|-------|------|-------|
+| Qwen2.5 7B Instruct Q4_K_M | ~4.5 GB | Good quality/speed balance, strong instruction following |
+| Mistral 7B Instruct Q4_K_M | ~4 GB | Fast, reliable summaries |
+| Llama 3 8B Instruct Q4_K_M | ~4.5 GB | Strong instruction following |
+| Phi-3 Mini 3.8B Q4 | ~2.3 GB | Faster, smaller, decent quality for shorter meetings |
+
+Any GGUF-format model compatible with llama.cpp will work. Download quantized versions from Hugging Face (search for "GGUF" in model repos).
+
+**Constraints**: CPU-only inference, 32K token context window, 4096 token generation budget. Long transcripts are automatically truncated to fit (a log warning is emitted when this happens).
+
+### Decision logic
+
+1. If `--no-summary` is set: skip summarization entirely
+2. If `--llm-model` is set: use local llama.cpp (cloud settings are ignored)
+3. If an API key is available: use the configured cloud provider
+4. If neither: skip with a warning
+
+### Cloud vs local trade-offs
+
+| | Cloud API | Local LLM |
+|---|---|---|
+| **Privacy** | Transcript sent to external API | Fully local — nothing leaves your machine |
+| **Cost** | Per-API pricing | Free |
+| **Speed** | Fast (API-side GPU inference) | Slower (CPU inference) |
+| **Quality** | State-of-the-art models | Depends on model choice; 7B models are solid |
+| **Setup** | API key | Download a ~4 GB GGUF file |
+| **Network** | Required | Not required |
+
 ## Output
 
 ### Directory structure
@@ -240,6 +319,7 @@ vad:
 summary:
   provider: xai
   model: grok-3
+  # llm_model: "~/.local/share/recmeet/models/llama/Qwen2.5-7B-Instruct-Q4_K_M.gguf"  # local LLM (overrides provider)
 
 # Per-provider API keys (env vars always override these)
 # api_keys:
@@ -281,7 +361,7 @@ make RECMEET_BUILD_TRAY=OFF RECMEET_USE_SHERPA=OFF
 
 ## Testing
 
-275 unit tests, 1206 assertions across 23 modules, plus integration and benchmark suites.
+314 unit tests, 1338 assertions across 23 modules, plus integration and benchmark suites.
 
 ```bash
 make test                # unit tests (no hardware needed)
