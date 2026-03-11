@@ -63,7 +63,10 @@ struct TrayState {
     Config cfg;
     IpcClient ipc;   // daemon connection
 
-    enum State { IDLE, RECORDING, REPROCESSING, POSTPROCESSING, DOWNLOADING } state = IDLE;
+    bool recording = false;
+    bool postprocessing = false;
+    bool downloading = false;
+    bool is_reprocess = false;  // derived from state string for display
     bool daemon_connected = false;
     guint reconnect_timer = 0;
     int reconnect_delay = 1;  // exponential backoff: 1, 2, 4, 8, ... max 30s
@@ -126,24 +129,26 @@ static void setup_ipc_watch();
 static void teardown_ipc_watch();
 static gboolean try_reconnect(gpointer);
 
-static void set_state(TrayState::State new_state) {
-    g_tray.state = new_state;
-    if (new_state == TrayState::IDLE) {
+static void update_state(bool rec, bool pp, bool dl, bool reproc = false) {
+    g_tray.recording = rec;
+    g_tray.postprocessing = pp;
+    g_tray.downloading = dl;
+    g_tray.is_reprocess = reproc;
+
+    if (!rec && !pp && !dl) {
         g_tray.progress_percent = -1;
         g_tray.current_phase.clear();
     }
+
     const char* icon = ICON_IDLE;
     const char* desc = "Idle";
-    if (new_state == TrayState::RECORDING) {
+    if (rec) {
         icon = ICON_RECORDING;
-        desc = "Recording";
-    } else if (new_state == TrayState::REPROCESSING) {
-        icon = ICON_PROCESSING;
-        desc = "Reprocessing";
-    } else if (new_state == TrayState::POSTPROCESSING) {
+        desc = reproc ? "Reprocessing" : "Recording";
+    } else if (pp) {
         icon = ICON_PROCESSING;
         desc = "Processing";
-    } else if (new_state == TrayState::DOWNLOADING) {
+    } else if (dl) {
         icon = ICON_PROCESSING;
         desc = "Downloading";
     }
@@ -179,24 +184,36 @@ static void handle_ipc_event(const IpcEvent& ev) {
             gtk_menu_item_set_label(GTK_MENU_ITEM(g_tray.status_menu_item), label.c_str());
         }
     } else if (ev.event == "state.changed") {
-        std::string state = json_val_as_string(ev.data.at("state"));
         auto err_it = ev.data.find("error");
         if (err_it != ev.data.end()) {
             std::string error = json_val_as_string(err_it->second);
             if (!error.empty())
                 notify("Pipeline error", error);
         }
-        if (state == "idle") set_state(TrayState::IDLE);
-        else if (state == "recording") set_state(TrayState::RECORDING);
-        else if (state == "reprocessing") set_state(TrayState::REPROCESSING);
-        else if (state == "postprocessing") set_state(TrayState::POSTPROCESSING);
-        else if (state == "downloading") set_state(TrayState::DOWNLOADING);
+        // Prefer boolean fields if present; fall back to state string
+        auto rec_it = ev.data.find("recording");
+        if (rec_it != ev.data.end()) {
+            bool rec = json_val_as_bool(rec_it->second);
+            bool pp  = json_val_as_bool(ev.data.at("postprocessing"));
+            bool dl  = json_val_as_bool(ev.data.at("downloading"));
+            std::string state_str = json_val_as_string(ev.data.at("state"));
+            bool reproc = state_str.find("reprocessing") != std::string::npos;
+            update_state(rec, pp, dl, reproc);
+        } else {
+            // Legacy fallback: parse state string
+            std::string state = json_val_as_string(ev.data.at("state"));
+            if (state == "idle") update_state(false, false, false);
+            else if (state == "recording") update_state(true, false, false);
+            else if (state == "reprocessing") update_state(true, false, false, true);
+            else if (state == "postprocessing") update_state(false, true, false);
+            else if (state == "downloading") update_state(false, false, true);
+        }
     } else if (ev.event == "job.complete") {
         std::string note = json_val_as_string(ev.data.at("note_path"));
         std::string dir = json_val_as_string(ev.data.at("output_dir"));
         if (!note.empty())
             notify("Meeting note ready", note);
-        set_state(TrayState::IDLE);
+        // Don't reset state here — the subsequent state.changed event handles it
     } else if (ev.event == "model.downloading") {
         std::string status = json_val_as_string(ev.data.at("status"));
         if (status == "downloading") {
@@ -220,7 +237,7 @@ static gboolean on_ipc_data(GIOChannel*, GIOCondition cond, gpointer) {
         g_tray.daemon_connected = false;
         teardown_ipc_watch();
         g_tray.ipc.close_connection();
-        set_state(TrayState::IDLE);
+        update_state(false, false, false);
         // Schedule reconnect with backoff
         g_tray.reconnect_delay = 1;
         g_tray.reconnect_timer = g_timeout_add_seconds(1, try_reconnect, nullptr);
@@ -233,7 +250,7 @@ static gboolean on_ipc_data(GIOChannel*, GIOCondition cond, gpointer) {
         g_tray.daemon_connected = false;
         teardown_ipc_watch();
         g_tray.ipc.close_connection();
-        set_state(TrayState::IDLE);
+        update_state(false, false, false);
         g_tray.reconnect_delay = 1;
         g_tray.reconnect_timer = g_timeout_add_seconds(1, try_reconnect, nullptr);
         return G_SOURCE_REMOVE;
@@ -274,12 +291,23 @@ static bool connect_to_daemon() {
     IpcResponse resp;
     IpcError err;
     if (g_tray.ipc.call("status.get", resp, err, 2000)) {
-        std::string state = json_val_as_string(resp.result["state"]);
-        if (state == "recording") set_state(TrayState::RECORDING);
-        else if (state == "reprocessing") set_state(TrayState::REPROCESSING);
-        else if (state == "postprocessing") set_state(TrayState::POSTPROCESSING);
-        else if (state == "downloading") set_state(TrayState::DOWNLOADING);
-        else set_state(TrayState::IDLE);
+        auto rec_it = resp.result.find("recording");
+        if (rec_it != resp.result.end()) {
+            bool rec = json_val_as_bool(rec_it->second);
+            bool pp  = json_val_as_bool(resp.result["postprocessing"]);
+            bool dl  = json_val_as_bool(resp.result["downloading"]);
+            std::string state_str = json_val_as_string(resp.result["state"]);
+            bool reproc = state_str.find("reprocessing") != std::string::npos;
+            update_state(rec, pp, dl, reproc);
+        } else {
+            // Legacy fallback
+            std::string state = json_val_as_string(resp.result["state"]);
+            if (state == "recording") update_state(true, false, false);
+            else if (state == "reprocessing") update_state(true, false, false, true);
+            else if (state == "postprocessing") update_state(false, true, false);
+            else if (state == "downloading") update_state(false, false, true);
+            else update_state(false, false, false);
+        }
     }
 
     log_info("[tray] Connected to daemon");
@@ -343,7 +371,7 @@ static std::string prompt_api_key(const ProviderInfo& provider) {
 // --- Recording (via IPC) ---
 
 static void on_record(GtkMenuItem*, gpointer) {
-    if (g_tray.state != TrayState::IDLE) return;
+    if (g_tray.recording || g_tray.downloading) return;
 
     if (!g_tray.daemon_connected) {
         if (!connect_to_daemon()) {
@@ -390,24 +418,42 @@ static void on_record(GtkMenuItem*, gpointer) {
         return;
     }
 
-    set_state(g_tray.cfg.reprocess_dir.empty() ? TrayState::RECORDING : TrayState::REPROCESSING);
+    bool reproc = !g_tray.cfg.reprocess_dir.empty();
+    update_state(true, g_tray.postprocessing, false, reproc);
 }
 
 static void on_stop(GtkMenuItem*, gpointer) {
-    if (g_tray.state != TrayState::RECORDING && g_tray.state != TrayState::REPROCESSING
-        && g_tray.state != TrayState::POSTPROCESSING) return;
+    if (!g_tray.recording && !g_tray.postprocessing) return;
+
+    // Send stop with appropriate target
+    JsonMap params;
+    if (g_tray.recording && g_tray.postprocessing)
+        params["target"] = std::string("all");
+    else if (g_tray.recording)
+        params["target"] = std::string("recording");
+    else
+        params["target"] = std::string("postprocessing");
 
     IpcResponse resp;
     IpcError err;
-    if (!g_tray.ipc.call("record.stop", resp, err, 5000)) {
+    if (!g_tray.ipc.call("record.stop", params, resp, err, 5000)) {
         log_error("[tray] record.stop failed: %s", err.message.c_str());
         return;
     }
+    // No optimistic state transition — wait for daemon's state.changed event
+}
 
-    // Optimistic UI update — daemon will confirm via state.changed event
-    // Skip if already postprocessing (cancel case — wait for daemon to confirm idle)
-    if (g_tray.state != TrayState::POSTPROCESSING)
-        set_state(TrayState::POSTPROCESSING);
+static void on_cancel_pp(GtkMenuItem*, gpointer) {
+    if (!g_tray.postprocessing) return;
+
+    JsonMap params;
+    params["target"] = std::string("postprocessing");
+
+    IpcResponse resp;
+    IpcError err;
+    if (!g_tray.ipc.call("record.stop", params, resp, err, 5000)) {
+        log_error("[tray] cancel postprocessing failed: %s", err.message.c_str());
+    }
 }
 
 // --- Radio / checkbox callbacks ---
@@ -433,7 +479,7 @@ static void on_model_selected(GtkCheckMenuItem* item, gpointer data) {
     save_config(g_tray.cfg);
 
     // Trigger model download if daemon is connected and idle
-    if (g_tray.daemon_connected && g_tray.state == TrayState::IDLE) {
+    if (g_tray.daemon_connected && !g_tray.recording && !g_tray.downloading) {
         JsonMap params;
         params["whisper_model"] = std::string(name);
         IpcResponse resp;
@@ -801,7 +847,7 @@ static void on_update_models(GtkMenuItem*, gpointer) {
         notify("Daemon not running", "Start recmeet-daemon first.");
         return;
     }
-    if (g_tray.state != TrayState::IDLE) return;
+    if (g_tray.recording || g_tray.downloading) return;
 
     IpcResponse resp;
     IpcError err;
@@ -836,8 +882,7 @@ static void on_about(GtkMenuItem*, gpointer) {
 }
 
 static void on_quit(GtkMenuItem*, gpointer) {
-    if (g_tray.state != TrayState::IDLE && g_tray.state != TrayState::DOWNLOADING
-        && g_tray.daemon_connected) {
+    if ((g_tray.recording || g_tray.postprocessing) && g_tray.daemon_connected) {
         IpcResponse resp;
         IpcError err;
         g_tray.ipc.call("record.stop", resp, err, 2000);
@@ -926,18 +971,19 @@ static GtkWidget* build_source_submenu(const std::string& current_name,
 
 static void build_menu() {
     auto* menu = gtk_menu_new();
-    bool is_idle = (g_tray.state == TrayState::IDLE);
-    bool is_active = (g_tray.state != TrayState::IDLE && g_tray.state != TrayState::DOWNLOADING);
+    bool is_idle = !g_tray.recording && !g_tray.postprocessing && !g_tray.downloading;
+    bool can_record = !g_tray.recording && !g_tray.downloading;
 
     // --- Status label ---
     std::string status;
     if (!g_tray.daemon_connected)
         status = "Status: Disconnected";
-    else if (g_tray.state == TrayState::RECORDING)
-        status = "Status: Recording...";
-    else if (g_tray.state == TrayState::REPROCESSING)
-        status = "Status: Reprocessing...";
-    else if (g_tray.state == TrayState::POSTPROCESSING) {
+    else if (g_tray.recording && g_tray.postprocessing) {
+        std::string rec_label = g_tray.is_reprocess ? "Reprocessing" : "Recording";
+        status = "Status: " + rec_label + "... (processing previous)";
+    } else if (g_tray.recording) {
+        status = g_tray.is_reprocess ? "Status: Reprocessing..." : "Status: Recording...";
+    } else if (g_tray.postprocessing) {
         status = "Status: Processing...";
         if (g_tray.progress_percent >= 0 && !g_tray.current_phase.empty()) {
             status = "Status: " + g_tray.current_phase + "... "
@@ -946,7 +992,7 @@ static void build_menu() {
             if (status.size() > 8)
                 status[8] = static_cast<char>(toupper(static_cast<unsigned char>(status[8])));
         }
-    } else if (g_tray.state == TrayState::DOWNLOADING) {
+    } else if (g_tray.downloading) {
         status = "Status: Downloading";
         if (!g_tray.download_model.empty())
             status += " " + g_tray.download_model;
@@ -961,15 +1007,27 @@ static void build_menu() {
     gtk_menu_shell_append(GTK_MENU_SHELL(menu), gtk_separator_menu_item_new());
 
     // --- Record / Stop / Cancel ---
-    if (is_active) {
-        const char* label = (g_tray.state == TrayState::RECORDING) ? "Stop Recording" : "Cancel";
+    if (g_tray.recording) {
+        const char* label = g_tray.is_reprocess ? "Cancel" : "Stop Recording";
         auto* item = gtk_menu_item_new_with_label(label);
         g_signal_connect(item, "activate", G_CALLBACK(on_stop), nullptr);
         gtk_menu_shell_append(GTK_MENU_SHELL(menu), item);
-    } else {
+    }
+    if (g_tray.postprocessing && !g_tray.recording) {
+        // Postprocessing only — show both Record and Cancel Processing
+        auto* rec_item = gtk_menu_item_new_with_label("Record");
+        g_signal_connect(rec_item, "activate", G_CALLBACK(on_record), nullptr);
+        gtk_widget_set_sensitive(rec_item, g_tray.daemon_connected);
+        gtk_menu_shell_append(GTK_MENU_SHELL(menu), rec_item);
+
+        auto* cancel_item = gtk_menu_item_new_with_label("Cancel Processing");
+        g_signal_connect(cancel_item, "activate", G_CALLBACK(on_cancel_pp), nullptr);
+        gtk_menu_shell_append(GTK_MENU_SHELL(menu), cancel_item);
+    }
+    if (!g_tray.recording && !g_tray.postprocessing) {
         auto* item = gtk_menu_item_new_with_label("Record");
         g_signal_connect(item, "activate", G_CALLBACK(on_record), nullptr);
-        gtk_widget_set_sensitive(item, is_idle && g_tray.daemon_connected);
+        gtk_widget_set_sensitive(item, can_record && g_tray.daemon_connected);
         gtk_menu_shell_append(GTK_MENU_SHELL(menu), item);
     }
 

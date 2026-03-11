@@ -141,6 +141,9 @@ static int client_status() {
         return 1;
     }
     printf("Daemon: running\nState: %s\n", json_val_as_string(resp.result["state"], "unknown").c_str());
+    int64_t queue_depth = json_val_as_int(resp.result["queue_depth"]);
+    if (queue_depth > 0)
+        printf("Queue: %lld job(s) pending\n", (long long)queue_depth);
     return 0;
 }
 
@@ -175,8 +178,9 @@ static int client_record(const Config& cfg) {
     static int last_cli_progress = -1;
     static const bool cli_tty = isatty(STDERR_FILENO);
     static int client_exit_code = 0;
+    int64_t my_job_id = 0;  // assigned after record.start response
 
-    client.set_event_callback([&client](const IpcEvent& ev) {
+    client.set_event_callback([&client, &my_job_id](const IpcEvent& ev) {
         if (ev.event == "phase") {
             std::string name = json_val_as_string(ev.data.at("name"));
             if (cli_tty && last_cli_progress >= 0)
@@ -210,6 +214,11 @@ static int client_record(const Config& cfg) {
                 }
             }
         } else if (ev.event == "job.complete") {
+            // Filter by our job_id if we have one (ignore completions from other jobs)
+            auto jid_it = ev.data.find("job_id");
+            if (my_job_id > 0 && jid_it != ev.data.end()
+                && json_val_as_int(jid_it->second) != my_job_id)
+                return;
             if (cli_tty && last_cli_progress >= 0)
                 fprintf(stderr, "\n");
             last_cli_progress = -1;
@@ -226,6 +235,13 @@ static int client_record(const Config& cfg) {
     if (!client.call("record.start", params, resp, err)) {
         fprintf(stderr, "Error: %s\n", err.message.c_str());
         return 1;
+    }
+
+    // Capture job_id for filtering job.complete events
+    {
+        auto jid_it = resp.result.find("job_id");
+        if (jid_it != resp.result.end())
+            my_job_id = json_val_as_int(jid_it->second);
     }
 
     if (is_reprocess)

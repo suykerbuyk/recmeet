@@ -19,10 +19,12 @@
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <csignal>
 #include <cstdio>
 #include <cstring>
 #include <mutex>
+#include <queue>
 #include <thread>
 #include <sys/file.h>
 #include <sys/stat.h>
@@ -31,21 +33,88 @@
 using namespace recmeet;
 
 // ---------------------------------------------------------------------------
-// Daemon state
+// Daemon state — independent atomics for concurrent recording + postprocessing
 // ---------------------------------------------------------------------------
 
-enum class DaemonState { Idle, Recording, Reprocessing, Postprocessing, Downloading };
+static std::atomic<bool> g_recording{false};
+static std::atomic<bool> g_postprocessing{false};
+static std::atomic<bool> g_downloading{false};
+static std::mutex g_state_mu;  // guards multi-flag transitions
 
-static std::atomic<DaemonState> g_state{DaemonState::Idle};
 static Config g_config;
-static StopToken g_stop;
 static std::mutex g_config_mu;
 
-// Active recording/postprocessing thread
-static std::thread g_worker;
+// Stop tokens — separate for independent cancellation
+static StopToken g_rec_stop;
+static StopToken g_pp_stop;
+
+// Worker threads
+static std::thread g_rec_worker;
+static std::thread g_pp_worker;   // long-lived, drains job queue
+static std::thread g_dl_worker;
+
+// Postprocessing job queue
+static std::atomic<int64_t> g_next_job_id{1};
+
+struct PostprocessJob {
+    int64_t job_id;
+    PostprocessInput input;
+    Config cfg;
+};
+
+static std::mutex g_queue_mu;
+static std::queue<PostprocessJob> g_job_queue;
+static std::condition_variable g_queue_cv;
+static bool g_queue_shutdown{false};
+
+// Whether the current recording is a reprocess (poll-thread-only variable,
+// set via server.post() from the recording worker)
+static bool g_is_reprocess = false;
 
 // Global server pointer for signal handler
 static IpcServer* g_server = nullptr;
+
+// ---------------------------------------------------------------------------
+// State helpers
+// ---------------------------------------------------------------------------
+
+static std::string composite_state_name() {
+    bool rec = g_recording.load();
+    bool pp  = g_postprocessing.load();
+    bool dl  = g_downloading.load();
+    if (rec && pp) return g_is_reprocess ? "reprocessing+postprocessing" : "recording+postprocessing";
+    if (rec)       return g_is_reprocess ? "reprocessing" : "recording";
+    if (pp)        return "postprocessing";
+    if (dl)        return "downloading";
+    return "idle";
+}
+
+static void fill_state_fields(JsonMap& data) {
+    data["state"] = composite_state_name();
+    data["recording"] = g_recording.load();
+    data["postprocessing"] = g_postprocessing.load();
+    data["downloading"] = g_downloading.load();
+}
+
+// For worker threads — schedules broadcast on the poll thread
+static void broadcast_state(IpcServer& server, const std::string& error = "") {
+    server.post([&server, error]() {
+        IpcEvent ev;
+        ev.event = "state.changed";
+        fill_state_fields(ev.data);
+        if (!error.empty()) ev.data["error"] = error;
+        server.broadcast(ev);
+    });
+}
+
+// For handlers running on the poll thread — broadcasts immediately
+static void broadcast_state_inline(IpcServer& server, const std::string& error = "") {
+    IpcEvent ev;
+    ev.event = "state.changed";
+    fill_state_fields(ev.data);
+    if (!error.empty()) ev.data["error"] = error;
+    server.broadcast(ev);
+}
 
 // ---------------------------------------------------------------------------
 // Signal handling
@@ -75,28 +144,14 @@ static void signal_handler(int sig) {
         }
         return;
     }
-    // SIGINT/SIGTERM → stop recording if active, then exit
-    g_stop.request();
+    // SIGINT/SIGTERM → stop all workers, then exit
+    g_rec_stop.request();
+    g_pp_stop.request();
     if (g_server) g_server->stop();
 }
 
 // Suppress whisper log output in daemon mode
 static void whisper_null_log(enum ggml_log_level, const char*, void*) {}
-
-// ---------------------------------------------------------------------------
-// Daemon state name
-// ---------------------------------------------------------------------------
-
-static const char* state_name(DaemonState s) {
-    switch (s) {
-        case DaemonState::Idle:            return "idle";
-        case DaemonState::Recording:       return "recording";
-        case DaemonState::Reprocessing:    return "reprocessing";
-        case DaemonState::Postprocessing:  return "postprocessing";
-        case DaemonState::Downloading:     return "downloading";
-    }
-    return "unknown";
-}
 
 // ---------------------------------------------------------------------------
 // Helper: ensure models are ready (non-interactive)
@@ -142,6 +197,99 @@ static bool ensure_models(Config& cfg) {
 #endif
 
     return true;
+}
+
+// ---------------------------------------------------------------------------
+// Postprocessing worker loop (long-lived thread)
+// ---------------------------------------------------------------------------
+
+static void pp_worker_loop(IpcServer& server) {
+    while (true) {
+        PostprocessJob job;
+        bool already_flagged = false;
+        {
+            std::unique_lock<std::mutex> lock(g_queue_mu);
+            g_queue_cv.wait(lock, [] {
+                return !g_job_queue.empty() || g_queue_shutdown;
+            });
+            if (g_queue_shutdown) return;
+            job = std::move(g_job_queue.front());
+            g_job_queue.pop();
+
+            // Check if recording worker already set g_postprocessing
+            // (atomic handoff — avoids transient idle)
+            already_flagged = g_postprocessing.load();
+        }
+
+        if (!already_flagged) {
+            // Direct enqueue (shouldn't normally happen, but be safe)
+            {
+                std::lock_guard<std::mutex> lock(g_state_mu);
+                g_postprocessing.store(true);
+            }
+            broadcast_state(server);
+        }
+        g_pp_stop.reset();
+
+        try {
+            // Per-job progress throttle state (NOT static)
+            auto last_broadcast = std::chrono::steady_clock::time_point{};
+            int last_percent = -1;
+
+            auto on_phase = [&server](const std::string& name) {
+                server.post([&server, name]() {
+                    IpcEvent ev;
+                    ev.event = "phase";
+                    ev.data["name"] = name;
+                    server.broadcast(ev);
+                });
+            };
+
+            auto on_progress = [&server, &last_broadcast, &last_percent](
+                                   const std::string& phase, int percent) {
+                using clock = std::chrono::steady_clock;
+                auto now = clock::now();
+                int elapsed = std::chrono::duration_cast<std::chrono::seconds>(
+                    now - last_broadcast).count();
+                int jump = percent - last_percent;
+                if (last_percent < 0 || elapsed >= 120 || jump >= 10) {
+                    last_broadcast = now;
+                    last_percent = percent;
+                    server.post([&server, phase, percent]() {
+                        IpcEvent ev;
+                        ev.event = "progress";
+                        ev.data["phase"] = phase;
+                        ev.data["percent"] = static_cast<int64_t>(percent);
+                        server.broadcast(ev);
+                    });
+                }
+            };
+
+            PipelineResult result = run_postprocessing(
+                job.cfg, job.input, on_phase, on_progress, &g_pp_stop);
+
+            // Broadcast job.complete with job_id
+            int64_t jid = job.job_id;
+            server.post([&server, result, jid]() {
+                IpcEvent ev;
+                ev.event = "job.complete";
+                ev.data["note_path"] = result.note_path.string();
+                ev.data["output_dir"] = result.output_dir.string();
+                ev.data["job_id"] = jid;
+                server.broadcast(ev);
+            });
+        } catch (const std::exception& e) {
+            log_error("daemon: postprocessing failed: %s", e.what());
+            broadcast_state(server, e.what());
+        }
+
+        // Clear postprocessing flag
+        {
+            std::lock_guard<std::mutex> lock(g_state_mu);
+            g_postprocessing.store(false);
+        }
+        broadcast_state(server);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -233,7 +381,11 @@ int main(int argc, char* argv[]) {
     // --- Method handlers ---
 
     server.on("status.get", [](const IpcRequest& req, IpcResponse& resp, IpcError&) {
-        resp.result["state"] = std::string(state_name(g_state.load()));
+        fill_state_fields(resp.result);
+        {
+            std::lock_guard<std::mutex> lock(g_queue_mu);
+            resp.result["queue_depth"] = static_cast<int64_t>(g_job_queue.size());
+        }
         return true;
     });
 
@@ -292,7 +444,6 @@ int main(int argc, char* argv[]) {
     });
 
     server.on("record.start", [&server](const IpcRequest& req, IpcResponse& resp, IpcError& err) {
-        DaemonState expected = DaemonState::Idle;
         bool is_reprocess = false;
 
         // Check if this is a reprocess request (peek at params before full config merge)
@@ -304,11 +455,15 @@ int main(int argc, char* argv[]) {
             }
         }
 
-        DaemonState initial = is_reprocess ? DaemonState::Reprocessing : DaemonState::Recording;
-        if (!g_state.compare_exchange_strong(expected, initial)) {
-            err.code = static_cast<int>(IpcErrorCode::Busy);
-            err.message = std::string("Daemon is busy (") + state_name(expected) + ")";
-            return false;
+        // Guard: !g_recording && !g_downloading (allow during postprocessing)
+        {
+            std::lock_guard<std::mutex> lock(g_state_mu);
+            if (g_recording.load() || g_downloading.load()) {
+                err.code = static_cast<int>(IpcErrorCode::Busy);
+                err.message = "Daemon is busy (" + composite_state_name() + ")";
+                return false;
+            }
+            g_recording.store(true);
         }
 
         // Snapshot config with any per-request overrides
@@ -330,26 +485,26 @@ int main(int argc, char* argv[]) {
         }
 
         if (!ensure_models(cfg)) {
-            g_state.store(DaemonState::Idle);
+            std::lock_guard<std::mutex> lock(g_state_mu);
+            g_recording.store(false);
             err.code = static_cast<int>(IpcErrorCode::InternalError);
             err.message = "Model setup failed";
             return false;
         }
 
-        // Broadcast state change so all clients (including other trays) learn about it
-        {
-            IpcEvent ev;
-            ev.event = "state.changed";
-            ev.data["state"] = std::string(state_name(initial));
-            server.broadcast(ev);
-        }
+        // Assign job_id for this recording
+        int64_t job_id = g_next_job_id.fetch_add(1);
 
-        g_stop.reset();
+        // Set reprocess flag on poll thread and broadcast
+        g_is_reprocess = is_reprocess;
+        broadcast_state_inline(server);
 
-        // Join any previous worker
-        if (g_worker.joinable()) g_worker.join();
+        g_rec_stop.reset();
 
-        g_worker = std::thread([&server, cfg]() {
+        // Join any previous recording worker
+        if (g_rec_worker.joinable()) g_rec_worker.join();
+
+        g_rec_worker = std::thread([&server, cfg, is_reprocess, job_id]() {
             auto on_phase = [&server](const std::string& phase) {
                 server.post([&server, phase]() {
                     IpcEvent ev;
@@ -360,85 +515,95 @@ int main(int argc, char* argv[]) {
             };
 
             try {
-                auto input = run_recording(cfg, g_stop, on_phase);
+                auto input = run_recording(cfg, g_rec_stop, on_phase);
 
-                // Reset stop token so postprocessing isn't immediately cancelled
-                g_stop.reset();
+                // Enqueue postprocessing job
+                PostprocessJob job;
+                job.job_id = job_id;
+                job.input = std::move(input);
+                job.cfg = cfg;
 
+                {
+                    std::lock_guard<std::mutex> qlock(g_queue_mu);
+                    g_job_queue.push(std::move(job));
+                }
+
+                // Atomic handoff: set postprocessing BEFORE clearing recording
+                {
+                    std::lock_guard<std::mutex> lock(g_state_mu);
+                    g_postprocessing.store(true);
+                    g_recording.store(false);
+                }
+
+                // Clear reprocess flag and broadcast new state
                 server.post([&server]() {
-                    g_state.store(DaemonState::Postprocessing);
-                    IpcEvent ev;
-                    ev.event = "state.changed";
-                    ev.data["state"] = std::string("postprocessing");
-                    server.broadcast(ev);
+                    g_is_reprocess = false;
                 });
+                broadcast_state(server);
 
-                auto on_progress = [&server](const std::string& phase, int percent) {
-                    using clock = std::chrono::steady_clock;
-                    static auto last_broadcast = clock::time_point{};
-                    static int last_percent = -1;
+                // Wake the pp worker
+                g_queue_cv.notify_one();
 
-                    auto now = clock::now();
-                    int elapsed_sec = std::chrono::duration_cast<std::chrono::seconds>(
-                        now - last_broadcast).count();
-                    int jump = percent - last_percent;
-
-                    // Throttle: broadcast every 120s or on ≥10% jump
-                    if (last_percent < 0 || elapsed_sec >= 120 || jump >= 10) {
-                        last_broadcast = now;
-                        last_percent = percent;
-                        server.post([&server, phase, percent]() {
-                            IpcEvent ev;
-                            ev.event = "progress";
-                            ev.data["phase"] = phase;
-                            ev.data["percent"] = static_cast<int64_t>(percent);
-                            server.broadcast(ev);
-                        });
-                    }
-                };
-
-                auto result = run_postprocessing(cfg, input, on_phase, on_progress, &g_stop);
-
-                server.post([&server, result]() {
-                    g_state.store(DaemonState::Idle);
-                    IpcEvent ev;
-                    ev.event = "job.complete";
-                    ev.data["note_path"] = result.note_path.string();
-                    ev.data["output_dir"] = result.output_dir.string();
-                    server.broadcast(ev);
-
-                    IpcEvent state_ev;
-                    state_ev.event = "state.changed";
-                    state_ev.data["state"] = std::string("idle");
-                    server.broadcast(state_ev);
-                });
             } catch (const std::exception& e) {
-                fprintf(stderr, "Pipeline error: %s\n", e.what());
-                log_error("daemon: pipeline error: %s", e.what());
-                server.post([&server, what = std::string(e.what())]() {
-                    g_state.store(DaemonState::Idle);
-                    IpcEvent ev;
-                    ev.event = "state.changed";
-                    ev.data["state"] = std::string("idle");
-                    ev.data["error"] = what;
-                    server.broadcast(ev);
+                fprintf(stderr, "Recording error: %s\n", e.what());
+                log_error("daemon: recording error: %s", e.what());
+
+                {
+                    std::lock_guard<std::mutex> lock(g_state_mu);
+                    g_recording.store(false);
+                }
+                server.post([&server]() {
+                    g_is_reprocess = false;
                 });
+                broadcast_state(server, e.what());
             }
         });
 
         resp.result["ok"] = true;
+        resp.result["job_id"] = job_id;
         return true;
     });
 
     server.on("record.stop", [](const IpcRequest& req, IpcResponse& resp, IpcError& err) {
-        DaemonState cur = g_state.load();
-        if (cur != DaemonState::Recording && cur != DaemonState::Reprocessing
-            && cur != DaemonState::Postprocessing) {
+        // Parse optional target param: "recording", "postprocessing", "all" (default)
+        std::string target = "all";
+        {
+            auto it = req.params.find("target");
+            if (it != req.params.end()) {
+                std::string val = json_val_as_string(it->second);
+                if (!val.empty()) target = val;
+            }
+        }
+
+        bool rec = g_recording.load();
+        bool pp  = g_postprocessing.load();
+
+        if (!rec && !pp) {
             err.code = static_cast<int>(IpcErrorCode::NotRecording);
             err.message = "Not recording";
             return false;
         }
-        g_stop.request();
+
+        if (target == "recording") {
+            if (!rec) {
+                err.code = static_cast<int>(IpcErrorCode::NotRecording);
+                err.message = "Not recording";
+                return false;
+            }
+            g_rec_stop.request();
+        } else if (target == "postprocessing") {
+            if (!pp) {
+                err.code = static_cast<int>(IpcErrorCode::NotRecording);
+                err.message = "Not postprocessing";
+                return false;
+            }
+            g_pp_stop.request();
+        } else {
+            // "all" — stop everything
+            if (rec) g_rec_stop.request();
+            if (pp) g_pp_stop.request();
+        }
+
         resp.result["ok"] = true;
         return true;
     });
@@ -536,11 +701,15 @@ int main(int argc, char* argv[]) {
     });
 
     server.on("models.ensure", [&server](const IpcRequest& req, IpcResponse& resp, IpcError& err) {
-        DaemonState expected = DaemonState::Idle;
-        if (!g_state.compare_exchange_strong(expected, DaemonState::Downloading)) {
-            err.code = static_cast<int>(IpcErrorCode::Busy);
-            err.message = std::string("Daemon is busy (") + state_name(expected) + ")";
-            return false;
+        // Guard: !g_recording && !g_downloading (allow during postprocessing)
+        {
+            std::lock_guard<std::mutex> lock(g_state_mu);
+            if (g_recording.load() || g_downloading.load()) {
+                err.code = static_cast<int>(IpcErrorCode::Busy);
+                err.message = "Daemon is busy (" + composite_state_name() + ")";
+                return false;
+            }
+            g_downloading.store(true);
         }
 
         // Determine what to download
@@ -555,9 +724,11 @@ int main(int argc, char* argv[]) {
         bool want_sherpa = cfg.diarize;
         bool want_vad = cfg.vad;
 
-        if (g_worker.joinable()) g_worker.join();
+        if (g_dl_worker.joinable()) g_dl_worker.join();
 
-        g_worker = std::thread([&server, whisper_model, want_sherpa, want_vad]() {
+        broadcast_state_inline(server);
+
+        g_dl_worker = std::thread([&server, whisper_model, want_sherpa, want_vad]() {
             auto broadcast_dl = [&server](const std::string& model, const std::string& status) {
                 server.post([&server, model, status]() {
                     IpcEvent ev;
@@ -567,13 +738,6 @@ int main(int argc, char* argv[]) {
                     server.broadcast(ev);
                 });
             };
-
-            server.post([&server]() {
-                IpcEvent ev;
-                ev.event = "state.changed";
-                ev.data["state"] = std::string("downloading");
-                server.broadcast(ev);
-            });
 
             try {
                 if (!is_whisper_model_cached(whisper_model)) {
@@ -605,13 +769,11 @@ int main(int argc, char* argv[]) {
                 });
             }
 
-            server.post([&server]() {
-                g_state.store(DaemonState::Idle);
-                IpcEvent ev;
-                ev.event = "state.changed";
-                ev.data["state"] = std::string("idle");
-                server.broadcast(ev);
-            });
+            {
+                std::lock_guard<std::mutex> lock(g_state_mu);
+                g_downloading.store(false);
+            }
+            broadcast_state(server);
         });
 
         resp.result["ok"] = true;
@@ -619,16 +781,22 @@ int main(int argc, char* argv[]) {
     });
 
     server.on("models.update", [&server](const IpcRequest&, IpcResponse& resp, IpcError& err) {
-        DaemonState expected = DaemonState::Idle;
-        if (!g_state.compare_exchange_strong(expected, DaemonState::Downloading)) {
-            err.code = static_cast<int>(IpcErrorCode::Busy);
-            err.message = std::string("Daemon is busy (") + state_name(expected) + ")";
-            return false;
+        // Guard: !g_recording && !g_downloading (allow during postprocessing)
+        {
+            std::lock_guard<std::mutex> lock(g_state_mu);
+            if (g_recording.load() || g_downloading.load()) {
+                err.code = static_cast<int>(IpcErrorCode::Busy);
+                err.message = "Daemon is busy (" + composite_state_name() + ")";
+                return false;
+            }
+            g_downloading.store(true);
         }
 
-        if (g_worker.joinable()) g_worker.join();
+        if (g_dl_worker.joinable()) g_dl_worker.join();
 
-        g_worker = std::thread([&server]() {
+        broadcast_state_inline(server);
+
+        g_dl_worker = std::thread([&server]() {
             auto broadcast_dl = [&server](const std::string& model, const std::string& status) {
                 server.post([&server, model, status]() {
                     IpcEvent ev;
@@ -638,13 +806,6 @@ int main(int argc, char* argv[]) {
                     server.broadcast(ev);
                 });
             };
-
-            server.post([&server]() {
-                IpcEvent ev;
-                ev.event = "state.changed";
-                ev.data["state"] = std::string("downloading");
-                server.broadcast(ev);
-            });
 
             auto models = list_cached_models();
             bool sherpa_updated = false;
@@ -683,13 +844,11 @@ int main(int argc, char* argv[]) {
                 }
             }
 
-            server.post([&server]() {
-                g_state.store(DaemonState::Idle);
-                IpcEvent ev;
-                ev.event = "state.changed";
-                ev.data["state"] = std::string("idle");
-                server.broadcast(ev);
-            });
+            {
+                std::lock_guard<std::mutex> lock(g_state_mu);
+                g_downloading.store(false);
+            }
+            broadcast_state(server);
         });
 
         resp.result["ok"] = true;
@@ -705,6 +864,9 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
+    // Start the long-lived postprocessing worker
+    g_pp_worker = std::thread([&server]() { pp_worker_loop(server); });
+
     // Signal handlers
     struct sigaction sa{};
     sa.sa_handler = signal_handler;
@@ -718,10 +880,21 @@ int main(int argc, char* argv[]) {
 
     server.run();
 
-    // Cleanup
+    // Cleanup — shut down all workers
     log_info("daemon: shutting down");
-    g_stop.request();
-    if (g_worker.joinable()) g_worker.join();
+    g_rec_stop.request();
+    g_pp_stop.request();
+
+    // Shut down the pp worker queue
+    {
+        std::lock_guard<std::mutex> lock(g_queue_mu);
+        g_queue_shutdown = true;
+    }
+    g_queue_cv.notify_one();
+
+    if (g_rec_worker.joinable()) g_rec_worker.join();
+    if (g_pp_worker.joinable()) g_pp_worker.join();
+    if (g_dl_worker.joinable()) g_dl_worker.join();
     g_server = nullptr;
 
     // Clean up PID file

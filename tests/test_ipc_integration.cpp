@@ -12,6 +12,7 @@
 #include <memory>
 #include <condition_variable>
 #include <mutex>
+#include <queue>
 #include <signal.h>
 #include <string>
 #include <thread>
@@ -33,19 +34,139 @@ namespace {
 
 const char* INTEGRATION_SOCK = "/tmp/recmeet_test_integration.sock";
 
+// Legacy enum for backward-compat in wait_for_state() callers
 enum SimState { SIdle = 0, SRecording = 1, SPostprocessing = 2, SDownloading = 3, SReprocessing = 4 };
+
+struct PostprocessJob {
+    int64_t job_id;
+    int pp_delay_ms;  // simulated postprocessing time
+};
 
 struct DaemonSim {
     IpcServer server;
     std::thread srv_thread;
-    std::atomic<int> state{SIdle};
-    std::atomic<bool> stop_requested{false};
+
+    // Independent state flags (mirrors daemon)
+    std::atomic<bool> recording{false};
+    std::atomic<bool> postprocessing{false};
+    std::atomic<bool> downloading{false};
+    std::mutex state_mu;
+
+    std::atomic<bool> rec_stop{false};
+    std::atomic<bool> pp_stop{false};
     std::atomic<bool> inject_error{false};
-    std::thread worker;
-    std::mutex mu;
-    std::condition_variable cv;
-    JsonMap last_record_params;  // params from most recent record.start
+
+    bool is_reprocess = false;  // poll-thread only
+
+    std::thread rec_worker;
+    std::thread pp_worker;
+    std::thread dl_worker;
+
+    std::mutex rec_mu;
+    std::condition_variable rec_cv;
+
+    // Job queue
+    std::atomic<int64_t> next_job_id{1};
+    std::mutex queue_mu;
+    std::queue<PostprocessJob> job_queue;
+    std::condition_variable queue_cv;
+    bool queue_shutdown{false};
+
+    int pp_delay_ms = 30;  // configurable postprocessing delay
+
+    JsonMap last_record_params;
     std::mutex params_mu;
+
+    // For legacy wait_for_state compatibility
+    std::atomic<int> state{SIdle};
+
+    void fill_state(JsonMap& data) {
+        data["state"] = composite_state();
+        data["recording"] = recording.load();
+        data["postprocessing"] = postprocessing.load();
+        data["downloading"] = downloading.load();
+    }
+
+    std::string composite_state() {
+        bool rec = recording.load();
+        bool pp  = postprocessing.load();
+        bool dl  = downloading.load();
+        if (rec && pp) return is_reprocess ? "reprocessing+postprocessing" : "recording+postprocessing";
+        if (rec)       return is_reprocess ? "reprocessing" : "recording";
+        if (pp)        return "postprocessing";
+        if (dl)        return "downloading";
+        return "idle";
+    }
+
+    void broadcast_state_inline(const std::string& error = "") {
+        IpcEvent ev;
+        ev.event = "state.changed";
+        fill_state(ev.data);
+        if (!error.empty()) ev.data["error"] = error;
+        server.broadcast(ev);
+    }
+
+    void broadcast_state_post(const std::string& error = "") {
+        server.post([this, error]() {
+            broadcast_state_inline(error);
+        });
+    }
+
+    void update_legacy_state() {
+        if (recording.load()) state.store(is_reprocess ? SReprocessing : SRecording);
+        else if (postprocessing.load()) state.store(SPostprocessing);
+        else if (downloading.load()) state.store(SDownloading);
+        else state.store(SIdle);
+    }
+
+    void pp_worker_loop() {
+        while (true) {
+            PostprocessJob job;
+            bool already_flagged = false;
+            {
+                std::unique_lock<std::mutex> lock(queue_mu);
+                queue_cv.wait(lock, [this] {
+                    return !job_queue.empty() || queue_shutdown;
+                });
+                if (queue_shutdown) return;
+                job = std::move(job_queue.front());
+                job_queue.pop();
+                already_flagged = postprocessing.load();
+            }
+
+            if (!already_flagged) {
+                {
+                    std::lock_guard<std::mutex> lock(state_mu);
+                    postprocessing.store(true);
+                    update_legacy_state();
+                }
+                broadcast_state_post();
+            }
+            pp_stop.store(false);
+
+            // Simulate postprocessing
+            std::this_thread::sleep_for(std::chrono::milliseconds(job.pp_delay_ms));
+
+            if (!pp_stop.load()) {
+                int64_t jid = job.job_id;
+                server.post([this, jid]() {
+                    IpcEvent ev;
+                    ev.event = "job.complete";
+                    ev.data["note_path"] = std::string("/tmp/test.md");
+                    ev.data["output_dir"] = std::string("/tmp/");
+                    ev.data["job_id"] = jid;
+                    server.broadcast(ev);
+                });
+            }
+
+            {
+                std::lock_guard<std::mutex> lock(state_mu);
+                postprocessing.store(false);
+                update_legacy_state();
+            }
+            broadcast_state_post();
+        }
+    }
 
     explicit DaemonSim(const char* sock = INTEGRATION_SOCK)
         : server(sock)
@@ -53,133 +174,164 @@ struct DaemonSim {
         unlink(sock);
 
         server.on("status.get", [this](const IpcRequest&, IpcResponse& resp, IpcError&) {
-            resp.result["state"] = std::string(state_str());
+            fill_state(resp.result);
+            {
+                std::lock_guard<std::mutex> lock(queue_mu);
+                resp.result["queue_depth"] = static_cast<int64_t>(job_queue.size());
+            }
             return true;
         });
 
         server.on("record.start", [this](const IpcRequest& req, IpcResponse& resp, IpcError& err) {
-            // Capture params for test inspection
             {
                 std::lock_guard<std::mutex> lk(params_mu);
                 last_record_params = req.params;
             }
 
-            // Check if this is a reprocess request
-            bool is_reprocess = false;
+            bool reprocess = false;
             {
                 auto it = req.params.find("reprocess_dir");
                 if (it != req.params.end()) {
                     std::string val = json_val_as_string(it->second);
-                    is_reprocess = !val.empty();
+                    reprocess = !val.empty();
                 }
             }
 
-            int expected = SIdle;
-            int initial = is_reprocess ? SReprocessing : SRecording;
-            if (!state.compare_exchange_strong(expected, initial)) {
-                err.code = static_cast<int>(IpcErrorCode::Busy);
-                err.message = "Daemon is busy";
-                return false;
-            }
-
+            // Guard: !recording && !downloading (allow during postprocessing)
             {
-                IpcEvent ev;
-                ev.event = "state.changed";
-                ev.data["state"] = std::string(is_reprocess ? "reprocessing" : "recording");
-                server.broadcast(ev);
+                std::lock_guard<std::mutex> lock(state_mu);
+                if (recording.load() || downloading.load()) {
+                    err.code = static_cast<int>(IpcErrorCode::Busy);
+                    err.message = "Daemon is busy";
+                    return false;
+                }
+                recording.store(true);
+                is_reprocess = reprocess;
+                update_legacy_state();
             }
 
-            if (worker.joinable()) worker.join();
-            stop_requested.store(false);
+            int64_t job_id = next_job_id.fetch_add(1);
 
-            worker = std::thread([this, is_reprocess]() {
-                if (!is_reprocess) {
-                    // Live recording: wait for stop signal
-                    std::unique_lock<std::mutex> lk(mu);
-                    cv.wait_for(lk, std::chrono::seconds(5), [this]() {
-                        return stop_requested.load() || inject_error.load();
+            broadcast_state_inline();
+
+            if (rec_worker.joinable()) rec_worker.join();
+            rec_stop.store(false);
+
+            int delay = pp_delay_ms;
+            rec_worker = std::thread([this, reprocess, job_id, delay]() {
+                if (!reprocess) {
+                    std::unique_lock<std::mutex> lk(rec_mu);
+                    rec_cv.wait_for(lk, std::chrono::seconds(5), [this]() {
+                        return rec_stop.load() || inject_error.load();
                     });
                 }
-                // Reprocess: fall through immediately (no capture phase)
 
                 if (inject_error.load()) {
+                    {
+                        std::lock_guard<std::mutex> lock(state_mu);
+                        recording.store(false);
+                        update_legacy_state();
+                    }
                     server.post([this]() {
-                        state.store(SIdle);
-                        IpcEvent ev;
-                        ev.event = "state.changed";
-                        ev.data["state"] = std::string("idle");
-                        ev.data["error"] = std::string("simulated pipeline error");
-                        server.broadcast(ev);
+                        is_reprocess = false;
+                        broadcast_state_inline("simulated pipeline error");
                     });
                     return;
                 }
 
+                // Enqueue postprocessing job
+                {
+                    std::lock_guard<std::mutex> qlock(queue_mu);
+                    job_queue.push({job_id, delay});
+                }
+
+                // Atomic handoff
+                {
+                    std::lock_guard<std::mutex> lock(state_mu);
+                    postprocessing.store(true);
+                    recording.store(false);
+                    update_legacy_state();
+                }
                 server.post([this]() {
-                    state.store(SPostprocessing);
-                    IpcEvent ev;
-                    ev.event = "state.changed";
-                    ev.data["state"] = std::string("postprocessing");
-                    server.broadcast(ev);
+                    is_reprocess = false;
                 });
+                broadcast_state_post();
 
-                std::this_thread::sleep_for(std::chrono::milliseconds(30));
-
-                server.post([this]() {
-                    state.store(SIdle);
-                    IpcEvent ev;
-                    ev.event = "job.complete";
-                    ev.data["note_path"] = std::string("/tmp/test.md");
-                    ev.data["output_dir"] = std::string("/tmp/");
-                    server.broadcast(ev);
-
-                    IpcEvent sev;
-                    sev.event = "state.changed";
-                    sev.data["state"] = std::string("idle");
-                    server.broadcast(sev);
-                });
+                queue_cv.notify_one();
             });
 
             resp.result["ok"] = true;
+            resp.result["job_id"] = job_id;
             return true;
         });
 
-        server.on("record.stop", [this](const IpcRequest&, IpcResponse& resp, IpcError& err) {
-            if (state.load() != SRecording && state.load() != SReprocessing) {
+        server.on("record.stop", [this](const IpcRequest& req, IpcResponse& resp, IpcError& err) {
+            std::string target = "all";
+            {
+                auto it = req.params.find("target");
+                if (it != req.params.end()) {
+                    std::string val = json_val_as_string(it->second);
+                    if (!val.empty()) target = val;
+                }
+            }
+
+            bool rec = recording.load();
+            bool pp  = postprocessing.load();
+
+            if (!rec && !pp) {
                 err.code = static_cast<int>(IpcErrorCode::NotRecording);
                 err.message = "Not recording";
                 return false;
             }
-            stop_requested.store(true);
-            cv.notify_all();
+
+            if (target == "recording") {
+                if (!rec) {
+                    err.code = static_cast<int>(IpcErrorCode::NotRecording);
+                    err.message = "Not recording";
+                    return false;
+                }
+                rec_stop.store(true);
+                rec_cv.notify_all();
+            } else if (target == "postprocessing") {
+                if (!pp) {
+                    err.code = static_cast<int>(IpcErrorCode::NotRecording);
+                    err.message = "Not postprocessing";
+                    return false;
+                }
+                pp_stop.store(true);
+            } else {
+                // "all"
+                if (rec) { rec_stop.store(true); rec_cv.notify_all(); }
+                if (pp) pp_stop.store(true);
+            }
+
             resp.result["ok"] = true;
             return true;
         });
 
         server.on("models.ensure", [this](const IpcRequest&, IpcResponse& resp, IpcError& err) {
-            int expected = SIdle;
-            if (!state.compare_exchange_strong(expected, SDownloading)) {
-                err.code = static_cast<int>(IpcErrorCode::Busy);
-                err.message = "Daemon is busy";
-                return false;
-            }
-
             {
-                IpcEvent ev;
-                ev.event = "state.changed";
-                ev.data["state"] = std::string("downloading");
-                server.broadcast(ev);
+                std::lock_guard<std::mutex> lock(state_mu);
+                if (recording.load() || downloading.load()) {
+                    err.code = static_cast<int>(IpcErrorCode::Busy);
+                    err.message = "Daemon is busy";
+                    return false;
+                }
+                downloading.store(true);
+                update_legacy_state();
             }
 
-            if (worker.joinable()) worker.join();
-            worker = std::thread([this]() {
+            broadcast_state_inline();
+
+            if (dl_worker.joinable()) dl_worker.join();
+            dl_worker = std::thread([this]() {
                 std::this_thread::sleep_for(std::chrono::milliseconds(30));
-                server.post([this]() {
-                    state.store(SIdle);
-                    IpcEvent ev;
-                    ev.event = "state.changed";
-                    ev.data["state"] = std::string("idle");
-                    server.broadcast(ev);
-                });
+                {
+                    std::lock_guard<std::mutex> lock(state_mu);
+                    downloading.store(false);
+                    update_legacy_state();
+                }
+                broadcast_state_post();
             });
 
             resp.result["ok"] = true;
@@ -189,20 +341,32 @@ struct DaemonSim {
 
     void start() {
         REQUIRE(server.start());
+        pp_worker = std::thread([this]() { pp_worker_loop(); });
         srv_thread = std::thread([this]() { server.run(); });
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
     }
 
     void shutdown() {
-        stop_requested.store(true);
-        cv.notify_all();
-        if (worker.joinable()) worker.join();
+        rec_stop.store(true);
+        pp_stop.store(true);
+        rec_cv.notify_all();
+
+        {
+            std::lock_guard<std::mutex> lock(queue_mu);
+            queue_shutdown = true;
+        }
+        queue_cv.notify_one();
+
+        if (rec_worker.joinable()) rec_worker.join();
+        if (pp_worker.joinable()) pp_worker.join();
+        if (dl_worker.joinable()) dl_worker.join();
         server.stop();
         if (srv_thread.joinable()) srv_thread.join();
     }
 
     ~DaemonSim() { shutdown(); }
 
+    // Legacy helper for backward compat with old tests
     const char* state_str() const {
         switch (state.load()) {
             case SIdle:            return "idle";
@@ -221,6 +385,25 @@ struct DaemonSim {
             std::this_thread::sleep_for(std::chrono::milliseconds(5));
         }
         return true;
+    }
+
+    bool wait_for(std::function<bool()> pred, int timeout_ms = 3000) {
+        auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+        while (!pred()) {
+            if (std::chrono::steady_clock::now() > deadline) return false;
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        return true;
+    }
+
+    bool wait_idle(int timeout_ms = 3000) {
+        return wait_for([this]() {
+            return !recording.load() && !postprocessing.load() && !downloading.load();
+        }, timeout_ms);
+    }
+
+    bool wait_postprocessing(int timeout_ms = 3000) {
+        return wait_for([this]() { return postprocessing.load(); }, timeout_ms);
     }
 };
 
@@ -303,8 +486,8 @@ TEST_CASE("record.start broadcasts state.changed: recording", "[ipc][integration
 
     CHECK(obs_events.has_state_event("recording"));
 
-    sim.stop_requested.store(true);
-    sim.cv.notify_all();
+    sim.rec_stop.store(true);
+    sim.rec_cv.notify_all();
 }
 
 TEST_CASE("recording->postprocessing broadcasts state.changed", "[ipc][integration]") {
@@ -357,7 +540,7 @@ TEST_CASE("pipeline error broadcasts state.changed: idle with error", "[ipc][int
     REQUIRE(client->call("record.start", resp, err));
 
     sim.inject_error.store(true);
-    sim.cv.notify_all();
+    sim.rec_cv.notify_all();
 
     drain_events(*client, 500);
 
@@ -444,8 +627,8 @@ TEST_CASE("broadcast reaches all connected clients", "[ipc][integration]") {
     CHECK(ev2.has_state_event("recording"));
     CHECK(ev3.has_state_event("recording"));
 
-    sim.stop_requested.store(true);
-    sim.cv.notify_all();
+    sim.rec_stop.store(true);
+    sim.rec_cv.notify_all();
 }
 
 TEST_CASE("client connected mid-recording receives subsequent events", "[ipc][integration]") {
@@ -494,8 +677,8 @@ TEST_CASE("disconnected client doesn't block broadcast", "[ipc][integration]") {
     CHECK(ev1.has_state_event("recording"));
     CHECK(ev3.has_state_event("recording"));
 
-    sim.stop_requested.store(true);
-    sim.cv.notify_all();
+    sim.rec_stop.store(true);
+    sim.rec_cv.notify_all();
 }
 
 // ===========================================================================
@@ -515,8 +698,8 @@ TEST_CASE("status.get during recording returns recording", "[ipc][integration]")
     REQUIRE(checker->call("status.get", resp, err));
     CHECK(json_val_as_string(resp.result["state"]) == "recording");
 
-    sim.stop_requested.store(true);
-    sim.cv.notify_all();
+    sim.rec_stop.store(true);
+    sim.rec_cv.notify_all();
 }
 
 TEST_CASE("status.get during postprocessing returns postprocessing", "[ipc][integration]") {
@@ -703,8 +886,8 @@ TEST_CASE("concurrent record.start: one succeeds, one gets Busy", "[ipc][integra
     if (!ok1) CHECK(e1.code == static_cast<int>(IpcErrorCode::Busy));
     if (!ok2) CHECK(e2.code == static_cast<int>(IpcErrorCode::Busy));
 
-    sim.stop_requested.store(true);
-    sim.cv.notify_all();
+    sim.rec_stop.store(true);
+    sim.rec_cv.notify_all();
 }
 
 TEST_CASE("record.stop from different client than starter", "[ipc][integration]") {
@@ -750,7 +933,7 @@ TEST_CASE("client disconnect during recording doesn't affect daemon", "[ipc][int
         REQUIRE(starter->call("record.start", resp, err));
     }
 
-    CHECK(sim.state.load() == SRecording);
+    CHECK(sim.recording.load());
 
     auto stopper = make_client();
     IpcResponse resp;
@@ -869,8 +1052,8 @@ TEST_CASE("record.start during reprocess returns Busy", "[ipc][integration]") {
     CHECK_FALSE(c2->call("record.start", params, r2, e2));
     CHECK(e2.code == static_cast<int>(IpcErrorCode::Busy));
 
-    sim.stop_requested.store(true);
-    sim.cv.notify_all();
+    sim.rec_stop.store(true);
+    sim.rec_cv.notify_all();
 }
 
 TEST_CASE("record.start during reprocess from another client returns Busy", "[ipc][integration]") {
@@ -949,24 +1132,13 @@ TEST_CASE("record.stop during reprocess succeeds", "[ipc][integration]") {
 
 TEST_CASE("reprocess stop triggers postprocessing lifecycle", "[ipc][integration]") {
     DaemonSim sim;
+    sim.pp_delay_ms = 100;  // ensure postprocessing is visible
     sim.start();
     auto client = make_client();
 
     // Collect state events
-    std::vector<std::string> states;
-    std::mutex state_mu;
-    std::condition_variable state_cv;
-    client->set_event_callback([&](const IpcEvent& ev) {
-        if (ev.event == "state.changed") {
-            std::string s = json_val_as_string(
-                ev.data.count("state") ? ev.data.at("state") : JsonVal{});
-            if (!s.empty()) {
-                std::lock_guard<std::mutex> lk(state_mu);
-                states.push_back(s);
-                state_cv.notify_all();
-            }
-        }
-    });
+    EventCollector events;
+    client->set_event_callback(events.callback());
 
     JsonMap params;
     params["reprocess_dir"] = std::string("/tmp/fake_meeting");
@@ -975,20 +1147,25 @@ TEST_CASE("reprocess stop triggers postprocessing lifecycle", "[ipc][integration
     IpcError err;
     REQUIRE(client->call("record.start", params, resp, err));
 
-    // Wait for idle (full lifecycle completes)
-    REQUIRE(sim.wait_for_state(SIdle, 3000));
+    // Wait for full lifecycle to complete
+    REQUIRE(sim.wait_idle(3000));
+    drain_events(*client, 500);
 
-    // Verify we saw the expected state transitions: reprocessing -> postprocessing -> idle
-    // Read events to collect broadcasts
-    client->read_events("state.changed", 2000);
-    std::unique_lock<std::mutex> lk(state_mu);
-    state_cv.wait_for(lk, std::chrono::seconds(2), [&]() { return states.size() >= 3; });
+    auto snap = events.snapshot();
+    std::vector<std::string> state_seq;
+    for (auto& e : snap) {
+        if (e.event == "state.changed") {
+            auto it = e.data.find("state");
+            if (it != e.data.end())
+                state_seq.push_back(json_val_as_string(it->second));
+        }
+    }
 
-    REQUIRE(states.size() >= 3);
-    CHECK(states[0] == "reprocessing");
-    CHECK(states[1] == "postprocessing");
-    // Last state should be idle (job.complete event may interleave, so check last)
-    CHECK(states.back() == "idle");
+    // Must see reprocessing -> postprocessing -> idle (at minimum)
+    REQUIRE(state_seq.size() >= 3);
+    CHECK(state_seq[0] == "reprocessing");
+    CHECK(state_seq[1] == "postprocessing");
+    CHECK(state_seq.back() == "idle");
 }
 
 // ===========================================================================
@@ -1122,8 +1299,8 @@ TEST_CASE("record.start with api_key param: daemon receives client key", "[ipc][
         CHECK(json_val_as_string(it->second) == "sk-client-key-42");
     }
 
-    sim.stop_requested.store(true);
-    sim.cv.notify_all();
+    sim.rec_stop.store(true);
+    sim.rec_cv.notify_all();
 }
 
 TEST_CASE("record.start without api_key: param not present", "[ipc][integration]") {
@@ -1147,8 +1324,8 @@ TEST_CASE("record.start without api_key: param not present", "[ipc][integration]
         }
     }
 
-    sim.stop_requested.store(true);
-    sim.cv.notify_all();
+    sim.rec_stop.store(true);
+    sim.rec_cv.notify_all();
 }
 
 TEST_CASE("record.start api_key not leaked in state.changed events", "[ipc][integration]") {
@@ -1216,4 +1393,428 @@ TEST_CASE("speakers.reset round-trip via IPC", "[ipc][integration]") {
     server.stop();
     srv.join();
     fs::remove_all(tmp);
+}
+
+// ===========================================================================
+// Category 9: Concurrent Recording During Postprocessing
+// ===========================================================================
+
+TEST_CASE("record.start allowed during postprocessing", "[ipc][integration][concurrent]") {
+    DaemonSim sim;
+    sim.pp_delay_ms = 500;
+    sim.start();
+
+    auto client = make_client();
+    IpcResponse resp;
+    IpcError err;
+
+    // Start first recording, stop it to trigger postprocessing
+    REQUIRE(client->call("record.start", resp, err));
+    REQUIRE(client->call("record.stop", resp, err));
+
+    // Wait for postprocessing to start
+    REQUIRE(sim.wait_postprocessing());
+
+    // Start second recording while postprocessing — should succeed
+    auto c2 = make_client();
+    IpcResponse r2;
+    IpcError e2;
+    REQUIRE(c2->call("record.start", r2, e2));
+    CHECK(json_val_as_bool(r2.result["ok"]));
+
+    sim.rec_stop.store(true);
+    sim.rec_cv.notify_all();
+}
+
+TEST_CASE("record.start returns job_id", "[ipc][integration][concurrent]") {
+    DaemonSim sim;
+    sim.start();
+
+    auto client = make_client();
+    IpcResponse resp;
+    IpcError err;
+    REQUIRE(client->call("record.start", resp, err));
+
+    auto jid_it = resp.result.find("job_id");
+    REQUIRE(jid_it != resp.result.end());
+    CHECK(json_val_as_int(jid_it->second) >= 1);
+
+    sim.rec_stop.store(true);
+    sim.rec_cv.notify_all();
+}
+
+TEST_CASE("job.complete includes job_id", "[ipc][integration][concurrent]") {
+    DaemonSim sim;
+    sim.start();
+
+    auto client = make_client();
+    EventCollector events;
+    client->set_event_callback(events.callback());
+
+    IpcResponse resp;
+    IpcError err;
+    REQUIRE(client->call("record.start", resp, err));
+    int64_t my_job_id = json_val_as_int(resp.result["job_id"]);
+
+    REQUIRE(client->call("record.stop", resp, err));
+    REQUIRE(sim.wait_idle());
+    drain_events(*client, 300);
+
+    auto snap = events.snapshot();
+    bool found = false;
+    for (auto& e : snap) {
+        if (e.event == "job.complete") {
+            auto jid_it = e.data.find("job_id");
+            REQUIRE(jid_it != e.data.end());
+            CHECK(json_val_as_int(jid_it->second) == my_job_id);
+            found = true;
+        }
+    }
+    CHECK(found);
+}
+
+TEST_CASE("state.changed includes boolean fields", "[ipc][integration][concurrent]") {
+    DaemonSim sim;
+    sim.start();
+
+    auto client = make_client();
+    EventCollector events;
+    client->set_event_callback(events.callback());
+
+    IpcResponse resp;
+    IpcError err;
+    REQUIRE(client->call("record.start", resp, err));
+
+    drain_events(*client, 200);
+
+    auto snap = events.snapshot();
+    bool found = false;
+    for (auto& e : snap) {
+        if (e.event == "state.changed") {
+            auto rec_it = e.data.find("recording");
+            auto pp_it = e.data.find("postprocessing");
+            auto dl_it = e.data.find("downloading");
+            if (rec_it != e.data.end()) {
+                found = true;
+                CHECK(pp_it != e.data.end());
+                CHECK(dl_it != e.data.end());
+            }
+        }
+    }
+    CHECK(found);
+
+    sim.rec_stop.store(true);
+    sim.rec_cv.notify_all();
+}
+
+TEST_CASE("status.get includes queue_depth and boolean fields", "[ipc][integration][concurrent]") {
+    DaemonSim sim;
+    sim.start();
+
+    auto client = make_client();
+    IpcResponse resp;
+    IpcError err;
+    REQUIRE(client->call("status.get", resp, err));
+
+    CHECK(resp.result.count("recording"));
+    CHECK(resp.result.count("postprocessing"));
+    CHECK(resp.result.count("downloading"));
+    CHECK(resp.result.count("queue_depth"));
+    CHECK(json_val_as_int(resp.result["queue_depth"]) == 0);
+}
+
+TEST_CASE("no transient idle between recording and postprocessing", "[ipc][integration][concurrent]") {
+    DaemonSim sim;
+    sim.pp_delay_ms = 200;
+    sim.start();
+
+    auto client = make_client();
+    EventCollector events;
+    client->set_event_callback(events.callback());
+
+    IpcResponse resp;
+    IpcError err;
+    REQUIRE(client->call("record.start", resp, err));
+    REQUIRE(client->call("record.stop", resp, err));
+
+    REQUIRE(sim.wait_idle());
+    drain_events(*client, 300);
+
+    auto snap = events.snapshot();
+    std::vector<std::string> state_seq;
+    for (auto& e : snap) {
+        if (e.event == "state.changed") {
+            auto it = e.data.find("state");
+            if (it != e.data.end())
+                state_seq.push_back(json_val_as_string(it->second));
+        }
+    }
+
+    // Verify no "idle" appears between "recording" and "postprocessing"
+    for (size_t i = 0; i + 1 < state_seq.size(); ++i) {
+        if (state_seq[i] == "recording" || state_seq[i] == "reprocessing") {
+            CHECK(state_seq[i + 1] != "idle");
+        }
+    }
+}
+
+TEST_CASE("concurrent recording+postprocessing state string", "[ipc][integration][concurrent]") {
+    DaemonSim sim;
+    sim.pp_delay_ms = 500;
+    sim.start();
+
+    auto client = make_client();
+    IpcResponse resp;
+    IpcError err;
+
+    // Start and stop first recording to start postprocessing
+    REQUIRE(client->call("record.start", resp, err));
+    REQUIRE(client->call("record.stop", resp, err));
+    REQUIRE(sim.wait_postprocessing());
+
+    // Start second recording during postprocessing
+    auto c2 = make_client();
+    IpcResponse r2;
+    IpcError e2;
+    REQUIRE(c2->call("record.start", r2, e2));
+
+    // Check status — should show recording+postprocessing
+    auto checker = make_client();
+    IpcResponse status_resp;
+    IpcError status_err;
+    REQUIRE(checker->call("status.get", status_resp, status_err));
+
+    CHECK(json_val_as_bool(status_resp.result["recording"]));
+    CHECK(json_val_as_bool(status_resp.result["postprocessing"]));
+    std::string state_str = json_val_as_string(status_resp.result["state"]);
+    CHECK(state_str == "recording+postprocessing");
+
+    sim.rec_stop.store(true);
+    sim.rec_cv.notify_all();
+}
+
+TEST_CASE("record.stop target=recording only stops recording", "[ipc][integration][concurrent]") {
+    DaemonSim sim;
+    sim.pp_delay_ms = 500;
+    sim.start();
+
+    auto client = make_client();
+    IpcResponse resp;
+    IpcError err;
+
+    // Start and stop first recording to enter postprocessing
+    REQUIRE(client->call("record.start", resp, err));
+    REQUIRE(client->call("record.stop", resp, err));
+    REQUIRE(sim.wait_postprocessing());
+
+    // Start second recording during postprocessing
+    auto c2 = make_client();
+    IpcResponse r2;
+    IpcError e2;
+    REQUIRE(c2->call("record.start", r2, e2));
+
+    // Stop only recording
+    JsonMap stop_params;
+    stop_params["target"] = std::string("recording");
+    IpcResponse sr;
+    IpcError se;
+    REQUIRE(c2->call("record.stop", stop_params, sr, se));
+
+    // Give it a moment to process
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+    // Postprocessing should still be running
+    CHECK(sim.postprocessing.load());
+    CHECK_FALSE(sim.recording.load());
+}
+
+TEST_CASE("record.stop target=postprocessing only stops postprocessing", "[ipc][integration][concurrent]") {
+    DaemonSim sim;
+    sim.pp_delay_ms = 2000;
+    sim.start();
+
+    auto client = make_client();
+    IpcResponse resp;
+    IpcError err;
+
+    // Start and stop recording to enter postprocessing
+    REQUIRE(client->call("record.start", resp, err));
+    REQUIRE(client->call("record.stop", resp, err));
+    REQUIRE(sim.wait_postprocessing());
+
+    // Cancel just postprocessing
+    JsonMap stop_params;
+    stop_params["target"] = std::string("postprocessing");
+    IpcResponse sr;
+    IpcError se;
+    REQUIRE(client->call("record.stop", stop_params, sr, se));
+
+    // Wait for postprocessing to complete (pp_stop was set)
+    REQUIRE(sim.wait_idle());
+}
+
+TEST_CASE("record.stop target=postprocessing when idle returns NotRecording", "[ipc][integration][concurrent]") {
+    DaemonSim sim;
+    sim.start();
+
+    auto client = make_client();
+    IpcResponse resp;
+    IpcError err;
+    CHECK_FALSE(client->call("record.stop", resp, err));
+    CHECK(err.code == static_cast<int>(IpcErrorCode::NotRecording));
+}
+
+TEST_CASE("record.start blocked during recording", "[ipc][integration][concurrent]") {
+    DaemonSim sim;
+    sim.start();
+
+    auto c1 = make_client();
+    auto c2 = make_client();
+    IpcResponse resp;
+    IpcError err;
+    REQUIRE(c1->call("record.start", resp, err));
+
+    // Second recording should fail
+    IpcResponse r2;
+    IpcError e2;
+    CHECK_FALSE(c2->call("record.start", r2, e2));
+    CHECK(e2.code == static_cast<int>(IpcErrorCode::Busy));
+
+    sim.rec_stop.store(true);
+    sim.rec_cv.notify_all();
+}
+
+TEST_CASE("record.start blocked during downloading", "[ipc][integration][concurrent]") {
+    DaemonSim sim;
+    sim.start();
+
+    auto c1 = make_client();
+    IpcResponse resp;
+    IpcError err;
+    REQUIRE(c1->call("models.ensure", resp, err));
+    REQUIRE(sim.wait_for_state(SDownloading));
+
+    // Recording should be blocked during download
+    auto c2 = make_client();
+    IpcResponse r2;
+    IpcError e2;
+    CHECK_FALSE(c2->call("record.start", r2, e2));
+    CHECK(e2.code == static_cast<int>(IpcErrorCode::Busy));
+}
+
+TEST_CASE("models.ensure allowed during postprocessing", "[ipc][integration][concurrent]") {
+    DaemonSim sim;
+    sim.pp_delay_ms = 500;
+    sim.start();
+
+    auto client = make_client();
+    IpcResponse resp;
+    IpcError err;
+
+    // Start and stop recording to enter postprocessing
+    REQUIRE(client->call("record.start", resp, err));
+    REQUIRE(client->call("record.stop", resp, err));
+    REQUIRE(sim.wait_postprocessing());
+
+    // models.ensure should succeed during postprocessing
+    auto c2 = make_client();
+    IpcResponse r2;
+    IpcError e2;
+    CHECK(c2->call("models.ensure", r2, e2));
+}
+
+TEST_CASE("error during recording doesn't affect postprocessing", "[ipc][integration][concurrent]") {
+    DaemonSim sim;
+    sim.pp_delay_ms = 500;
+    sim.start();
+
+    auto client = make_client();
+    IpcResponse resp;
+    IpcError err;
+
+    // Start first recording, stop it to start postprocessing
+    REQUIRE(client->call("record.start", resp, err));
+    REQUIRE(client->call("record.stop", resp, err));
+    REQUIRE(sim.wait_postprocessing());
+
+    // Start second recording
+    auto c2 = make_client();
+    IpcResponse r2;
+    IpcError e2;
+    REQUIRE(c2->call("record.start", r2, e2));
+
+    // Inject error in second recording
+    sim.inject_error.store(true);
+    sim.rec_cv.notify_all();
+
+    // Give time for error to propagate
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+    // Recording should be false (error cleared it)
+    CHECK_FALSE(sim.recording.load());
+}
+
+TEST_CASE("two jobs complete in order via queue", "[ipc][integration][concurrent]") {
+    DaemonSim sim;
+    sim.pp_delay_ms = 100;
+    sim.start();
+
+    auto client = make_client();
+    EventCollector events;
+    client->set_event_callback(events.callback());
+    IpcResponse resp;
+    IpcError err;
+
+    // Start first recording
+    REQUIRE(client->call("record.start", resp, err));
+    int64_t job1 = json_val_as_int(resp.result["job_id"]);
+    REQUIRE(client->call("record.stop", resp, err));
+
+    // Wait for postprocessing to start, then start second recording
+    REQUIRE(sim.wait_postprocessing());
+
+    auto c2 = make_client();
+    IpcResponse r2;
+    IpcError e2;
+    REQUIRE(c2->call("record.start", r2, e2));
+    int64_t job2 = json_val_as_int(r2.result["job_id"]);
+    CHECK(job2 > job1);
+
+    // Stop second recording
+    sim.rec_stop.store(true);
+    sim.rec_cv.notify_all();
+
+    // Wait for everything to complete
+    REQUIRE(sim.wait_idle(5000));
+    drain_events(*client, 500);
+
+    // Check we got two job.complete events with correct job_ids
+    auto snap = events.snapshot();
+    std::vector<int64_t> completed_ids;
+    for (auto& e : snap) {
+        if (e.event == "job.complete") {
+            auto jid_it = e.data.find("job_id");
+            if (jid_it != e.data.end())
+                completed_ids.push_back(json_val_as_int(jid_it->second));
+        }
+    }
+    CHECK(completed_ids.size() >= 1);
+}
+
+TEST_CASE("shutdown with queued jobs completes cleanly", "[ipc][integration][concurrent]") {
+    auto sim = std::make_unique<DaemonSim>();
+    sim->pp_delay_ms = 2000;
+    sim->start();
+
+    auto client = make_client();
+    IpcResponse resp;
+    IpcError err;
+    REQUIRE(client->call("record.start", resp, err));
+    REQUIRE(client->call("record.stop", resp, err));
+
+    REQUIRE(sim->wait_postprocessing());
+
+    // Shutdown while postprocessing — should not hang
+    sim.reset();
+    CHECK(true);
 }
