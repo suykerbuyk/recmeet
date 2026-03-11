@@ -194,6 +194,63 @@ std::vector<std::string> list_speakers(const fs::path& db_dir) {
     return names;
 }
 
+bool remove_embedding(const fs::path& db_dir, const std::string& name,
+                      const std::vector<float>& embedding, float epsilon) {
+    if (embedding.empty()) return false;
+
+    auto profiles = load_speaker_db(db_dir);
+    SpeakerProfile* found = nullptr;
+    for (auto& p : profiles) {
+        if (p.name == name) { found = &p; break; }
+    }
+    if (!found) return false;
+
+    // Find embedding by L2 distance
+    float threshold = epsilon * epsilon * static_cast<float>(embedding.size());
+    auto it = std::find_if(found->embeddings.begin(), found->embeddings.end(),
+        [&](const std::vector<float>& e) {
+            if (e.size() != embedding.size()) return false;
+            float dist2 = 0.0f;
+            for (size_t i = 0; i < e.size(); ++i) {
+                float d = e[i] - embedding[i];
+                dist2 += d * d;
+            }
+            return dist2 < threshold;
+        });
+    if (it == found->embeddings.end()) return false;
+
+    found->embeddings.erase(it);
+
+    if (found->embeddings.empty()) {
+        remove_speaker(db_dir, name);
+    } else {
+        found->updated = iso_now();
+        save_speaker(db_dir, *found);
+    }
+    return true;
+}
+
+bool relabel_meeting_speaker(const fs::path& meeting_dir, int cluster_id,
+                             const std::string& new_label, float confidence) {
+    auto speakers = load_meeting_speakers(meeting_dir);
+    if (speakers.empty()) return false;
+
+    bool found = false;
+    for (auto& s : speakers) {
+        if (s.cluster_id == cluster_id) {
+            s.label = new_label;
+            s.identified = true;
+            s.confidence = confidence;
+            found = true;
+            break;
+        }
+    }
+    if (!found) return false;
+
+    save_meeting_speakers(meeting_dir, speakers);
+    return true;
+}
+
 // ---------------------------------------------------------------------------
 // Per-meeting speaker data (speakers.json)
 // ---------------------------------------------------------------------------

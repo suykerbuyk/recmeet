@@ -342,6 +342,201 @@ TEST_CASE("speaker_id: reset preserves non-json files", "[speaker_id]") {
 }
 
 // ---------------------------------------------------------------------------
+// remove_embedding tests
+// ---------------------------------------------------------------------------
+
+TEST_CASE("speaker_id: remove_embedding exact match removes embedding", "[speaker_id]") {
+    auto tmp = fs::temp_directory_path() / "recmeet_test_spk_rm_emb_exact";
+    fs::remove_all(tmp);
+    fs::create_directories(tmp);
+
+    SpeakerProfile p;
+    p.name = "Alice";
+    p.created = p.updated = "2026-01-01T00:00:00Z";
+    p.embeddings = {{1.0f, 2.0f, 3.0f}, {4.0f, 5.0f, 6.0f}};
+    save_speaker(tmp, p);
+
+    CHECK(remove_embedding(tmp, "Alice", {1.0f, 2.0f, 3.0f}));
+    auto loaded = load_speaker_db(tmp);
+    REQUIRE(loaded.size() == 1);
+    REQUIRE(loaded[0].embeddings.size() == 1);
+    CHECK(loaded[0].embeddings[0] == std::vector<float>{4.0f, 5.0f, 6.0f});
+    fs::remove_all(tmp);
+}
+
+TEST_CASE("speaker_id: remove_embedding epsilon tolerance matches near-equal", "[speaker_id]") {
+    auto tmp = fs::temp_directory_path() / "recmeet_test_spk_rm_emb_eps";
+    fs::remove_all(tmp);
+    fs::create_directories(tmp);
+
+    SpeakerProfile p;
+    p.name = "Bob";
+    p.created = p.updated = "2026-01-01T00:00:00Z";
+    p.embeddings = {{1.0f, 2.0f, 3.0f}};
+    save_speaker(tmp, p);
+
+    // Slightly different values within epsilon tolerance
+    CHECK(remove_embedding(tmp, "Bob", {1.0000001f, 2.0000001f, 3.0000001f}));
+    CHECK(load_speaker_db(tmp).empty()); // profile deleted (last embedding)
+    fs::remove_all(tmp);
+}
+
+TEST_CASE("speaker_id: remove_embedding no match returns false", "[speaker_id]") {
+    auto tmp = fs::temp_directory_path() / "recmeet_test_spk_rm_emb_nomatch";
+    fs::remove_all(tmp);
+    fs::create_directories(tmp);
+
+    SpeakerProfile p;
+    p.name = "Charlie";
+    p.created = p.updated = "2026-01-01T00:00:00Z";
+    p.embeddings = {{1.0f, 2.0f, 3.0f}};
+    save_speaker(tmp, p);
+
+    CHECK_FALSE(remove_embedding(tmp, "Charlie", {9.0f, 9.0f, 9.0f}));
+    CHECK(load_speaker_db(tmp).size() == 1); // unchanged
+    fs::remove_all(tmp);
+}
+
+TEST_CASE("speaker_id: remove_embedding last embedding deletes profile", "[speaker_id]") {
+    auto tmp = fs::temp_directory_path() / "recmeet_test_spk_rm_emb_last";
+    fs::remove_all(tmp);
+    fs::create_directories(tmp);
+
+    SpeakerProfile p;
+    p.name = "Dana";
+    p.created = p.updated = "2026-01-01T00:00:00Z";
+    p.embeddings = {{1.0f, 2.0f}};
+    save_speaker(tmp, p);
+
+    CHECK(remove_embedding(tmp, "Dana", {1.0f, 2.0f}));
+    CHECK(load_speaker_db(tmp).empty());
+    CHECK_FALSE(fs::exists(tmp / "Dana.json"));
+    fs::remove_all(tmp);
+}
+
+TEST_CASE("speaker_id: remove_embedding nonexistent speaker returns false", "[speaker_id]") {
+    auto tmp = fs::temp_directory_path() / "recmeet_test_spk_rm_emb_nospeaker";
+    fs::remove_all(tmp);
+    fs::create_directories(tmp);
+
+    CHECK_FALSE(remove_embedding(tmp, "Nobody", {1.0f}));
+    fs::remove_all(tmp);
+}
+
+TEST_CASE("speaker_id: remove_embedding empty vector returns false", "[speaker_id]") {
+    auto tmp = fs::temp_directory_path() / "recmeet_test_spk_rm_emb_empty";
+    fs::remove_all(tmp);
+    fs::create_directories(tmp);
+
+    SpeakerProfile p;
+    p.name = "Eve";
+    p.created = p.updated = "2026-01-01T00:00:00Z";
+    p.embeddings = {{1.0f}};
+    save_speaker(tmp, p);
+
+    CHECK_FALSE(remove_embedding(tmp, "Eve", {}));
+    fs::remove_all(tmp);
+}
+
+TEST_CASE("speaker_id: remove_embedding preserves other embeddings", "[speaker_id]") {
+    auto tmp = fs::temp_directory_path() / "recmeet_test_spk_rm_emb_preserve";
+    fs::remove_all(tmp);
+    fs::create_directories(tmp);
+
+    SpeakerProfile p;
+    p.name = "Frank";
+    p.created = p.updated = "2026-01-01T00:00:00Z";
+    p.embeddings = {{1.0f}, {2.0f}, {3.0f}};
+    save_speaker(tmp, p);
+
+    CHECK(remove_embedding(tmp, "Frank", {2.0f}));
+    auto loaded = load_speaker_db(tmp);
+    REQUIRE(loaded.size() == 1);
+    REQUIRE(loaded[0].embeddings.size() == 2);
+    CHECK(loaded[0].embeddings[0] == std::vector<float>{1.0f});
+    CHECK(loaded[0].embeddings[1] == std::vector<float>{3.0f});
+    fs::remove_all(tmp);
+}
+
+TEST_CASE("speaker_id: remove_embedding dimension mismatch returns false", "[speaker_id]") {
+    auto tmp = fs::temp_directory_path() / "recmeet_test_spk_rm_emb_dim";
+    fs::remove_all(tmp);
+    fs::create_directories(tmp);
+
+    SpeakerProfile p;
+    p.name = "Grace";
+    p.created = p.updated = "2026-01-01T00:00:00Z";
+    p.embeddings = {{1.0f, 2.0f, 3.0f}};
+    save_speaker(tmp, p);
+
+    CHECK_FALSE(remove_embedding(tmp, "Grace", {1.0f, 2.0f})); // wrong dimension
+    CHECK(load_speaker_db(tmp).size() == 1); // unchanged
+    fs::remove_all(tmp);
+}
+
+// ---------------------------------------------------------------------------
+// relabel_meeting_speaker tests
+// ---------------------------------------------------------------------------
+
+TEST_CASE("speaker_id: relabel changes label and flags", "[speaker_id]") {
+    auto tmp = fs::temp_directory_path() / "recmeet_test_spk_relabel";
+    fs::remove_all(tmp);
+    fs::create_directories(tmp);
+
+    std::vector<MeetingSpeaker> spks = {
+        {0, "Speaker_01", false, {1.0f}, 10.0f, 0.0f},
+        {1, "Speaker_02", false, {2.0f}, 20.0f, 0.0f},
+    };
+    save_meeting_speakers(tmp, spks);
+
+    CHECK(relabel_meeting_speaker(tmp, 0, "John"));
+    auto loaded = load_meeting_speakers(tmp);
+    REQUIRE(loaded.size() == 2);
+    CHECK(loaded[0].label == "John");
+    CHECK(loaded[0].identified == true);
+    CHECK(loaded[0].confidence == 1.0f);
+    CHECK(loaded[1].label == "Speaker_02"); // unchanged
+    fs::remove_all(tmp);
+}
+
+TEST_CASE("speaker_id: relabel unknown cluster_id returns false", "[speaker_id]") {
+    auto tmp = fs::temp_directory_path() / "recmeet_test_spk_relabel_unknown";
+    fs::remove_all(tmp);
+    fs::create_directories(tmp);
+
+    std::vector<MeetingSpeaker> spks = {
+        {0, "Speaker_01", false, {1.0f}, 10.0f, 0.0f},
+    };
+    save_meeting_speakers(tmp, spks);
+
+    CHECK_FALSE(relabel_meeting_speaker(tmp, 99, "John"));
+    fs::remove_all(tmp);
+}
+
+TEST_CASE("speaker_id: relabel empty speakers returns false", "[speaker_id]") {
+    auto tmp = fs::temp_directory_path() / "recmeet_test_spk_relabel_empty";
+    fs::remove_all(tmp);
+    CHECK_FALSE(relabel_meeting_speaker(tmp, 0, "John"));
+}
+
+TEST_CASE("speaker_id: relabel custom confidence value", "[speaker_id]") {
+    auto tmp = fs::temp_directory_path() / "recmeet_test_spk_relabel_conf";
+    fs::remove_all(tmp);
+    fs::create_directories(tmp);
+
+    std::vector<MeetingSpeaker> spks = {
+        {0, "Speaker_01", false, {1.0f}, 10.0f, 0.0f},
+    };
+    save_meeting_speakers(tmp, spks);
+
+    CHECK(relabel_meeting_speaker(tmp, 0, "Bob", 0.95f));
+    auto loaded = load_meeting_speakers(tmp);
+    REQUIRE(loaded.size() == 1);
+    CHECK(loaded[0].confidence == Catch::Approx(0.95f));
+    fs::remove_all(tmp);
+}
+
+// ---------------------------------------------------------------------------
 // merge_speakers with name map tests
 // ---------------------------------------------------------------------------
 

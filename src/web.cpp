@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 #include "config.h"
+#include "ipc_client.h"
 #include "log.h"
 #include "speaker_id.h"
 #include "util.h"
@@ -450,6 +451,14 @@ int main(int argc, char* argv[]) {
             return;
         }
 
+        // Quality gate: reject short audio samples
+        if (found->duration_sec < 5.0f) {
+            res.status = 400;
+            res.set_content(json_error("speaker has less than 5 seconds of audio — enrollment would be unreliable"),
+                            "application/json");
+            return;
+        }
+
         std::lock_guard<std::mutex> lock(speaker_mu);
 
         // Load or create profile
@@ -470,11 +479,69 @@ int main(int argc, char* argv[]) {
         profile.embeddings.push_back(found->embedding);
 
         save_speaker(speaker_db_dir, profile);
-        res.set_content(json_ok(), "application/json");
+
+        // Include quality info in response
+        std::string warning;
+        if (found->confidence > 0.0f && found->confidence < 0.5f)
+            warning = "Low confidence (" + std::to_string(found->confidence).substr(0, 4) +
+                      ") — this enrollment may be inaccurate";
+
+        std::ostringstream resp;
+        resp << R"({"ok":true,"duration_sec":)" << found->duration_sec
+             << R"(,"confidence":)" << found->confidence;
+        if (!warning.empty())
+            resp << R"(,"warning":")" << escape_json(warning) << "\"";
+        resp << "}";
+        res.set_content(resp.str(), "application/json");
 #else
         res.status = 501;
         res.set_content(json_error("enrollment requires sherpa-onnx support"), "application/json");
 #endif
+    });
+
+    // Remove a specific embedding from a speaker profile by index
+    server.Post(R"(/api/speakers/([^/]+)/remove-embedding)", [&](const httplib::Request& req, httplib::Response& res) {
+        auto name = req.matches[1].str();
+        if (!is_safe_dirname(name)) {
+            res.status = 400;
+            res.set_content(json_error("invalid speaker name"), "application/json");
+            return;
+        }
+
+        int index = json_get_int(req.body, "index", -1);
+        if (index < 0) {
+            res.status = 400;
+            res.set_content(json_error("missing or invalid 'index' field"), "application/json");
+            return;
+        }
+
+        std::lock_guard<std::mutex> lock(speaker_mu);
+        auto profiles = load_speaker_db(speaker_db_dir);
+        SpeakerProfile* found = nullptr;
+        for (auto& p : profiles) {
+            if (p.name == name) { found = &p; break; }
+        }
+        if (!found) {
+            res.status = 404;
+            res.set_content(json_error("speaker not found"), "application/json");
+            return;
+        }
+        if (index >= static_cast<int>(found->embeddings.size())) {
+            res.status = 400;
+            res.set_content(json_error("index out of range"), "application/json");
+            return;
+        }
+
+        found->embeddings.erase(found->embeddings.begin() + index);
+        if (found->embeddings.empty()) {
+            remove_speaker(speaker_db_dir, name);
+            res.set_content(R"({"ok":true,"remaining":0})", "application/json");
+        } else {
+            found->updated = iso_now();
+            save_speaker(speaker_db_dir, *found);
+            res.set_content(R"({"ok":true,"remaining":)" +
+                            std::to_string(found->embeddings.size()) + "}", "application/json");
+        }
     });
 
     // --- Meeting endpoints ---
@@ -519,6 +586,155 @@ int main(int argc, char* argv[]) {
 #else
         res.set_content("[]", "application/json");
 #endif
+    });
+
+    // Relabel a meeting speaker (correct misidentification)
+    server.Post(R"(/api/meetings/([^/]+)/speakers/relabel)", [&](const httplib::Request& req, httplib::Response& res) {
+        auto dir_name = req.matches[1].str();
+        if (!is_safe_dirname(dir_name)) {
+            res.status = 400;
+            res.set_content(json_error("invalid meeting directory name"), "application/json");
+            return;
+        }
+
+        int cluster_id = json_get_int(req.body, "cluster_id", -1);
+        auto new_label = json_get_str(req.body, "new_label");
+        if (cluster_id < 0 || new_label.empty()) {
+            res.status = 400;
+            res.set_content(json_error("missing required fields: cluster_id, new_label"), "application/json");
+            return;
+        }
+
+        auto meeting_path = output_dir / dir_name;
+        if (!fs::is_directory(meeting_path)) {
+            res.status = 404;
+            res.set_content(json_error("meeting directory not found"), "application/json");
+            return;
+        }
+
+#if RECMEET_USE_SHERPA
+        // Parse update_profile flag (default true)
+        auto up_str = json_get_str(req.body, "update_profile");
+        bool update_profile = up_str.empty() || up_str != "false";
+
+        std::lock_guard<std::mutex> lock(speaker_mu);
+
+        auto meeting_speakers = load_meeting_speakers(meeting_path);
+        if (meeting_speakers.empty()) {
+            res.status = 404;
+            res.set_content(json_error("no speakers.json in meeting directory"), "application/json");
+            return;
+        }
+
+        // Find the speaker entry
+        MeetingSpeaker* spk = nullptr;
+        for (auto& s : meeting_speakers) {
+            if (s.cluster_id == cluster_id) { spk = &s; break; }
+        }
+        if (!spk) {
+            res.status = 404;
+            res.set_content(json_error("cluster_id not found in meeting speakers"), "application/json");
+            return;
+        }
+
+        std::string old_label = spk->label;
+
+        // Move embedding between profiles if requested
+        if (update_profile && !spk->embedding.empty()) {
+            // Remove from old speaker profile (if it was identified)
+            if (spk->identified && !old_label.empty())
+                remove_embedding(speaker_db_dir, old_label, spk->embedding);
+
+            // Add to new speaker profile
+            auto profiles = load_speaker_db(speaker_db_dir);
+            SpeakerProfile profile;
+            for (const auto& p : profiles) {
+                if (p.name == new_label) { profile = p; break; }
+            }
+            if (profile.name.empty()) {
+                profile.name = new_label;
+                profile.created = iso_now();
+            }
+            profile.updated = iso_now();
+            profile.embeddings.push_back(spk->embedding);
+            save_speaker(speaker_db_dir, profile);
+        }
+
+        // Update meeting speakers.json
+        spk->label = new_label;
+        spk->identified = true;
+        spk->confidence = 1.0f;
+        save_meeting_speakers(meeting_path, meeting_speakers);
+
+        res.set_content(R"({"ok":true,"old_label":")" + escape_json(old_label) + R"("})",
+                        "application/json");
+#else
+        res.status = 501;
+        res.set_content(json_error("relabeling requires sherpa-onnx support"), "application/json");
+#endif
+    });
+
+    // Reprocess a meeting with num_speakers override
+    server.Post(R"(/api/meetings/([^/]+)/reprocess)", [&](const httplib::Request& req, httplib::Response& res) {
+        auto dir_name = req.matches[1].str();
+        if (!is_safe_dirname(dir_name)) {
+            res.status = 400;
+            res.set_content(json_error("invalid meeting directory name"), "application/json");
+            return;
+        }
+
+        auto meeting_path = output_dir / dir_name;
+        if (!fs::is_directory(meeting_path)) {
+            res.status = 404;
+            res.set_content(json_error("meeting directory not found"), "application/json");
+            return;
+        }
+
+        auto audio_path = find_audio_file(meeting_path);
+        if (audio_path.empty()) {
+            res.status = 400;
+            res.set_content(json_error("no audio file found in meeting directory"), "application/json");
+            return;
+        }
+
+        int num_speakers = json_get_int(req.body, "num_speakers", 0);
+
+        // Connect to daemon and request reprocess
+        try {
+            IpcClient client;
+            if (!client.connect()) {
+                res.status = 502;
+                res.set_content(json_error("cannot connect to daemon — is it running?"), "application/json");
+                return;
+            }
+
+            JsonMap params;
+            params["reprocess_dir"] = meeting_path.string();
+            if (num_speakers > 0)
+                params["num_speakers"] = static_cast<int64_t>(num_speakers);
+
+            IpcResponse ipc_resp;
+            IpcError ipc_err;
+            bool ok = client.call("record.start", params, ipc_resp, ipc_err, 5000);
+
+            if (!ok) {
+                res.status = 409;
+                res.set_content(json_error(ipc_err.message.empty() ? "daemon busy" : ipc_err.message),
+                                "application/json");
+                return;
+            }
+
+            // Return job_id from daemon
+            std::string job_id_str = "0";
+            auto jit = ipc_resp.result.find("job_id");
+            if (jit != ipc_resp.result.end())
+                job_id_str = json_val_as_string(jit->second);
+
+            res.set_content(R"({"ok":true,"job_id":)" + job_id_str + "}", "application/json");
+        } catch (const std::exception& e) {
+            res.status = 502;
+            res.set_content(json_error(std::string("daemon error: ") + e.what()), "application/json");
+        }
     });
 
     // Serve meeting note as rendered HTML page

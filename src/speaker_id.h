@@ -34,6 +34,15 @@ int reset_speakers(const fs::path& db_dir);
 /// List enrolled speaker names.
 std::vector<std::string> list_speakers(const fs::path& db_dir);
 
+/// Remove a specific embedding from a speaker profile by L2 distance match.
+/// Deletes the profile file if no embeddings remain. Returns true if found and removed.
+bool remove_embedding(const fs::path& db_dir, const std::string& name,
+                      const std::vector<float>& embedding, float epsilon = 1e-6f);
+
+/// Relabel a meeting speaker by cluster_id. Returns true if found and updated.
+bool relabel_meeting_speaker(const fs::path& meeting_dir, int cluster_id,
+                             const std::string& new_label, float confidence = 1.0f);
+
 #if RECMEET_USE_SHERPA
 
 /// Per-meeting speaker data persisted as speakers.json alongside audio artifacts.

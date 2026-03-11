@@ -85,11 +85,30 @@ async function resetAllSpeakers() {
 }
 
 async function enrollSpeaker(name, meetingDir, clusterId) {
-  await api('POST', '/api/speakers/enroll', {
+  const result = await api('POST', '/api/speakers/enroll', {
     name, meeting_dir: meetingDir, cluster_id: clusterId
   });
   // Invalidate cache for this meeting
   delete meetingSpeakerCache[meetingDir];
+  return result;
+}
+
+async function relabelSpeaker(meetingDir, clusterId, newLabel, updateProfile = true) {
+  const result = await api('POST', `/api/meetings/${encodeURIComponent(meetingDir)}/speakers/relabel`, {
+    cluster_id: clusterId, new_label: newLabel, update_profile: updateProfile ? 'true' : 'false'
+  });
+  delete meetingSpeakerCache[meetingDir];
+  return result;
+}
+
+async function removeEmbedding(name, index) {
+  return await api('POST', `/api/speakers/${encodeURIComponent(name)}/remove-embedding`, { index });
+}
+
+async function reprocessMeeting(meetingDir, numSpeakers) {
+  return await api('POST', `/api/meetings/${encodeURIComponent(meetingDir)}/reprocess`, {
+    num_speakers: numSpeakers || 0
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -277,6 +296,40 @@ async function showSpeakerDetail(name) {
       )
     );
     container.appendChild(info);
+
+    // Enrollment list with remove buttons
+    if (detail.enrollments > 0) {
+      const embCard = html('div', { className: 'card' },
+        html('h3', { style: 'margin:0 0 12px' }, 'Enrollments')
+      );
+      for (let i = 0; i < detail.enrollments; i++) {
+        const row = html('div', { className: 'speaker-row' },
+          html('span', null, `Embedding #${i + 1}`),
+          html('button', {
+            className: 'btn btn-danger btn-sm',
+            onclick: async (e) => {
+              const ok = await confirm('Remove Enrollment',
+                `Remove enrollment #${i + 1} from "${name}"? (${detail.enrollments - 1} remaining)`);
+              if (!ok) return;
+              try {
+                const result = await removeEmbedding(name, i);
+                toast(`Removed enrollment (${result.remaining} remaining)`);
+                if (result.remaining === 0) {
+                  await fetchSpeakers();
+                  switchView('speakers');
+                } else {
+                  showSpeakerDetail(name);
+                }
+              } catch (err) {
+                toast('Remove failed: ' + err.message);
+              }
+            }
+          }, 'Remove')
+        );
+        embCard.appendChild(row);
+      }
+      container.appendChild(embCard);
+    }
   } catch (e) {
     container.appendChild(html('div', { className: 'empty' },
       html('h3', null, 'Failed to load speaker details'),
@@ -313,6 +366,10 @@ function renderMeetings() {
         className: 'btn btn-sm',
         onclick: () => openMeetingNote(mtg.name)
       }, 'View Note'),
+      html('button', {
+        className: 'btn btn-sm',
+        onclick: () => showReprocessDialog(mtg.name)
+      }, 'Reprocess'),
       html('span', { className: 'card-date' },
         mtg.has_speakers_json
           ? `${mtg.speaker_count} speaker(s)`
@@ -360,9 +417,21 @@ async function loadMeetingSpeakers(dirName, container) {
       // Duration
       row.appendChild(html('span', { className: 'speaker-duration' }, formatDuration(spk.duration_sec)));
 
-      // Identified badge or enroll form
+      // Confidence badge
+      if (spk.confidence > 0) {
+        const confText = (spk.confidence * 100).toFixed(0) + '%';
+        const confClass = spk.confidence >= 0.7 ? 'badge-success' : spk.confidence >= 0.5 ? 'badge-warning' : 'badge-danger';
+        row.appendChild(html('span', { className: 'badge ' + confClass }, confText));
+      }
+
+      // Identified: show relabel button; Unidentified: show enroll form
       if (spk.identified) {
         row.appendChild(html('span', { className: 'badge badge-success' }, 'identified'));
+        const relabelBtn = html('button', {
+          className: 'btn btn-sm',
+          onclick: () => showRelabelForm(row, relabelBtn, dirName, spk, container)
+        }, 'Relabel');
+        row.appendChild(relabelBtn);
       } else {
         const input = html('input', {
           className: 'enroll-input',
@@ -377,9 +446,12 @@ async function loadMeetingSpeakers(dirName, container) {
             try {
               enrollBtn.disabled = true;
               enrollBtn.textContent = '...';
-              await enrollSpeaker(name, dirName, spk.cluster_id);
-              toast(`Enrolled "${name}"`);
-              // Refresh both views
+              const result = await enrollSpeaker(name, dirName, spk.cluster_id);
+              let msg = `Enrolled "${name}"`;
+              if (result && result.warning) {
+                msg += ' — ' + result.warning;
+              }
+              toast(msg);
               await fetchSpeakers();
               await loadMeetingSpeakers(dirName, container);
             } catch (e) {
@@ -390,7 +462,6 @@ async function loadMeetingSpeakers(dirName, container) {
           }
         }, 'Enroll');
 
-        // Allow Enter key to submit
         input.addEventListener('keydown', (e) => {
           if (e.key === 'Enter') enrollBtn.click();
         });
@@ -404,6 +475,88 @@ async function loadMeetingSpeakers(dirName, container) {
   } catch (e) {
     container.textContent = 'Failed to load speakers.';
   }
+}
+
+function showReprocessDialog(dirName) {
+  const input = html('input', {
+    type: 'number', min: '0', max: '20', value: '',
+    placeholder: 'auto', style: 'width:80px'
+  });
+  const overlay = html('div', { className: 'overlay' },
+    html('div', { className: 'dialog' },
+      html('h3', null, 'Reprocess Meeting'),
+      html('p', null, `Re-diarize "${dirName}" with a speaker count hint.`),
+      html('div', { style: 'margin:12px 0' },
+        html('label', { style: 'font-weight:600' }, 'Number of speakers: '),
+        input
+      ),
+      html('div', { className: 'dialog-actions' },
+        html('button', { className: 'btn', onclick: () => overlay.remove() }, 'Cancel'),
+        html('button', {
+          className: 'btn btn-primary',
+          onclick: async () => {
+            const num = parseInt(input.value) || 0;
+            overlay.remove();
+            try {
+              const result = await reprocessMeeting(dirName, num);
+              toast(`Reprocessing started (job #${result.job_id})`);
+            } catch (e) {
+              toast('Reprocess failed: ' + e.message);
+            }
+          }
+        }, 'Reprocess')
+      )
+    )
+  );
+  document.body.appendChild(overlay);
+  input.focus();
+}
+
+function showRelabelForm(row, btn, dirName, spk, container) {
+  btn.style.display = 'none';
+  const input = html('input', {
+    className: 'enroll-input',
+    type: 'text',
+    value: spk.label
+  });
+  const updateChk = html('input', { type: 'checkbox', checked: 'checked' });
+  const chkLabel = html('label', { style: 'font-size:0.8rem;display:flex;align-items:center;gap:4px' },
+    updateChk, 'Update profiles'
+  );
+  const saveBtn = html('button', {
+    className: 'btn btn-primary btn-sm',
+    onclick: async () => {
+      const name = input.value.trim();
+      if (!name) { toast('Enter a name'); return; }
+      try {
+        saveBtn.disabled = true;
+        saveBtn.textContent = '...';
+        await relabelSpeaker(dirName, spk.cluster_id, name, updateChk.checked);
+        toast(`Relabeled to "${name}"`);
+        await fetchSpeakers();
+        await loadMeetingSpeakers(dirName, container);
+      } catch (e) {
+        toast('Relabel failed: ' + e.message);
+        saveBtn.disabled = false;
+        saveBtn.textContent = 'Save';
+      }
+    }
+  }, 'Save');
+  const cancelBtn = html('button', {
+    className: 'btn btn-sm',
+    onclick: () => {
+      input.remove(); chkLabel.remove(); saveBtn.remove(); cancelBtn.remove();
+      btn.style.display = '';
+    }
+  }, 'Cancel');
+  input.addEventListener('keydown', (e) => { if (e.key === 'Enter') saveBtn.click(); });
+
+  row.appendChild(input);
+  row.appendChild(chkLabel);
+  row.appendChild(saveBtn);
+  row.appendChild(cancelBtn);
+  input.focus();
+  input.select();
 }
 
 async function openMeetingNote(dirName) {
