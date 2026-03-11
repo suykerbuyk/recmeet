@@ -604,6 +604,106 @@ IdentifyResult identify_speakers(
     return result;
 }
 
+std::vector<MeetingSpeaker> re_identify_meeting(
+    const std::vector<MeetingSpeaker>& speakers,
+    const std::vector<SpeakerProfile>& db,
+    float threshold) {
+
+    if (speakers.empty() || db.empty()) return {};
+
+    // Infer embedding dimension from first non-empty meeting embedding
+    int dim = 0;
+    for (const auto& s : speakers) {
+        if (!s.embedding.empty()) {
+            dim = static_cast<int>(s.embedding.size());
+            break;
+        }
+    }
+    if (dim == 0) return {};
+
+    // Create manager and register DB embeddings
+    const auto* mgr = SherpaOnnxCreateSpeakerEmbeddingManager(dim);
+    if (!mgr) return {};
+
+    for (const auto& profile : db) {
+        for (const auto& emb : profile.embeddings) {
+            if (static_cast<int>(emb.size()) == dim)
+                SherpaOnnxSpeakerEmbeddingManagerAdd(mgr, profile.name.c_str(), emb.data());
+        }
+    }
+
+    // Collect candidates: match each non-manual speaker against DB
+    struct Candidate {
+        size_t index;      // index into speakers
+        std::string name;
+        float score;
+    };
+    std::vector<Candidate> candidates;
+
+    for (size_t i = 0; i < speakers.size(); ++i) {
+        const auto& s = speakers[i];
+        // Skip manually corrected speakers
+        if (s.confidence == 1.0f) continue;
+        // Skip speakers with no/mismatched embedding
+        if (s.embedding.empty() || static_cast<int>(s.embedding.size()) != dim) continue;
+
+        const auto* best = SherpaOnnxSpeakerEmbeddingManagerGetBestMatches(
+            mgr, s.embedding.data(), threshold, 1);
+        if (best && best->count > 0 && best->matches[0].name) {
+            candidates.push_back({i, best->matches[0].name, best->matches[0].score});
+        }
+        if (best)
+            SherpaOnnxSpeakerEmbeddingManagerFreeBestMatches(best);
+    }
+
+    SherpaOnnxDestroySpeakerEmbeddingManager(mgr);
+
+    // Conflict resolution: sort by score descending, assign greedily
+    std::sort(candidates.begin(), candidates.end(),
+              [](const Candidate& a, const Candidate& b) { return a.score > b.score; });
+
+    std::map<std::string, size_t> assigned_names;  // name -> speaker index
+    std::map<size_t, Candidate*> assigned_speakers; // speaker index -> candidate
+
+    for (auto& c : candidates) {
+        if (assigned_names.count(c.name)) continue;
+        assigned_names[c.name] = c.index;
+        assigned_speakers[c.index] = &c;
+    }
+
+    // Build updated list and check for changes
+    auto updated = speakers;
+    bool changed = false;
+
+    for (size_t i = 0; i < updated.size(); ++i) {
+        auto& s = updated[i];
+        if (s.confidence == 1.0f) continue;  // manual — preserve
+        if (s.embedding.empty() || static_cast<int>(s.embedding.size()) != dim) continue;
+
+        auto it = assigned_speakers.find(i);
+        if (it != assigned_speakers.end()) {
+            // Matched a profile
+            if (s.label != it->second->name || !s.identified ||
+                s.confidence != it->second->score) {
+                s.label = it->second->name;
+                s.identified = true;
+                s.confidence = it->second->score;
+                changed = true;
+            }
+        } else {
+            // No match — reset if was previously identified
+            if (s.identified) {
+                s.label = format_speaker(s.cluster_id);
+                s.identified = false;
+                s.confidence = 0.0f;
+                changed = true;
+            }
+        }
+    }
+
+    return changed ? updated : std::vector<MeetingSpeaker>{};
+}
+
 #endif // RECMEET_USE_SHERPA
 
 } // namespace recmeet

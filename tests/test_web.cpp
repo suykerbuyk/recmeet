@@ -388,6 +388,42 @@ struct TestServer {
 #endif
         });
 
+        // Batch re-identify all meetings against current speaker DB
+        server.Post("/api/speakers/batch-reidentify", [this](const httplib::Request&, httplib::Response& res) {
+#if RECMEET_USE_SHERPA
+            std::lock_guard<std::mutex> lock(speaker_mu);
+            auto db = load_speaker_db(speaker_db_dir);
+            if (db.empty()) {
+                res.set_content(R"({"ok":true,"meetings_updated":0,"meetings_scanned":0})",
+                                "application/json");
+                return;
+            }
+
+            int scanned = 0, updated = 0;
+            if (fs::is_directory(output_dir)) {
+                for (const auto& entry : fs::directory_iterator(output_dir)) {
+                    if (!entry.is_directory()) continue;
+                    if (!fs::exists(entry.path() / "speakers.json")) continue;
+                    auto spks = load_meeting_speakers(entry.path());
+                    if (spks.empty()) continue;
+                    ++scanned;
+                    auto result = re_identify_meeting(spks, db);
+                    if (!result.empty()) {
+                        save_meeting_speakers(entry.path(), result);
+                        ++updated;
+                    }
+                }
+            }
+
+            res.set_content(R"({"ok":true,"meetings_updated":)" + std::to_string(updated) +
+                            R"(,"meetings_scanned":)" + std::to_string(scanned) + "}",
+                            "application/json");
+#else
+            res.status = 501;
+            res.set_content(R"({"error":"batch re-identify requires sherpa-onnx"})", "application/json");
+#endif
+        });
+
         // Static file serving
         if (!web_root.empty() && fs::is_directory(web_root)) {
             server.set_mount_point("/", web_root.string());
@@ -1266,6 +1302,168 @@ TEST_CASE("web: relabel then list shows updated speaker", "[web][integration]") 
 
     fs::remove_all(tmp);
 }
+
+// ---------------------------------------------------------------------------
+// Batch re-identify endpoint tests
+// ---------------------------------------------------------------------------
+
+TEST_CASE("web: POST batch-reidentify updates meetings after profile change", "[web]") {
+    auto tmp = fs::temp_directory_path() / "recmeet_test_web_batch_reid";
+    fs::remove_all(tmp);
+    fs::create_directories(tmp / "speakers");
+
+    // Create two meetings with speakers.json
+    auto mtg1 = tmp / "meetings" / "2026-03-08_10-00";
+    auto mtg2 = tmp / "meetings" / "2026-03-09_14-00";
+    fs::create_directories(mtg1);
+    fs::create_directories(mtg2);
+    std::ofstream(mtg1 / "audio.wav") << "RIFF";
+    std::ofstream(mtg2 / "audio.wav") << "RIFF";
+
+    std::vector<float> alice_emb = {1.0f, 0.0f, 0.0f};
+    std::vector<float> other_emb = {0.0f, 0.0f, 1.0f};
+
+    // Meeting 1: unidentified speaker with Alice's embedding
+    std::vector<MeetingSpeaker> spks1 = {
+        {0, "Speaker_01", false, alice_emb, 10.0f, 0.0f},
+    };
+    save_meeting_speakers(mtg1, spks1);
+
+    // Meeting 2: different embedding, won't match
+    std::vector<MeetingSpeaker> spks2 = {
+        {0, "Speaker_01", false, other_emb, 10.0f, 0.0f},
+    };
+    save_meeting_speakers(mtg2, spks2);
+
+    // Enroll Alice
+    SpeakerProfile alice;
+    alice.name = "Alice";
+    alice.created = alice.updated = "2026-01-01T00:00:00Z";
+    alice.embeddings = {alice_emb};
+    save_speaker(tmp / "speakers", alice);
+
+    TestServer srv;
+    srv.speaker_db_dir = tmp / "speakers";
+    srv.output_dir = tmp / "meetings";
+    srv.start();
+
+    auto cli = srv.client();
+    auto res = cli.Post("/api/speakers/batch-reidentify", "", "application/json");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(res->body.find("\"ok\":true") != std::string::npos);
+    CHECK(res->body.find("\"meetings_scanned\":2") != std::string::npos);
+    CHECK(res->body.find("\"meetings_updated\":1") != std::string::npos);
+
+    // Verify meeting 1 was updated
+    auto loaded1 = load_meeting_speakers(mtg1);
+    REQUIRE(loaded1.size() == 1);
+    CHECK(loaded1[0].label == "Alice");
+    CHECK(loaded1[0].identified == true);
+
+    // Verify meeting 2 was not changed
+    auto loaded2 = load_meeting_speakers(mtg2);
+    REQUIRE(loaded2.size() == 1);
+    CHECK(loaded2[0].label == "Speaker_01");
+    CHECK(loaded2[0].identified == false);
+
+    fs::remove_all(tmp);
+}
+
+TEST_CASE("web: POST batch-reidentify empty DB returns 0 updated", "[web]") {
+    auto tmp = fs::temp_directory_path() / "recmeet_test_web_batch_reid_nodb";
+    fs::remove_all(tmp);
+    fs::create_directories(tmp / "speakers");
+    fs::create_directories(tmp / "meetings");
+
+    TestServer srv;
+    srv.speaker_db_dir = tmp / "speakers";
+    srv.output_dir = tmp / "meetings";
+    srv.start();
+
+    auto cli = srv.client();
+    auto res = cli.Post("/api/speakers/batch-reidentify", "", "application/json");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(res->body.find("\"meetings_updated\":0") != std::string::npos);
+    CHECK(res->body.find("\"meetings_scanned\":0") != std::string::npos);
+
+    fs::remove_all(tmp);
+}
+
+TEST_CASE("web: POST batch-reidentify no meetings returns 0 scanned", "[web]") {
+    auto tmp = fs::temp_directory_path() / "recmeet_test_web_batch_reid_nomtg";
+    fs::remove_all(tmp);
+    fs::create_directories(tmp / "speakers");
+    fs::create_directories(tmp / "meetings");
+
+    SpeakerProfile p;
+    p.name = "Alice";
+    p.created = p.updated = "2026-01-01T00:00:00Z";
+    p.embeddings = {{1.0f, 0.0f, 0.0f}};
+    save_speaker(tmp / "speakers", p);
+
+    TestServer srv;
+    srv.speaker_db_dir = tmp / "speakers";
+    srv.output_dir = tmp / "meetings";
+    srv.start();
+
+    auto cli = srv.client();
+    auto res = cli.Post("/api/speakers/batch-reidentify", "", "application/json");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(res->body.find("\"meetings_scanned\":0") != std::string::npos);
+
+    fs::remove_all(tmp);
+}
+
+TEST_CASE("web: POST batch-reidentify preserves manual labels", "[web]") {
+    auto tmp = fs::temp_directory_path() / "recmeet_test_web_batch_reid_manual";
+    fs::remove_all(tmp);
+    fs::create_directories(tmp / "speakers");
+    auto mtg = tmp / "meetings" / "2026-03-10_10-00";
+    fs::create_directories(mtg);
+    std::ofstream(mtg / "audio.wav") << "RIFF";
+
+    std::vector<float> emb = {1.0f, 0.0f, 0.0f};
+
+    // Speaker was manually labeled "Boss" with confidence 1.0
+    std::vector<MeetingSpeaker> spks = {
+        {0, "Boss", true, emb, 10.0f, 1.0f},
+    };
+    save_meeting_speakers(mtg, spks);
+
+    // DB has a different name for the same embedding
+    SpeakerProfile alice;
+    alice.name = "Alice";
+    alice.created = alice.updated = "2026-01-01T00:00:00Z";
+    alice.embeddings = {emb};
+    save_speaker(tmp / "speakers", alice);
+
+    TestServer srv;
+    srv.speaker_db_dir = tmp / "speakers";
+    srv.output_dir = tmp / "meetings";
+    srv.start();
+
+    auto cli = srv.client();
+    auto res = cli.Post("/api/speakers/batch-reidentify", "", "application/json");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    // No changes since the label is manual
+    CHECK(res->body.find("\"meetings_updated\":0") != std::string::npos);
+
+    // Verify manual label preserved
+    auto loaded = load_meeting_speakers(mtg);
+    REQUIRE(loaded.size() == 1);
+    CHECK(loaded[0].label == "Boss");
+    CHECK(loaded[0].confidence == 1.0f);
+
+    fs::remove_all(tmp);
+}
+
+// ---------------------------------------------------------------------------
+// Integration: relabel + re-enroll workflow
+// ---------------------------------------------------------------------------
 
 TEST_CASE("web: relabel moves embedding from old to new profile", "[web][integration]") {
     auto tmp = fs::temp_directory_path() / "recmeet_test_web_relabel_move";

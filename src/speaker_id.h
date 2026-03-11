@@ -86,6 +86,14 @@ IdentifyResult identify_speakers(
     const fs::path& model_path,
     float threshold = 0.6f,
     int threads = 0);
+
+/// Re-identify meeting speakers against current DB using saved embeddings.
+/// Speakers with confidence == 1.0 (manually corrected) are preserved.
+/// Returns updated speaker list if anything changed, empty if unchanged.
+std::vector<MeetingSpeaker> re_identify_meeting(
+    const std::vector<MeetingSpeaker>& speakers,
+    const std::vector<SpeakerProfile>& db,
+    float threshold = 0.6f);
 #endif
 
 /// Default speaker database directory.

@@ -544,6 +544,44 @@ int main(int argc, char* argv[]) {
         }
     });
 
+    // Batch re-identify all meetings against current speaker DB
+    server.Post("/api/speakers/batch-reidentify", [&](const httplib::Request&, httplib::Response& res) {
+#if RECMEET_USE_SHERPA
+        std::lock_guard<std::mutex> lock(speaker_mu);
+        auto db = load_speaker_db(speaker_db_dir);
+        if (db.empty()) {
+            res.set_content(R"({"ok":true,"meetings_updated":0,"meetings_scanned":0})",
+                            "application/json");
+            return;
+        }
+
+        auto meetings = discover_meetings(output_dir);
+        int scanned = 0, updated = 0;
+
+        for (const auto& mtg : meetings) {
+            if (!mtg.has_speakers_json) continue;
+            auto meeting_path = output_dir / mtg.name;
+            auto spks = load_meeting_speakers(meeting_path);
+            if (spks.empty()) continue;
+            ++scanned;
+
+            auto result = re_identify_meeting(spks, db);
+            if (!result.empty()) {
+                save_meeting_speakers(meeting_path, result);
+                ++updated;
+            }
+        }
+
+        res.set_content(R"({"ok":true,"meetings_updated":)" + std::to_string(updated) +
+                        R"(,"meetings_scanned":)" + std::to_string(scanned) + "}",
+                        "application/json");
+#else
+        res.status = 501;
+        res.set_content(json_error("batch re-identify requires sherpa-onnx support"),
+                        "application/json");
+#endif
+    });
+
     // --- Meeting endpoints ---
 
     server.Get("/api/meetings", [&](const httplib::Request&, httplib::Response& res) {

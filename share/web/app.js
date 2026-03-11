@@ -111,6 +111,10 @@ async function reprocessMeeting(meetingDir, numSpeakers) {
   });
 }
 
+async function batchReidentify() {
+  return await api('POST', '/api/speakers/batch-reidentify');
+}
+
 // ---------------------------------------------------------------------------
 // Toast
 // ---------------------------------------------------------------------------
@@ -157,6 +161,8 @@ function renderSpeakers() {
     html('h2', null, 'Enrolled Speakers'),
     html('div', null,
       html('button', { className: 'btn', onclick: refreshSpeakers }, 'Refresh'),
+      document.createTextNode(' '),
+      html('button', { className: 'btn', onclick: handleBatchReidentify }, 'Batch Re-identify'),
       document.createTextNode(' '),
       html('button', { className: 'btn btn-danger', onclick: handleResetAll }, 'Reset All')
     )
@@ -236,6 +242,22 @@ async function handleResetAll() {
     await refreshSpeakers();
   } catch (e) {
     toast('Reset failed: ' + e.message);
+  }
+}
+
+async function handleBatchReidentify() {
+  const ok = await confirm('Batch Re-identify',
+    'Re-identify speakers in all past meetings using the current speaker database. Manually corrected labels will be preserved.');
+  if (!ok) return;
+  try {
+    const result = await batchReidentify();
+    toast(`Updated ${result.meetings_updated} of ${result.meetings_scanned} meeting(s)`);
+    // Invalidate all cached meeting speakers
+    for (const key of Object.keys(meetingSpeakerCache)) {
+      delete meetingSpeakerCache[key];
+    }
+  } catch (e) {
+    toast('Batch re-identify failed: ' + e.message);
   }
 }
 

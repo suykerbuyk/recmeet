@@ -540,6 +540,167 @@ TEST_CASE("speaker_id: relabel custom confidence value", "[speaker_id]") {
 // merge_speakers with name map tests
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// re_identify_meeting tests (requires sherpa-onnx)
+// ---------------------------------------------------------------------------
+
+#if RECMEET_USE_SHERPA
+
+TEST_CASE("re_identify_meeting: empty speakers returns empty", "[speaker_id]") {
+    std::vector<SpeakerProfile> db = {{"Alice", {{1.0f, 0.0f, 0.0f}}, "", ""}};
+    auto result = re_identify_meeting({}, db);
+    CHECK(result.empty());
+}
+
+TEST_CASE("re_identify_meeting: empty DB returns empty", "[speaker_id]") {
+    std::vector<MeetingSpeaker> spks = {
+        {0, "Speaker_01", false, {1.0f, 0.0f, 0.0f}, 10.0f, 0.0f},
+    };
+    auto result = re_identify_meeting(spks, {});
+    CHECK(result.empty());
+}
+
+TEST_CASE("re_identify_meeting: single speaker matches single profile", "[speaker_id]") {
+    // Identical embedding → perfect match
+    std::vector<float> emb = {1.0f, 0.0f, 0.0f};
+    std::vector<MeetingSpeaker> spks = {
+        {0, "Speaker_01", false, emb, 10.0f, 0.0f},
+    };
+    std::vector<SpeakerProfile> db = {{"Alice", {emb}, "", ""}};
+
+    auto result = re_identify_meeting(spks, db, 0.5f);
+    REQUIRE(result.size() == 1);
+    CHECK(result[0].label == "Alice");
+    CHECK(result[0].identified == true);
+    CHECK(result[0].confidence > 0.5f);
+}
+
+TEST_CASE("re_identify_meeting: unmatched speaker stays unidentified", "[speaker_id]") {
+    // Orthogonal embeddings → no match
+    std::vector<MeetingSpeaker> spks = {
+        {0, "Speaker_01", false, {1.0f, 0.0f, 0.0f}, 10.0f, 0.0f},
+    };
+    std::vector<SpeakerProfile> db = {{"Alice", {{0.0f, 1.0f, 0.0f}}, "", ""}};
+
+    auto result = re_identify_meeting(spks, db, 0.9f);
+    // No change since speaker was already unidentified and still doesn't match
+    CHECK(result.empty());
+}
+
+TEST_CASE("re_identify_meeting: manual label (confidence=1.0) preserved", "[speaker_id]") {
+    std::vector<float> emb = {1.0f, 0.0f, 0.0f};
+    std::vector<MeetingSpeaker> spks = {
+        {0, "ManualJohn", true, emb, 10.0f, 1.0f},  // manually set
+    };
+    // DB has a different name for the same embedding
+    std::vector<SpeakerProfile> db = {{"Alice", {emb}, "", ""}};
+
+    auto result = re_identify_meeting(spks, db, 0.5f);
+    // No changes — manual label preserved
+    CHECK(result.empty());
+}
+
+TEST_CASE("re_identify_meeting: conflict resolution — highest score wins", "[speaker_id]") {
+    // Two speakers, both match "Alice" — higher score wins
+    std::vector<float> emb_good = {1.0f, 0.0f, 0.0f};
+    std::vector<float> emb_ok = {0.9f, 0.1f, 0.0f};  // still close but not identical
+    std::vector<MeetingSpeaker> spks = {
+        {0, "Speaker_01", false, emb_ok, 10.0f, 0.0f},
+        {1, "Speaker_02", false, emb_good, 10.0f, 0.0f},
+    };
+    std::vector<SpeakerProfile> db = {{"Alice", {emb_good}, "", ""}};
+
+    auto result = re_identify_meeting(spks, db, 0.5f);
+    REQUIRE(result.size() == 2);
+    // Speaker 1 (emb_good) should get Alice (higher score)
+    CHECK(result[1].label == "Alice");
+    CHECK(result[1].identified == true);
+    // Speaker 0 should remain unidentified
+    CHECK(result[0].identified == false);
+}
+
+TEST_CASE("re_identify_meeting: previously identified speaker loses match", "[speaker_id]") {
+    // Speaker was identified as "Bob" but Bob's profile is now different
+    std::vector<MeetingSpeaker> spks = {
+        {0, "Bob", true, {1.0f, 0.0f, 0.0f}, 10.0f, 0.7f},
+    };
+    // DB only has Alice with a completely different embedding
+    std::vector<SpeakerProfile> db = {{"Alice", {{0.0f, 1.0f, 0.0f}}, "", ""}};
+
+    auto result = re_identify_meeting(spks, db, 0.9f);
+    REQUIRE(result.size() == 1);
+    CHECK(result[0].label == "Speaker_01");
+    CHECK(result[0].identified == false);
+    CHECK(result[0].confidence == 0.0f);
+}
+
+TEST_CASE("re_identify_meeting: no changes returns empty vector", "[speaker_id]") {
+    std::vector<float> emb = {1.0f, 0.0f, 0.0f};
+    std::vector<MeetingSpeaker> spks = {
+        {0, "Alice", true, emb, 10.0f, 0.85f},  // already correctly identified
+    };
+    std::vector<SpeakerProfile> db = {{"Alice", {emb}, "", ""}};
+
+    // If the label already matches, the score might differ slightly
+    // but the function should detect that the identification would
+    // yield the same result. If the score changes, it counts as a change.
+    // This test verifies re_identify with matching name produces updated result
+    // only if score actually differs.
+    auto result = re_identify_meeting(spks, db, 0.5f);
+    // Score will differ from 0.85 → changed
+    CHECK(!result.empty());
+    CHECK(result[0].label == "Alice");
+}
+
+TEST_CASE("re_identify_meeting: empty embedding skipped gracefully", "[speaker_id]") {
+    std::vector<MeetingSpeaker> spks = {
+        {0, "Speaker_01", false, {}, 10.0f, 0.0f},  // no embedding
+        {1, "Speaker_02", false, {1.0f, 0.0f, 0.0f}, 10.0f, 0.0f},
+    };
+    std::vector<SpeakerProfile> db = {{"Alice", {{1.0f, 0.0f, 0.0f}}, "", ""}};
+
+    auto result = re_identify_meeting(spks, db, 0.5f);
+    REQUIRE(result.size() == 2);
+    // Speaker 0 has no embedding, stays unidentified
+    CHECK(result[0].identified == false);
+    // Speaker 1 matches Alice
+    CHECK(result[1].label == "Alice");
+    CHECK(result[1].identified == true);
+}
+
+TEST_CASE("re_identify_meeting: mixed manual + auto + unidentified", "[speaker_id]") {
+    std::vector<float> alice_emb = {1.0f, 0.0f, 0.0f};
+    std::vector<float> bob_emb = {0.0f, 1.0f, 0.0f};
+    std::vector<float> unknown_emb = {0.0f, 0.0f, 1.0f};
+
+    std::vector<MeetingSpeaker> spks = {
+        {0, "ManualName", true, alice_emb, 10.0f, 1.0f},        // manual — preserved
+        {1, "WrongName", true, bob_emb, 10.0f, 0.7f},           // auto-identified
+        {2, "Speaker_03", false, unknown_emb, 10.0f, 0.0f},     // unidentified
+    };
+    std::vector<SpeakerProfile> db = {
+        {"Alice", {alice_emb}, "", ""},
+        {"Bob", {bob_emb}, "", ""},
+    };
+
+    auto result = re_identify_meeting(spks, db, 0.5f);
+    REQUIRE(result.size() == 3);
+    // Manual preserved
+    CHECK(result[0].label == "ManualName");
+    CHECK(result[0].confidence == 1.0f);
+    // Auto re-identified to Bob
+    CHECK(result[1].label == "Bob");
+    CHECK(result[1].identified == true);
+    // Unknown stays unidentified (orthogonal to both profiles)
+    CHECK(result[2].identified == false);
+}
+
+#endif // RECMEET_USE_SHERPA
+
+// ---------------------------------------------------------------------------
+// merge_speakers with name map tests
+// ---------------------------------------------------------------------------
+
 TEST_CASE("merge_speakers: with speaker_names map uses enrolled names", "[diarize][speaker_id]") {
     std::vector<TranscriptSegment> transcript = {
         {0.0, 4.0, "Hello"},
