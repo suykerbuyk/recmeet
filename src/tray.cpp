@@ -425,11 +425,11 @@ static void on_record(GtkMenuItem*, gpointer) {
 static void on_stop(GtkMenuItem*, gpointer) {
     if (!g_tray.recording && !g_tray.postprocessing) return;
 
-    // Send stop with appropriate target
+    // Send stop with appropriate target.
+    // When both recording and postprocessing are active (concurrent jobs),
+    // only stop the recording — postprocessing belongs to a previous job.
     JsonMap params;
-    if (g_tray.recording && g_tray.postprocessing)
-        params["target"] = std::string("all");
-    else if (g_tray.recording)
+    if (g_tray.recording)
         params["target"] = std::string("recording");
     else
         params["target"] = std::string("postprocessing");
