@@ -5,8 +5,6 @@
 #include "log.h"
 
 #include <sndfile.h>
-#include <cstdio>
-#include <cmath>
 
 namespace recmeet {
 
@@ -118,17 +116,9 @@ fs::path validate_reprocess_input(const fs::path& input) {
     if (!fs::is_regular_file(input))
         throw RecmeetError("Not a file or directory: " + input.string());
 
-    // Try opening with libsndfile
-    SF_INFO info = {};
-    SNDFILE* sf = sf_open(input.c_str(), SFM_READ, &info);
-    if (sf) {
-        sf_close(sf);
-        return input;
-    }
-
-    // sf_open failed — provide format-specific guidance
+    // Check extension for known unsupported formats before sf_open,
+    // because libsndfile/mpg123 emits noisy warnings on stderr for these.
     std::string ext = input.extension().string();
-    // Lowercase the extension for comparison
     for (auto& c : ext) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
 
     if (ext == ".mp3" || ext == ".m4a" || ext == ".aac" ||
@@ -138,6 +128,14 @@ fs::path validate_reprocess_input(const fs::path& input) {
             "Unsupported audio format: " + ext.substr(1) + "\n"
             "Convert with: ffmpeg -i " + input.filename().string() +
             " -ar 16000 -ac 1 " + stem + ".wav");
+    }
+
+    // Try opening with libsndfile
+    SF_INFO info = {};
+    SNDFILE* sf = sf_open(input.c_str(), SFM_READ, &info);
+    if (sf) {
+        sf_close(sf);
+        return input;
     }
 
     throw RecmeetError(
