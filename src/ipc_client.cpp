@@ -157,6 +157,7 @@ bool IpcClient::read_and_dispatch(int timeout_ms) {
         if (!line.empty()) process_line(line);
     }
     if (pending_done_) return true;
+    if (fd_ < 0) return false;  // callback closed connection
 
     struct pollfd pfd;
     pfd.fd = fd_;

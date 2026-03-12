@@ -112,6 +112,53 @@ TEST_CASE("IpcClient: call() without connect returns error", "[ipc_client]") {
     CHECK(err.message == "Not connected");
 }
 
+TEST_CASE("IpcClient: read_events exits when callback closes connection", "[ipc_client]") {
+    unlink(TEST_SOCK);
+
+    IpcServer server(TEST_SOCK);
+    server.on("trigger", [&server](const IpcRequest&, IpcResponse& resp, IpcError&) {
+        resp.result["ok"] = true;
+        // Schedule the error event after the response is sent
+        std::thread([&server]() {
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            server.post([&server]() {
+                IpcEvent ev;
+                ev.event = "state.changed";
+                ev.data["error"] = std::string("Transcription produced no text.");
+                server.broadcast(ev);
+            });
+        }).detach();
+        return true;
+    });
+    REQUIRE(server.start());
+    std::thread srv([&server]() { server.run(); });
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+    IpcClient client(TEST_SOCK);
+    REQUIRE(client.connect());
+
+    bool got_error = false;
+    client.set_event_callback([&client, &got_error](const IpcEvent& ev) {
+        if (ev.event == "state.changed") {
+            got_error = true;
+            client.close_connection();  // simulate main.cpp error handler
+        }
+    });
+
+    IpcResponse resp;
+    IpcError err;
+    REQUIRE(client.call("trigger", resp, err));
+
+    // read_events must return promptly (not hang) even though until_event
+    // "job.complete" is never sent — because the callback closed the fd.
+    bool finished = client.read_events("job.complete", 3000);
+    CHECK_FALSE(finished);
+    CHECK(got_error);
+
+    server.stop();
+    srv.join();
+}
+
 TEST_CASE("daemon_running: returns false when no daemon", "[ipc_client]") {
     unlink(TEST_SOCK);
     CHECK_FALSE(daemon_running(TEST_SOCK));
