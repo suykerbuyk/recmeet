@@ -170,6 +170,8 @@ Any GGUF-format model compatible with llama.cpp will work. Download quantized ve
 
 **Constraints**: CPU-only inference, 32K token context window, 4096 token generation budget. Long transcripts are automatically truncated to fit (a log warning is emitted when this happens).
 
+**Memory**: By default, recmeet disables mmap for LLM model loading (`--no-mmap`). This reads the model into heap memory instead of memory-mapping the file, which avoids swap thrashing that can freeze your system during summarization — even when free RAM is available. If you have plenty of RAM and want faster model loading, use `--mmap` or set `llm_mmap: true` in your config.
+
 ### Decision logic
 
 1. If `--no-summary` is set: skip summarization entirely
@@ -242,6 +244,8 @@ Options:
   --device-pattern RE  Regex for device auto-detection
   --context-file PATH  Pre-meeting notes to include in summary prompt
   --llm-model PATH     Local GGUF model for summarization (instead of API)
+  --mmap               Use mmap for LLM model loading (faster load, may cause swap)
+  --no-mmap            Disable mmap for LLM model loading (default, avoids swap thrashing)
   --no-diarize         Disable speaker diarization
   --num-speakers N     Number of speakers (0 = auto-detect, default: 0)
   --cluster-threshold F  Clustering distance threshold (default: 1.18, higher = fewer speakers)
@@ -320,6 +324,7 @@ summary:
   provider: xai
   model: grok-3
   # llm_model: "~/.local/share/recmeet/models/llama/Qwen2.5-7B-Instruct-Q4_K_M.gguf"  # local LLM (overrides provider)
+  # llm_mmap: false     # true = mmap model loading (faster load, may cause swap thrashing)
 
 # Per-provider API keys (env vars always override these)
 # api_keys:

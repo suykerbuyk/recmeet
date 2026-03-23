@@ -52,6 +52,8 @@ CliResult parse_cli(int argc, char* argv[]) {
         {"speaker-threshold", required_argument, nullptr, 1014},
         {"speaker-db",     required_argument, nullptr, 1015},
         {"reset-speakers", no_argument,       nullptr, 1016},
+        {"mmap",           no_argument,       nullptr, 1017},
+        {"no-mmap",        no_argument,       nullptr, 1018},
         {"help",           no_argument,       nullptr, 'h'},
         {"version",        no_argument,       nullptr, 'v'},
         {nullptr, 0, nullptr, 0},
@@ -105,6 +107,8 @@ CliResult parse_cli(int argc, char* argv[]) {
             case 1014: result.cfg.speaker_threshold = std::atof(optarg); break;
             case 1015: result.cfg.speaker_db = optarg; break;
             case 1016: result.reset_speakers = true; break;
+            case 1017: result.cfg.llm_mmap = true; break;
+            case 1018: result.cfg.llm_mmap = false; break;
             case 'v': result.show_version = true; return result;
             case 'h': result.show_help = true; return result;
             default:  result.show_help = true; return result;

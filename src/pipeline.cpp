@@ -447,7 +447,7 @@ PipelineResult run_postprocessing(const Config& cfg, const PostprocessInput& inp
             notify("Summarizing...", "Local LLM");
             try {
                 fs::path llm_path = ensure_llama_model(cfg.llm_model);
-                summary_text = summarize_local(transcript_text, llm_path, context_text, threads);
+                summary_text = summarize_local(transcript_text, llm_path, context_text, threads, cfg.llm_mmap);
             } catch (const std::exception& e) {
                 log_warn("Local summary failed: %s", e.what());
             }

@@ -32,6 +32,7 @@ TEST_CASE("save_config + load_config round-trip", "[config]") {
     cfg.api_model = "gpt-4";
     cfg.no_summary = true;
     cfg.llm_model = "/path/to/model.gguf";
+    cfg.llm_mmap = true;
     cfg.cluster_threshold = 0.8f;
     cfg.threads = 12;
     cfg.log_level_str = "info";
@@ -60,6 +61,7 @@ TEST_CASE("save_config + load_config round-trip", "[config]") {
     CHECK(content.find("model: gpt-4") != std::string::npos);
     CHECK(content.find("disabled: true") != std::string::npos);
     CHECK(content.find("llm_model: \"/path/to/model.gguf\"") != std::string::npos);
+    CHECK(content.find("llm_mmap: true") != std::string::npos);
     CHECK(content.find("cluster_threshold: 0.8") != std::string::npos);
     CHECK(content.find("threads: 12") != std::string::npos);
     CHECK(content.find("level: info") != std::string::npos);
@@ -82,6 +84,7 @@ TEST_CASE("save_config + load_config round-trip", "[config]") {
     CHECK(loaded.api_model == "gpt-4");
     CHECK(loaded.no_summary == true);
     CHECK(loaded.llm_model == "/path/to/model.gguf");
+    CHECK(loaded.llm_mmap == true);
     CHECK(loaded.cluster_threshold == 0.8f);
     CHECK(loaded.threads == 12);
     CHECK(loaded.log_level_str == "info");
@@ -105,6 +108,7 @@ TEST_CASE("load_config: returns defaults when no file exists", "[config]") {
     CHECK(cfg.mic_only == false);
     CHECK(cfg.keep_sources == false);
     CHECK(cfg.no_summary == false);
+    CHECK(cfg.llm_mmap == false);
     CHECK(cfg.diarize == true);
     CHECK(cfg.num_speakers == 0);
     CHECK(cfg.cluster_threshold == 1.18f);

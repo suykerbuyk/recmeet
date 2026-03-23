@@ -52,6 +52,7 @@ struct Config {
 
     // Local LLM
     std::string llm_model; // path or name, empty = use HTTP API
+    bool llm_mmap = false;  // use mmap for model loading (default: off to avoid swap thrashing)
 
     // Diarization (on by default when built with RECMEET_USE_SHERPA)
     bool diarize = true;

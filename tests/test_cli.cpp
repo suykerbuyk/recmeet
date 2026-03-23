@@ -98,6 +98,21 @@ TEST_CASE("parse_cli: --llm-model sets llm_model", "[cli]") {
     CHECK(cli.cfg.llm_model == "/path/to/model.gguf");
 }
 
+TEST_CASE("parse_cli: --mmap enables llm_mmap", "[cli]") {
+    auto cli = run_cli({"recmeet", "--mmap"});
+    CHECK(cli.cfg.llm_mmap == true);
+}
+
+TEST_CASE("parse_cli: --no-mmap disables llm_mmap", "[cli]") {
+    auto cli = run_cli({"recmeet", "--no-mmap"});
+    CHECK(cli.cfg.llm_mmap == false);
+}
+
+TEST_CASE("parse_cli: llm_mmap defaults to false", "[cli]") {
+    auto cli = run_cli({"recmeet"});
+    CHECK(cli.cfg.llm_mmap == false);
+}
+
 TEST_CASE("parse_cli: --context-file sets context_file", "[cli]") {
     auto cli = run_cli({"recmeet", "--context-file", "/tmp/notes.md"});
     CHECK(cli.cfg.context_file == "/tmp/notes.md");

@@ -89,6 +89,8 @@ static void print_usage() {
         "  --device-pattern RE  Regex for device auto-detection\n"
         "  --context-file PATH  Pre-meeting notes to include in summary prompt\n"
         "  --llm-model PATH     Local GGUF model for summarization (instead of API)\n"
+        "  --mmap               Use mmap for LLM model loading (faster load, may cause swap)\n"
+        "  --no-mmap            Disable mmap for LLM model loading (default, avoids swap thrashing)\n"
         "  --no-diarize         Disable speaker diarization\n"
         "  --num-speakers N     Number of speakers (0 = auto-detect, default: 0)\n"
         "  --cluster-threshold F  Clustering distance threshold (default: 1.18, higher = fewer speakers)\n"

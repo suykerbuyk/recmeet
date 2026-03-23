@@ -188,12 +188,15 @@ std::string summarize_http(const std::string& transcript,
 std::string summarize_local(const std::string& transcript,
                              const fs::path& model_path,
                              const std::string& context,
-                             int threads) {
-    log_info("Loading LLM model: %s", model_path.filename().c_str());
+                             int threads,
+                             bool use_mmap) {
+    log_info("Loading LLM model: %s (mmap: %s)",
+             model_path.filename().c_str(), use_mmap ? "on" : "off");
 
     llama_backend_init();
 
     llama_model_params model_params = llama_model_default_params();
+    model_params.use_mmap = use_mmap;
     llama_model* model = llama_model_load_from_file(model_path.c_str(), model_params);
     if (!model) {
         llama_backend_free();

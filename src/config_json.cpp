@@ -30,6 +30,7 @@ JsonMap config_to_map(const Config& cfg) {
     m["api_model"]       = cfg.api_model;
     m["no_summary"]      = cfg.no_summary;
     m["llm_model"]       = cfg.llm_model;
+    m["llm_mmap"]        = cfg.llm_mmap;
 
     // Diarization
     m["diarize"]             = cfg.diarize;
@@ -126,6 +127,7 @@ Config config_from_map(const JsonMap& m) {
     str("api_model", cfg.api_model);
     b("no_summary", cfg.no_summary);
     str("llm_model", cfg.llm_model);
+    b("llm_mmap", cfg.llm_mmap);
 
     b("diarize", cfg.diarize);
     i("num_speakers", cfg.num_speakers);

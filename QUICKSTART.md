@@ -205,6 +205,7 @@ summary:
   provider: xai
   model: grok-3
   # disabled: true       # uncomment to skip summarization
+  # llm_mmap: false      # true = mmap model loading (faster load, may cause swap thrashing)
 
 # Per-provider API keys (env vars always override these)
 # api_keys:

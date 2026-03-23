@@ -21,6 +21,7 @@ static Config make_test_config() {
     cfg.api_model = "gpt-4";
     cfg.no_summary = true;
     cfg.llm_model = "/path/to/model.gguf";
+    cfg.llm_mmap = true;
     cfg.diarize = false;
     cfg.num_speakers = 3;
     cfg.cluster_threshold = 0.8f;
@@ -60,6 +61,7 @@ TEST_CASE("config_to_json + config_from_json round-trip", "[config_json]") {
     CHECK(loaded.api_model == original.api_model);
     CHECK(loaded.no_summary == original.no_summary);
     CHECK(loaded.llm_model == original.llm_model);
+    CHECK(loaded.llm_mmap == original.llm_mmap);
     CHECK(loaded.diarize == original.diarize);
     CHECK(loaded.num_speakers == original.num_speakers);
     CHECK_THAT(loaded.cluster_threshold,

@@ -154,6 +154,7 @@ Config load_config(const fs::path& config_path) {
     cfg.api_model = get_val(entries, "summary", "model", cfg.api_model);
     cfg.no_summary = get_bool(entries, "summary", "disabled", false);
     cfg.llm_model = get_val(entries, "summary", "llm_model", "");
+    cfg.llm_mmap = get_bool(entries, "summary", "llm_mmap", false);
 
     // Per-provider API keys
     for (size_t i = 0; i < NUM_PROVIDERS; ++i) {
@@ -258,6 +259,8 @@ void save_config(const Config& cfg, const fs::path& config_path) {
         out << "  disabled: true\n";
     if (!cfg.llm_model.empty())
         out << "  llm_model: \"" << cfg.llm_model << "\"\n";
+    if (cfg.llm_mmap)
+        out << "  llm_mmap: true\n";
 
     // Per-provider API keys (never write legacy api_key)
     {
