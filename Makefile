@@ -51,7 +51,7 @@ CMAKE_OPTS += -DRECMEET_BUILD_WEB=$(RECMEET_BUILD_WEB)
 endif
 
 # ── Targets ─────────────────────────────────────────────────────────
-.PHONY: build test integration benchmark install uninstall package-deb package-rpm package-arch clean help daemon-start daemon-stop daemon-status
+.PHONY: build test integration benchmark install uninstall package-deb package-rpm package-arch clean help daemon-start daemon-stop daemon-status go-build go-test go-coverage go-clean
 
 build:
 	cmake -B $(BUILD_DIR) -G Ninja $(CMAKE_OPTS)
@@ -139,7 +139,23 @@ daemon-stop:
 daemon-status:
 	@./$(BUILD_DIR)/recmeet --status
 
-clean:
+# ── Go tool targets ────────────────────────────────────────────────
+go-build:
+	cd tools && go build -o ../$(BUILD_DIR)/recmeet-mcp ./cmd/recmeet-mcp
+	cd tools && go build -o ../$(BUILD_DIR)/recmeet-agent ./cmd/recmeet-agent
+
+go-test:
+	cd tools && go test ./... -count=1
+
+go-coverage:
+	cd tools && go test ./... -coverprofile=coverage.out
+	cd tools && go tool cover -func=coverage.out
+
+go-clean:
+	rm -f $(BUILD_DIR)/recmeet-mcp $(BUILD_DIR)/recmeet-agent
+	rm -f tools/coverage.out
+
+clean: go-clean
 	rm -rf $(BUILD_DIR)
 	rm -rf dist/arch/src/ dist/arch/pkg/
 	rm -f dist/arch/*.zst
@@ -160,6 +176,10 @@ help:
 	@echo "  make package-deb   Build + create .deb package"
 	@echo "  make package-rpm   Build + create .rpm package"
 	@echo "  make package-arch  Build Arch package via makepkg"
+	@echo "  make go-build      Build Go tools (recmeet-mcp, recmeet-agent)"
+	@echo "  make go-test       Run Go tool tests"
+	@echo "  make go-coverage   Run Go tests with coverage report"
+	@echo "  make go-clean      Remove Go build artifacts"
 	@echo "  make clean         Remove build + packaging artifacts"
 	@echo "  make help          Show this message"
 	@echo ""

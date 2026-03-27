@@ -1,0 +1,41 @@
+# recmeet configuration
+
+audio:
+  device_pattern: "alsa_input"
+  mic_source: "alsa_input.pci-0000_00_1f.3.analog-stereo"
+  mic_only: true
+
+transcription:
+  model: small
+  language: en
+
+summary:
+  provider: anthropic
+  model: claude-sonnet-4-6
+  disabled: false
+  llm_model: "/path/to/model.gguf"
+
+api_keys:
+  anthropic: "sk-ant-test123"
+  openai: "sk-test456"
+
+diarization:
+  enabled: true
+  num_speakers: 2
+  cluster_threshold: 1.0
+
+speaker_id:
+  enabled: true
+  threshold: 0.7
+  database: "/tmp/speakers"
+
+output:
+  directory: "/home/test/meetings"
+
+notes:
+  domain: engineering
+  directory: "/home/test/notes"
+
+web:
+  port: 9090
+  bind: "0.0.0.0"

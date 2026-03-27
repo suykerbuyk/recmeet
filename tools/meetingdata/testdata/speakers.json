@@ -1,0 +1,20 @@
+{
+  "speakers": [
+    {
+      "cluster_id": 0,
+      "label": "Alice_Smith",
+      "identified": true,
+      "duration_sec": 234.5,
+      "confidence": 0.95,
+      "embedding": [0.1, 0.2, 0.3]
+    },
+    {
+      "cluster_id": 1,
+      "label": "Speaker_01",
+      "identified": false,
+      "duration_sec": 156.2,
+      "confidence": 0.0,
+      "embedding": [0.4, 0.5, 0.6]
+    }
+  ]
+}
