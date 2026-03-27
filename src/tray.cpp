@@ -14,6 +14,7 @@
 
 #include <libayatana-appindicator/app-indicator.h>
 #include <gtk/gtk.h>
+#include <glib-unix.h>
 
 #include <fcntl.h>
 #include <signal.h>
@@ -881,35 +882,25 @@ static void on_about(GtkMenuItem*, gpointer) {
     gtk_widget_destroy(dialog);
 }
 
-static void on_quit(GtkMenuItem*, gpointer) {
-    if ((g_tray.recording || g_tray.postprocessing) && g_tray.daemon_connected) {
-        IpcResponse resp;
-        IpcError err;
-        g_tray.ipc.call("record.stop", resp, err, 2000);
-    }
-    teardown_ipc_watch();
-    g_tray.ipc.close_connection();
-
-    // Terminate managed web server
-    if (g_tray.web_server_pid > 0) {
-        log_info("[tray] stopping recmeet-web (pid %d)", g_tray.web_server_pid);
-        kill(g_tray.web_server_pid, SIGTERM);
-        for (int i = 0; i < 10; ++i) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(50));
-            int status;
-            if (waitpid(g_tray.web_server_pid, &status, WNOHANG) != 0) {
-                g_tray.web_server_pid = -1;
-                break;
-            }
-        }
-        if (g_tray.web_server_pid > 0) {
-            log_warn("[tray] recmeet-web did not exit, sending SIGKILL");
-            kill(g_tray.web_server_pid, SIGKILL);
-            waitpid(g_tray.web_server_pid, nullptr, 0);
+static void stop_web_server() {
+    if (g_tray.web_server_pid <= 0) return;
+    log_info("[tray] stopping recmeet-web (pid %d)", g_tray.web_server_pid);
+    kill(g_tray.web_server_pid, SIGTERM);
+    for (int i = 0; i < 10; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        int status;
+        if (waitpid(g_tray.web_server_pid, &status, WNOHANG) != 0) {
             g_tray.web_server_pid = -1;
+            return;
         }
     }
+    log_warn("[tray] recmeet-web did not exit, sending SIGKILL");
+    kill(g_tray.web_server_pid, SIGKILL);
+    waitpid(g_tray.web_server_pid, nullptr, 0);
+    g_tray.web_server_pid = -1;
+}
 
+static void on_quit(GtkMenuItem*, gpointer) {
     gtk_main_quit();
 }
 
@@ -1372,11 +1363,30 @@ int main(int argc, char* argv[]) {
         sigaction(SIGCHLD, &sa, nullptr);
     }
 
+    // Handle SIGTERM/SIGINT gracefully via GLib main loop
+    g_unix_signal_add(SIGTERM, [](gpointer) -> gboolean {
+        gtk_main_quit();
+        return G_SOURCE_REMOVE;
+    }, nullptr);
+    g_unix_signal_add(SIGINT, [](gpointer) -> gboolean {
+        gtk_main_quit();
+        return G_SOURCE_REMOVE;
+    }, nullptr);
+
     log_info("recmeet-tray %s running (%zu mic(s), %zu monitor(s))",
             RECMEET_VERSION, g_tray.mics.size(), g_tray.monitors.size());
     gtk_main();
 
+    // Cleanup — runs whether exited via on_quit, SIGTERM, or SIGINT
+    if ((g_tray.recording || g_tray.postprocessing) && g_tray.daemon_connected) {
+        IpcResponse resp;
+        IpcError err;
+        g_tray.ipc.call("record.stop", resp, err, 2000);
+    }
     teardown_ipc_watch();
+    g_tray.ipc.close_connection();
+    stop_web_server();
+
     if (g_tray.reconnect_timer)
         g_source_remove(g_tray.reconnect_timer);
 
