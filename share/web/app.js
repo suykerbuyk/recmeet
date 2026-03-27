@@ -423,6 +423,16 @@ function renderMeetings() {
 async function loadMeetingSpeakers(dirName, container) {
   try {
     const spks = await fetchMeetingSpeakers(dirName);
+
+    // Preserve unsaved input values before rebuild
+    const drafts = {};
+    container.querySelectorAll('.speaker-row').forEach(row => {
+      const inp = row.querySelector('.enroll-input');
+      if (inp && inp.value.trim()) {
+        const cid = row.dataset.clusterId;
+        if (cid) drafts[cid] = inp.value;
+      }
+    });
     container.innerHTML = '';
 
     if (spks.length === 0) {
@@ -432,6 +442,7 @@ async function loadMeetingSpeakers(dirName, container) {
 
     for (const spk of spks) {
       const row = html('div', { className: 'speaker-row' });
+      row.dataset.clusterId = spk.cluster_id;
 
       // Label
       row.appendChild(html('span', { className: 'speaker-label' }, spk.label));
@@ -460,6 +471,7 @@ async function loadMeetingSpeakers(dirName, container) {
           type: 'text',
           placeholder: 'Name...'
         });
+        if (drafts[spk.cluster_id]) input.value = drafts[spk.cluster_id];
         const enrollBtn = html('button', {
           className: 'btn btn-primary btn-sm',
           onclick: async () => {

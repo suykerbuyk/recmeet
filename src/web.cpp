@@ -763,12 +763,12 @@ int main(int argc, char* argv[]) {
             }
 
             // Return job_id from daemon
-            std::string job_id_str = "0";
+            int64_t job_id = 0;
             auto jit = ipc_resp.result.find("job_id");
             if (jit != ipc_resp.result.end())
-                job_id_str = json_val_as_string(jit->second);
+                job_id = json_val_as_int(jit->second);
 
-            res.set_content(R"({"ok":true,"job_id":)" + job_id_str + "}", "application/json");
+            res.set_content(R"({"ok":true,"job_id":)" + std::to_string(job_id) + "}", "application/json");
         } catch (const std::exception& e) {
             res.status = 502;
             res.set_content(json_error(std::string("daemon error: ") + e.what()), "application/json");
