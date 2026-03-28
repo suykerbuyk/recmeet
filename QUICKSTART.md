@@ -35,7 +35,7 @@ cd recmeet
 make build
 ```
 
-This produces four binaries in `build/`:
+This produces four C++ binaries in `build/`:
 
 | Binary | Purpose |
 |--------|---------|
@@ -43,6 +43,17 @@ This produces four binaries in `build/`:
 | `recmeet-daemon` | Background daemon (owns pipeline logic) |
 | `recmeet-tray` | System tray applet (GTK3, daemon client) |
 | `recmeet_tests` | Test suite |
+
+Optionally, build the Go-based AI tools (requires Go 1.25+):
+
+```bash
+make go-build
+```
+
+| Binary | Purpose |
+|--------|---------|
+| `recmeet-mcp` | MCP server (exposes meeting data to AI tools) |
+| `recmeet-agent` | AI agent CLI (meeting prep + follow-up) |
 
 ## 3. First recording (standalone, no setup needed)
 
@@ -358,7 +369,90 @@ recmeet --speaker-threshold 0.7            # stricter matching
 recmeet --speaker-db /path/to/speakers/    # custom database location
 ```
 
-## 12. Common workflows
+## 12. MCP server (IDE integration)
+
+The MCP server lets AI tools (Claude Code, Claude Desktop, Cursor) query your meeting data directly.
+
+### Build
+
+```bash
+make go-build
+```
+
+### Configure your MCP client
+
+For Claude Code, add to `~/.claude.json`:
+
+```json
+{
+  "mcpServers": {
+    "recmeet": {
+      "command": "/path/to/build/recmeet-mcp"
+    }
+  }
+}
+```
+
+### Available tools
+
+| Tool | What it does |
+|------|-------------|
+| `search_meetings` | Search notes by keyword, date range, participants |
+| `get_meeting` | Full meeting details by directory name |
+| `list_action_items` | Action items filtered by status or assignee |
+| `get_speaker_profiles` | List enrolled speaker voiceprints |
+| `write_context_file` | Stage a context file for a future recording |
+
+Once configured, ask your AI tool: "What action items came out of last week's meetings?" or "Search my meetings about the auth migration."
+
+## 13. AI agent (meeting prep + follow-up)
+
+The agent CLI uses Claude to automate pre-meeting research and post-meeting follow-up.
+
+### Prerequisites
+
+```bash
+export ANTHROPIC_API_KEY=your-key-here    # required
+export BRAVE_API_KEY=your-key-here        # optional — enables web search
+make go-build
+```
+
+### Prepare for a meeting
+
+```bash
+# Basic prep — searches past meetings, checks open action items
+recmeet-agent prep "Weekly sprint planning"
+
+# With participants and agenda
+recmeet-agent prep "Q2 roadmap review" \
+    --participants "Alice,Bob" \
+    --agenda-url "https://docs.example.com/agenda"
+```
+
+The agent writes a Markdown briefing file. Use it as context for your recording:
+
+```bash
+recmeet --context-file path/to/briefing.md
+```
+
+### Follow up after a meeting
+
+```bash
+recmeet-agent follow-up meetings/2026-03-15_14-30/Meeting_2026-03-15_14-30_Sprint_Review.md \
+    --my-name "John"
+```
+
+The agent reads the meeting note, classifies action items by assignee, and drafts follow-up messages.
+
+### Common flags
+
+```bash
+--model string    # LLM model (default: claude-sonnet-4-6)
+--verbose         # Show tool calls and intermediate steps
+--dry-run         # Print prompts without calling the API
+```
+
+## 14. Common workflows
 
 ### Record with specific audio sources
 

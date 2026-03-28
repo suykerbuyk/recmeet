@@ -21,6 +21,8 @@ The result: full transcriptions with speaker labels, professionally structured s
 - **Outputs** timestamped transcripts, structured summaries, and meeting notes with YAML frontmatter (Obsidian-compatible)
 - **System tray applet** for point-and-click control from swaybar or any system tray
 - **Daemon architecture** — a background daemon owns all pipeline logic; the CLI and tray are thin IPC clients
+- **MCP server** for IDE integration — exposes meeting data to Claude Code, Claude Desktop, and other MCP-compatible tools
+- **AI agent CLI** for pre-meeting prep and post-meeting follow-up — searches past meetings, drafts briefings, and generates follow-up communications using Claude
 
 ## Quick start
 
@@ -364,12 +366,23 @@ make RECMEET_BUILD_TRAY=OFF RECMEET_USE_SHERPA=OFF
 # cmake -B build -G Ninja -DRECMEET_BUILD_TRAY=OFF -DRECMEET_USE_SHERPA=OFF
 ```
 
-## Testing
+### Go tools (MCP server + AI agent)
 
-314 unit tests, 1338 assertions across 23 modules, plus integration and benchmark suites.
+Requires Go 1.25+:
 
 ```bash
-make test                # unit tests (no hardware needed)
+make go-build            # builds recmeet-mcp + recmeet-agent into build/
+make go-test             # run Go tests
+make go-coverage         # test coverage report
+```
+
+## Testing
+
+318 C++ unit tests (1350 assertions) across 23 modules, plus integration, benchmark, and Go test suites.
+
+```bash
+make test                # C++ unit tests (no hardware needed)
+make go-test             # Go tests (93 tests across meetingdata, mcpserver, agent)
 make benchmark           # benchmark tests (needs whisper models + assets/)
 
 # Or run directly for more control:
@@ -443,7 +456,7 @@ From there, the project evolved through extensive iteration: doubling test cover
 
 ## Architecture
 
-Four binaries share a common static library. The daemon owns all pipeline logic (audio capture, transcription, diarization, summarization). The CLI and tray are thin IPC clients that communicate via a Unix domain socket using newline-delimited JSON.
+Four C++ binaries share a common static library. The daemon owns all pipeline logic (audio capture, transcription, diarization, summarization). The CLI and tray are thin IPC clients that communicate via a Unix domain socket using newline-delimited JSON. Two additional Go binaries provide AI-powered tooling.
 
 ```
 recmeet_core  (static library — 23 modules)
@@ -452,6 +465,11 @@ recmeet_core  (static library — 23 modules)
     +-- recmeet         (CLI — dual-mode: IPC client or standalone)
     +-- recmeet-tray    (system tray — IPC client, GTK3 + AppIndicator)
     +-- recmeet_tests   (Catch2 test suite)
+
+tools/  (Go module — github.com/syketech/recmeet-tools)
+    |
+    +-- recmeet-mcp    (MCP server — exposes meeting data to AI tools)
+    +-- recmeet-agent  (AI agent CLI — meeting prep + follow-up workflows)
 ```
 
 ### Daemon mode (recommended)
@@ -475,6 +493,120 @@ The CLI auto-detects a running daemon and operates as a client. Use `--no-daemon
 - **Events** (server push): `phase`, `state.changed`, `job.complete`, `model.downloading`
 
 See [BUILD.md](BUILD.md) for a detailed build system tutorial.
+
+## MCP server
+
+`recmeet-mcp` is a [Model Context Protocol](https://modelcontextprotocol.io/) server that exposes your meeting data to AI tools — Claude Code, Claude Desktop, Cursor, or any MCP-compatible client. It runs over stdio and reads the same `config.yaml` as the rest of recmeet.
+
+### Available tools
+
+| Tool | Description |
+|------|-------------|
+| `search_meetings` | Search meeting notes by keyword, date range, and participants |
+| `get_meeting` | Get full details for a specific meeting by directory name |
+| `list_action_items` | List action items across all meetings, filtered by status or assignee |
+| `get_speaker_profiles` | List enrolled speaker profiles from the voiceprint database |
+| `write_context_file` | Write a pre-meeting context file for use in future recordings |
+
+### Setup
+
+Build the MCP server:
+
+```bash
+make go-build    # builds recmeet-mcp + recmeet-agent into build/
+```
+
+Add to your MCP client configuration. For Claude Code (`~/.claude.json`):
+
+```json
+{
+  "mcpServers": {
+    "recmeet": {
+      "command": "/path/to/recmeet-mcp"
+    }
+  }
+}
+```
+
+For Claude Desktop (`claude_desktop_config.json`):
+
+```json
+{
+  "mcpServers": {
+    "recmeet": {
+      "command": "/path/to/recmeet-mcp",
+      "args": []
+    }
+  }
+}
+```
+
+Once configured, you can ask your AI tool things like:
+- "Search my meetings for discussions about the auth migration"
+- "What action items are assigned to me?"
+- "Show me the full notes from last Tuesday's standup"
+- "Write a context file for tomorrow's sprint planning"
+
+## AI agent
+
+`recmeet-agent` is an AI-powered CLI that uses Claude to automate meeting preparation and follow-up. It searches your past meetings, fetches web content, and generates structured briefings or follow-up drafts.
+
+### Prerequisites
+
+```bash
+export ANTHROPIC_API_KEY=your-key-here    # required
+export BRAVE_API_KEY=your-key-here        # optional, enables web search
+```
+
+### Meeting preparation
+
+Generate a briefing document before a meeting:
+
+```bash
+# Basic prep
+recmeet-agent prep "Weekly sprint planning"
+
+# With participant context and agenda
+recmeet-agent prep "Q2 roadmap review" \
+    --participants "Alice,Bob" \
+    --agenda-url "https://docs.example.com/q2-roadmap"
+
+# Custom output path
+recmeet-agent prep "1:1 with manager" --output prep-notes.md
+```
+
+The agent searches past meetings involving the participants, checks for open action items, optionally fetches and analyzes the agenda URL, and compiles everything into an organized Markdown briefing. Use the briefing as a `--context-file` when recording:
+
+```bash
+recmeet --context-file prep-notes.md
+```
+
+### Post-meeting follow-up
+
+Draft follow-up communications from meeting notes:
+
+```bash
+recmeet-agent follow-up meetings/2026-03-15_14-30/Meeting_2026-03-15_14-30_Sprint_Review.md \
+    --my-name "John"
+```
+
+The agent reads the meeting note, classifies action items by assignee and urgency, and drafts follow-up messages for each participant.
+
+### Agent CLI reference
+
+```
+Usage: recmeet-agent <command> [flags]
+
+Commands:
+  prep        Prepare context for an upcoming meeting
+  follow-up   Process meeting notes and draft follow-up communications
+
+Common flags:
+  --model string    LLM model (default: claude-sonnet-4-6)
+  --verbose         Show tool calls and intermediate steps
+  --dry-run         Print prompts without calling the API
+  --config string   Config file path (default: ~/.config/recmeet/config.yaml)
+```
 
 ## License
 
