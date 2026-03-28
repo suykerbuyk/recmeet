@@ -44,11 +44,7 @@ This produces four C++ binaries in `build/`:
 | `recmeet-tray` | System tray applet (GTK3, daemon client) |
 | `recmeet_tests` | Test suite |
 
-Optionally, build the Go-based AI tools (requires Go 1.25+):
-
-```bash
-make go-build
-```
+`make build` also builds the Go-based AI tools (requires Go 1.25+):
 
 | Binary | Purpose |
 |--------|---------|
@@ -376,7 +372,7 @@ The MCP server lets AI tools (Claude Code, Claude Desktop, Cursor) query your me
 ### Build
 
 ```bash
-make go-build
+make build
 ```
 
 ### Configure your MCP client
@@ -414,7 +410,7 @@ The agent CLI uses Claude to automate pre-meeting research and post-meeting foll
 ```bash
 export ANTHROPIC_API_KEY=your-key-here    # required
 export BRAVE_API_KEY=your-key-here        # optional — enables web search
-make go-build
+make build
 ```
 
 ### Prepare for a meeting

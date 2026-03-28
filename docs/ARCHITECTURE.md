@@ -43,7 +43,7 @@ graph TD
 
 ## Build System and Binary Topology
 
-CMake builds one static library (`recmeet_core`) from all shared sources, then links it into three C++ executables. Two additional Go binaries are built separately via `make go-build`.
+CMake builds one static library (`recmeet_core`) from all shared sources, then links it into three C++ executables. Two additional Go binaries are also built by `make build`.
 
 | Target | Language | Source | Extra deps | Feature-gated |
 |---|---|---|---|---|

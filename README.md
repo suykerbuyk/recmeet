@@ -368,12 +368,10 @@ make RECMEET_BUILD_TRAY=OFF RECMEET_USE_SHERPA=OFF
 
 ### Go tools (MCP server + AI agent)
 
-Requires Go 1.25+:
+`make build` also builds the Go tools (requires Go 1.25+). For coverage:
 
 ```bash
-make go-build            # builds recmeet-mcp + recmeet-agent into build/
-make go-test             # run Go tests
-make go-coverage         # test coverage report
+make coverage            # Go test coverage report
 ```
 
 ## Testing
@@ -381,8 +379,7 @@ make go-coverage         # test coverage report
 318 C++ unit tests (1350 assertions) across 23 modules, plus integration, benchmark, and Go test suites.
 
 ```bash
-make test                # C++ unit tests (no hardware needed)
-make go-test             # Go tests (93 tests across meetingdata, mcpserver, agent)
+make test                # C++ unit + Go tests (no hardware needed)
 make benchmark           # benchmark tests (needs whisper models + assets/)
 
 # Or run directly for more control:
@@ -513,7 +510,7 @@ See [BUILD.md](BUILD.md) for a detailed build system tutorial.
 Build the MCP server:
 
 ```bash
-make go-build    # builds recmeet-mcp + recmeet-agent into build/
+make build       # builds all binaries including recmeet-mcp + recmeet-agent
 ```
 
 Add to your MCP client configuration. For Claude Code (`~/.claude.json`):
