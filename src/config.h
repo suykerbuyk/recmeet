@@ -89,6 +89,7 @@ struct Config {
 
     // Context
     fs::path context_file;
+    std::string context_inline;  // Inline context from dialog or --context-text CLI
 
     // Reprocess
     fs::path reprocess_dir;

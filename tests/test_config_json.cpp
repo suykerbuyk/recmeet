@@ -36,6 +36,8 @@ static Config make_test_config() {
     cfg.log_dir = "/tmp/recmeet-test-logs";
     cfg.output_dir = "/tmp/meetings";
     cfg.note_dir = "/home/user/obsidian/Meetings";
+    cfg.context_file = "/tmp/context.txt";
+    cfg.context_inline = "Subject: Weekly standup\nParticipants: Alice, Bob";
     cfg.reprocess_dir = "/tmp/meetings/2026-03-06_11-58";
     cfg.note.domain = "engineering";
     return cfg;
@@ -82,6 +84,8 @@ TEST_CASE("config_to_json + config_from_json round-trip", "[config_json]") {
     CHECK(loaded.log_dir == original.log_dir);
     CHECK(loaded.output_dir == original.output_dir);
     CHECK(loaded.note_dir == original.note_dir);
+    CHECK(loaded.context_file == original.context_file);
+    CHECK(loaded.context_inline == original.context_inline);
     CHECK(loaded.reprocess_dir == original.reprocess_dir);
     CHECK(loaded.note.domain == original.note.domain);
 }
@@ -95,6 +99,8 @@ TEST_CASE("config_to_map + config_from_map round-trip", "[config_json]") {
     CHECK(loaded.mic_only == original.mic_only);
     CHECK(loaded.whisper_model == original.whisper_model);
     CHECK(loaded.vocabulary == original.vocabulary);
+    CHECK(loaded.context_file == original.context_file);
+    CHECK(loaded.context_inline == original.context_inline);
     CHECK(loaded.threads == original.threads);
     CHECK(loaded.note.domain == original.note.domain);
 }

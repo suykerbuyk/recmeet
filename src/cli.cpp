@@ -58,6 +58,7 @@ CliResult parse_cli(int argc, char* argv[]) {
         {"list-vocab",     no_argument,       nullptr, 1020},
         {"add-vocab",      required_argument, nullptr, 1021},
         {"remove-vocab",   required_argument, nullptr, 1022},
+        {"context-text",   required_argument, nullptr, 1024},
         {"reset-vocab",    no_argument,       nullptr, 1023},
         {"help",           no_argument,       nullptr, 'h'},
         {"version",        no_argument,       nullptr, 'v'},
@@ -119,6 +120,7 @@ CliResult parse_cli(int argc, char* argv[]) {
             case 1021: result.add_vocab = optarg; break;
             case 1022: result.remove_vocab = optarg; break;
             case 1023: result.reset_vocab = true; break;
+            case 1024: result.cfg.context_inline = optarg; break;
             case 'v': result.show_version = true; return result;
             case 'h': result.show_help = true; return result;
             default:  result.show_help = true; return result;

@@ -4,6 +4,7 @@
 #include "pipeline.h"
 #include "config.h"
 #include "diarize.h"
+#include "ipc_protocol.h"
 #include "speaker_id.h"
 #include "vad.h"
 #include "device_enum.h"
@@ -34,6 +35,40 @@ std::string read_context_file(const fs::path& path) {
     std::ostringstream buf;
     buf << in.rdbuf();
     return buf.str();
+}
+
+void save_meeting_context(const fs::path& out_dir, const std::string& context_inline,
+                          const fs::path& context_file) {
+    if (context_inline.empty() && context_file.empty()) return;
+    fs::path path = out_dir / "context.json";
+    std::ofstream out(path);
+    if (!out) {
+        log_warn("Failed to write context.json: %s", path.c_str());
+        return;
+    }
+    out << "{\"context\":\"" << json_escape(context_inline)
+        << "\",\"context_file\":\"" << json_escape(context_file.string()) << "\"}";
+    log_info("Saved context.json");
+}
+
+std::string load_meeting_context(const fs::path& out_dir) {
+    fs::path path = out_dir / "context.json";
+    if (!fs::exists(path)) return "";
+    std::ifstream in(path);
+    if (!in) return "";
+    std::ostringstream buf;
+    buf << in.rdbuf();
+    std::string json = buf.str();
+
+    // Minimal parse: extract "context" value using IPC parser
+    IpcMessage msg;
+    std::string wrapped = "{\"id\":0,\"result\":" + json + "}";
+    if (parse_ipc_message(wrapped, msg) && msg.type == IpcMessageType::Response) {
+        auto it = msg.response.result.find("context");
+        if (it != msg.response.result.end())
+            return json_val_as_string(it->second);
+    }
+    return "";
 }
 
 namespace {
@@ -476,7 +511,23 @@ PipelineResult run_postprocessing(const Config& cfg, const PostprocessInput& inp
     pipe_result.output_dir = input.out_dir;
 
     std::string summary_text;
-    std::string context_text = read_context_file(cfg.context_file);
+    // Merge context: inline > file > saved context.json (reprocess fallback)
+    std::string context_text = cfg.context_inline;
+    if (!cfg.context_file.empty()) {
+        std::string file_ctx = read_context_file(cfg.context_file);
+        if (!file_ctx.empty()) {
+            if (!context_text.empty()) context_text += "\n\n";
+            context_text += file_ctx;
+        }
+    }
+    if (context_text.empty() && !cfg.reprocess_dir.empty()) {
+        context_text = load_meeting_context(input.out_dir);
+    }
+
+    // Persist context for future reprocessing
+    if (!context_text.empty() && cfg.reprocess_dir.empty()) {
+        save_meeting_context(input.out_dir, cfg.context_inline, cfg.context_file);
+    }
 
     MeetingMetadata metadata;
 

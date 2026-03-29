@@ -71,6 +71,11 @@ static bool g_queue_shutdown{false};
 // set via server.post() from the recording worker)
 static bool g_is_reprocess = false;
 
+// Pending context from tray dialog (sent via job.context before record.stop)
+static std::mutex g_context_mu;
+static std::string g_pending_context;
+static std::string g_pending_vocab;
+
 // Global server pointer for signal handler
 static IpcServer* g_server = nullptr;
 
@@ -517,11 +522,26 @@ int main(int argc, char* argv[]) {
             try {
                 auto input = run_recording(cfg, g_rec_stop, on_phase);
 
+                // Apply any context sent by tray before stop
+                Config job_cfg = cfg;
+                {
+                    std::lock_guard<std::mutex> ctx_lock(g_context_mu);
+                    if (!g_pending_context.empty()) {
+                        job_cfg.context_inline = g_pending_context;
+                        g_pending_context.clear();
+                    }
+                    if (!g_pending_vocab.empty()) {
+                        if (!job_cfg.vocabulary.empty()) job_cfg.vocabulary += ", ";
+                        job_cfg.vocabulary += g_pending_vocab;
+                        g_pending_vocab.clear();
+                    }
+                }
+
                 // Enqueue postprocessing job
                 PostprocessJob job;
                 job.job_id = job_id;
                 job.input = std::move(input);
-                job.cfg = cfg;
+                job.cfg = job_cfg;
 
                 {
                     std::lock_guard<std::mutex> qlock(g_queue_mu);
@@ -604,6 +624,23 @@ int main(int argc, char* argv[]) {
             if (pp) g_pp_stop.request();
         }
 
+        resp.result["ok"] = true;
+        return true;
+    });
+
+    server.on("job.context", [](const IpcRequest& req, IpcResponse& resp, IpcError& err) {
+        if (!g_recording.load()) {
+            err.code = static_cast<int>(IpcErrorCode::NotRecording);
+            err.message = "No active recording";
+            return false;
+        }
+        std::lock_guard<std::mutex> lock(g_context_mu);
+        auto ctx_it = req.params.find("context_inline");
+        if (ctx_it != req.params.end())
+            g_pending_context = json_val_as_string(ctx_it->second);
+        auto vocab_it = req.params.find("vocabulary_append");
+        if (vocab_it != req.params.end())
+            g_pending_vocab = json_val_as_string(vocab_it->second);
         resp.result["ok"] = true;
         return true;
     });

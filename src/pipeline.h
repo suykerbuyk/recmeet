@@ -40,6 +40,14 @@ std::string build_initial_prompt(const std::vector<std::string>& speaker_names,
 /// Read entire file as string. Returns empty if missing or unreadable.
 std::string read_context_file(const fs::path& path);
 
+/// Save inline context as context.json in the meeting output directory.
+void save_meeting_context(const fs::path& out_dir, const std::string& context_inline,
+                          const fs::path& context_file = {});
+
+/// Load context string from context.json in a meeting directory.
+/// Returns empty if file doesn't exist.
+std::string load_meeting_context(const fs::path& out_dir);
+
 /// Record audio. Phase: "recording". For --reprocess, resolves paths only.
 PostprocessInput run_recording(const Config& cfg, StopToken& stop,
                                PhaseCallback on_phase = nullptr);

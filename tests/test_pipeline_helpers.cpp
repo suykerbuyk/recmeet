@@ -85,6 +85,70 @@ TEST_CASE("build_initial_prompt: skips empty vocabulary tokens", "[pipeline]") {
     CHECK(result == "foo, bar, baz");
 }
 
+// --- save/load meeting context tests ---
+
+TEST_CASE("save_meeting_context + load_meeting_context round-trip", "[pipeline]") {
+    auto dir = tmp_dir();
+
+    save_meeting_context(dir, "Subject: Standup\nParticipants: Alice, Bob");
+    std::string loaded = load_meeting_context(dir);
+    CHECK(loaded == "Subject: Standup\nParticipants: Alice, Bob");
+
+    fs::remove_all(dir);
+}
+
+TEST_CASE("save_meeting_context with context_file", "[pipeline]") {
+    auto dir = tmp_dir();
+
+    save_meeting_context(dir, "inline notes", "/tmp/agenda.txt");
+    std::string loaded = load_meeting_context(dir);
+    CHECK(loaded == "inline notes");
+
+    // Verify context.json exists
+    CHECK(fs::exists(dir / "context.json"));
+
+    fs::remove_all(dir);
+}
+
+TEST_CASE("load_meeting_context: returns empty for missing dir", "[pipeline]") {
+    CHECK(load_meeting_context("/nonexistent/dir").empty());
+}
+
+TEST_CASE("save_meeting_context: no-op when both empty", "[pipeline]") {
+    auto dir = tmp_dir();
+    save_meeting_context(dir, "");
+    CHECK_FALSE(fs::exists(dir / "context.json"));
+    fs::remove_all(dir);
+}
+
+TEST_CASE("save_meeting_context: special characters round-trip", "[pipeline]") {
+    auto dir = tmp_dir();
+    std::string ctx = "Agenda: \"Q1 Review\"\nBudget: $1,000\\item";
+    save_meeting_context(dir, ctx);
+    CHECK(load_meeting_context(dir) == ctx);
+    fs::remove_all(dir);
+}
+
+TEST_CASE("load_meeting_context: returns empty for malformed JSON", "[pipeline]") {
+    auto dir = tmp_dir();
+    {
+        std::ofstream out(dir / "context.json");
+        out << "not valid json";
+    }
+    CHECK(load_meeting_context(dir).empty());
+    fs::remove_all(dir);
+}
+
+TEST_CASE("load_meeting_context: returns empty when context key missing", "[pipeline]") {
+    auto dir = tmp_dir();
+    {
+        std::ofstream out(dir / "context.json");
+        out << "{\"other_key\":\"value\"}";
+    }
+    CHECK(load_meeting_context(dir).empty());
+    fs::remove_all(dir);
+}
+
 TEST_CASE("run_postprocessing: transcribe minimal WAV with no summary/diarize", "[integration]") {
     ensure_whisper_model("tiny");
 

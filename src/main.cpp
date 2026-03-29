@@ -95,6 +95,7 @@ static void print_usage() {
         "  --no-summary         Skip summarization (record + transcribe only)\n"
         "  --device-pattern RE  Regex for device auto-detection\n"
         "  --context-file PATH  Pre-meeting notes to include in summary prompt\n"
+        "  --context-text TEXT  Inline pre-meeting context for summary\n"
         "  --llm-model PATH     Local GGUF model for summarization (instead of API)\n"
         "  --mmap               Use mmap for LLM model loading (faster load, may cause swap)\n"
         "  --no-mmap            Disable mmap for LLM model loading (default, avoids swap thrashing)\n"

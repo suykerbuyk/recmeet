@@ -96,6 +96,14 @@ struct TrayState {
 
     // Managed web server process
     pid_t web_server_pid = -1;  // -1 = not managed by us
+
+    // Pre-recording context dialog
+    struct {
+        GtkWidget* window = nullptr;
+        GtkWidget* subject_entry = nullptr;
+        GtkWidget* participants_entry = nullptr;
+        GtkWidget* notes_view = nullptr;
+    } ctx;
 };
 
 static TrayState g_tray;
@@ -104,6 +112,7 @@ static TrayState g_tray;
 static void build_menu();
 static void refresh_sources();
 static void fetch_provider_models();
+static void close_context_window();
 
 // --- Helpers ---
 
@@ -131,10 +140,15 @@ static void teardown_ipc_watch();
 static gboolean try_reconnect(gpointer);
 
 static void update_state(bool rec, bool pp, bool dl, bool reproc = false) {
+    bool was_recording = g_tray.recording;
     g_tray.recording = rec;
     g_tray.postprocessing = pp;
     g_tray.downloading = dl;
     g_tray.is_reprocess = reproc;
+
+    // Close context window when recording ends (postprocessing begins)
+    if (was_recording && !rec)
+        close_context_window();
 
     if (!rec && !pp && !dl) {
         g_tray.progress_percent = -1;
@@ -369,6 +383,137 @@ static std::string prompt_api_key(const ProviderInfo& provider) {
     return result;
 }
 
+// --- Pre-recording context dialog ---
+
+static gboolean on_context_window_delete(GtkWidget*, GdkEvent*, gpointer) {
+    // Hide instead of destroy so values persist
+    gtk_widget_hide(g_tray.ctx.window);
+    return TRUE;  // prevent destruction
+}
+
+static void show_context_window() {
+    if (g_tray.ctx.window) {
+        gtk_window_present(GTK_WINDOW(g_tray.ctx.window));
+        return;
+    }
+
+    auto* win = gtk_window_new(GTK_WINDOW_TOPLEVEL);
+    gtk_window_set_title(GTK_WINDOW(win), "Meeting Context");
+    gtk_window_set_default_size(GTK_WINDOW(win), 400, 280);
+    gtk_window_set_type_hint(GTK_WINDOW(win), GDK_WINDOW_TYPE_HINT_DIALOG);
+    gtk_container_set_border_width(GTK_CONTAINER(win), 12);
+    g_signal_connect(win, "delete-event", G_CALLBACK(on_context_window_delete), nullptr);
+
+    auto* vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8);
+    gtk_container_add(GTK_CONTAINER(win), vbox);
+
+    // Hint label
+    auto* hint = gtk_label_new("Fill in while recording. All fields optional.");
+    gtk_widget_set_halign(hint, GTK_ALIGN_START);
+    PangoAttrList* attrs = pango_attr_list_new();
+    pango_attr_list_insert(attrs, pango_attr_style_new(PANGO_STYLE_ITALIC));
+    gtk_label_set_attributes(GTK_LABEL(hint), attrs);
+    pango_attr_list_unref(attrs);
+    gtk_box_pack_start(GTK_BOX(vbox), hint, FALSE, FALSE, 0);
+
+    // Subject
+    auto* subject_label = gtk_label_new("Subject");
+    gtk_widget_set_halign(subject_label, GTK_ALIGN_START);
+    gtk_box_pack_start(GTK_BOX(vbox), subject_label, FALSE, FALSE, 0);
+    auto* subject = gtk_entry_new();
+    gtk_entry_set_placeholder_text(GTK_ENTRY(subject), "Meeting subject (optional)");
+    gtk_box_pack_start(GTK_BOX(vbox), subject, FALSE, FALSE, 0);
+
+    // Participants
+    auto* part_label = gtk_label_new("Participants");
+    gtk_widget_set_halign(part_label, GTK_ALIGN_START);
+    gtk_box_pack_start(GTK_BOX(vbox), part_label, FALSE, FALSE, 0);
+    auto* participants = gtk_entry_new();
+    gtk_entry_set_placeholder_text(GTK_ENTRY(participants), "Participant names, comma-separated (optional)");
+    gtk_box_pack_start(GTK_BOX(vbox), participants, FALSE, FALSE, 0);
+
+    // Notes
+    auto* notes_label = gtk_label_new("Notes");
+    gtk_widget_set_halign(notes_label, GTK_ALIGN_START);
+    gtk_box_pack_start(GTK_BOX(vbox), notes_label, FALSE, FALSE, 0);
+    auto* scroll = gtk_scrolled_window_new(nullptr, nullptr);
+    gtk_scrolled_window_set_min_content_height(GTK_SCROLLED_WINDOW(scroll), 80);
+    gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(scroll),
+                                   GTK_POLICY_AUTOMATIC, GTK_POLICY_AUTOMATIC);
+    auto* notes = gtk_text_view_new();
+    gtk_text_view_set_wrap_mode(GTK_TEXT_VIEW(notes), GTK_WRAP_WORD);
+    gtk_container_add(GTK_CONTAINER(scroll), notes);
+    gtk_box_pack_start(GTK_BOX(vbox), scroll, TRUE, TRUE, 0);
+
+    // Close button
+    auto* btn_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
+    gtk_widget_set_halign(btn_box, GTK_ALIGN_END);
+    auto* close_btn = gtk_button_new_with_label("Close");
+    g_signal_connect_swapped(close_btn, "clicked", G_CALLBACK(gtk_widget_hide), win);
+    gtk_box_pack_end(GTK_BOX(btn_box), close_btn, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(vbox), btn_box, FALSE, FALSE, 0);
+
+    g_tray.ctx.window = win;
+    g_tray.ctx.subject_entry = subject;
+    g_tray.ctx.participants_entry = participants;
+    g_tray.ctx.notes_view = notes;
+
+    gtk_widget_show_all(win);
+}
+
+/// Capture context values, destroy the window, return assembled context string.
+/// Also returns comma-separated participant names for vocabulary hints.
+struct CapturedContext {
+    std::string context_inline;
+    std::string vocab_additions;
+};
+
+static CapturedContext capture_and_clear_context() {
+    CapturedContext result;
+    if (!g_tray.ctx.window) return result;
+
+    std::string subject = gtk_entry_get_text(GTK_ENTRY(g_tray.ctx.subject_entry));
+    std::string participants = gtk_entry_get_text(GTK_ENTRY(g_tray.ctx.participants_entry));
+
+    GtkTextBuffer* buf = gtk_text_view_get_buffer(GTK_TEXT_VIEW(g_tray.ctx.notes_view));
+    GtkTextIter start, end;
+    gtk_text_buffer_get_bounds(buf, &start, &end);
+    gchar* notes_raw = gtk_text_buffer_get_text(buf, &start, &end, FALSE);
+    std::string notes = notes_raw ? notes_raw : "";
+    g_free(notes_raw);
+
+    // Assemble context_inline
+    if (!subject.empty())
+        result.context_inline += "Subject: " + subject + "\n";
+    if (!participants.empty()) {
+        result.context_inline += "Participants: " + participants + "\n";
+        result.vocab_additions = participants;
+    }
+    if (!notes.empty()) {
+        if (!result.context_inline.empty()) result.context_inline += "\n";
+        result.context_inline += notes;
+    }
+
+    // Destroy window
+    gtk_widget_destroy(g_tray.ctx.window);
+    g_tray.ctx.window = nullptr;
+    g_tray.ctx.subject_entry = nullptr;
+    g_tray.ctx.participants_entry = nullptr;
+    g_tray.ctx.notes_view = nullptr;
+
+    return result;
+}
+
+static void close_context_window() {
+    if (g_tray.ctx.window) {
+        gtk_widget_destroy(g_tray.ctx.window);
+        g_tray.ctx.window = nullptr;
+        g_tray.ctx.subject_entry = nullptr;
+        g_tray.ctx.participants_entry = nullptr;
+        g_tray.ctx.notes_view = nullptr;
+    }
+}
+
 // --- Recording (via IPC) ---
 
 static void on_record(GtkMenuItem*, gpointer) {
@@ -421,10 +566,29 @@ static void on_record(GtkMenuItem*, gpointer) {
 
     bool reproc = !g_tray.cfg.reprocess_dir.empty();
     update_state(true, g_tray.postprocessing, false, reproc);
+
+    // Open non-modal context dialog (not for reprocess)
+    if (!reproc)
+        show_context_window();
 }
 
 static void on_stop(GtkMenuItem*, gpointer) {
     if (!g_tray.recording && !g_tray.postprocessing) return;
+
+    // Capture context from dialog before stopping recording
+    if (g_tray.recording && g_tray.ctx.window) {
+        auto captured = capture_and_clear_context();
+        if (!captured.context_inline.empty()) {
+            JsonMap ctx_params;
+            ctx_params["context_inline"] = captured.context_inline;
+            if (!captured.vocab_additions.empty())
+                ctx_params["vocabulary_append"] = captured.vocab_additions;
+            IpcResponse ctx_resp;
+            IpcError ctx_err;
+            if (!g_tray.ipc.call("job.context", ctx_params, ctx_resp, ctx_err, 5000))
+                log_warn("[tray] job.context failed: %s", ctx_err.message.c_str());
+        }
+    }
 
     // Send stop with appropriate target.
     // When both recording and postprocessing are active (concurrent jobs),
@@ -1003,6 +1167,14 @@ static void build_menu() {
         auto* item = gtk_menu_item_new_with_label(label);
         g_signal_connect(item, "activate", G_CALLBACK(on_stop), nullptr);
         gtk_menu_shell_append(GTK_MENU_SHELL(menu), item);
+
+        if (!g_tray.is_reprocess) {
+            auto* ctx_item = gtk_menu_item_new_with_label("Edit Context...");
+            g_signal_connect(ctx_item, "activate",
+                             G_CALLBACK(+[](GtkMenuItem*, gpointer) { show_context_window(); }),
+                             nullptr);
+            gtk_menu_shell_append(GTK_MENU_SHELL(menu), ctx_item);
+        }
     }
     if (g_tray.postprocessing && !g_tray.recording) {
         // Postprocessing only — show both Record and Cancel Processing

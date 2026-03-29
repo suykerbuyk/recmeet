@@ -77,6 +77,11 @@ struct DaemonSim {
     JsonMap last_record_params;
     std::mutex params_mu;
 
+    // Pending context from job.context handler
+    std::mutex context_mu;
+    std::string pending_context;
+    std::string pending_vocab;
+
     // For legacy wait_for_state compatibility
     std::atomic<int> state{SIdle};
 
@@ -305,6 +310,23 @@ struct DaemonSim {
                 if (pp) pp_stop.store(true);
             }
 
+            resp.result["ok"] = true;
+            return true;
+        });
+
+        server.on("job.context", [this](const IpcRequest& req, IpcResponse& resp, IpcError& err) {
+            if (!recording.load()) {
+                err.code = static_cast<int>(IpcErrorCode::NotRecording);
+                err.message = "No active recording";
+                return false;
+            }
+            std::lock_guard<std::mutex> lock(context_mu);
+            auto ctx_it = req.params.find("context_inline");
+            if (ctx_it != req.params.end())
+                pending_context = json_val_as_string(ctx_it->second);
+            auto vocab_it = req.params.find("vocabulary_append");
+            if (vocab_it != req.params.end())
+                pending_vocab = json_val_as_string(vocab_it->second);
             resp.result["ok"] = true;
             return true;
         });
@@ -1817,4 +1839,76 @@ TEST_CASE("shutdown with queued jobs completes cleanly", "[ipc][integration][con
     // Shutdown while postprocessing — should not hang
     sim.reset();
     CHECK(true);
+}
+
+// ===========================================================================
+// Category: job.context handler
+// ===========================================================================
+
+TEST_CASE("job.context when idle returns NotRecording", "[ipc][integration]") {
+    DaemonSim sim;
+    sim.start();
+
+    auto client = make_client();
+    IpcResponse resp;
+    IpcError err;
+    JsonMap params;
+    params["context_inline"] = std::string("Subject: Test");
+    REQUIRE_FALSE(client->call("job.context", params, resp, err));
+    CHECK(err.code == static_cast<int>(IpcErrorCode::NotRecording));
+}
+
+TEST_CASE("job.context stores context during recording", "[ipc][integration]") {
+    DaemonSim sim;
+    sim.start();
+
+    auto client = make_client();
+    IpcResponse resp;
+    IpcError err;
+
+    // Start recording
+    REQUIRE(client->call("record.start", resp, err));
+    REQUIRE(sim.recording.load());
+
+    // Send context
+    JsonMap params;
+    params["context_inline"] = std::string("Subject: Standup\nParticipants: Alice, Bob");
+    params["vocabulary_append"] = std::string("Alice, Bob");
+    REQUIRE(client->call("job.context", params, resp, err));
+    CHECK(json_val_as_bool(resp.result["ok"]));
+
+    // Verify stored
+    {
+        std::lock_guard<std::mutex> lock(sim.context_mu);
+        CHECK(sim.pending_context == "Subject: Standup\nParticipants: Alice, Bob");
+        CHECK(sim.pending_vocab == "Alice, Bob");
+    }
+
+    // Stop and clean up
+    REQUIRE(client->call("record.stop", resp, err));
+    REQUIRE(sim.wait_idle());
+}
+
+TEST_CASE("job.context with only context_inline (no vocabulary)", "[ipc][integration]") {
+    DaemonSim sim;
+    sim.start();
+
+    auto client = make_client();
+    IpcResponse resp;
+    IpcError err;
+
+    REQUIRE(client->call("record.start", resp, err));
+
+    JsonMap params;
+    params["context_inline"] = std::string("Just some notes");
+    REQUIRE(client->call("job.context", params, resp, err));
+
+    {
+        std::lock_guard<std::mutex> lock(sim.context_mu);
+        CHECK(sim.pending_context == "Just some notes");
+        CHECK(sim.pending_vocab.empty());
+    }
+
+    REQUIRE(client->call("record.stop", resp, err));
+    REQUIRE(sim.wait_idle());
 }

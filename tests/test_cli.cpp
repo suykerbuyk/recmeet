@@ -277,3 +277,20 @@ TEST_CASE("parse_cli: --reset-vocab sets flag", "[cli]") {
     auto cli = run_cli({"recmeet", "--reset-vocab"});
     CHECK(cli.reset_vocab);
 }
+
+TEST_CASE("parse_cli: --context-text sets context_inline", "[cli]") {
+    auto cli = run_cli({"recmeet", "--context-text", "Subject: Standup\nParticipants: Alice, Bob"});
+    CHECK(cli.cfg.context_inline == "Subject: Standup\nParticipants: Alice, Bob");
+}
+
+TEST_CASE("parse_cli: default context_inline is empty", "[cli]") {
+    auto cli = run_cli({"recmeet"});
+    CHECK(cli.cfg.context_inline.empty());
+}
+
+TEST_CASE("parse_cli: --context-text and --context-file can coexist", "[cli]") {
+    auto cli = run_cli({"recmeet", "--context-text", "inline notes",
+                         "--context-file", "/tmp/agenda.txt"});
+    CHECK(cli.cfg.context_inline == "inline notes");
+    CHECK(cli.cfg.context_file == "/tmp/agenda.txt");
+}
