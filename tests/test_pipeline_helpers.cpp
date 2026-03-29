@@ -52,6 +52,39 @@ TEST_CASE("read_context_file: returns empty for empty file", "[pipeline]") {
     fs::remove_all(dir);
 }
 
+// --- build_initial_prompt tests ---
+
+TEST_CASE("build_initial_prompt: empty inputs", "[pipeline]") {
+    CHECK(build_initial_prompt({}, "").empty());
+}
+
+TEST_CASE("build_initial_prompt: speaker names only", "[pipeline]") {
+    CHECK(build_initial_prompt({"Alice", "Bob"}, "") == "Alice, Bob");
+}
+
+TEST_CASE("build_initial_prompt: single speaker", "[pipeline]") {
+    CHECK(build_initial_prompt({"John Suykerbuyk"}, "") == "John Suykerbuyk");
+}
+
+TEST_CASE("build_initial_prompt: vocabulary only", "[pipeline]") {
+    CHECK(build_initial_prompt({}, "PipeWire, recmeet") == "PipeWire, recmeet");
+}
+
+TEST_CASE("build_initial_prompt: combined speakers and vocabulary", "[pipeline]") {
+    auto result = build_initial_prompt({"John Suykerbuyk"}, "PipeWire, recmeet");
+    CHECK(result == "John Suykerbuyk, PipeWire, recmeet");
+}
+
+TEST_CASE("build_initial_prompt: trims whitespace from vocabulary", "[pipeline]") {
+    auto result = build_initial_prompt({}, "  foo ,  bar  ");
+    CHECK(result == "foo, bar");
+}
+
+TEST_CASE("build_initial_prompt: skips empty vocabulary tokens", "[pipeline]") {
+    auto result = build_initial_prompt({}, "foo,,bar, ,baz");
+    CHECK(result == "foo, bar, baz");
+}
+
 TEST_CASE("run_postprocessing: transcribe minimal WAV with no summary/diarize", "[integration]") {
     ensure_whisper_model("tiny");
 

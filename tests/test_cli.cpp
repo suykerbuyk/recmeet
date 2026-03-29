@@ -247,3 +247,33 @@ TEST_CASE("parse_cli: default log_level_str is none", "[cli]") {
     auto cli = run_cli({"recmeet"});
     CHECK((cli.cfg.log_level_str.empty() || cli.cfg.log_level_str == "none"));
 }
+
+TEST_CASE("parse_cli: --vocab sets vocabulary", "[cli]") {
+    auto cli = run_cli({"recmeet", "--vocab", "John Suykerbuyk, PipeWire"});
+    CHECK(cli.cfg.vocabulary == "John Suykerbuyk, PipeWire");
+}
+
+TEST_CASE("parse_cli: default vocabulary is empty", "[cli]") {
+    auto cli = run_cli({"recmeet"});
+    CHECK(cli.cfg.vocabulary.empty());
+}
+
+TEST_CASE("parse_cli: --list-vocab sets flag", "[cli]") {
+    auto cli = run_cli({"recmeet", "--list-vocab"});
+    CHECK(cli.list_vocab);
+}
+
+TEST_CASE("parse_cli: --add-vocab sets value", "[cli]") {
+    auto cli = run_cli({"recmeet", "--add-vocab", "Kubernetes"});
+    CHECK(cli.add_vocab == "Kubernetes");
+}
+
+TEST_CASE("parse_cli: --remove-vocab sets value", "[cli]") {
+    auto cli = run_cli({"recmeet", "--remove-vocab", "PipeWire"});
+    CHECK(cli.remove_vocab == "PipeWire");
+}
+
+TEST_CASE("parse_cli: --reset-vocab sets flag", "[cli]") {
+    auto cli = run_cli({"recmeet", "--reset-vocab"});
+    CHECK(cli.reset_vocab);
+}

@@ -27,6 +27,7 @@ TEST_CASE("save_config + load_config round-trip", "[config]") {
     cfg.keep_sources = true;
     cfg.whisper_model = "small";
     cfg.language = "en";
+    cfg.vocabulary = "John Suykerbuyk, PipeWire";
     cfg.provider = "openai";
     cfg.api_url = "https://api.example.com/v1/chat";
     cfg.api_model = "gpt-4";
@@ -56,6 +57,7 @@ TEST_CASE("save_config + load_config round-trip", "[config]") {
     CHECK(content.find("keep_sources: true") != std::string::npos);
     CHECK(content.find("model: small") != std::string::npos);
     CHECK(content.find("language: en") != std::string::npos);
+    CHECK(content.find("vocabulary: \"John Suykerbuyk, PipeWire\"") != std::string::npos);
     CHECK(content.find("provider: openai") != std::string::npos);
     CHECK(content.find("api_url: \"https://api.example.com/v1/chat\"") != std::string::npos);
     CHECK(content.find("model: gpt-4") != std::string::npos);
@@ -79,6 +81,7 @@ TEST_CASE("save_config + load_config round-trip", "[config]") {
     CHECK(loaded.keep_sources == true);
     CHECK(loaded.whisper_model == "small");
     CHECK(loaded.language == "en");
+    CHECK(loaded.vocabulary == "John Suykerbuyk, PipeWire");
     CHECK(loaded.provider == "openai");
     CHECK(loaded.api_url == "https://api.example.com/v1/chat");
     CHECK(loaded.api_model == "gpt-4");

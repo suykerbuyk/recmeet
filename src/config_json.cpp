@@ -22,6 +22,7 @@ JsonMap config_to_map(const Config& cfg) {
     // Transcription
     m["whisper_model"]   = cfg.whisper_model;
     m["language"]        = cfg.language;
+    m["vocabulary"]      = cfg.vocabulary;
 
     // Summarization
     m["provider"]        = cfg.provider;
@@ -120,6 +121,7 @@ Config config_from_map(const JsonMap& m) {
 
     str("whisper_model", cfg.whisper_model);
     str("language", cfg.language);
+    str("vocabulary", cfg.vocabulary);
 
     str("provider", cfg.provider);
     str("api_key", cfg.api_key);

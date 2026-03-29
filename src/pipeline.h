@@ -33,6 +33,10 @@ using ProgressCallback = std::function<void(const std::string&, int)>;
 /// Compute weighted progress across VAD segments (for testing).
 int vad_weighted_progress(size_t seg_index, int seg_percent, const std::vector<size_t>& seg_samples);
 
+/// Build whisper initial_prompt from speaker names and vocabulary hints.
+std::string build_initial_prompt(const std::vector<std::string>& speaker_names,
+                                 const std::string& vocabulary);
+
 /// Read entire file as string. Returns empty if missing or unreadable.
 std::string read_context_file(const fs::path& path);
 

@@ -54,6 +54,11 @@ CliResult parse_cli(int argc, char* argv[]) {
         {"reset-speakers", no_argument,       nullptr, 1016},
         {"mmap",           no_argument,       nullptr, 1017},
         {"no-mmap",        no_argument,       nullptr, 1018},
+        {"vocab",          required_argument, nullptr, 1019},
+        {"list-vocab",     no_argument,       nullptr, 1020},
+        {"add-vocab",      required_argument, nullptr, 1021},
+        {"remove-vocab",   required_argument, nullptr, 1022},
+        {"reset-vocab",    no_argument,       nullptr, 1023},
         {"help",           no_argument,       nullptr, 'h'},
         {"version",        no_argument,       nullptr, 'v'},
         {nullptr, 0, nullptr, 0},
@@ -109,6 +114,11 @@ CliResult parse_cli(int argc, char* argv[]) {
             case 1016: result.reset_speakers = true; break;
             case 1017: result.cfg.llm_mmap = true; break;
             case 1018: result.cfg.llm_mmap = false; break;
+            case 1019: result.cfg.vocabulary = optarg; break;
+            case 1020: result.list_vocab = true; break;
+            case 1021: result.add_vocab = optarg; break;
+            case 1022: result.remove_vocab = optarg; break;
+            case 1023: result.reset_vocab = true; break;
             case 'v': result.show_version = true; return result;
             case 'h': result.show_help = true; return result;
             default:  result.show_help = true; return result;

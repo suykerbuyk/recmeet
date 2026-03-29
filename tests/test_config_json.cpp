@@ -16,6 +16,7 @@ static Config make_test_config() {
     cfg.keep_sources = true;
     cfg.whisper_model = "small";
     cfg.language = "en";
+    cfg.vocabulary = "John Suykerbuyk, PipeWire";
     cfg.provider = "openai";
     cfg.api_url = "https://api.example.com/v1/chat";
     cfg.api_model = "gpt-4";
@@ -56,6 +57,7 @@ TEST_CASE("config_to_json + config_from_json round-trip", "[config_json]") {
     CHECK(loaded.keep_sources == original.keep_sources);
     CHECK(loaded.whisper_model == original.whisper_model);
     CHECK(loaded.language == original.language);
+    CHECK(loaded.vocabulary == original.vocabulary);
     CHECK(loaded.provider == original.provider);
     CHECK(loaded.api_url == original.api_url);
     CHECK(loaded.api_model == original.api_model);
@@ -92,6 +94,7 @@ TEST_CASE("config_to_map + config_from_map round-trip", "[config_json]") {
     CHECK(loaded.device_pattern == original.device_pattern);
     CHECK(loaded.mic_only == original.mic_only);
     CHECK(loaded.whisper_model == original.whisper_model);
+    CHECK(loaded.vocabulary == original.vocabulary);
     CHECK(loaded.threads == original.threads);
     CHECK(loaded.note.domain == original.note.domain);
 }

@@ -225,8 +225,9 @@ flowchart TD
 
     subgraph "Phase 2: run_postprocessing()"
         LOAD_AUDIO["Load audio file → float[]"]
+        VOCAB["Build vocabulary hints<br/>(enrolled names + config)"]
         VAD["VAD segmentation<br/>(sherpa-onnx, optional)"]
-        TRANSCRIBE["Whisper transcription"]
+        TRANSCRIBE["Whisper transcription<br/>(with initial_prompt)"]
         DIARIZE["Speaker diarization<br/>(sherpa-onnx, optional)"]
         IDENTIFY["Speaker identification<br/>(voiceprint matching, optional)"]
         FREE_AUDIO["Free audio buffer"]
@@ -235,7 +236,7 @@ flowchart TD
     end
 
     DETECT --> CAPTURE --> STOP --> DRAIN --> VALIDATE --> MIX
-    MIX --> LOAD_AUDIO --> VAD --> TRANSCRIBE --> DIARIZE
+    MIX --> LOAD_AUDIO --> VOCAB --> VAD --> TRANSCRIBE --> DIARIZE
     DIARIZE --> IDENTIFY --> FREE_AUDIO --> SUMMARIZE --> NOTE
 ```
 
@@ -247,6 +248,37 @@ The postprocessing phase uses nested scopes to minimize peak memory:
 2. **Whisper model scope** — the `WhisperModel` object is freed after transcription completes, before diarization begins.
 
 This matters because whisper models (75 MB–1.5 GB) and audio buffers (16-bit, 16 kHz) can be large.
+
+## Vocabulary Hints
+
+Vocabulary hints improve transcription accuracy for unusual names and domain-specific terms by biasing whisper's decoder via its `initial_prompt` parameter.
+
+### Data flow
+
+Before transcription begins, `run_postprocessing()` builds a combined prompt from two sources:
+
+1. **Enrolled speaker names** — loaded automatically via `list_speakers()` (when speaker ID is enabled)
+2. **User-specified vocabulary** — from `Config::vocabulary` (set via `--vocab`, `--add-vocab`, or `config.yaml`)
+
+The helper `build_initial_prompt()` combines both into a comma-separated string (e.g., `"John Suykerbuyk, Alice, PipeWire, Kubernetes"`), which is passed to `TranscribeOptions::initial_prompt` and ultimately to `whisper_full_params::initial_prompt`.
+
+### Token limit
+
+Whisper limits `initial_prompt` to `whisper_n_text_ctx()/2` tokens (typically 224). With typical name lengths, this supports ~50-100 vocabulary entries before truncation.
+
+### Configuration
+
+| Config field | CLI flag | Default | Description |
+|---|---|---|---|
+| `transcription.vocabulary` | `--vocab` | `""` | Comma-separated vocabulary hints |
+| — | `--add-vocab` | — | Add a word to persistent vocabulary |
+| — | `--remove-vocab` | — | Remove a word from persistent vocabulary |
+| — | `--list-vocab` | — | List persistent vocabulary words |
+| — | `--reset-vocab` | — | Clear all persistent vocabulary words |
+
+### IPC support
+
+The `vocabulary` field flows through the daemon's IPC config system (`config_to_map` / `config_from_map`), so vocabulary hints work for recordings started via the tray or CLI in client mode.
 
 ## Speaker Identification
 

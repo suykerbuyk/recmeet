@@ -15,7 +15,7 @@ The result: full transcriptions with speaker labels, professionally structured s
 ## What it does
 
 - **Records** mic input and speaker output simultaneously via PipeWire/PulseAudio — captures both sides of any conversation regardless of platform
-- **Transcribes** with whisper.cpp (tiny through large-v3 models, auto-downloaded on first use)
+- **Transcribes** with whisper.cpp (tiny through large-v3 models, auto-downloaded on first use), with vocabulary hints to improve accuracy for names and domain-specific terms
 - **Identifies speakers** via sherpa-onnx diarization (Pyannote segmentation + 3D-Speaker embeddings), with cross-session speaker identification — enroll voices once, get real names in every transcript
 - **Summarizes** via cloud API (xAI/OpenAI/Anthropic — all OpenAI-compatible) or a local GGUF model via llama.cpp — your choice
 - **Outputs** timestamped transcripts, structured summaries, and meeting notes with YAML frontmatter (Obsidian-compatible)
@@ -101,11 +101,11 @@ Record ──► Transcribe ──► Diarize ──► Identify ──► Summa
 
 1. **Record**: PipeWire captures the mic via `pw_stream`; PulseAudio's `pa_simple` captures the speaker monitor (`.monitor` sources are a PulseAudio abstraction that PipeWire doesn't reliably handle, especially over Bluetooth). Both streams are mixed in-process into a single WAV.
 
-2. **Transcribe**: whisper.cpp runs locally on CPU, producing timestamped segments. Models are GGUF format, auto-downloaded from Hugging Face on first use (141 MB for `base`, up to 1.5 GB for `large-v3`).
+2. **Transcribe**: whisper.cpp runs locally on CPU, producing timestamped segments. Models are GGUF format, auto-downloaded from Hugging Face on first use (141 MB for `base`, up to 1.5 GB for `large-v3`). Vocabulary hints bias the decoder toward correct spellings of names and domain terms — enrolled speaker names are included automatically.
 
 3. **Diarize** (optional, on by default): sherpa-onnx labels each segment with `Speaker_01`, `Speaker_02`, etc. using neural speaker embeddings and clustering. Configurable threshold for tuning speaker count detection.
 
-4. **Identify** (optional, on by default when speakers are enrolled): Matches diarization clusters against enrolled voiceprints using cosine similarity on 3D-Speaker embeddings. Enrolled speakers get their real names (`John`, `Alice`) instead of generic labels. The speaker database lives at `~/.local/share/recmeet/speakers/` — one JSON file per person containing their averaged embedding vectors. Enroll speakers from past recordings with `recmeet --enroll "Name" --from meetings/DIR/`.
+4. **Identify** (optional, on by default when speakers are enrolled): Matches diarization clusters against enrolled voiceprints using cosine similarity on 3D-Speaker embeddings. Enrolled speakers get their real names (`John`, `Alice`) instead of generic labels. The speaker database lives at `~/.local/share/recmeet/speakers/` — one JSON file per person containing their averaged embedding vectors. Enroll speakers from past recordings with `recmeet --enroll "Name" --from meetings/DIR/`. Enrolled names are automatically passed to whisper as vocabulary hints, improving transcription accuracy for unusual names.
 
 5. **Summarize**: Either a cloud API call (xAI, OpenAI, or Anthropic — all use the same OpenAI-compatible endpoint) or a local GGUF model via llama.cpp. Same structured prompt for both paths. Dynamic context sizing with token-level truncation for long meetings.
 
@@ -236,6 +236,11 @@ Options:
   --keep-sources       Keep separate mic.wav and monitor.wav after mixing
   --model NAME         Whisper model: tiny/base/small/medium/large-v3 (default: base)
   --language CODE      Force whisper language (e.g. en, de, ja; default: auto-detect)
+  --vocab WORDS        Comma-separated vocabulary hints for transcription (names, terms)
+  --list-vocab         List persistent vocabulary words and exit
+  --add-vocab WORD     Add a word to persistent vocabulary and exit
+  --remove-vocab WORD  Remove a word from persistent vocabulary and exit
+  --reset-vocab        Clear all persistent vocabulary words and exit
   --output-dir DIR     Base directory for outputs (default: ./meetings)
   --note-dir DIR       Directory for meeting notes (default: same as audio)
   --provider NAME      API provider: xai, openai, anthropic (default: xai)
@@ -304,6 +309,7 @@ audio:
 transcription:
   model: base
   language: "" # empty = auto-detect
+  # vocabulary: "John Suykerbuyk, PipeWire, Kubernetes"  # hints for whisper (enrolled speaker names are added automatically)
 
 diarization:
   enabled: true
@@ -376,7 +382,7 @@ make coverage            # Go test coverage report
 
 ## Testing
 
-318 C++ unit tests (1350 assertions) across 23 modules, plus integration, benchmark, and Go test suites.
+331 C++ unit tests (1367 assertions) across 23 modules, plus integration, benchmark, and Go test suites.
 
 ```bash
 make test                # C++ unit + Go tests (no hardware needed)

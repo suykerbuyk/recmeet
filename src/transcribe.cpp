@@ -101,7 +101,8 @@ static bool whisper_abort_cb(void* user_data) {
 static TranscriptResult transcribe_impl(whisper_context* ctx, const float* samples,
                                          size_t num_samples, double offset_seconds,
                                          const std::string& language, int threads,
-                                         TranscribeCallbackState* cb_state) {
+                                         TranscribeCallbackState* cb_state,
+                                         const std::string& initial_prompt = "") {
     // Set up whisper params
     whisper_full_params wparams = whisper_full_default_params(WHISPER_SAMPLING_GREEDY);
     wparams.n_threads = threads > 0 ? threads : default_thread_count();
@@ -112,6 +113,10 @@ static TranscriptResult transcribe_impl(whisper_context* ctx, const float* sampl
     // Relax no-speech suppression — default logprob_thold (-1.0) can be too
     // aggressive for smaller models on Bluetooth mic audio.
     wparams.logprob_thold = -2.0f;
+
+    // Vocabulary hints (biases decoder toward specific names/terms)
+    if (!initial_prompt.empty())
+        wparams.initial_prompt = initial_prompt.c_str();
 
     // Language forcing
     if (!language.empty()) {
@@ -188,7 +193,8 @@ TranscriptResult transcribe(WhisperModel& model, const float* samples,
     cb_state.on_progress = opts.on_progress;
     cb_state.stop = opts.stop;
     return transcribe_impl(model.get(), samples, num_samples, offset_seconds,
-                           opts.language, opts.threads, &cb_state);
+                           opts.language, opts.threads, &cb_state,
+                           opts.initial_prompt);
 }
 
 TranscriptResult transcribe(WhisperModel& model, const fs::path& audio_path,

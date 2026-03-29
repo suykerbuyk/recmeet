@@ -18,9 +18,11 @@
 
 #include <whisper.h>
 
+#include <algorithm>
 #include <csignal>
 #include <cstring>
 #include <cstdio>
+#include <sstream>
 #include <unistd.h>
 
 using namespace recmeet;
@@ -79,6 +81,11 @@ static void print_usage() {
         "  --keep-sources       Keep separate mic.wav and monitor.wav after mixing\n"
         "  --model NAME         Whisper model: tiny/base/small/medium/large-v3 (default: base)\n"
         "  --language CODE      Force whisper language (e.g. en, de, ja; default: auto-detect)\n"
+        "  --vocab WORDS        Comma-separated vocabulary hints for transcription (names, terms)\n"
+        "  --list-vocab         List persistent vocabulary words and exit\n"
+        "  --add-vocab WORD     Add a word to persistent vocabulary and exit\n"
+        "  --remove-vocab WORD  Remove a word from persistent vocabulary and exit\n"
+        "  --reset-vocab        Clear all persistent vocabulary words and exit\n"
         "  --output-dir DIR     Base directory for outputs (default: ./meetings)\n"
         "  --note-dir DIR       Directory for meeting notes (default: same as audio)\n"
         "  --provider NAME      API provider: xai, openai, anthropic (default: xai)\n"
@@ -362,6 +369,94 @@ int main(int argc, char* argv[]) {
 
         fprintf(stderr, any_error ? "Done (with errors).\n" : "Done.\n");
         return any_error ? 1 : 0;
+    }
+
+    // Vocabulary management commands — standalone, no daemon needed
+    if (cli.list_vocab) {
+        if (cli.cfg.vocabulary.empty()) {
+            printf("No vocabulary words configured.\n");
+            printf("Enrolled speaker names are included automatically.\n");
+        } else {
+            std::istringstream ss(cli.cfg.vocabulary);
+            std::string token;
+            std::vector<std::string> words;
+            while (std::getline(ss, token, ',')) {
+                auto start = token.find_first_not_of(" \t");
+                auto end = token.find_last_not_of(" \t");
+                if (start != std::string::npos)
+                    words.push_back(token.substr(start, end - start + 1));
+            }
+            printf("Vocabulary words (%zu):\n", words.size());
+            for (const auto& w : words)
+                printf("  %s\n", w.c_str());
+        }
+        return 0;
+    }
+
+    if (!cli.add_vocab.empty()) {
+        std::string word = cli.add_vocab;
+        if (cli.cfg.vocabulary.empty()) {
+            cli.cfg.vocabulary = word;
+        } else {
+            // Check for duplicates
+            std::istringstream ss(cli.cfg.vocabulary);
+            std::string token;
+            bool found = false;
+            while (std::getline(ss, token, ',')) {
+                auto start = token.find_first_not_of(" \t");
+                auto end = token.find_last_not_of(" \t");
+                if (start != std::string::npos) {
+                    std::string trimmed = token.substr(start, end - start + 1);
+                    if (trimmed == word) { found = true; break; }
+                }
+            }
+            if (found) {
+                printf("'%s' is already in vocabulary.\n", word.c_str());
+                return 0;
+            }
+            cli.cfg.vocabulary += ", " + word;
+        }
+        save_config(cli.cfg);
+        printf("Added '%s' to vocabulary.\n", word.c_str());
+        return 0;
+    }
+
+    if (!cli.remove_vocab.empty()) {
+        std::string target = cli.remove_vocab;
+        std::istringstream ss(cli.cfg.vocabulary);
+        std::string token;
+        std::vector<std::string> words;
+        while (std::getline(ss, token, ',')) {
+            auto start = token.find_first_not_of(" \t");
+            auto end = token.find_last_not_of(" \t");
+            if (start != std::string::npos)
+                words.push_back(token.substr(start, end - start + 1));
+        }
+        auto it = std::find(words.begin(), words.end(), target);
+        if (it == words.end()) {
+            fprintf(stderr, "'%s' not found in vocabulary.\n", target.c_str());
+            return 1;
+        }
+        words.erase(it);
+        cli.cfg.vocabulary.clear();
+        for (size_t i = 0; i < words.size(); ++i) {
+            if (i > 0) cli.cfg.vocabulary += ", ";
+            cli.cfg.vocabulary += words[i];
+        }
+        save_config(cli.cfg);
+        printf("Removed '%s' from vocabulary.\n", target.c_str());
+        return 0;
+    }
+
+    if (cli.reset_vocab) {
+        if (cli.cfg.vocabulary.empty()) {
+            printf("Vocabulary is already empty.\n");
+        } else {
+            cli.cfg.vocabulary.clear();
+            save_config(cli.cfg);
+            printf("Cleared all vocabulary words.\n");
+        }
+        return 0;
     }
 
     // Speaker management commands — standalone, no daemon needed

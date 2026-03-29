@@ -144,6 +144,7 @@ Config load_config(const fs::path& config_path) {
     // Transcription section
     cfg.whisper_model = get_val(entries, "transcription", "model", cfg.whisper_model);
     cfg.language = get_val(entries, "transcription", "language", "");
+    cfg.vocabulary = get_val(entries, "transcription", "vocabulary", "");
 
     // Summary section
     cfg.provider = get_val(entries, "summary", "provider", cfg.provider);
@@ -249,6 +250,8 @@ void save_config(const Config& cfg, const fs::path& config_path) {
         << "  model: " << cfg.whisper_model << "\n";
     if (!cfg.language.empty())
         out << "  language: " << cfg.language << "\n";
+    if (!cfg.vocabulary.empty())
+        out << "  vocabulary: \"" << cfg.vocabulary << "\"\n";
 
     out << "\nsummary:\n"
         << "  provider: " << cfg.provider << "\n";

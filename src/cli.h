@@ -28,6 +28,12 @@ struct CliResult {
     std::string remove_speaker;  // --remove-speaker "Name"
     std::string identify_dir;    // --identify <meeting_dir>
     bool reset_speakers = false;  // --reset-speakers
+
+    // Vocabulary management
+    bool list_vocab = false;         // --list-vocab
+    std::string add_vocab;           // --add-vocab "word"
+    std::string remove_vocab;        // --remove-vocab "word"
+    bool reset_vocab = false;        // --reset-vocab
 };
 
 /// Parse command-line arguments. Loads config file as defaults, then applies flag overrides.

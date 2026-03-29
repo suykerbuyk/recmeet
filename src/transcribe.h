@@ -62,6 +62,7 @@ struct TranscriptResult {
 
 struct TranscribeOptions {
     std::string language;
+    std::string initial_prompt;  // vocabulary/spelling hints for whisper
     int threads = 0;
     std::function<void(int)> on_progress;  // percent 0-100
     StopToken* stop = nullptr;

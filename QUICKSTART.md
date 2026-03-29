@@ -190,6 +190,7 @@ audio:
 transcription:
   model: base
   language: ""           # empty = auto-detect
+  # vocabulary: "John Suykerbuyk, PipeWire, Kubernetes"  # hints for whisper
 
 diarization:
   enabled: true
@@ -365,9 +366,63 @@ recmeet --speaker-threshold 0.7            # stricter matching
 recmeet --speaker-db /path/to/speakers/    # custom database location
 ```
 
-## 12. MCP server (IDE integration)
+## 12. Vocabulary hints (transcription accuracy)
+
+Whisper can mangle unusual names and domain-specific terms. Vocabulary hints bias the transcription decoder toward correct spellings. Enrolled speaker names are included automatically — no configuration needed for names you've already enrolled.
+
+### Automatic hints (speaker names)
+
+When speakers are enrolled (section 11), their names are automatically passed to whisper as vocabulary hints during transcription. If you've enrolled "John Suykerbuyk", whisper will produce the correct spelling instead of phonetic approximations like "John Seck-Rick".
+
+### Managing persistent vocabulary
+
+For terms beyond speaker names — company names, product names, jargon — use the vocabulary management commands:
+
+```bash
+# Add words to persistent vocabulary
+recmeet --add-vocab "SykeTech"
+recmeet --add-vocab "PipeWire"
+recmeet --add-vocab "Kubernetes"
+
+# List current vocabulary
+recmeet --list-vocab
+# Output:
+#   Vocabulary words (3):
+#     SykeTech
+#     PipeWire
+#     Kubernetes
+
+# Remove a word
+recmeet --remove-vocab "Kubernetes"
+
+# Clear all vocabulary words
+recmeet --reset-vocab
+```
+
+Vocabulary is saved to `~/.config/recmeet/config.yaml` under `transcription.vocabulary` and persists across sessions.
+
+### One-off vocabulary (CLI flag)
+
+For a single recording, use `--vocab` to override the persistent vocabulary:
+
+```bash
+recmeet --vocab "John Suykerbuyk, PipeWire, recmeet"
+```
+
+### Configuration
+
+```yaml
+# ~/.config/recmeet/config.yaml
+transcription:
+  vocabulary: "SykeTech, PipeWire, Kubernetes"
+```
+
+Enrolled speaker names are always included alongside vocabulary hints — you don't need to add them manually. The combined list is passed to whisper's `initial_prompt` parameter, which biases the decoder toward the specified tokens.
+
+## 13. MCP server (IDE integration)
 
 The MCP server lets AI tools (Claude Code, Claude Desktop, Cursor) query your meeting data directly.
+
 
 ### Build
 
@@ -401,7 +456,7 @@ For Claude Code, add to `~/.claude.json`:
 
 Once configured, ask your AI tool: "What action items came out of last week's meetings?" or "Search my meetings about the auth migration."
 
-## 13. AI agent (meeting prep + follow-up)
+## 14. AI agent (meeting prep + follow-up)
 
 The agent CLI uses Claude to automate pre-meeting research and post-meeting follow-up.
 
@@ -448,7 +503,7 @@ The agent reads the meeting note, classifies action items by assignee, and draft
 --dry-run         # Print prompts without calling the API
 ```
 
-## 14. Common workflows
+## 15. Common workflows
 
 ### Record with specific audio sources
 

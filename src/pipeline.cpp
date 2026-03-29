@@ -21,6 +21,7 @@
 #include <chrono>
 #include <cstdio>
 #include <fstream>
+#include <sstream>
 #include <thread>
 #include <unistd.h>
 
@@ -249,6 +250,31 @@ int vad_weighted_progress(size_t seg_index, int seg_percent, const std::vector<s
     return static_cast<int>(done * 100 / total);
 }
 
+std::string build_initial_prompt(const std::vector<std::string>& speaker_names,
+                                 const std::string& vocabulary) {
+    std::string result;
+
+    for (const auto& name : speaker_names) {
+        if (!result.empty()) result += ", ";
+        result += name;
+    }
+
+    if (!vocabulary.empty()) {
+        std::istringstream ss(vocabulary);
+        std::string token;
+        while (std::getline(ss, token, ',')) {
+            auto start = token.find_first_not_of(" \t");
+            auto end = token.find_last_not_of(" \t");
+            if (start == std::string::npos) continue;
+            std::string trimmed = token.substr(start, end - start + 1);
+            if (!result.empty()) result += ", ";
+            result += trimmed;
+        }
+    }
+
+    return result;
+}
+
 PipelineResult run_postprocessing(const Config& cfg, const PostprocessInput& input,
                                   PhaseCallback on_phase, ProgressCallback on_progress,
                                   StopToken* stop) {
@@ -262,6 +288,20 @@ PipelineResult run_postprocessing(const Config& cfg, const PostprocessInput& inp
     };
 
     int threads = cfg.threads > 0 ? cfg.threads : default_thread_count();
+
+    // Build initial_prompt from enrolled speaker names + vocabulary hints
+    std::string initial_prompt;
+    {
+        std::vector<std::string> names;
+        if (cfg.speaker_id) {
+            fs::path db_dir = cfg.speaker_db.empty()
+                ? default_speaker_db_dir() : cfg.speaker_db;
+            names = list_speakers(db_dir);
+        }
+        initial_prompt = build_initial_prompt(names, cfg.vocabulary);
+        if (!initial_prompt.empty())
+            log_info("Vocabulary hints: %s", initial_prompt.c_str());
+    }
 
     // --- Transcribe + Diarize (if not pre-computed) ---
     std::string transcript_text = input.transcript_text;
@@ -309,6 +349,7 @@ PipelineResult run_postprocessing(const Config& cfg, const PostprocessInput& inp
 
                             TranscribeOptions opts;
                             opts.language = cfg.language;
+                            opts.initial_prompt = initial_prompt;
                             opts.threads = threads;
                             opts.stop = stop;
                             if (on_progress) {
@@ -338,6 +379,7 @@ PipelineResult run_postprocessing(const Config& cfg, const PostprocessInput& inp
 
                     TranscribeOptions opts;
                     opts.language = cfg.language;
+                    opts.initial_prompt = initial_prompt;
                     opts.threads = threads;
                     opts.stop = stop;
                     if (on_progress) {
