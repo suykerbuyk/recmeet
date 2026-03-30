@@ -15,6 +15,7 @@ namespace recmeet {
 struct PipelineResult {
     fs::path note_path;
     fs::path output_dir;
+    std::string transcript_text;  ///< Raw timestamped transcript (empty if transcription skipped).
 };
 
 /// Input for post-processing phase (output of recording phase).

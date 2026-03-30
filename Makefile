@@ -51,7 +51,7 @@ CMAKE_OPTS += -DRECMEET_BUILD_WEB=$(RECMEET_BUILD_WEB)
 endif
 
 # ── Targets ─────────────────────────────────────────────────────────
-.PHONY: build test integration benchmark install uninstall package-deb package-rpm package-arch clean coverage help daemon-start daemon-stop daemon-status
+.PHONY: build test integration benchmark full-stack install uninstall package-deb package-rpm package-arch clean coverage help daemon-start daemon-stop daemon-status
 
 build:
 	cmake -B $(BUILD_DIR) -G Ninja $(CMAKE_OPTS)
@@ -62,7 +62,7 @@ build:
 test:
 	cmake -B $(BUILD_DIR) -G Ninja $(CMAKE_OPTS) -DRECMEET_BUILD_TESTS=ON
 	ninja -C $(BUILD_DIR)
-	./$(BUILD_DIR)/recmeet_tests "~[integration]~[benchmark]"
+	./$(BUILD_DIR)/recmeet_tests "~[integration]~[benchmark]~[full-stack]"
 	cd tools && go test ./... -count=1
 
 integration:
@@ -74,6 +74,12 @@ benchmark:
 	cmake -B $(BUILD_DIR) -G Ninja $(CMAKE_OPTS) -DRECMEET_BUILD_TESTS=ON
 	ninja -C $(BUILD_DIR)
 	./$(BUILD_DIR)/recmeet_tests "[benchmark]"
+
+full-stack:
+	cmake -B $(BUILD_DIR) -G Ninja $(CMAKE_OPTS) -DRECMEET_BUILD_TESTS=ON
+	ninja -C $(BUILD_DIR)
+	./$(BUILD_DIR)/recmeet --download-models --model base
+	./$(BUILD_DIR)/recmeet_tests "[full-stack]"
 
 install: build
 	DESTDIR=$(DESTDIR) cmake --install $(BUILD_DIR)
@@ -161,6 +167,7 @@ help:
 	@echo "  make test          Build + run unit tests"
 	@echo "  make integration   Build + run integration tests"
 	@echo "  make benchmark     Build + run benchmark tests"
+	@echo "  make full-stack    Build + run end-to-end pipeline tests"
 	@echo "  make install       Build + install to PREFIX (default: ~/.local)"
 	@echo "  make uninstall     Remove installed files from PREFIX"
 	@echo "  make daemon-start  Build + start daemon in background"

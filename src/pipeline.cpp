@@ -582,6 +582,7 @@ PipelineResult run_postprocessing(const Config& cfg, const PostprocessInput& inp
         md.time = time_str;
         md.summary_text = summary_text;
         md.transcript_text = transcript_text;
+        pipe_result.transcript_text = transcript_text;
         md.context_text = context_text;
         md.output_dir = input.out_dir;
         if (!cfg.note_dir.empty()) {

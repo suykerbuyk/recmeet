@@ -382,16 +382,18 @@ make coverage            # Go test coverage report
 
 ## Testing
 
-331 C++ unit tests (1367 assertions) across 23 modules, plus integration, benchmark, and Go test suites.
+440 C++ test cases (1435+ assertions) across 25 modules, plus integration, benchmark, full-stack, and Go test suites.
 
 ```bash
 make test                # C++ unit + Go tests (no hardware needed)
 make benchmark           # benchmark tests (needs whisper models + assets/)
+make full-stack          # end-to-end pipeline tests (models + assets/)
 
 # Or run directly for more control:
-./build/recmeet_tests "~[integration]~[benchmark]"   # unit tests
+./build/recmeet_tests "~[integration]~[benchmark]~[full-stack]"  # unit tests only
 ./build/recmeet_tests "[integration]"                 # needs running PipeWire session
 ./build/recmeet_tests "[benchmark]"                   # needs whisper models + assets/
+./build/recmeet_tests "[full-stack]"                  # end-to-end pipeline (models + assets/)
 ./build/recmeet_tests "[cli]"                         # single module
 ```
 
