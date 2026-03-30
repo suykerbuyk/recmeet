@@ -323,6 +323,8 @@ static void pp_worker_loop(IpcServer& server) {
             auto last_broadcast = std::chrono::steady_clock::time_point{};
             int last_percent = -1;
             std::string last_stderr_line;
+            auto last_heartbeat = std::chrono::steady_clock::now();
+            bool killed_stale = false;
             std::string captured_note_path;
             std::string captured_output_dir;
 
@@ -343,6 +345,24 @@ static void pp_worker_loop(IpcServer& server) {
                     g_pp_stop.reset();
                 }
 
+                // Staleness watchdog — kill child if no heartbeat/progress for 120s
+                if (!killed_stale) {
+                    auto now_hb = std::chrono::steady_clock::now();
+                    auto stale_s = std::chrono::duration_cast<std::chrono::seconds>(
+                        now_hb - last_heartbeat).count();
+                    if (stale_s >= 120) {
+                        log_error("daemon: child stale for %lds, killing pid %d",
+                                  (long)stale_s, (int)pid);
+                        kill(pid, SIGTERM);
+                        killed_stale = true;
+                        for (auto& pfd : pfds) {
+                            if (pfd.fd >= 0) close(pfd.fd);
+                            pfd.fd = -1;
+                        }
+                        break;
+                    }
+                }
+
                 if (ret <= 0) continue;
 
                 // Process stdout
@@ -359,7 +379,10 @@ static void pp_worker_loop(IpcServer& server) {
                             pos = nl + 1;
 
                             std::string event = parse_ndjson_string(line, "event");
+                            // Any event from child counts as proof of life
+                            last_heartbeat = std::chrono::steady_clock::now();
                             if (event == "phase") {
+                                last_percent = -1;  // Reset throttle on phase change
                                 std::string name = parse_ndjson_string(line, "name");
                                 server.post([&server, name]() {
                                     IpcEvent ev;
@@ -462,7 +485,9 @@ static void pp_worker_loop(IpcServer& server) {
                 log_info("Postprocessing cancelled for job %ld", (long)job.job_id);
             } else {
                 std::string msg;
-                if (WIFSIGNALED(status)) {
+                if (killed_stale) {
+                    msg = "Processing stalled (no heartbeat for 120s) — likely onnxruntime deadlock";
+                } else if (WIFSIGNALED(status)) {
                     char sigbuf[128];
                     snprintf(sigbuf, sizeof(sigbuf), "Processing crashed (signal %d: %s)",
                              WTERMSIG(status), strsignal(WTERMSIG(status)));

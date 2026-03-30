@@ -20,11 +20,14 @@
 #include <whisper.h>
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <csignal>
 #include <cstring>
 #include <cstdio>
 #include <fstream>
 #include <sstream>
+#include <thread>
 #include <unistd.h>
 
 using namespace recmeet;
@@ -740,6 +743,24 @@ static int subprocess_main(CliResult& cli) {
     sigaction(SIGINT, &sa, nullptr);
     sigaction(SIGTERM, &sa, nullptr);
 
+    // Heartbeat thread — writes periodic NDJSON so the daemon knows we're alive.
+    // Any real progress/phase event also serves as a heartbeat, so the interval
+    // here (10 s) is just a fallback for long-running stages that don't report.
+    std::atomic<bool> heartbeat_stop{false};
+    std::thread heartbeat_thread([&heartbeat_stop]() {
+        while (!heartbeat_stop.load(std::memory_order_relaxed)) {
+            for (int i = 0; i < 100 && !heartbeat_stop.load(std::memory_order_relaxed); ++i)
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            if (!heartbeat_stop.load(std::memory_order_relaxed))
+                write_ndjson("heartbeat", "{}");
+        }
+    });
+
+    auto stop_heartbeat = [&]() {
+        heartbeat_stop.store(true, std::memory_order_relaxed);
+        if (heartbeat_thread.joinable()) heartbeat_thread.join();
+    };
+
     auto on_phase = [](const std::string& name) {
         char buf[256];
         snprintf(buf, sizeof(buf), "{\"name\":\"%s\"}", name.c_str());
@@ -777,8 +798,10 @@ static int subprocess_main(CliResult& cli) {
         std::error_code ec;
         fs::remove(cli.config_json_path, ec);
 
+        stop_heartbeat();
         return 0;
     } catch (const RecmeetError& e) {
+        stop_heartbeat();
         std::string msg = e.what();
         if (msg == "Cancelled") {
             std::error_code ec;
@@ -790,6 +813,7 @@ static int subprocess_main(CliResult& cli) {
         fs::remove(cli.config_json_path, ec);
         return 1;
     } catch (const std::exception& e) {
+        stop_heartbeat();
         fprintf(stderr, "%s\n", e.what());
         std::error_code ec;
         fs::remove(cli.config_json_path, ec);

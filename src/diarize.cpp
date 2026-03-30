@@ -69,7 +69,7 @@ DiarizeResult diarize(const float* samples, size_t num_samples,
 
     SherpaOnnxOfflineSpeakerSegmentationModelConfig seg_cfg{};
     seg_cfg.pyannote = pyannote;
-    int t = threads > 0 ? threads : default_thread_count();
+    int t = std::min(threads > 0 ? threads : default_thread_count(), 4);
     seg_cfg.num_threads = t;
     seg_cfg.debug = 0;
     seg_cfg.provider = "cpu";

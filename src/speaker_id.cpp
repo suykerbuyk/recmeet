@@ -421,7 +421,7 @@ std::vector<float> extract_speaker_embedding(
     const DiarizeResult& diar, int speaker_id,
     const fs::path& model_path, int threads) {
 
-    int t = threads > 0 ? threads : default_thread_count();
+    int t = std::min(threads > 0 ? threads : default_thread_count(), 4);
 
     SherpaOnnxSpeakerEmbeddingExtractorConfig cfg{};
     cfg.model = model_path.c_str();
@@ -484,7 +484,7 @@ IdentifyResult identify_speakers(
     IdentifyResult result;
     if (diar.segments.empty()) return result;
 
-    int t = threads > 0 ? threads : default_thread_count();
+    int t = std::min(threads > 0 ? threads : default_thread_count(), 4);
 
     // Create embedding extractor
     SherpaOnnxSpeakerEmbeddingExtractorConfig cfg{};
