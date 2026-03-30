@@ -6,6 +6,7 @@
 #include "device_enum.h"
 #include "ipc_protocol.h"
 #include "ipc_server.h"
+#include "ndjson_parse.h"
 #include "speaker_id.h"
 #include "summarize.h"
 #include "log.h"
@@ -23,11 +24,14 @@
 #include <csignal>
 #include <cstdio>
 #include <cstring>
+#include <fstream>
 #include <mutex>
 #include <queue>
 #include <thread>
+#include <poll.h>
 #include <sys/file.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 using namespace recmeet;
@@ -75,6 +79,10 @@ static bool g_is_reprocess = false;
 static std::mutex g_context_mu;
 static std::string g_pending_context;
 static std::string g_pending_vocab;
+
+// Subprocess postprocessing state
+static std::atomic<pid_t> g_pp_child_pid{-1};
+static std::string g_self_exe;  // resolved at startup
 
 // Global server pointer for signal handler
 static IpcServer* g_server = nullptr;
@@ -205,7 +213,18 @@ static bool ensure_models(Config& cfg) {
 }
 
 // ---------------------------------------------------------------------------
-// Postprocessing worker loop (long-lived thread)
+// Subprocess helpers
+// ---------------------------------------------------------------------------
+
+static fs::path write_job_config(const PostprocessJob& job) {
+    auto path = fs::temp_directory_path() / ("recmeet-pp-" + std::to_string(job.job_id) + ".json");
+    std::ofstream out(path);
+    out << config_to_json(job.cfg);
+    return path;
+}
+
+// ---------------------------------------------------------------------------
+// Postprocessing worker loop (long-lived thread, fork/exec subprocess)
 // ---------------------------------------------------------------------------
 
 static void pp_worker_loop(IpcServer& server) {
@@ -227,7 +246,6 @@ static void pp_worker_loop(IpcServer& server) {
         }
 
         if (!already_flagged) {
-            // Direct enqueue (shouldn't normally happen, but be safe)
             {
                 std::lock_guard<std::mutex> lock(g_state_mu);
                 g_postprocessing.store(true);
@@ -236,59 +254,237 @@ static void pp_worker_loop(IpcServer& server) {
         }
         g_pp_stop.reset();
 
-        try {
-            // Per-job progress throttle state (NOT static)
-            auto last_broadcast = std::chrono::steady_clock::time_point{};
-            int last_percent = -1;
+        // Write config to temp file
+        auto config_path = write_job_config(job);
 
-            auto on_phase = [&server](const std::string& name) {
-                server.post([&server, name]() {
-                    IpcEvent ev;
-                    ev.event = "phase";
-                    ev.data["name"] = name;
-                    server.broadcast(ev);
-                });
-            };
+        // Build argv
+        std::string out_dir_str = job.input.out_dir.string();
+        std::string config_path_str = config_path.string();
 
-            auto on_progress = [&server, &last_broadcast, &last_percent](
-                                   const std::string& phase, int percent) {
-                using clock = std::chrono::steady_clock;
-                auto now = clock::now();
-                int elapsed = std::chrono::duration_cast<std::chrono::seconds>(
-                    now - last_broadcast).count();
-                int jump = percent - last_percent;
-                if (last_percent < 0 || elapsed >= 120 || jump >= 10) {
-                    last_broadcast = now;
-                    last_percent = percent;
-                    server.post([&server, phase, percent]() {
-                        IpcEvent ev;
-                        ev.event = "progress";
-                        ev.data["phase"] = phase;
-                        ev.data["percent"] = static_cast<int64_t>(percent);
-                        server.broadcast(ev);
-                    });
-                }
-            };
+        std::vector<std::string> argv_strs = {
+            g_self_exe,
+            "--reprocess", out_dir_str,
+            "--config-json", config_path_str,
+            "--progress-json",
+            "--no-daemon"
+        };
+        std::vector<char*> argv_ptrs;
+        for (auto& s : argv_strs) argv_ptrs.push_back(s.data());
+        argv_ptrs.push_back(nullptr);
 
-            PipelineResult result = run_postprocessing(
-                job.cfg, job.input, on_phase, on_progress, &g_pp_stop);
-
-            // Broadcast job.complete with job_id
-            int64_t jid = job.job_id;
-            server.post([&server, result, jid]() {
-                IpcEvent ev;
-                ev.event = "job.complete";
-                ev.data["note_path"] = result.note_path.string();
-                ev.data["output_dir"] = result.output_dir.string();
-                ev.data["job_id"] = jid;
-                server.broadcast(ev);
-            });
-        } catch (const std::exception& e) {
-            log_error("daemon: postprocessing failed: %s", e.what());
-            broadcast_state(server, e.what());
+        // Create pipes
+        int stdout_pipe[2], stderr_pipe[2];
+        if (pipe(stdout_pipe) < 0 || pipe(stderr_pipe) < 0) {
+            log_error("daemon: pipe() failed: %s", strerror(errno));
+            notify("Postprocessing failed", "Could not create pipes");
+            broadcast_state(server, "pipe() failed");
+            std::error_code ec;
+            fs::remove(config_path, ec);
+            goto clear_state;
         }
 
-        // Clear postprocessing flag
+        {
+            pid_t pid = fork();
+
+            if (pid == 0) {
+                // Child — reset signal handlers immediately
+                signal(SIGINT, SIG_DFL);
+                signal(SIGTERM, SIG_DFL);
+                signal(SIGHUP, SIG_DFL);
+
+                close(stdout_pipe[0]);
+                close(stderr_pipe[0]);
+                dup2(stdout_pipe[1], STDOUT_FILENO);
+                dup2(stderr_pipe[1], STDERR_FILENO);
+                close(stdout_pipe[1]);
+                close(stderr_pipe[1]);
+
+                execv(g_self_exe.c_str(), argv_ptrs.data());
+                _exit(127);
+            }
+
+            if (pid < 0) {
+                log_error("daemon: fork() failed: %s", strerror(errno));
+                notify("Postprocessing failed", "Could not launch subprocess");
+                broadcast_state(server, "fork() failed");
+                close(stdout_pipe[0]); close(stdout_pipe[1]);
+                close(stderr_pipe[0]); close(stderr_pipe[1]);
+                std::error_code ec;
+                fs::remove(config_path, ec);
+                goto clear_state;
+            }
+
+            // Parent
+            close(stdout_pipe[1]);
+            close(stderr_pipe[1]);
+            g_pp_child_pid.store(pid);
+
+            // Per-job progress throttle state
+            auto last_broadcast = std::chrono::steady_clock::time_point{};
+            int last_percent = -1;
+            std::string last_stderr_line;
+            std::string captured_note_path;
+            std::string captured_output_dir;
+
+            // Poll loop on both pipes
+            struct pollfd pfds[2] = {
+                {stdout_pipe[0], POLLIN, 0},
+                {stderr_pipe[0], POLLIN, 0}
+            };
+            int nfds = 2;
+            std::string stdout_buf, stderr_buf;
+
+            while (nfds > 0) {
+                int ret = poll(pfds, nfds, 1000);
+
+                // Check cancel
+                if (g_pp_stop.stop_requested()) {
+                    kill(pid, SIGTERM);
+                    g_pp_stop.reset();
+                }
+
+                if (ret <= 0) continue;
+
+                // Process stdout
+                if (pfds[0].fd >= 0 && (pfds[0].revents & (POLLIN | POLLHUP))) {
+                    char buf[4096];
+                    ssize_t n = read(pfds[0].fd, buf, sizeof(buf));
+                    if (n > 0) {
+                        stdout_buf.append(buf, n);
+                        // Process complete lines
+                        size_t pos = 0;
+                        size_t nl;
+                        while ((nl = stdout_buf.find('\n', pos)) != std::string::npos) {
+                            std::string line = stdout_buf.substr(pos, nl - pos);
+                            pos = nl + 1;
+
+                            std::string event = parse_ndjson_string(line, "event");
+                            if (event == "phase") {
+                                std::string name = parse_ndjson_string(line, "name");
+                                server.post([&server, name]() {
+                                    IpcEvent ev;
+                                    ev.event = "phase";
+                                    ev.data["name"] = name;
+                                    server.broadcast(ev);
+                                });
+                            } else if (event == "progress") {
+                                std::string phase = parse_ndjson_string(line, "phase");
+                                int64_t percent = parse_ndjson_int(line, "percent");
+                                // Apply throttle
+                                using clock = std::chrono::steady_clock;
+                                auto now = clock::now();
+                                int elapsed = std::chrono::duration_cast<std::chrono::seconds>(
+                                    now - last_broadcast).count();
+                                int jump = static_cast<int>(percent) - last_percent;
+                                if (last_percent < 0 || elapsed >= 120 || jump >= 10) {
+                                    last_broadcast = now;
+                                    last_percent = static_cast<int>(percent);
+                                    server.post([&server, phase, percent]() {
+                                        IpcEvent ev;
+                                        ev.event = "progress";
+                                        ev.data["phase"] = phase;
+                                        ev.data["percent"] = percent;
+                                        server.broadcast(ev);
+                                    });
+                                }
+                            } else if (event == "job.complete") {
+                                captured_note_path = parse_ndjson_string(line, "note_path");
+                                captured_output_dir = parse_ndjson_string(line, "output_dir");
+                            }
+                        }
+                        stdout_buf.erase(0, pos);
+                    } else if (n == 0) {
+                        close(pfds[0].fd);
+                        pfds[0].fd = -1;
+                        pfds[0].events = 0;
+                    }
+                }
+
+                // Process stderr
+                if (pfds[1].fd >= 0 && (pfds[1].revents & (POLLIN | POLLHUP))) {
+                    char buf[4096];
+                    ssize_t n = read(pfds[1].fd, buf, sizeof(buf));
+                    if (n > 0) {
+                        stderr_buf.append(buf, n);
+                        size_t pos = 0;
+                        size_t nl;
+                        while ((nl = stderr_buf.find('\n', pos)) != std::string::npos) {
+                            std::string line = stderr_buf.substr(pos, nl - pos);
+                            pos = nl + 1;
+                            if (!line.empty()) {
+                                log_info("pp-child: %s", line.c_str());
+                                last_stderr_line = line;
+                            }
+                        }
+                        stderr_buf.erase(0, pos);
+                    } else if (n == 0) {
+                        close(pfds[1].fd);
+                        pfds[1].fd = -1;
+                        pfds[1].events = 0;
+                    }
+                }
+
+                // Recount active fds
+                nfds = 0;
+                for (auto& pfd : pfds) {
+                    if (pfd.fd >= 0) ++nfds;
+                }
+                // Compact: move valid fds to front
+                if (nfds == 1 && pfds[0].fd < 0) {
+                    pfds[0] = pfds[1];
+                    pfds[1].fd = -1;
+                }
+            }
+
+            // Reap child
+            int status;
+            waitpid(pid, &status, 0);
+            g_pp_child_pid.store(-1);
+
+            // Clean up config file
+            {
+                std::error_code ec;
+                fs::remove(config_path, ec);
+            }
+
+            // Interpret result
+            if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
+                int64_t jid = job.job_id;
+                server.post([&server, captured_note_path, captured_output_dir, jid]() {
+                    IpcEvent ev;
+                    ev.event = "job.complete";
+                    ev.data["note_path"] = captured_note_path;
+                    ev.data["output_dir"] = captured_output_dir;
+                    ev.data["job_id"] = jid;
+                    server.broadcast(ev);
+                });
+            } else if (WIFEXITED(status) && WEXITSTATUS(status) == 2) {
+                log_info("Postprocessing cancelled for job %ld", (long)job.job_id);
+            } else {
+                std::string msg;
+                if (WIFSIGNALED(status)) {
+                    char sigbuf[128];
+                    snprintf(sigbuf, sizeof(sigbuf), "Processing crashed (signal %d: %s)",
+                             WTERMSIG(status), strsignal(WTERMSIG(status)));
+                    msg = sigbuf;
+                } else if (WIFEXITED(status) && WEXITSTATUS(status) == 127) {
+                    msg = "Failed to launch postprocessing subprocess";
+                } else {
+                    char exitbuf[64];
+                    snprintf(exitbuf, sizeof(exitbuf), "Processing failed (exit %d)",
+                             WEXITSTATUS(status));
+                    msg = exitbuf;
+                    if (!last_stderr_line.empty())
+                        msg += ": " + last_stderr_line;
+                }
+                msg += " — audio preserved at " + job.input.out_dir.string();
+                log_error("daemon: %s", msg.c_str());
+                notify("Postprocessing failed", msg);
+                broadcast_state(server, msg);
+            }
+        }
+
+    clear_state:
         {
             std::lock_guard<std::mutex> lock(g_state_mu);
             g_postprocessing.store(false);
@@ -378,6 +574,19 @@ int main(int argc, char* argv[]) {
     // based on the merged config (client may send an API key)
 
     notify_init();
+
+    // Resolve path to recmeet binary for subprocess postprocessing
+    {
+        std::error_code ec;
+        auto self = fs::read_symlink("/proc/self/exe", ec);
+        if (!ec) {
+            auto sibling = self.parent_path() / "recmeet";
+            if (fs::exists(sibling, ec))
+                g_self_exe = sibling.string();
+        }
+        if (g_self_exe.empty())
+            g_self_exe = "recmeet";
+    }
 
     // Create server
     IpcServer server(socket_path);
@@ -618,10 +827,15 @@ int main(int argc, char* argv[]) {
                 return false;
             }
             g_pp_stop.request();
+            { pid_t child = g_pp_child_pid.load(); if (child > 0) kill(child, SIGTERM); }
         } else {
             // "all" — stop everything
             if (rec) g_rec_stop.request();
-            if (pp) g_pp_stop.request();
+            if (pp) {
+                g_pp_stop.request();
+                pid_t child = g_pp_child_pid.load();
+                if (child > 0) kill(child, SIGTERM);
+            }
         }
 
         resp.result["ok"] = true;
@@ -921,6 +1135,7 @@ int main(int argc, char* argv[]) {
     log_info("daemon: shutting down");
     g_rec_stop.request();
     g_pp_stop.request();
+    { pid_t child = g_pp_child_pid.load(); if (child > 0) kill(child, SIGTERM); }
 
     // Shut down the pp worker queue
     {

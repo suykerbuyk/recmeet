@@ -10,6 +10,7 @@
 #include "ipc_protocol.h"
 #include "log.h"
 #include "model_manager.h"
+#include "ndjson_parse.h"
 #include "notify.h"
 #include "pipeline.h"
 #include "speaker_id.h"
@@ -22,6 +23,7 @@
 #include <csignal>
 #include <cstring>
 #include <cstdio>
+#include <fstream>
 #include <sstream>
 #include <unistd.h>
 
@@ -704,7 +706,103 @@ int main(int argc, char* argv[]) {
     return standalone_main(cli);
 }
 
+// ---------------------------------------------------------------------------
+// Subprocess postprocessing mode (daemon-internal)
+// Writes NDJSON progress to stdout, exit 0=ok, 1=error, 2=cancelled.
+// ---------------------------------------------------------------------------
+
+static int subprocess_main(CliResult& cli) {
+    // Load full config from JSON file
+    std::string json_content;
+    {
+        std::ifstream in(cli.config_json_path);
+        if (!in) {
+            fprintf(stderr, "Cannot open config file: %s\n", cli.config_json_path.c_str());
+            return 1;
+        }
+        std::ostringstream ss;
+        ss << in.rdbuf();
+        json_content = ss.str();
+    }
+
+    Config cfg = config_from_json(json_content);
+
+    // Suppress whisper log noise
+    whisper_log_set([](enum ggml_log_level, const char*, void*) {}, nullptr);
+
+    // Do NOT call notify_init() — avoid duplicate desktop notifications
+    // (the daemon handles notifications from IPC events)
+
+    // Install signal handler for graceful cancellation
+    struct sigaction sa{};
+    sa.sa_handler = signal_handler;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGINT, &sa, nullptr);
+    sigaction(SIGTERM, &sa, nullptr);
+
+    auto on_phase = [](const std::string& name) {
+        char buf[256];
+        snprintf(buf, sizeof(buf), "{\"name\":\"%s\"}", name.c_str());
+        write_ndjson("phase", buf);
+    };
+
+    auto on_progress = [](const std::string& phase, int percent) {
+        char buf[256];
+        snprintf(buf, sizeof(buf), "{\"phase\":\"%s\",\"percent\":%d}", phase.c_str(), percent);
+        write_ndjson("progress", buf);
+    };
+
+    try {
+        auto input = run_recording(cfg, g_stop, on_phase);
+        auto result = run_postprocessing(cfg, input, on_phase, on_progress, &g_stop);
+
+        // Emit job.complete
+        std::string data = "{\"note_path\":\"";
+        // Simple JSON escaping for paths
+        for (char c : result.note_path.string()) {
+            if (c == '"') data += "\\\"";
+            else if (c == '\\') data += "\\\\";
+            else data += c;
+        }
+        data += "\",\"output_dir\":\"";
+        for (char c : result.output_dir.string()) {
+            if (c == '"') data += "\\\"";
+            else if (c == '\\') data += "\\\\";
+            else data += c;
+        }
+        data += "\"}";
+        write_ndjson("job.complete", data.c_str());
+
+        // Clean up config file
+        std::error_code ec;
+        fs::remove(cli.config_json_path, ec);
+
+        return 0;
+    } catch (const RecmeetError& e) {
+        std::string msg = e.what();
+        if (msg == "Cancelled") {
+            std::error_code ec;
+            fs::remove(cli.config_json_path, ec);
+            return 2;
+        }
+        fprintf(stderr, "%s\n", e.what());
+        std::error_code ec;
+        fs::remove(cli.config_json_path, ec);
+        return 1;
+    } catch (const std::exception& e) {
+        fprintf(stderr, "%s\n", e.what());
+        std::error_code ec;
+        fs::remove(cli.config_json_path, ec);
+        return 1;
+    }
+}
+
 static int standalone_main(CliResult& cli) {
+    // Subprocess mode: daemon launched us with --progress-json --config-json
+    if (cli.progress_json && !cli.config_json_path.empty()) {
+        return subprocess_main(cli);
+    }
+
     Config cfg = cli.cfg;
 
     // List sources mode

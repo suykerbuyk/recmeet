@@ -34,6 +34,10 @@ struct CliResult {
     std::string add_vocab;           // --add-vocab "word"
     std::string remove_vocab;        // --remove-vocab "word"
     bool reset_vocab = false;        // --reset-vocab
+
+    // Subprocess mode (daemon-internal, undocumented)
+    bool progress_json = false;          // --progress-json
+    std::string config_json_path;        // --config-json <path>
 };
 
 /// Parse command-line arguments. Loads config file as defaults, then applies flag overrides.

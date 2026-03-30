@@ -68,6 +68,14 @@ JsonMap config_to_map(const Config& cfg) {
 
     // Notes
     m["note_domain"]      = cfg.note.domain;
+    {
+        std::string joined;
+        for (const auto& t : cfg.note.tags) {
+            if (!joined.empty()) joined += ",";
+            joined += t;
+        }
+        m["note_tags"] = joined;
+    }
 
     // Per-provider API keys (flat dot-prefixed to avoid nested JSON)
     for (const auto& [name, key] : cfg.api_keys) {
@@ -162,6 +170,21 @@ Config config_from_map(const JsonMap& m) {
     str("context_inline", cfg.context_inline);
 
     str("note_domain", cfg.note.domain);
+    {
+        auto it = m.find("note_tags");
+        if (it != m.end()) {
+            std::string s = json_val_as_string(it->second);
+            cfg.note.tags.clear();
+            size_t pos = 0;
+            while (pos < s.size()) {
+                auto next = s.find(',', pos);
+                if (next == std::string::npos) next = s.size();
+                auto tag = s.substr(pos, next - pos);
+                if (!tag.empty()) cfg.note.tags.push_back(tag);
+                pos = next + 1;
+            }
+        }
+    }
 
     // Per-provider API keys (dot-prefixed)
     const std::string prefix = "api_keys.";

@@ -5,6 +5,10 @@
 #include <catch2/matchers/catch_matchers_floating_point.hpp>
 #include "config_json.h"
 
+#include <filesystem>
+#include <fstream>
+#include <sstream>
+
 using namespace recmeet;
 
 static Config make_test_config() {
@@ -40,6 +44,7 @@ static Config make_test_config() {
     cfg.context_inline = "Subject: Weekly standup\nParticipants: Alice, Bob";
     cfg.reprocess_dir = "/tmp/meetings/2026-03-06_11-58";
     cfg.note.domain = "engineering";
+    cfg.note.tags = {"meeting", "standup", "engineering"};
     return cfg;
 }
 
@@ -88,6 +93,8 @@ TEST_CASE("config_to_json + config_from_json round-trip", "[config_json]") {
     CHECK(loaded.context_inline == original.context_inline);
     CHECK(loaded.reprocess_dir == original.reprocess_dir);
     CHECK(loaded.note.domain == original.note.domain);
+    REQUIRE(loaded.note.tags.size() == original.note.tags.size());
+    CHECK(loaded.note.tags == original.note.tags);
 }
 
 TEST_CASE("config_to_map + config_from_map round-trip", "[config_json]") {
@@ -103,6 +110,24 @@ TEST_CASE("config_to_map + config_from_map round-trip", "[config_json]") {
     CHECK(loaded.context_inline == original.context_inline);
     CHECK(loaded.threads == original.threads);
     CHECK(loaded.note.domain == original.note.domain);
+    CHECK(loaded.note.tags == original.note.tags);
+}
+
+TEST_CASE("note.tags round-trip: empty tags", "[config_json]") {
+    Config cfg;
+    cfg.note.tags.clear();
+    std::string json = config_to_json(cfg);
+    Config loaded = config_from_json(json);
+    CHECK(loaded.note.tags.empty());
+}
+
+TEST_CASE("note.tags round-trip: single tag", "[config_json]") {
+    Config cfg;
+    cfg.note.tags = {"solo"};
+    std::string json = config_to_json(cfg);
+    Config loaded = config_from_json(json);
+    REQUIRE(loaded.note.tags.size() == 1);
+    CHECK(loaded.note.tags[0] == "solo");
 }
 
 TEST_CASE("config_from_json: returns defaults on invalid JSON", "[config_json]") {
@@ -196,4 +221,41 @@ TEST_CASE("api_keys not leaked in IPC events", "[config_json]") {
 
     // Verify no nested "api_keys" key exists (would break IPC protocol)
     CHECK(map.find("api_keys") == map.end());
+}
+
+TEST_CASE("config_to_json file round-trip (subprocess config transfer)", "[config_json]") {
+    Config original = make_test_config();
+
+    // Write to temp file (same as daemon's write_job_config)
+    auto path = std::filesystem::temp_directory_path() / "recmeet-test-config.json";
+    {
+        std::ofstream out(path);
+        REQUIRE(out.good());
+        out << config_to_json(original);
+    }
+
+    // Read back (same as subprocess_main)
+    std::string json_content;
+    {
+        std::ifstream in(path);
+        REQUIRE(in.good());
+        std::ostringstream ss;
+        ss << in.rdbuf();
+        json_content = ss.str();
+    }
+
+    Config loaded = config_from_json(json_content);
+
+    CHECK(loaded.whisper_model == original.whisper_model);
+    CHECK(loaded.reprocess_dir == original.reprocess_dir);
+    CHECK(loaded.context_inline == original.context_inline);
+    CHECK(loaded.note.domain == original.note.domain);
+    CHECK(loaded.note.tags == original.note.tags);
+    CHECK(loaded.vocabulary == original.vocabulary);
+    CHECK(loaded.diarize == original.diarize);
+    CHECK(loaded.vad == original.vad);
+    CHECK(loaded.llm_mmap == original.llm_mmap);
+
+    // Cleanup
+    std::filesystem::remove(path);
 }

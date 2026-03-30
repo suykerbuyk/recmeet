@@ -235,6 +235,7 @@ if(RECMEET_BUILD_TESTS)
         tests/test_ipc_server.cpp
         tests/test_ipc_client.cpp
         tests/test_ipc_integration.cpp
+        tests/test_ndjson_parse.cpp
     )
     target_link_libraries(recmeet_tests PRIVATE recmeet_core Catch2::Catch2WithMain)
     if(RECMEET_BUILD_WEB)

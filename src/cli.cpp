@@ -60,6 +60,8 @@ CliResult parse_cli(int argc, char* argv[]) {
         {"remove-vocab",   required_argument, nullptr, 1022},
         {"context-text",   required_argument, nullptr, 1024},
         {"reset-vocab",    no_argument,       nullptr, 1023},
+        {"progress-json",  no_argument,       nullptr, 1025},
+        {"config-json",    required_argument, nullptr, 1026},
         {"help",           no_argument,       nullptr, 'h'},
         {"version",        no_argument,       nullptr, 'v'},
         {nullptr, 0, nullptr, 0},
@@ -121,6 +123,8 @@ CliResult parse_cli(int argc, char* argv[]) {
             case 1022: result.remove_vocab = optarg; break;
             case 1023: result.reset_vocab = true; break;
             case 1024: result.cfg.context_inline = optarg; break;
+            case 1025: result.progress_json = true; break;
+            case 1026: result.config_json_path = optarg; break;
             case 'v': result.show_version = true; return result;
             case 'h': result.show_help = true; return result;
             default:  result.show_help = true; return result;

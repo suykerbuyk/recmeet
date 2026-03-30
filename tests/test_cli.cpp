@@ -288,6 +288,36 @@ TEST_CASE("parse_cli: default context_inline is empty", "[cli]") {
     CHECK(cli.cfg.context_inline.empty());
 }
 
+TEST_CASE("parse_cli: --progress-json sets flag", "[cli]") {
+    auto cli = run_cli({"recmeet", "--progress-json"});
+    CHECK(cli.progress_json == true);
+}
+
+TEST_CASE("parse_cli: default progress_json is false", "[cli]") {
+    auto cli = run_cli({"recmeet"});
+    CHECK(cli.progress_json == false);
+}
+
+TEST_CASE("parse_cli: --config-json sets path", "[cli]") {
+    auto cli = run_cli({"recmeet", "--config-json", "/tmp/pp-config.json"});
+    CHECK(cli.config_json_path == "/tmp/pp-config.json");
+}
+
+TEST_CASE("parse_cli: default config_json_path is empty", "[cli]") {
+    auto cli = run_cli({"recmeet"});
+    CHECK(cli.config_json_path.empty());
+}
+
+TEST_CASE("parse_cli: subprocess mode flags combine", "[cli]") {
+    auto cli = run_cli({"recmeet", "--reprocess", "/tmp/dir",
+                         "--config-json", "/tmp/cfg.json",
+                         "--progress-json", "--no-daemon"});
+    CHECK(cli.progress_json == true);
+    CHECK(cli.config_json_path == "/tmp/cfg.json");
+    CHECK(cli.cfg.reprocess_dir == "/tmp/dir");
+    CHECK(cli.daemon_mode == DaemonMode::Disable);
+}
+
 TEST_CASE("parse_cli: --context-text and --context-file can coexist", "[cli]") {
     auto cli = run_cli({"recmeet", "--context-text", "inline notes",
                          "--context-file", "/tmp/agenda.txt"});
