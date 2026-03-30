@@ -299,6 +299,9 @@ static void pp_worker_loop(IpcServer& server) {
                 close(stdout_pipe[1]);
                 close(stderr_pipe[1]);
 
+                // Close leaked daemon FDs (pid lock, log, IPC sockets)
+                closefrom(3);
+
                 execv(g_self_exe.c_str(), argv_ptrs.data());
                 _exit(127);
             }
@@ -324,6 +327,7 @@ static void pp_worker_loop(IpcServer& server) {
             int last_percent = -1;
             std::string last_stderr_line;
             auto last_heartbeat = std::chrono::steady_clock::now();
+            auto last_progress = last_heartbeat;  // track forward motion separately
             bool killed_stale = false;
             std::string captured_note_path;
             std::string captured_output_dir;
@@ -345,16 +349,26 @@ static void pp_worker_loop(IpcServer& server) {
                     g_pp_stop.reset();
                 }
 
-                // Staleness watchdog — kill child if no heartbeat/progress for 120s
+                // Staleness watchdog — two checks:
+                // 1. No events at all for 120s → pipe/process dead
+                // 2. No progress/phase for 300s → processing stuck (heartbeat alive but no work)
                 if (!killed_stale) {
                     auto now_hb = std::chrono::steady_clock::now();
-                    auto stale_s = std::chrono::duration_cast<std::chrono::seconds>(
+                    auto hb_stale = std::chrono::duration_cast<std::chrono::seconds>(
                         now_hb - last_heartbeat).count();
-                    if (stale_s >= 120) {
-                        log_error("daemon: child stale for %lds, killing pid %d",
-                                  (long)stale_s, (int)pid);
-                        kill(pid, SIGTERM);
+                    auto progress_stale = std::chrono::duration_cast<std::chrono::seconds>(
+                        now_hb - last_progress).count();
+                    if (hb_stale >= 120) {
+                        log_error("daemon: child stale for %lds (no events), killing pid %d",
+                                  (long)hb_stale, (int)pid);
                         killed_stale = true;
+                    } else if (progress_stale >= 300) {
+                        log_error("daemon: child stuck for %lds (no progress), killing pid %d",
+                                  (long)progress_stale, (int)pid);
+                        killed_stale = true;
+                    }
+                    if (killed_stale) {
+                        kill(pid, SIGTERM);
                         for (auto& pfd : pfds) {
                             if (pfd.fd >= 0) close(pfd.fd);
                             pfd.fd = -1;
@@ -379,8 +393,11 @@ static void pp_worker_loop(IpcServer& server) {
                             pos = nl + 1;
 
                             std::string event = parse_ndjson_string(line, "event");
-                            // Any event from child counts as proof of life
+                            // Any event proves pipe is alive
                             last_heartbeat = std::chrono::steady_clock::now();
+                            // Phase/progress events prove forward motion
+                            if (event == "phase" || event == "progress")
+                                last_progress = last_heartbeat;
                             if (event == "phase") {
                                 last_percent = -1;  // Reset throttle on phase change
                                 std::string name = parse_ndjson_string(line, "name");
@@ -486,7 +503,7 @@ static void pp_worker_loop(IpcServer& server) {
             } else {
                 std::string msg;
                 if (killed_stale) {
-                    msg = "Processing stalled (no heartbeat for 120s) — likely onnxruntime deadlock";
+                    msg = "Processing stalled (no progress) — likely onnxruntime deadlock";
                 } else if (WIFSIGNALED(status)) {
                     char sigbuf[128];
                     snprintf(sigbuf, sizeof(sigbuf), "Processing crashed (signal %d: %s)",

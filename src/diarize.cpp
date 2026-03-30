@@ -57,7 +57,8 @@ std::vector<TranscriptSegment> merge_speakers(
 
 #if RECMEET_USE_SHERPA
 DiarizeResult diarize(const float* samples, size_t num_samples,
-                      int num_speakers, int threads, float threshold) {
+                      int num_speakers, int threads, float threshold,
+                      DiarizeProgressCallback on_progress) {
     if (!samples || num_samples == 0)
         throw RecmeetError("Cannot diarize: empty audio buffer");
 
@@ -101,8 +102,19 @@ DiarizeResult diarize(const float* samples, size_t num_samples,
     log_info("Diarizing %zu samples (%.1fs)...",
             num_samples, num_samples / 16000.0);
 
-    const auto* raw_result = SherpaOnnxOfflineSpeakerDiarizationProcess(
-        sd, samples, static_cast<int32_t>(num_samples));
+    const SherpaOnnxOfflineSpeakerDiarizationResult* raw_result;
+    if (on_progress) {
+        auto c_callback = [](int32_t done, int32_t total, void* arg) -> int32_t {
+            auto* fn = static_cast<DiarizeProgressCallback*>(arg);
+            (*fn)(done, total);
+            return 0;
+        };
+        raw_result = SherpaOnnxOfflineSpeakerDiarizationProcessWithCallback(
+            sd, samples, static_cast<int32_t>(num_samples), c_callback, &on_progress);
+    } else {
+        raw_result = SherpaOnnxOfflineSpeakerDiarizationProcess(
+            sd, samples, static_cast<int32_t>(num_samples));
+    }
 
     if (!raw_result) {
         SherpaOnnxDestroyOfflineSpeakerDiarization(sd);
@@ -137,11 +149,12 @@ DiarizeResult diarize(const float* samples, size_t num_samples,
 }
 
 DiarizeResult diarize(const fs::path& audio_path, int num_speakers, int threads,
-                      float threshold) {
+                      float threshold, DiarizeProgressCallback on_progress) {
     auto samples = read_wav_float(audio_path);
     if (samples.empty())
         throw RecmeetError("Cannot read audio for diarization: " + audio_path.string());
-    return diarize(samples.data(), samples.size(), num_speakers, threads, threshold);
+    return diarize(samples.data(), samples.size(), num_speakers, threads, threshold,
+                   std::move(on_progress));
 }
 #endif
 

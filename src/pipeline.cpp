@@ -434,8 +434,15 @@ PipelineResult run_postprocessing(const Config& cfg, const PostprocessInput& inp
             if (cfg.diarize && !result.segments.empty()) {
                 phase("diarizing");
                 notify("Diarizing...", "Identifying speakers");
+                DiarizeProgressCallback diar_progress;
+                if (on_progress) {
+                    diar_progress = [&on_progress](int done, int total) {
+                        on_progress("diarizing", total > 0 ? done * 100 / total : 0);
+                    };
+                }
                 auto diar = diarize(samples.data(), samples.size(),
-                                    cfg.num_speakers, threads, cfg.cluster_threshold);
+                                    cfg.num_speakers, threads, cfg.cluster_threshold,
+                                    diar_progress);
 
                 // Speaker identification + embedding extraction
                 std::map<int, std::string> speaker_names;
