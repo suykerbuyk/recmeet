@@ -155,43 +155,52 @@ macro(recmeet_pkg_check _rm_prefix _rm_module)
 endmacro()
 
 # ---------------------------------------------------------------------------
-# 6. recmeet_check_onnxruntime() — warn if system onnxruntime is missing
+# 6. recmeet_check_onnxruntime() — check for a usable onnxruntime
 # ---------------------------------------------------------------------------
-# sherpa-onnx's pre-built static libonnxruntime.a was compiled with GCC 11.
-# On GCC 12+ the std::regex ABI changed, causing SIGABRT in onnxruntime's
-# ParseSemVerVersion(). A system-installed onnxruntime (built with the host
-# GCC) avoids this. The build still succeeds without it — sherpa-onnx falls
-# back to the pre-built download — but diarization will crash at runtime
-# on GCC 12+. On GCC 11.x the pre-built lib is ABI-compatible and safe.
+# Priority order:
+#   1. Locally-built onnxruntime (via SHERPA_ONNXRUNTIME_LIB_DIR env var,
+#      set by scripts/build-onnxruntime.sh or auto-detected by Makefile)
+#   2. System package (find_library)
+#   3. sherpa-onnx pre-built static lib (fallback — ABI-unsafe on GCC 12+)
+#
+# On GCC 12+ without option 1 or 2, the build is blocked with FATAL_ERROR
+# because the pre-built lib WILL crash at runtime (protobuf ABI skew and/or
+# std::regex ABI break).
 function(recmeet_check_onnxruntime)
+    # Priority 1: Local build via env var (set by scripts/build-onnxruntime.sh)
+    if(DEFINED ENV{SHERPA_ONNXRUNTIME_LIB_DIR})
+        message(STATUS "Using locally-built onnxruntime: $ENV{SHERPA_ONNXRUNTIME_LIB_DIR}")
+        return()
+    endif()
+
+    # Priority 2: System package
     find_library(_onnxrt_lib onnxruntime)
     if(_onnxrt_lib)
         message(STATUS "System onnxruntime found: ${_onnxrt_lib}")
         return()
     endif()
 
-    # Detect host GCC major version to assess ABI risk.
+    # No onnxruntime found — assess risk based on GCC version
     set(_gcc_major 0)
     if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
         string(REGEX MATCH "^[0-9]+" _gcc_major "${CMAKE_CXX_COMPILER_VERSION}")
     endif()
 
     if(_gcc_major GREATER_EQUAL 12)
-        # GCC 12+ has an ABI break in std::regex vs the GCC 11-compiled
-        # pre-built libonnxruntime.a — diarization will SIGABRT at runtime.
         set(_hint "")
         if(DEFINED _RECMEET_PKG_${RECMEET_DISTRO}_onnxruntime)
             set(_pkg "${_RECMEET_PKG_${RECMEET_DISTRO}_onnxruntime}")
-            set(_hint "\n  Install it:\n    ${_RECMEET_INSTALL_CMD_${RECMEET_DISTRO}} ${_pkg}")
+            set(_hint "\n  Or install system package:\n    ${_RECMEET_INSTALL_CMD_${RECMEET_DISTRO}} ${_pkg}")
         endif()
-        message(WARNING
-            "System onnxruntime not found (GCC ${CMAKE_CXX_COMPILER_VERSION} detected). "
-            "sherpa-onnx will fall back to its pre-built static libonnxruntime.a "
-            "(compiled with GCC 11), which WILL crash (SIGABRT in std::regex) "
-            "due to ABI incompatibility with GCC 12+. "
-            "Install a system onnxruntime built with your host compiler to fix this.${_hint}")
+        message(FATAL_ERROR
+            "No onnxruntime found (GCC ${CMAKE_CXX_COMPILER_VERSION} detected). "
+            "sherpa-onnx's pre-built static lib WILL crash due to ABI incompatibility.\n"
+            "\n"
+            "  Build from source (~20 min):\n"
+            "    ./scripts/build-onnxruntime.sh\n"
+            "    make clean build\n"
+            "${_hint}")
     else()
-        # GCC 11.x or Clang — pre-built lib is ABI-compatible, just note it.
         message(STATUS "System onnxruntime not found; using sherpa-onnx pre-built static library "
             "(ABI-compatible with ${CMAKE_CXX_COMPILER_ID} ${CMAKE_CXX_COMPILER_VERSION})")
     endif()

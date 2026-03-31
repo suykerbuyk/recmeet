@@ -50,8 +50,23 @@ ifdef RECMEET_BUILD_WEB
 CMAKE_OPTS += -DRECMEET_BUILD_WEB=$(RECMEET_BUILD_WEB)
 endif
 
+# ── Auto-detect locally-built onnxruntime ──────────────────────────
+ONNXRT_LOCAL := $(CURDIR)/vendor/onnxruntime-local
+ifneq ($(wildcard $(ONNXRT_LOCAL)/lib/libonnxruntime.so),)
+export SHERPA_ONNXRUNTIME_LIB_DIR     ?= $(ONNXRT_LOCAL)/lib
+# Headers may be in include/ or include/onnxruntime/ depending on ORT version
+ifneq ($(wildcard $(ONNXRT_LOCAL)/include/onnxruntime/onnxruntime_c_api.h),)
+export SHERPA_ONNXRUNTIME_INCLUDE_DIR ?= $(ONNXRT_LOCAL)/include/onnxruntime
+else
+export SHERPA_ONNXRUNTIME_INCLUDE_DIR ?= $(ONNXRT_LOCAL)/include
+endif
+endif
+
 # ── Targets ─────────────────────────────────────────────────────────
-.PHONY: build test integration benchmark full-stack install uninstall package-deb package-rpm package-arch clean coverage help daemon-start daemon-stop daemon-status
+.PHONY: build build-onnxruntime test integration benchmark full-stack install uninstall package-deb package-rpm package-arch clean coverage help daemon-start daemon-stop daemon-status
+
+build-onnxruntime:
+	./scripts/build-onnxruntime.sh
 
 build:
 	cmake -B $(BUILD_DIR) -G Ninja $(CMAKE_OPTS)
@@ -156,6 +171,7 @@ clean:
 	rm -f $(BUILD_DIR)/recmeet-mcp $(BUILD_DIR)/recmeet-agent
 	rm -f tools/coverage.out
 	rm -rf $(BUILD_DIR)
+	rm -rf vendor/onnxruntime-local
 	rm -rf dist/arch/src/ dist/arch/pkg/
 	rm -f dist/arch/*.zst
 	git checkout dist/arch/PKGBUILD 2>/dev/null || true
@@ -163,6 +179,7 @@ clean:
 help:
 	@echo "recmeet build targets:"
 	@echo ""
+	@echo "  make build-onnxruntime  Build onnxruntime from source (~20 min)"
 	@echo "  make build         Configure + build (Release)"
 	@echo "  make test          Build + run unit tests"
 	@echo "  make integration   Build + run integration tests"

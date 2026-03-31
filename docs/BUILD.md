@@ -525,12 +525,74 @@ runs.
 | GTK3 | `gtk3` | `libgtk-3-dev` | `gtk3-devel` |
 | onnxruntime ¹ | `onnxruntime-cpu` | `libonnxruntime-dev` | `onnxruntime-devel` |
 
-¹ **Recommended** when diarization is enabled (`RECMEET_USE_SHERPA=ON`, the
-default). sherpa-onnx bundles a pre-built static `libonnxruntime.a` compiled
-with GCC 11, whose `std::regex` ABI is incompatible with GCC 12+. Installing
-the system onnxruntime package (built with your host GCC) avoids a SIGABRT
-crash during speaker diarization. The build succeeds without it, but
-diarization will crash at runtime on GCC 12+ systems.
+¹ **Required** when diarization is enabled (`RECMEET_USE_SHERPA=ON`, the
+default) on GCC 12+. There are two known ABI crash vectors: (1) sherpa-onnx
+bundles a pre-built static `libonnxruntime.a` compiled with GCC 11, whose
+`std::regex` ABI is incompatible with GCC 12+; (2) rolling distros like Arch
+can upgrade protobuf (e.g., 33→34) while the system onnxruntime package was
+built against the old version, causing SIGABRT during ONNX model parsing.
+
+**Recommended fix**: build onnxruntime from source (see below). This bundles
+protobuf internally and uses your host GCC, eliminating both crash vectors.
+
+---
+
+## Building onnxruntime from source
+
+On rolling-release distros (especially Arch Linux), the system `onnxruntime-cpu`
+package can break due to protobuf version upgrades or GCC ABI changes. Building
+onnxruntime from source with the host compiler eliminates these issues.
+
+### Quick version
+
+```bash
+make build-onnxruntime    # ~20 min, installs to vendor/onnxruntime-local/
+make clean build          # rebuilds recmeet using local onnxruntime
+make test                 # verify
+```
+
+The Makefile auto-detects `vendor/onnxruntime-local/` and exports the
+environment variables sherpa-onnx needs. No manual `export` required.
+
+### What the script does
+
+`scripts/build-onnxruntime.sh` clones onnxruntime v1.23.2 (shallow), builds a
+shared library with the official `build.sh` wrapper, and installs headers and
+`.so` to `vendor/onnxruntime-local/`. The build happens in `/tmp/onnxruntime-build`
+(~5 GB, disposable).
+
+Key properties:
+- **CPU only** — no CUDA. Matches the `onnxruntime-cpu` package.
+- **Shared library** — sherpa-onnx's cmake checks for `.so` first on Linux.
+- **Bundles protobuf internally** — immune to system protobuf version changes.
+- **Host GCC** — no ABI mismatch with the rest of the build.
+
+### Customization
+
+```bash
+ORT_VERSION=1.24.0 ./scripts/build-onnxruntime.sh   # different version
+PREFIX=/opt/ort ./scripts/build-onnxruntime.sh       # different install location
+JOBS=4 ./scripts/build-onnxruntime.sh                # limit parallelism
+```
+
+When using a custom `PREFIX`, set the env vars before building recmeet:
+```bash
+export SHERPA_ONNXRUNTIME_LIB_DIR=/opt/ort/lib
+export SHERPA_ONNXRUNTIME_INCLUDE_DIR=/opt/ort/include
+make clean build
+```
+
+### Verification
+
+After building, confirm the local onnxruntime is picked up:
+
+```bash
+# CMake should print "Using locally-built onnxruntime: ..."
+make build 2>&1 | grep onnxruntime
+
+# The shared lib should resolve to the local build
+ldd build/libsherpa-onnx-c-api.so | grep onnxruntime
+```
 
 ---
 

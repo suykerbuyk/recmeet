@@ -10,6 +10,7 @@ meetings/
 
 # Build
 build/
+vendor/onnxruntime-local/
 cmake-build-*/
 compile_commands.json
 
