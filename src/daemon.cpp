@@ -254,6 +254,10 @@ static void pp_worker_loop(IpcServer& server) {
         }
         g_pp_stop.reset();
 
+        // Subprocess must always reprocess (never record new audio).
+        // The daemon already captured the audio; point the subprocess at it.
+        job.cfg.reprocess_dir = job.input.out_dir;
+
         // Write config to temp file
         auto config_path = write_job_config(job);
 
@@ -321,6 +325,8 @@ static void pp_worker_loop(IpcServer& server) {
             close(stdout_pipe[1]);
             close(stderr_pipe[1]);
             g_pp_child_pid.store(pid);
+            log_info("daemon: subprocess launched (pid=%d, job=%ld, dir=%s)",
+                     (int)pid, (long)job.job_id, out_dir_str.c_str());
 
             // Per-job progress throttle state
             auto last_broadcast = std::chrono::steady_clock::time_point{};
@@ -480,6 +486,12 @@ static void pp_worker_loop(IpcServer& server) {
             int status;
             waitpid(pid, &status, 0);
             g_pp_child_pid.store(-1);
+            if (WIFEXITED(status))
+                log_info("daemon: subprocess exited (pid=%d, exit=%d, job=%ld)",
+                         (int)pid, WEXITSTATUS(status), (long)job.job_id);
+            else if (WIFSIGNALED(status))
+                log_info("daemon: subprocess killed (pid=%d, signal=%d, job=%ld)",
+                         (int)pid, WTERMSIG(status), (long)job.job_id);
 
             // Clean up config file
             {
@@ -750,6 +762,8 @@ int main(int argc, char* argv[]) {
 
         // Assign job_id for this recording
         int64_t job_id = g_next_job_id.fetch_add(1);
+        log_info("daemon: record.start (mode=%s, job=%ld)",
+                 is_reprocess ? "reprocess" : "recording", (long)job_id);
 
         // Set reprocess flag on poll thread and broadcast
         g_is_reprocess = is_reprocess;
