@@ -6,6 +6,7 @@ After=recmeet-daemon.service
 [Service]
 Type=simple
 ExecStart=@RECMEET_WEB_EXEC@
+Environment=RECMEET_LOG_LEVEL=error
 Restart=on-failure
 RestartSec=5
 

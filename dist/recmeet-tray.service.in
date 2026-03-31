@@ -8,6 +8,7 @@ After=graphical-session.target recmeet-daemon.service
 [Service]
 Type=simple
 ExecStart=@RECMEET_TRAY_EXEC@
+Environment=RECMEET_LOG_LEVEL=error
 Restart=on-failure
 RestartSec=5
 

@@ -59,6 +59,7 @@ std::vector<TranscriptSegment> merge_speakers(
 DiarizeResult diarize(const float* samples, size_t num_samples,
                       int num_speakers, int threads, float threshold,
                       DiarizeProgressCallback on_progress) {
+    log_debug("diarize: ENTER (samples=%zu, speakers=%d, threads=%d)", num_samples, num_speakers, threads);
     if (!samples || num_samples == 0)
         throw RecmeetError("Cannot diarize: empty audio buffer");
 
@@ -95,6 +96,7 @@ DiarizeResult diarize(const float* samples, size_t num_samples,
     config.min_duration_on = 0.3f;
     config.min_duration_off = 0.5f;
 
+    log_debug("diarize: models configured");
     const auto* sd = SherpaOnnxCreateOfflineSpeakerDiarization(&config);
     if (!sd)
         throw RecmeetError("Failed to create sherpa-onnx speaker diarization");
@@ -109,6 +111,7 @@ DiarizeResult diarize(const float* samples, size_t num_samples,
             (*fn)(done, total);
             return 0;
         };
+        log_debug("diarize: calling ProcessWithCallback (this may deadlock)...");
         raw_result = SherpaOnnxOfflineSpeakerDiarizationProcessWithCallback(
             sd, samples, static_cast<int32_t>(num_samples), c_callback, &on_progress);
     } else {
@@ -116,6 +119,7 @@ DiarizeResult diarize(const float* samples, size_t num_samples,
             sd, samples, static_cast<int32_t>(num_samples));
     }
 
+    log_debug("diarize: ProcessWithCallback returned (result=%p)", (void*)raw_result);
     if (!raw_result) {
         SherpaOnnxDestroyOfflineSpeakerDiarization(sd);
         throw RecmeetError("Speaker diarization processing failed");
@@ -142,8 +146,10 @@ DiarizeResult diarize(const float* samples, size_t num_samples,
     SherpaOnnxOfflineSpeakerDiarizationDestroyResult(raw_result);
     SherpaOnnxDestroyOfflineSpeakerDiarization(sd);
 
+    log_debug("diarize: extracted %zu segments from %d speakers", result.segments.size(), result.num_speakers);
     log_info("Diarization complete: %d speakers, %zu segments",
             result.num_speakers, result.segments.size());
+    log_debug("diarize: EXIT (%zu segments)", result.segments.size());
 
     return result;
 }

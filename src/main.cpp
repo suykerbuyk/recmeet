@@ -672,9 +672,9 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    // Initialize logging
+    // Initialize logging (stderr only on interactive TTY, not subprocess pipe)
     auto log_level = parse_log_level(cfg.log_level_str);
-    log_init(log_level, cfg.log_dir);
+    log_init(log_level, cfg.log_dir, cfg.log_retention_hours, isatty(STDERR_FILENO));
 
     // Early validation: reject unsupported audio formats before daemon dispatch
     if (!cfg.reprocess_dir.empty()) {
@@ -715,6 +715,10 @@ int main(int argc, char* argv[]) {
 // ---------------------------------------------------------------------------
 
 static int subprocess_main(CliResult& cli) {
+    // Subprocess must NOT log to file or stderr — output goes through NDJSON
+    // stdout and parent captures stderr for relay
+    log_shutdown();
+
     // Load full config from JSON file
     std::string json_content;
     {

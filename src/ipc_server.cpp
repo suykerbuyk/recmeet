@@ -12,6 +12,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <poll.h>
+#include <sys/syscall.h>
 
 namespace recmeet {
 
@@ -87,6 +88,7 @@ bool IpcServer::start() {
 }
 
 void IpcServer::run() {
+    log_debug("ipc: event loop ENTER (tid=%d)", (int)syscall(SYS_gettid));
     while (running_) {
         // Build pollfd array: [wakeup_read, listen_fd, ...clients]
         std::vector<struct pollfd> fds;
@@ -119,6 +121,7 @@ void IpcServer::run() {
                 handle_client_data(fds[i].fd);
         }
     }
+    log_debug("ipc: event loop EXIT");
 }
 
 void IpcServer::stop() {
@@ -140,6 +143,7 @@ void IpcServer::broadcast(const IpcEvent& ev) {
 }
 
 void IpcServer::post(std::function<void()> fn) {
+    log_debug("ipc: post() from tid=%d", (int)syscall(SYS_gettid));
     {
         std::lock_guard<std::mutex> lock(post_mu_);
         posted_.push_back(std::move(fn));
@@ -189,6 +193,7 @@ void IpcServer::handle_client_data(int fd) {
             continue;
         }
 
+        log_debug("ipc: handling '%s' from fd=%d", msg.request.method.c_str(), fd);
         auto handler_it = handlers_.find(msg.request.method);
         if (handler_it == handlers_.end()) {
             IpcError err;
@@ -241,6 +246,8 @@ void IpcServer::run_posted() {
         std::lock_guard<std::mutex> lock(post_mu_);
         fns.swap(posted_);
     }
+    if (!fns.empty())
+        log_debug("ipc: executing %zu posted callbacks", fns.size());
     for (auto& fn : fns) fn();
 }
 

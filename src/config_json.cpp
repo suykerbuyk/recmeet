@@ -56,6 +56,7 @@ JsonMap config_to_map(const Config& cfg) {
     // Logging
     m["log_level"]        = cfg.log_level_str;
     m["log_dir"]          = cfg.log_dir.string();
+    m["log_retention_hours"] = static_cast<int64_t>(cfg.log_retention_hours);
 
     // Output
     m["output_dir"]       = cfg.output_dir.string();
@@ -161,6 +162,7 @@ Config config_from_map(const JsonMap& m) {
 
     str("log_level", cfg.log_level_str);
     path("log_dir", cfg.log_dir);
+    i("log_retention_hours", cfg.log_retention_hours);
 
     path("output_dir", cfg.output_dir);
     path("note_dir", cfg.note_dir);

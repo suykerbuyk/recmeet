@@ -10,6 +10,8 @@
 
 #include <atomic>
 #include <cstring>
+#include <sys/syscall.h>
+#include <unistd.h>
 
 namespace recmeet {
 
@@ -24,10 +26,19 @@ struct PwCaptureImpl {
     std::mutex buf_mtx;
     std::vector<int16_t> buffer;
     std::atomic<bool> running{false};
+
+    std::atomic<bool> first_callback_received{false};
+    std::atomic<pid_t> callback_tid{0};
 };
 
 static void on_process(void* userdata) {
     auto* impl = static_cast<PwCaptureImpl*>(userdata);
+
+    // Capture thread ID on first callback (atomic, no mutex — RT-safe)
+    if (!impl->first_callback_received.exchange(true)) {
+        impl->callback_tid.store(syscall(SYS_gettid));
+    }
+
     pw_buffer* b = pw_stream_dequeue_buffer(impl->stream);
     if (!b) return;
 
@@ -48,6 +59,7 @@ static void on_process(void* userdata) {
         constexpr size_t WARN_SAMPLES = SAMPLE_RATE * 60 * 120;
         if (impl->buffer.size() >= WARN_SAMPLES &&
             impl->buffer.size() - n_samples < WARN_SAMPLES) {
+            // TODO: RT-unsafe log call — runs on PipeWire RT thread
             log_warn("Audio buffer exceeds 120 minutes (%.0f MB). "
                     "Memory usage will continue to grow.",
                     impl->buffer.size() * sizeof(int16_t) / (1024.0 * 1024.0));
@@ -62,6 +74,8 @@ static void on_state_changed(void* userdata, enum pw_stream_state old_state,
     (void)old_state;
     (void)error;
     auto* impl = static_cast<PwCaptureImpl*>(userdata);
+    // Runs on PipeWire thread loop thread (not RT audio thread) — mutex-safe
+    log_debug("pw-capture: state → %s", pw_stream_state_as_string(state));
     if (state == PW_STREAM_STATE_STREAMING)
         impl->running = true;
     else if (state == PW_STREAM_STATE_UNCONNECTED || state == PW_STREAM_STATE_ERROR)
@@ -89,9 +103,11 @@ PipeWireCapture::~PipeWireCapture() {
 }
 
 void PipeWireCapture::start() {
+    log_debug("pw-capture: start ENTER");
     impl_->loop = pw_thread_loop_new("recmeet-capture", nullptr);
     if (!impl_->loop)
         throw RecmeetError("Failed to create PipeWire thread loop");
+    log_debug("pw-capture: thread loop created");
 
     pw_properties* props = pw_properties_new(
         PW_KEY_MEDIA_TYPE, "Audio",
@@ -118,6 +134,7 @@ void PipeWireCapture::start() {
         impl_->loop = nullptr;
         throw RecmeetError("Failed to create PipeWire stream");
     }
+    log_debug("pw-capture: stream created");
 
     // Set up audio format: S16LE, 16kHz, mono
     uint8_t param_buf[1024];
@@ -147,14 +164,25 @@ void PipeWireCapture::start() {
         impl_->loop = nullptr;
         throw RecmeetError("Failed to connect PipeWire stream: " + std::string(strerror(-ret)));
     }
+    log_debug("pw-capture: stream connected");
 
     pw_thread_loop_start(impl_->loop);
+    log_debug("pw-capture: thread loop started");
 }
 
 void PipeWireCapture::stop() {
+    log_debug("pw-capture: stop ENTER");
     if (impl_->loop) {
         pw_thread_loop_stop(impl_->loop);
     }
+
+    if (impl_->first_callback_received.load()) {
+        log_debug("pw-capture: audio callbacks received (first callback tid=%d, buffered=%zu samples)",
+                  (int)impl_->callback_tid.load(), impl_->buffer.size());
+    } else {
+        log_warn("pw-capture: NO audio callbacks received (stream may have failed)");
+    }
+
     if (impl_->stream) {
         pw_stream_destroy(impl_->stream);
         impl_->stream = nullptr;
@@ -164,6 +192,9 @@ void PipeWireCapture::stop() {
         impl_->loop = nullptr;
     }
     impl_->running = false;
+
+    size_t buffer_size = impl_->buffer.size();
+    log_debug("pw-capture: stop EXIT (buffered=%zu samples)", buffer_size);
 }
 
 std::vector<int16_t> PipeWireCapture::drain() {

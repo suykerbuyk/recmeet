@@ -31,6 +31,7 @@
 #include <poll.h>
 #include <sys/file.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -228,6 +229,7 @@ static fs::path write_job_config(const PostprocessJob& job) {
 // ---------------------------------------------------------------------------
 
 static void pp_worker_loop(IpcServer& server) {
+    log_debug("daemon: pp_worker_loop ENTER (tid=%d)", (int)syscall(SYS_gettid));
     while (true) {
         PostprocessJob job;
         bool already_flagged = false;
@@ -236,9 +238,13 @@ static void pp_worker_loop(IpcServer& server) {
             g_queue_cv.wait(lock, [] {
                 return !g_job_queue.empty() || g_queue_shutdown;
             });
-            if (g_queue_shutdown) return;
+            if (g_queue_shutdown) {
+                log_debug("daemon: pp_worker_loop EXIT (shutdown)");
+                return;
+            }
             job = std::move(g_job_queue.front());
             g_job_queue.pop();
+            log_debug("daemon: pp_worker dequeued job=%ld (queue_size=%zu)", (long)job.job_id, g_job_queue.size());
 
             // Check if recording worker already set g_postprocessing
             // (atomic handoff — avoids transient idle)
@@ -249,6 +255,7 @@ static void pp_worker_loop(IpcServer& server) {
             {
                 std::lock_guard<std::mutex> lock(g_state_mu);
                 g_postprocessing.store(true);
+                log_debug("daemon: state postprocessing=true");
             }
             broadcast_state(server);
         }
@@ -259,6 +266,7 @@ static void pp_worker_loop(IpcServer& server) {
         job.cfg.reprocess_dir = job.input.out_dir;
 
         // Write config to temp file
+        log_debug("daemon: writing job config (reprocess_dir=%s)", job.cfg.reprocess_dir.c_str());
         auto config_path = write_job_config(job);
 
         // Build argv
@@ -288,6 +296,7 @@ static void pp_worker_loop(IpcServer& server) {
         }
 
         {
+            log_debug("daemon: forking subprocess");
             pid_t pid = fork();
 
             if (pid == 0) {
@@ -345,9 +354,11 @@ static void pp_worker_loop(IpcServer& server) {
             };
             int nfds = 2;
             std::string stdout_buf, stderr_buf;
+            int poll_iter = 0;
 
             while (nfds > 0) {
                 int ret = poll(pfds, nfds, 1000);
+                ++poll_iter;
 
                 // Check cancel
                 if (g_pp_stop.stop_requested()) {
@@ -364,6 +375,10 @@ static void pp_worker_loop(IpcServer& server) {
                         now_hb - last_heartbeat).count();
                     auto progress_stale = std::chrono::duration_cast<std::chrono::seconds>(
                         now_hb - last_progress).count();
+                    if (poll_iter % 30 == 0) {
+                        log_debug("daemon: subprocess poll (hb_age=%lds, progress_age=%lds)",
+                                  (long)hb_stale, (long)progress_stale);
+                    }
                     if (hb_stale >= 120) {
                         log_error("daemon: child stale for %lds (no events), killing pid %d",
                                   (long)hb_stale, (int)pid);
@@ -436,6 +451,9 @@ static void pp_worker_loop(IpcServer& server) {
                             } else if (event == "job.complete") {
                                 captured_note_path = parse_ndjson_string(line, "note_path");
                                 captured_output_dir = parse_ndjson_string(line, "output_dir");
+                            } else if (event.empty() && !line.empty()) {
+                                log_debug("daemon: subprocess stdout unparseable: %.*s",
+                                          (int)std::min(line.size(), (size_t)200), line.c_str());
                             }
                         }
                         stdout_buf.erase(0, pos);
@@ -542,6 +560,7 @@ static void pp_worker_loop(IpcServer& server) {
         {
             std::lock_guard<std::mutex> lock(g_state_mu);
             g_postprocessing.store(false);
+            log_debug("daemon: state postprocessing=false");
         }
         broadcast_state(server);
     }
@@ -558,11 +577,12 @@ static void print_usage() {
         "Run the recmeet daemon (IPC server for CLI and tray clients).\n"
         "\n"
         "Options:\n"
-        "  --socket PATH     Unix socket path (default: $XDG_RUNTIME_DIR/recmeet/daemon.sock)\n"
-        "  --log-level LEVEL Log level: none, error, warn, info (default: info)\n"
-        "  --log-dir DIR     Log file directory\n"
-        "  -h, --help        Show this help\n"
-        "  -v, --version     Show version\n"
+        "  --socket PATH       Unix socket path (default: $XDG_RUNTIME_DIR/recmeet/daemon.sock)\n"
+        "  --log-level LEVEL   Log level: none, error, warn, info, debug (default: info)\n"
+        "  --log-dir DIR       Log file directory\n"
+        "  --log-retention N   Log retention in hours (default: 4)\n"
+        "  -h, --help          Show this help\n"
+        "  -v, --version       Show version\n"
     );
 }
 
@@ -574,6 +594,11 @@ int main(int argc, char* argv[]) {
     std::string socket_path = default_socket_path();
     std::string log_level_str = "info";
     fs::path log_dir;
+    int log_retention_hours = 4;
+
+    // Env var override (between default and CLI)
+    if (const char* env = std::getenv("RECMEET_LOG_LEVEL"))
+        log_level_str = env;
 
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
@@ -582,6 +607,7 @@ int main(int argc, char* argv[]) {
         if (arg == "--socket" && i + 1 < argc) { socket_path = argv[++i]; continue; }
         if (arg == "--log-level" && i + 1 < argc) { log_level_str = argv[++i]; continue; }
         if (arg == "--log-dir" && i + 1 < argc) { log_dir = argv[++i]; continue; }
+        if (arg == "--log-retention" && i + 1 < argc) { log_retention_hours = std::atoi(argv[++i]); continue; }
         fprintf(stderr, "Unknown option: %s\n", arg.c_str());
         return 1;
     }
@@ -605,9 +631,9 @@ int main(int argc, char* argv[]) {
         // Keep fd open (holds the lock until process exits)
     }
 
-    // Initialize logging
+    // Initialize logging (daemon always logs to stderr — journald or interactive)
     auto log_level = parse_log_level(log_level_str);
-    log_init(log_level, log_dir);
+    log_init(log_level, log_dir, log_retention_hours, true);
     log_info("daemon: starting (socket=%s)", socket_path.c_str());
 
     // Suppress whisper output
@@ -775,6 +801,7 @@ int main(int argc, char* argv[]) {
         if (g_rec_worker.joinable()) g_rec_worker.join();
 
         g_rec_worker = std::thread([&server, cfg, is_reprocess, job_id]() {
+            log_debug("daemon: rec_worker ENTER (tid=%d, job=%ld)", (int)syscall(SYS_gettid), (long)job_id);
             auto on_phase = [&server](const std::string& phase) {
                 server.post([&server, phase]() {
                     IpcEvent ev;
@@ -808,6 +835,7 @@ int main(int argc, char* argv[]) {
                 job.input = std::move(input);
                 job.cfg = job_cfg;
 
+                log_debug("daemon: rec_worker handoff to pp (job=%ld)", (long)job_id);
                 {
                     std::lock_guard<std::mutex> qlock(g_queue_mu);
                     g_job_queue.push(std::move(job));
@@ -817,6 +845,7 @@ int main(int argc, char* argv[]) {
                 {
                     std::lock_guard<std::mutex> lock(g_state_mu);
                     g_postprocessing.store(true);
+                    log_debug("daemon: state postprocessing=true");
                     g_recording.store(false);
                 }
 
@@ -828,6 +857,7 @@ int main(int argc, char* argv[]) {
 
                 // Wake the pp worker
                 g_queue_cv.notify_one();
+                log_debug("daemon: rec_worker EXIT (job=%ld)", (long)job_id);
 
             } catch (const std::exception& e) {
                 fprintf(stderr, "Recording error: %s\n", e.what());
@@ -841,6 +871,7 @@ int main(int argc, char* argv[]) {
                     g_is_reprocess = false;
                 });
                 broadcast_state(server, e.what());
+                log_debug("daemon: rec_worker EXIT (job=%ld)", (long)job_id);
             }
         });
 
@@ -1036,6 +1067,7 @@ int main(int argc, char* argv[]) {
         broadcast_state_inline(server);
 
         g_dl_worker = std::thread([&server, whisper_model, want_sherpa, want_vad]() {
+            log_debug("daemon: dl_worker ENTER (tid=%d)", (int)syscall(SYS_gettid));
             auto broadcast_dl = [&server](const std::string& model, const std::string& status) {
                 server.post([&server, model, status]() {
                     IpcEvent ev;
@@ -1080,6 +1112,7 @@ int main(int argc, char* argv[]) {
                 std::lock_guard<std::mutex> lock(g_state_mu);
                 g_downloading.store(false);
             }
+            log_debug("daemon: dl_worker EXIT");
             broadcast_state(server);
         });
 
@@ -1104,6 +1137,7 @@ int main(int argc, char* argv[]) {
         broadcast_state_inline(server);
 
         g_dl_worker = std::thread([&server]() {
+            log_debug("daemon: dl_worker ENTER (tid=%d)", (int)syscall(SYS_gettid));
             auto broadcast_dl = [&server](const std::string& model, const std::string& status) {
                 server.post([&server, model, status]() {
                     IpcEvent ev;
@@ -1155,6 +1189,7 @@ int main(int argc, char* argv[]) {
                 std::lock_guard<std::mutex> lock(g_state_mu);
                 g_downloading.store(false);
             }
+            log_debug("daemon: dl_worker EXIT");
             broadcast_state(server);
         });
 
@@ -1184,6 +1219,7 @@ int main(int argc, char* argv[]) {
 
     log_info("daemon: listening on %s", socket_path.c_str());
     fprintf(stderr, "recmeet-daemon %s listening on %s\n", RECMEET_VERSION, socket_path.c_str());
+    log_debug("daemon: entering event loop");
 
     server.run();
 
@@ -1200,7 +1236,9 @@ int main(int argc, char* argv[]) {
     }
     g_queue_cv.notify_one();
 
+    log_debug("daemon: shutdown: joining rec_worker...");
     if (g_rec_worker.joinable()) g_rec_worker.join();
+    log_debug("daemon: shutdown: joining pp_worker...");
     if (g_pp_worker.joinable()) g_pp_worker.join();
     if (g_dl_worker.joinable()) g_dl_worker.join();
     g_server = nullptr;

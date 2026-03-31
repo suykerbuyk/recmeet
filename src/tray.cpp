@@ -19,6 +19,7 @@
 #include <fcntl.h>
 #include <signal.h>
 #include <sys/socket.h>
+#include <sys/syscall.h>
 #include <sys/wait.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -172,6 +173,7 @@ static void update_state(bool rec, bool pp, bool dl, bool reproc = false) {
 }
 
 static void handle_ipc_event(const IpcEvent& ev) {
+    log_debug("tray: event '%s'", ev.event.c_str());
     if (ev.event == "phase") {
         std::string name = json_val_as_string(ev.data.at("name"));
         log_info("[tray] Phase: %s", name.c_str());
@@ -247,7 +249,9 @@ static void handle_ipc_event(const IpcEvent& ev) {
 }
 
 static gboolean on_ipc_data(GIOChannel*, GIOCondition cond, gpointer) {
+    log_debug("tray: on_ipc_data (cond=%d)", (int)cond);
     if (cond & (G_IO_HUP | G_IO_ERR)) {
+        log_debug("tray: daemon disconnected");
         log_warn("[tray] Daemon disconnected");
         g_tray.daemon_connected = false;
         teardown_ipc_watch();
@@ -261,6 +265,7 @@ static gboolean on_ipc_data(GIOChannel*, GIOCondition cond, gpointer) {
 
     // Read and dispatch one round of data
     if (!g_tray.ipc.read_and_dispatch(0)) {
+        log_debug("tray: daemon disconnected");
         log_warn("[tray] Daemon connection lost");
         g_tray.daemon_connected = false;
         teardown_ipc_watch();
@@ -331,11 +336,14 @@ static bool connect_to_daemon() {
 
 static gboolean try_reconnect(gpointer) {
     g_tray.reconnect_timer = 0;
+    log_debug("tray: reconnect attempt");
     if (connect_to_daemon()) {
+        log_debug("tray: reconnected to daemon");
         g_tray.reconnect_delay = 1;  // reset backoff
         build_menu();
         return G_SOURCE_REMOVE;
     }
+    log_debug("tray: reconnect failed");
     // Exponential backoff: 1, 2, 4, 8, 16, 30, 30, ...
     g_tray.reconnect_timer = g_timeout_add_seconds(
         g_tray.reconnect_delay, try_reconnect, nullptr);
@@ -1489,9 +1497,9 @@ int main(int argc, char* argv[]) {
 
     g_tray.cfg = load_config();
 
-    // Initialize logging
+    // Initialize logging (tray always logs to stderr — journald or interactive)
     auto log_level = parse_log_level(g_tray.cfg.log_level_str);
-    log_init(log_level, g_tray.cfg.log_dir);
+    log_init(log_level, g_tray.cfg.log_dir, g_tray.cfg.log_retention_hours, true);
 
     // Create indicator
     G_GNUC_BEGIN_IGNORE_DEPRECATIONS

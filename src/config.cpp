@@ -194,9 +194,15 @@ Config load_config(const fs::path& config_path) {
     cfg.threads = std::atoi(threads_str.c_str());
 
     // Logging section
-    cfg.log_level_str = get_val(entries, "logging", "level", "none");
+    cfg.log_level_str = get_val(entries, "logging", "level", "error");
     std::string log_dir_val = get_val(entries, "logging", "directory", "");
     if (!log_dir_val.empty()) cfg.log_dir = log_dir_val;
+    std::string retention_val = get_val(entries, "logging", "retention_hours", "4");
+    if (!retention_val.empty()) cfg.log_retention_hours = std::stoi(retention_val);
+
+    // Env var override for log level (between config file and CLI)
+    if (const char* env_level = std::getenv("RECMEET_LOG_LEVEL"))
+        cfg.log_level_str = env_level;
 
     // Output section
     std::string out = get_val(entries, "output", "directory", "");
@@ -323,11 +329,13 @@ void save_config(const Config& cfg, const fs::path& config_path) {
             << "  threads: " << cfg.threads << "\n";
     }
 
-    if (cfg.log_level_str != "none" && !cfg.log_level_str.empty()) {
+    if (cfg.log_level_str != "error" || !cfg.log_dir.empty() || cfg.log_retention_hours != 4) {
         out << "\nlogging:\n"
             << "  level: " << cfg.log_level_str << "\n";
         if (!cfg.log_dir.empty())
             out << "  directory: \"" << cfg.log_dir.string() << "\"\n";
+        if (cfg.log_retention_hours != 4)
+            out << "  retention_hours: " << cfg.log_retention_hours << "\n";
     }
 
     out << "\nnotes:\n"

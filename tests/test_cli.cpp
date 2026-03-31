@@ -243,9 +243,9 @@ TEST_CASE("parse_cli: --log-level sets log level", "[cli]") {
     CHECK(cli.cfg.log_level_str == "info");
 }
 
-TEST_CASE("parse_cli: default log_level_str is none", "[cli]") {
+TEST_CASE("parse_cli: default log_level_str is error", "[cli]") {
     auto cli = run_cli({"recmeet"});
-    CHECK((cli.cfg.log_level_str.empty() || cli.cfg.log_level_str == "none"));
+    CHECK(cli.cfg.log_level_str == "error");
 }
 
 TEST_CASE("parse_cli: --vocab sets vocabulary", "[cli]") {

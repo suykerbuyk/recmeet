@@ -60,6 +60,7 @@ CliResult parse_cli(int argc, char* argv[]) {
         {"remove-vocab",   required_argument, nullptr, 1022},
         {"context-text",   required_argument, nullptr, 1024},
         {"reset-vocab",    no_argument,       nullptr, 1023},
+        {"log-retention",  required_argument, nullptr, 1027},
         {"progress-json",  no_argument,       nullptr, 1025},
         {"config-json",    required_argument, nullptr, 1026},
         {"help",           no_argument,       nullptr, 'h'},
@@ -125,6 +126,7 @@ CliResult parse_cli(int argc, char* argv[]) {
             case 1024: result.cfg.context_inline = optarg; break;
             case 1025: result.progress_json = true; break;
             case 1026: result.config_json_path = optarg; break;
+            case 1027: result.cfg.log_retention_hours = std::atoi(optarg); break;
             case 'v': result.show_version = true; return result;
             case 'h': result.show_help = true; return result;
             default:  result.show_help = true; return result;

@@ -90,6 +90,9 @@ void display_elapsed(StopToken& stop) {
 } // anonymous namespace
 
 PostprocessInput run_recording(const Config& cfg, StopToken& stop, PhaseCallback on_phase) {
+    log_debug("pipeline: run_recording ENTER (mic=%s, monitor=%s)",
+              cfg.mic_source.c_str(), cfg.monitor_source.c_str());
+
     auto phase = [&](const std::string& name) {
         if (on_phase) on_phase(name);
     };
@@ -171,7 +174,9 @@ PostprocessInput run_recording(const Config& cfg, StopToken& stop, PhaseCallback
 
             // Start mic capture via PipeWire
             PipeWireCapture mic_cap(mic_source);
+            log_debug("pipeline: PipeWireCapture created");
             mic_cap.start();
+            log_debug("pipeline: capture start (mic)");
 
             // Start monitor capture — try PipeWire CAPTURE_SINK first, fall back to pa_simple
             std::unique_ptr<PipeWireCapture> mon_pw;
@@ -183,16 +188,21 @@ PostprocessInput run_recording(const Config& cfg, StopToken& stop, PhaseCallback
                 monitor_source.compare(monitor_source.size() - mon_suffix.size(),
                                         mon_suffix.size(), mon_suffix) == 0;
             if (is_pa_monitor) {
+                log_debug("pipeline: falling back to PulseMonitorCapture");
                 mon_pa = std::make_unique<PulseMonitorCapture>(monitor_source);
                 mon_pa->start();
+                log_debug("pipeline: capture start (monitor)");
             } else {
                 try {
                     mon_pw = std::make_unique<PipeWireCapture>(monitor_source, /*capture_sink=*/true);
                     mon_pw->start();
+                    log_debug("pipeline: capture start (monitor)");
                 } catch (const RecmeetError& e) {
                     log_warn("PipeWire monitor failed (%s), falling back to pa_simple", e.what());
+                    log_debug("pipeline: falling back to PulseMonitorCapture");
                     mon_pa = std::make_unique<PulseMonitorCapture>(monitor_source);
                     mon_pa->start();
+                    log_debug("pipeline: capture start (monitor)");
                 }
             }
 
@@ -203,6 +213,7 @@ PostprocessInput run_recording(const Config& cfg, StopToken& stop, PhaseCallback
             while (!stop.stop_requested())
                 std::this_thread::sleep_for(std::chrono::milliseconds(200));
 
+            log_debug("pipeline: stop requested, draining audio");
             timer_stop.request();
             timer_thread.join();
             fprintf(stderr, "Recording stopped.\n");
@@ -215,11 +226,15 @@ PostprocessInput run_recording(const Config& cfg, StopToken& stop, PhaseCallback
             // Drain and write
             auto mic_samples = mic_cap.drain();
             auto mon_samples = mon_pw ? mon_pw->drain() : mon_pa->drain();
+            log_debug("pipeline: drained audio (%.1fs)",
+                      mic_samples.size() / (float)SAMPLE_RATE);
 
             fs::path mic_path = pp.out_dir / "mic.wav";
             fs::path mon_path = pp.out_dir / "monitor.wav";
             write_wav(mic_path, mic_samples);
+            log_debug("pipeline: wrote %s", mic_path.c_str());
             write_wav(mon_path, mon_samples);
+            log_debug("pipeline: wrote %s", mon_path.c_str());
 
             // Validate mic (fatal)
             validate_audio(mic_path, 1.0, "Mic audio");
@@ -231,9 +246,11 @@ PostprocessInput run_recording(const Config& cfg, StopToken& stop, PhaseCallback
                 auto mixed = mix_audio(mic_samples, mon_samples);
                 write_wav(pp.audio_path, mixed);
                 log_info("Mixed audio saved: %s", pp.audio_path.c_str());
+                log_debug("pipeline: wrote %s", pp.audio_path.c_str());
             } catch (const AudioValidationError& e) {
                 log_warn("Monitor audio unusable (%s). Using mic only.", e.what());
                 write_wav(pp.audio_path, mic_samples);
+                log_debug("pipeline: wrote %s", pp.audio_path.c_str());
             }
 
             // Clean up source files unless --keep-sources
@@ -245,7 +262,9 @@ PostprocessInput run_recording(const Config& cfg, StopToken& stop, PhaseCallback
             notify("Recording started", "Source: " + mic_source);
 
             PipeWireCapture cap(mic_source);
+            log_debug("pipeline: PipeWireCapture created");
             cap.start();
+            log_debug("pipeline: capture start (mic)");
 
             StopToken timer_stop;
             std::thread timer_thread(display_elapsed, std::ref(timer_stop));
@@ -253,18 +272,23 @@ PostprocessInput run_recording(const Config& cfg, StopToken& stop, PhaseCallback
             while (!stop.stop_requested())
                 std::this_thread::sleep_for(std::chrono::milliseconds(200));
 
+            log_debug("pipeline: stop requested, draining audio");
             timer_stop.request();
             timer_thread.join();
             fprintf(stderr, "Recording stopped.\n");
 
             cap.stop();
             auto samples = cap.drain();
+            log_debug("pipeline: drained audio (%.1fs)",
+                      samples.size() / (float)SAMPLE_RATE);
             write_wav(pp.audio_path, samples);
+            log_debug("pipeline: wrote %s", pp.audio_path.c_str());
             validate_audio(pp.audio_path);
         }
 
     }
 
+    log_debug("pipeline: run_recording EXIT (out_dir=%s)", pp.out_dir.c_str());
     return pp;
 }
 
@@ -313,6 +337,8 @@ std::string build_initial_prompt(const std::vector<std::string>& speaker_names,
 PipelineResult run_postprocessing(const Config& cfg, const PostprocessInput& input,
                                   PhaseCallback on_phase, ProgressCallback on_progress,
                                   StopToken* stop) {
+    log_debug("pipeline: run_postprocessing ENTER (dir=%s)", input.out_dir.c_str());
+
     auto phase = [&](const std::string& name) {
         if (on_phase) on_phase(name);
     };
@@ -349,10 +375,14 @@ PipelineResult run_postprocessing(const Config& cfg, const PostprocessInput& inp
             auto samples = read_wav_float(input.audio_path);
             log_info("Audio: %.1fs (%zu samples)",
                     samples.size() / (float)SAMPLE_RATE, samples.size());
+            log_debug("pipeline: loaded audio (%.1fs, %zu samples)",
+                      samples.size() / (float)SAMPLE_RATE, samples.size());
 
             {   // --- whisper model scope --- freed before diarization
+                log_debug("pipeline: loading whisper model '%s'...", cfg.whisper_model.c_str());
                 fs::path model_path = ensure_whisper_model(cfg.whisper_model);
                 WhisperModel model(model_path);
+                log_debug("pipeline: whisper model loaded");
 
 #if RECMEET_USE_SHERPA
                 if (cfg.vad) {
@@ -365,7 +395,10 @@ PipelineResult run_postprocessing(const Config& cfg, const PostprocessInput& inp
                     vad_cfg.min_speech_duration = cfg.vad_min_speech;
                     vad_cfg.max_speech_duration = cfg.vad_max_speech;
 
+                    log_debug("pipeline: running VAD");
                     auto vad_result = detect_speech(samples, vad_cfg, threads);
+                    log_debug("pipeline: VAD complete (%zu speech segments)",
+                              vad_result.segments.size());
 
                     if (!vad_result.segments.empty()) {
                         phase("transcribing");
@@ -377,6 +410,7 @@ PipelineResult run_postprocessing(const Config& cfg, const PostprocessInput& inp
                         for (const auto& seg : vad_result.segments)
                             seg_samples.push_back(static_cast<size_t>(seg.end_sample - seg.start_sample));
 
+                        log_debug("pipeline: transcribing...");
                         for (size_t si = 0; si < vad_result.segments.size(); ++si) {
                             check_cancel();
                             const auto& seg = vad_result.segments[si];
@@ -403,6 +437,8 @@ PipelineResult run_postprocessing(const Config& cfg, const PostprocessInput& inp
                         }
                         log_info("Transcribed %zu segments across %zu VAD regions",
                                 result.segments.size(), vad_result.segments.size());
+                        log_debug("pipeline: transcription complete (%zu segments)",
+                                  result.segments.size());
                     } else {
                         log_info("VAD found no speech — skipping transcription.");
                     }
@@ -423,9 +459,12 @@ PipelineResult run_postprocessing(const Config& cfg, const PostprocessInput& inp
                         };
                     }
 
+                    log_debug("pipeline: transcribing...");
                     result = transcribe(model, samples.data(), samples.size(), 0.0, opts);
                     log_info("Transcribed %d segments (language: %s)",
                             (int)result.segments.size(), result.language.c_str());
+                    log_debug("pipeline: transcription complete (%zu segments)",
+                              result.segments.size());
                 }
             }   // whisper model freed
 
@@ -440,9 +479,11 @@ PipelineResult run_postprocessing(const Config& cfg, const PostprocessInput& inp
                         on_progress("diarizing", total > 0 ? done * 100 / total : 0);
                     };
                 }
+                log_debug("pipeline: diarizing (%d speakers)", cfg.num_speakers);
                 auto diar = diarize(samples.data(), samples.size(),
                                     cfg.num_speakers, threads, cfg.cluster_threshold,
                                     diar_progress);
+                log_debug("pipeline: diarization complete (%zu segments)", diar.segments.size());
 
                 // Speaker identification + embedding extraction
                 std::map<int, std::string> speaker_names;
@@ -459,9 +500,11 @@ PipelineResult run_postprocessing(const Config& cfg, const PostprocessInput& inp
                         notify("Identifying speakers...",
                                std::to_string(db.size()) + " enrolled");
                     }
+                    log_debug("pipeline: identifying speakers");
                     auto id_result = identify_speakers(
                         samples.data(), samples.size(), diar, db,
                         model_paths.embedding, cfg.speaker_threshold, threads);
+                    log_debug("pipeline: speaker ID complete");
                     speaker_names = id_result.names;
 
                     // Build and save speakers.json
@@ -545,9 +588,11 @@ PipelineResult run_postprocessing(const Config& cfg, const PostprocessInput& inp
         if (!cfg.llm_model.empty()) {  // NOLINT(readability-misleading-indentation)
             // Local summarization
             notify("Summarizing...", "Local LLM");
+            log_debug("pipeline: summarizing (provider=local)");
             try {
                 fs::path llm_path = ensure_llama_model(cfg.llm_model);
                 summary_text = summarize_local(transcript_text, llm_path, context_text, threads, cfg.llm_mmap);
+                log_debug("pipeline: summary complete");
             } catch (const std::exception& e) {
                 log_warn("Local summary failed: %s", e.what());
             }
@@ -561,9 +606,11 @@ PipelineResult run_postprocessing(const Config& cfg, const PostprocessInput& inp
                 else url = "https://api.x.ai/v1/chat/completions";
             }
             notify("Summarizing...", "Sending to " + cfg.api_model);
+            log_debug("pipeline: summarizing (provider=%s)", cfg.provider.c_str());
             try {
                 summary_text = summarize_http(transcript_text, url,
                                                cfg.api_key, cfg.api_model, context_text);
+                log_debug("pipeline: summary complete");
             } catch (const std::exception& e) {
                 log_warn("Summary failed: %s", e.what());
                 log_warn("Transcript is still available.");
@@ -616,6 +663,7 @@ PipelineResult run_postprocessing(const Config& cfg, const PostprocessInput& inp
     phase("complete");
     notify("Meeting complete", input.out_dir.string());
     fprintf(stderr, "\nDone! Files in: %s\n", input.out_dir.c_str());
+    log_debug("pipeline: run_postprocessing EXIT");
     return pipe_result;
 }
 

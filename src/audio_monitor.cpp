@@ -7,7 +7,8 @@
 #include <pulse/simple.h>
 #include <pulse/error.h>
 
-#include <chrono>
+#include <sys/syscall.h>
+#include <unistd.h>
 
 namespace recmeet {
 
@@ -19,10 +20,12 @@ PulseMonitorCapture::~PulseMonitorCapture() {
 }
 
 void PulseMonitorCapture::start() {
+    log_debug("pa-monitor: start ENTER (source=%s)", source_.c_str());
     stop_.reset();
     running_ = true;
 
     thread_ = std::thread([this] {
+        log_debug("pa-monitor: worker ENTER (tid=%d)", (int)syscall(SYS_gettid));
         pa_sample_spec ss = {};
         ss.format = PA_SAMPLE_S16LE;
         ss.rate = SAMPLE_RATE;
@@ -45,6 +48,7 @@ void PulseMonitorCapture::start() {
             running_ = false;
             return;
         }
+        log_debug("pa-monitor: connected to PulseAudio");
 
         // Read in chunks of ~100ms
         constexpr size_t chunk_samples = SAMPLE_RATE / 10;
@@ -68,15 +72,21 @@ void PulseMonitorCapture::start() {
         }
 
         pa_simple_free(s);
+        {
+            std::lock_guard lk(buf_mtx_);
+            log_debug("pa-monitor: worker EXIT (buffered=%zu samples)", buffer_.size());
+        }
         running_ = false;
     });
 }
 
 void PulseMonitorCapture::stop() {
+    log_debug("pa-monitor: stop ENTER");
     stop_.request();
     if (thread_.joinable())
         thread_.join();
     running_ = false;
+    log_debug("pa-monitor: stop EXIT (thread joined)");
 }
 
 std::vector<int16_t> PulseMonitorCapture::drain() {

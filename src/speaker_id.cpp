@@ -421,6 +421,7 @@ std::vector<float> extract_speaker_embedding(
     const DiarizeResult& diar, int speaker_id,
     const fs::path& model_path, int threads) {
 
+    log_debug("speaker-id: extract_embedding ENTER (samples=%zu)", num_samples);
     int t = std::min(threads > 0 ? threads : default_thread_count(), 4);
 
     SherpaOnnxSpeakerEmbeddingExtractorConfig cfg{};
@@ -433,6 +434,7 @@ std::vector<float> extract_speaker_embedding(
     if (!extractor)
         throw RecmeetError("Failed to create speaker embedding extractor");
 
+    log_debug("speaker-id: extractor created");
     // Feed all segments belonging to this speaker into a single stream
     auto* stream = SherpaOnnxSpeakerEmbeddingExtractorCreateStream(extractor);
     if (!stream) {
@@ -471,6 +473,7 @@ std::vector<float> extract_speaker_embedding(
     SherpaOnnxDestroyOnlineStream(stream);
     SherpaOnnxDestroySpeakerEmbeddingExtractor(extractor);
 
+    log_debug("speaker-id: extract_embedding EXIT (dims=%d)", static_cast<int>(embedding.size()));
     return embedding;
 }
 
@@ -510,6 +513,7 @@ IdentifyResult identify_speakers(
             log_warn("Failed to create speaker embedding manager");
             return result;
         }
+        log_debug("speaker-id: manager created");
 
         for (const auto& profile : db) {
             for (const auto& emb : profile.embeddings) {
@@ -528,6 +532,7 @@ IdentifyResult identify_speakers(
                 == speaker_ids.end())
             speaker_ids.push_back(seg.speaker);
     }
+    log_debug("speaker-id: identify ENTER (clusters=%zu)", speaker_ids.size());
 
     // Track candidates for conflict resolution
     std::vector<std::pair<int, std::string>> candidates;  // {speaker_id, name}
@@ -593,6 +598,7 @@ IdentifyResult identify_speakers(
         result.names[sid] = name;
         result.scores[sid] = candidate_scores[idx];
         used_names[name] = true;
+        log_debug("speaker-id: matched cluster %d -> '%s' (score=%.3f)", sid, name.c_str(), candidate_scores[idx]);
         log_info("Speaker %d identified as '%s' (score: %.3f)",
                  sid, name.c_str(), candidate_scores[idx]);
     }
@@ -601,6 +607,7 @@ IdentifyResult identify_speakers(
         SherpaOnnxDestroySpeakerEmbeddingManager(mgr);
     SherpaOnnxDestroySpeakerEmbeddingExtractor(extractor);
 
+    log_debug("speaker-id: identify EXIT (matched=%zu/%zu)", result.names.size(), speaker_ids.size());
     return result;
 }
 
@@ -609,6 +616,7 @@ std::vector<MeetingSpeaker> re_identify_meeting(
     const std::vector<SpeakerProfile>& db,
     float threshold) {
 
+    log_debug("speaker-id: re_identify ENTER");
     if (speakers.empty() || db.empty()) return {};
 
     // Infer embedding dimension from first non-empty meeting embedding
@@ -701,6 +709,7 @@ std::vector<MeetingSpeaker> re_identify_meeting(
         }
     }
 
+    log_debug("speaker-id: re_identify EXIT");
     return changed ? updated : std::vector<MeetingSpeaker>{};
 }
 

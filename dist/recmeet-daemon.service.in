@@ -6,6 +6,7 @@ Documentation=https://github.com/suykerbuyk/recmeet
 Type=simple
 ExecStart=@RECMEET_DAEMON_EXEC@
 ExecReload=/bin/kill -HUP $MAINPID
+Environment=RECMEET_LOG_LEVEL=error
 Restart=on-failure
 RestartSec=5
 

@@ -289,8 +289,8 @@ int main(int argc, char* argv[]) {
     if (!bind_addr.empty()) cfg.web_bind = bind_addr;
     if (!log_level_str.empty()) cfg.log_level_str = log_level_str;
 
-    // Init logging
-    log_init(parse_log_level(cfg.log_level_str), cfg.log_dir);
+    // Init logging (web always logs to stderr — journald or interactive)
+    log_init(parse_log_level(cfg.log_level_str), cfg.log_dir, cfg.log_retention_hours, true);
 
     // Resolve speaker DB directory
     fs::path speaker_db_dir = cfg.speaker_db.empty()
