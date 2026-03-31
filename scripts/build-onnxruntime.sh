@@ -40,6 +40,15 @@ fi
 
 cd "${BUILD_DIR}/onnxruntime"
 
+# Patch GCC 15 compatibility issues — ORT 1.23.2 predates GCC 15's stricter
+# transitive-include behavior (headers no longer implicitly include <cstdint>).
+echo "--- Applying GCC 15 compatibility patches ---"
+SEMVER_H="onnxruntime/core/common/semver.h"
+if [ -f "${SEMVER_H}" ] && ! grep -q '<cstdint>' "${SEMVER_H}"; then
+    sed -i '/#include "core\/common\/status.h"/a #include <cstdint>' "${SEMVER_H}"
+    echo "  Patched ${SEMVER_H}: added #include <cstdint>"
+fi
+
 # Build with the official build.sh — handles protobuf bundling, abseil, etc.
 # CPU only, shared lib, Release. No --minimal_build (requires ORT format models;
 # sherpa-onnx uses standard ONNX format).
@@ -49,9 +58,11 @@ echo "--- Building (this takes 15-30 minutes) ---"
     --build_shared_lib \
     --parallel "${JOBS}" \
     --skip_tests \
+    --compile_no_warning_as_error \
     --cmake_extra_defines \
         CMAKE_INSTALL_PREFIX="${PREFIX}" \
-        onnxruntime_BUILD_UNIT_TESTS=OFF
+        onnxruntime_BUILD_UNIT_TESTS=OFF \
+        FETCHCONTENT_TRY_FIND_PACKAGE_MODE=NEVER
 
 echo "--- Installing to ${PREFIX} ---"
 cmake --install "${BUILD_DIR}/onnxruntime/build/Linux/Release" --prefix "${PREFIX}"

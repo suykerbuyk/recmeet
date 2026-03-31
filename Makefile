@@ -171,10 +171,13 @@ clean:
 	rm -f $(BUILD_DIR)/recmeet-mcp $(BUILD_DIR)/recmeet-agent
 	rm -f tools/coverage.out
 	rm -rf $(BUILD_DIR)
-	rm -rf vendor/onnxruntime-local
+	@# vendor/onnxruntime-local preserved — takes ~20 min to rebuild (use make clean-ort)
 	rm -rf dist/arch/src/ dist/arch/pkg/
 	rm -f dist/arch/*.zst
 	git checkout dist/arch/PKGBUILD 2>/dev/null || true
+
+clean-ort:
+	rm -rf vendor/onnxruntime-local
 
 help:
 	@echo "recmeet build targets:"
@@ -194,7 +197,8 @@ help:
 	@echo "  make package-rpm   Build + create .rpm package"
 	@echo "  make package-arch  Build Arch package via makepkg"
 	@echo "  make coverage      Run Go tests with coverage report"
-	@echo "  make clean         Remove build + packaging artifacts"
+	@echo "  make clean         Remove build + packaging artifacts (preserves onnxruntime)"
+	@echo "  make clean-ort     Remove locally-built onnxruntime"
 	@echo "  make help          Show this message"
 	@echo ""
 	@echo "Quick start:  make build && make test"
