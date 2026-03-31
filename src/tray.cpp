@@ -8,7 +8,7 @@
 #include "ipc_protocol.h"
 #include "log.h"
 #include "notify.h"
-#include "summarize.h"
+#include "api_models.h"
 #include "util.h"
 #include "version.h"
 
@@ -678,7 +678,6 @@ static void on_no_summary_toggled(GtkCheckMenuItem* item, gpointer) {
     save_config(g_tray.cfg);
 }
 
-#if RECMEET_USE_SHERPA
 static void on_diarize_toggled(GtkCheckMenuItem* item, gpointer) {
     g_tray.cfg.diarize = gtk_check_menu_item_get_active(item);
     save_config(g_tray.cfg);
@@ -688,7 +687,6 @@ static void on_vad_toggled(GtkCheckMenuItem* item, gpointer) {
     g_tray.cfg.vad = gtk_check_menu_item_get_active(item);
     save_config(g_tray.cfg);
 }
-#endif
 
 // --- Provider / model callbacks ---
 
@@ -1292,7 +1290,6 @@ static void build_menu() {
         if (!is_idle) gtk_widget_set_sensitive(item, FALSE);
         gtk_menu_shell_append(GTK_MENU_SHELL(menu), item);
     }
-#if RECMEET_USE_SHERPA
     {
         auto* item = gtk_check_menu_item_new_with_label("Speaker Diarization");
         gtk_check_menu_item_set_active(GTK_CHECK_MENU_ITEM(item), g_tray.cfg.diarize);
@@ -1307,7 +1304,6 @@ static void build_menu() {
         if (!is_idle) gtk_widget_set_sensitive(item, FALSE);
         gtk_menu_shell_append(GTK_MENU_SHELL(menu), item);
     }
-#endif
 
     gtk_menu_shell_append(GTK_MENU_SHELL(menu), gtk_separator_menu_item_new());
 

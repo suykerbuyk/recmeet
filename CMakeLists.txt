@@ -110,20 +110,47 @@ endif()
 # Re-enable deprecation warnings for our own code
 set(CMAKE_WARN_DEPRECATED ON CACHE BOOL "" FORCE)
 
-# Core library (everything except main.cpp and tray.cpp)
-set(CORE_SOURCES
+# IPC library (config, IPC, utilities — no ML dependencies)
+set(IPC_SOURCES
+    src/json_util.cpp
+    src/api_models.cpp
     src/util.cpp
     src/log.cpp
     src/config.cpp
     src/notify.cpp
     src/device_enum.cpp
+    src/http_client.cpp
+    src/ipc_protocol.cpp
+    src/config_json.cpp
+    src/ipc_client.cpp
+    src/ipc_server.cpp
+)
+
+add_library(recmeet_ipc STATIC ${IPC_SOURCES})
+add_dependencies(recmeet_ipc recmeet_version)
+target_include_directories(recmeet_ipc PUBLIC
+    src
+    ${CMAKE_BINARY_DIR}/generated
+)
+target_link_libraries(recmeet_ipc PUBLIC
+    Threads::Threads
+    PkgConfig::PULSE
+    PkgConfig::CURL
+)
+
+if(RECMEET_USE_NOTIFY)
+    target_link_libraries(recmeet_ipc PUBLIC PkgConfig::NOTIFY)
+    target_compile_definitions(recmeet_ipc PUBLIC RECMEET_USE_NOTIFY=1)
+endif()
+
+# Core library (ML pipeline — depends on recmeet_ipc)
+set(CORE_SOURCES
     src/audio_capture.cpp
     src/audio_monitor.cpp
     src/audio_file.cpp
     src/audio_mixer.cpp
     src/model_manager.cpp
     src/transcribe.cpp
-    src/http_client.cpp
     src/summarize.cpp
     src/note.cpp
     src/pipeline.cpp
@@ -131,32 +158,17 @@ set(CORE_SOURCES
     src/diarize.cpp
     src/speaker_id.cpp
     src/vad.cpp
-    src/ipc_protocol.cpp
-    src/config_json.cpp
-    src/ipc_server.cpp
-    src/ipc_client.cpp
 )
 
 add_library(recmeet_core STATIC ${CORE_SOURCES})
 add_dependencies(recmeet_core recmeet_version)
-target_include_directories(recmeet_core PUBLIC
-    src
-    ${CMAKE_BINARY_DIR}/generated
-)
 target_link_libraries(recmeet_core PUBLIC
-    Threads::Threads
+    recmeet_ipc
     PkgConfig::PIPEWIRE
-    PkgConfig::PULSE
     PkgConfig::PULSE_SIMPLE
     PkgConfig::SNDFILE
-    PkgConfig::CURL
     whisper
 )
-
-if(RECMEET_USE_NOTIFY)
-    target_link_libraries(recmeet_core PUBLIC PkgConfig::NOTIFY)
-    target_compile_definitions(recmeet_core PUBLIC RECMEET_USE_NOTIFY=1)
-endif()
 
 if(RECMEET_USE_LLAMA)
     target_link_libraries(recmeet_core PUBLIC llama)
@@ -189,7 +201,7 @@ endif()
 if(RECMEET_BUILD_TRAY)
     add_executable(recmeet-tray src/tray.cpp)
     target_link_libraries(recmeet-tray PRIVATE
-        recmeet_core
+        recmeet_ipc
         PkgConfig::GTK3
         PkgConfig::APPINDICATOR
     )

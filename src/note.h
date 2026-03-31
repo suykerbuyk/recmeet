@@ -4,7 +4,6 @@
 #pragma once
 
 #include "util.h"
-#include "transcribe.h"
 
 #include <string>
 #include <vector>

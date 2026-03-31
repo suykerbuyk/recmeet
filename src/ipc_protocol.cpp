@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 #include "ipc_protocol.h"
-#include "summarize.h"  // json_escape(), json_extract_string()
+#include "json_util.h"
 
 #include <cstdlib>
 #include <unistd.h>

@@ -2,10 +2,10 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 #include "summarize.h"
+#include "json_util.h"
 #include "http_client.h"
 #include "log.h"
 
-#include <algorithm>
 #include <cstdio>
 #include <sstream>
 #include <string>
@@ -17,95 +17,6 @@
 #endif
 
 namespace recmeet {
-
-// --- Public JSON helpers (declared in summarize.h) ---
-
-std::string json_escape(const std::string& s) {
-    std::string out;
-    out.reserve(s.size() + 32);
-    for (char c : s) {
-        switch (c) {
-            case '"':  out += "\\\""; break;
-            case '\\': out += "\\\\"; break;
-            case '\n': out += "\\n";  break;
-            case '\r': out += "\\r";  break;
-            case '\t': out += "\\t";  break;
-            default:   out += c;
-        }
-    }
-    return out;
-}
-
-std::string json_extract_string(const std::string& json, const std::string& key) {
-    std::string search = "\"" + key + "\"";
-    auto pos = json.find(search);
-    if (pos == std::string::npos) return "";
-
-    pos = json.find('"', pos + search.size() + 1); // skip ':'
-    if (pos == std::string::npos) return "";
-    pos++; // skip opening quote
-
-    std::string result;
-    while (pos < json.size() && json[pos] != '"') {
-        if (json[pos] == '\\' && pos + 1 < json.size()) {
-            pos++;
-            switch (json[pos]) {
-                case 'n': result += '\n'; break;
-                case 'r': result += '\r'; break;
-                case 't': result += '\t'; break;
-                case '"': result += '"'; break;
-                case '\\': result += '\\'; break;
-                default: result += '\\'; result += json[pos]; break;
-            }
-        } else {
-            result += json[pos];
-        }
-        pos++;
-    }
-    return result;
-}
-
-bool is_chat_model(const std::string& id) {
-    static const char* skip[] = {
-        "embed", "tts", "whisper", "dall-e", "image",
-        "video", "moderation", "audio", "realtime",
-    };
-    for (const auto* s : skip)
-        if (id.find(s) != std::string::npos)
-            return false;
-    return true;
-}
-
-std::vector<std::string> fetch_models(const std::string& models_url, const std::string& api_key) {
-    std::map<std::string, std::string> headers = {
-        {"Authorization", "Bearer " + api_key},
-    };
-    std::string response = http_get(models_url, headers);
-
-    // Extract all "id" values from the response JSON
-    std::vector<std::string> models;
-    std::string search = "\"id\"";
-    size_t pos = 0;
-    while ((pos = response.find(search, pos)) != std::string::npos) {
-        pos += search.size();
-        // Skip to the value string
-        pos = response.find('"', pos + 1); // skip ':'
-        if (pos == std::string::npos) break;
-        pos++; // skip opening quote
-
-        std::string id;
-        while (pos < response.size() && response[pos] != '"') {
-            id += response[pos];
-            pos++;
-        }
-
-        if (!id.empty() && is_chat_model(id))
-            models.push_back(id);
-    }
-
-    std::sort(models.begin(), models.end());
-    return models;
-}
 
 std::string build_user_prompt(const std::string& transcript, const std::string& context) {
     std::ostringstream oss;
