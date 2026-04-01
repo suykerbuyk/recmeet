@@ -9,6 +9,10 @@
 #include <sys/stat.h>
 #include <sys/socket.h>
 #include <sys/un.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <arpa/inet.h>
+#include <netdb.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <poll.h>
@@ -16,8 +20,11 @@
 
 namespace recmeet {
 
-IpcServer::IpcServer(const std::string& socket_path)
-    : socket_path_(socket_path) {}
+IpcServer::IpcServer(const std::string& socket_path) {
+    if (!parse_ipc_address(socket_path, addr_)) {
+        addr_ = default_ipc_address();
+    }
+}
 
 IpcServer::~IpcServer() {
     stop();
@@ -26,7 +33,8 @@ IpcServer::~IpcServer() {
     if (wakeup_write_ >= 0) { close(wakeup_write_); wakeup_write_ = -1; }
     for (auto& [fd, _] : clients_) close(fd);
     clients_.clear();
-    unlink(socket_path_.c_str());
+    if (addr_.transport == IpcTransport::Unix)
+        unlink(addr_.socket_path.c_str());
 }
 
 void IpcServer::on(const std::string& method, MethodHandler handler) {
@@ -45,15 +53,20 @@ bool IpcServer::start() {
     fcntl(wakeup_read_, F_SETFL, O_NONBLOCK);
     fcntl(wakeup_write_, F_SETFL, O_NONBLOCK);
 
+    if (addr_.transport == IpcTransport::Tcp)
+        return start_tcp();
+    return start_unix();
+}
+
+bool IpcServer::start_unix() {
     // Create socket directory
-    std::string dir = socket_path_.substr(0, socket_path_.rfind('/'));
+    std::string dir = addr_.socket_path.substr(0, addr_.socket_path.rfind('/'));
     if (!dir.empty()) {
-        // mkdir -p (one level only — $XDG_RUNTIME_DIR should already exist)
         mkdir(dir.c_str(), 0700);
     }
 
     // Remove stale socket file
-    unlink(socket_path_.c_str());
+    unlink(addr_.socket_path.c_str());
 
     listen_fd_ = socket(AF_UNIX, SOCK_STREAM, 0);
     if (listen_fd_ < 0) {
@@ -63,21 +76,70 @@ bool IpcServer::start() {
 
     struct sockaddr_un addr{};
     addr.sun_family = AF_UNIX;
-    if (socket_path_.size() >= sizeof(addr.sun_path)) {
+    if (addr_.socket_path.size() >= sizeof(addr.sun_path)) {
         log_error("ipc_server: socket path too long");
         close(listen_fd_); listen_fd_ = -1;
         return false;
     }
-    std::strncpy(addr.sun_path, socket_path_.c_str(), sizeof(addr.sun_path) - 1);
+    std::strncpy(addr.sun_path, addr_.socket_path.c_str(), sizeof(addr.sun_path) - 1);
 
     if (bind(listen_fd_, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) < 0) {
-        log_error("ipc_server: bind(%s) failed: %s", socket_path_.c_str(), strerror(errno));
+        log_error("ipc_server: bind(%s) failed: %s", addr_.socket_path.c_str(), strerror(errno));
         close(listen_fd_); listen_fd_ = -1;
         return false;
     }
 
     if (listen(listen_fd_, 8) < 0) {
         log_error("ipc_server: listen() failed: %s", strerror(errno));
+        close(listen_fd_); listen_fd_ = -1;
+        return false;
+    }
+
+    fcntl(listen_fd_, F_SETFL, O_NONBLOCK);
+    running_ = true;
+    return true;
+}
+
+bool IpcServer::start_tcp() {
+    listen_fd_ = socket(AF_INET, SOCK_STREAM, 0);
+    if (listen_fd_ < 0) {
+        log_error("ipc_server: socket(TCP) failed: %s", strerror(errno));
+        return false;
+    }
+
+    int yes = 1;
+    setsockopt(listen_fd_, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+
+    struct sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(addr_.port);
+    if (addr_.host == "0.0.0.0" || addr_.host.empty()) {
+        addr.sin_addr.s_addr = INADDR_ANY;
+    } else {
+        if (inet_pton(AF_INET, addr_.host.c_str(), &addr.sin_addr) != 1) {
+            // Try resolving hostname
+            struct addrinfo hints{}, *res = nullptr;
+            hints.ai_family = AF_INET;
+            hints.ai_socktype = SOCK_STREAM;
+            if (getaddrinfo(addr_.host.c_str(), nullptr, &hints, &res) != 0 || !res) {
+                log_error("ipc_server: cannot resolve host: %s", addr_.host.c_str());
+                close(listen_fd_); listen_fd_ = -1;
+                return false;
+            }
+            addr.sin_addr = reinterpret_cast<struct sockaddr_in*>(res->ai_addr)->sin_addr;
+            freeaddrinfo(res);
+        }
+    }
+
+    if (bind(listen_fd_, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) < 0) {
+        log_error("ipc_server: bind(%s:%d) failed: %s",
+                  addr_.host.c_str(), addr_.port, strerror(errno));
+        close(listen_fd_); listen_fd_ = -1;
+        return false;
+    }
+
+    if (listen(listen_fd_, 8) < 0) {
+        log_error("ipc_server: listen(TCP) failed: %s", strerror(errno));
         close(listen_fd_); listen_fd_ = -1;
         return false;
     }
@@ -158,6 +220,19 @@ void IpcServer::accept_client() {
     int fd = accept(listen_fd_, nullptr, nullptr);
     if (fd < 0) return;
     fcntl(fd, F_SETFL, O_NONBLOCK);
+
+    if (addr_.transport == IpcTransport::Tcp) {
+        int yes = 1;
+        setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &yes, sizeof(yes));
+        setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &yes, sizeof(yes));
+        int idle = 30;
+        setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &idle, sizeof(idle));
+        int intvl = 10;
+        setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &intvl, sizeof(intvl));
+        int cnt = 3;
+        setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &cnt, sizeof(cnt));
+    }
+
     clients_[fd] = {};
     log_info("ipc_server: client connected (fd=%d, total=%zu)", fd, clients_.size());
 }

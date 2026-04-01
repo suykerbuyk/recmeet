@@ -64,6 +64,7 @@ struct TrayState {
 
     Config cfg;
     IpcClient ipc;   // daemon connection
+    std::string daemon_addr;  // --daemon ADDRESS or RECMEET_DAEMON_ADDR
 
     bool recording = false;
     bool postprocessing = false;
@@ -1490,6 +1491,22 @@ static void build_menu() {
 int main(int argc, char* argv[]) {
     gtk_init(&argc, &argv);
     notify_init();
+
+    // Parse --daemon ADDRESS (GTK leaves unknown args in argv)
+    for (int i = 1; i < argc; ++i) {
+        if (std::string(argv[i]) == "--daemon" && i + 1 < argc) {
+            g_tray.daemon_addr = argv[++i];
+            break;
+        }
+    }
+    // RECMEET_DAEMON_ADDR env var as fallback
+    if (g_tray.daemon_addr.empty()) {
+        if (const char* env = std::getenv("RECMEET_DAEMON_ADDR"))
+            g_tray.daemon_addr = env;
+    }
+    // Set IPC address before first connect
+    if (!g_tray.daemon_addr.empty())
+        g_tray.ipc.set_address(g_tray.daemon_addr);
 
     g_tray.cfg = load_config();
 

@@ -578,6 +578,7 @@ static void print_usage() {
         "\n"
         "Options:\n"
         "  --socket PATH       Unix socket path (default: $XDG_RUNTIME_DIR/recmeet/daemon.sock)\n"
+        "  --listen ADDRESS    Listen address: Unix path or host:port for TCP\n"
         "  --log-level LEVEL   Log level: none, error, warn, info, debug (default: info)\n"
         "  --log-dir DIR       Log file directory\n"
         "  --log-retention N   Log retention in hours (default: 4)\n"
@@ -605,6 +606,7 @@ int main(int argc, char* argv[]) {
         if ((arg == "-h" || arg == "--help")) { print_usage(); return 0; }
         if ((arg == "-v" || arg == "--version")) { printf("recmeet-daemon %s\n", RECMEET_VERSION); return 0; }
         if (arg == "--socket" && i + 1 < argc) { socket_path = argv[++i]; continue; }
+        if (arg == "--listen" && i + 1 < argc) { socket_path = argv[++i]; continue; }
         if (arg == "--log-level" && i + 1 < argc) { log_level_str = argv[++i]; continue; }
         if (arg == "--log-dir" && i + 1 < argc) { log_dir = argv[++i]; continue; }
         if (arg == "--log-retention" && i + 1 < argc) { log_retention_hours = std::atoi(argv[++i]); continue; }
@@ -613,9 +615,22 @@ int main(int argc, char* argv[]) {
     }
 
     // PID file with flock() to prevent duplicate daemons
-    std::string pid_path = socket_path + ".pid";
-    std::string pid_dir = pid_path.substr(0, pid_path.rfind('/'));
-    if (!pid_dir.empty()) mkdir(pid_dir.c_str(), 0700);
+    // For TCP addresses, use a fixed path under XDG_RUNTIME_DIR
+    IpcAddress listen_addr;
+    parse_ipc_address(socket_path, listen_addr);
+    std::string pid_path;
+    if (listen_addr.transport == IpcTransport::Tcp) {
+        const char* runtime = std::getenv("XDG_RUNTIME_DIR");
+        std::string pid_dir_str = runtime
+            ? std::string(runtime) + "/recmeet"
+            : "/tmp/recmeet-" + std::to_string(getuid());
+        mkdir(pid_dir_str.c_str(), 0700);
+        pid_path = pid_dir_str + "/daemon-tcp.pid";
+    } else {
+        pid_path = socket_path + ".pid";
+        std::string pid_dir = pid_path.substr(0, pid_path.rfind('/'));
+        if (!pid_dir.empty()) mkdir(pid_dir.c_str(), 0700);
+    }
     int pid_fd = open(pid_path.c_str(), O_WRONLY | O_CREAT, 0644);
     if (pid_fd >= 0) {
         if (flock(pid_fd, LOCK_EX | LOCK_NB) < 0) {

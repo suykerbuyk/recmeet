@@ -3,8 +3,10 @@
 
 #include <catch2/catch_test_macros.hpp>
 #include "ipc_server.h"
+#include "ipc_client.h"
 #include "ipc_protocol.h"
 
+#include <atomic>
 #include <cstring>
 #include <string>
 #include <thread>
@@ -232,4 +234,74 @@ TEST_CASE("IpcServer: post() wakes poll loop", "[ipc_server]") {
 
     srv_thread.join();
     CHECK(posted_ran);
+}
+
+// ---------------------------------------------------------------------------
+// TCP server tests
+// ---------------------------------------------------------------------------
+
+TEST_CASE("IpcServer TCP: listen + echo round-trip", "[ipc_server]") {
+    IpcServer server("127.0.0.1:19876");
+    server.on("echo", [](const IpcRequest& req, IpcResponse& resp, IpcError&) {
+        resp.result["msg"] = req.params.at("msg");
+        return true;
+    });
+    REQUIRE(server.start());
+    std::thread srv([&server]() { server.run(); });
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+    IpcClient client("127.0.0.1:19876");
+    REQUIRE(client.connect());
+    CHECK(client.is_remote());
+
+    JsonMap params;
+    params["msg"] = std::string("hello-tcp");
+    IpcResponse resp;
+    IpcError err;
+    REQUIRE(client.call("echo", params, resp, err));
+    CHECK(json_val_as_string(resp.result["msg"]) == "hello-tcp");
+
+    server.stop();
+    srv.join();
+}
+
+TEST_CASE("IpcServer TCP: broadcast to 2 clients", "[ipc_server]") {
+    IpcServer server("127.0.0.1:19877");
+    server.on("ping", [](const IpcRequest&, IpcResponse& resp, IpcError&) {
+        resp.result["ok"] = true;
+        return true;
+    });
+    REQUIRE(server.start());
+    std::thread srv([&server]() { server.run(); });
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+    IpcClient c1("127.0.0.1:19877"), c2("127.0.0.1:19877");
+    REQUIRE(c1.connect());
+    REQUIRE(c2.connect());
+
+    // Give server time to accept both clients
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+    std::atomic<int> events_seen{0};
+    auto handler = [&events_seen](const IpcEvent& ev) {
+        if (ev.event == "test.broadcast") events_seen++;
+    };
+    c1.set_event_callback(handler);
+    c2.set_event_callback(handler);
+
+    // Broadcast from server
+    server.post([&server]() {
+        IpcEvent ev;
+        ev.event = "test.broadcast";
+        ev.data["value"] = std::string("hello");
+        server.broadcast(ev);
+    });
+
+    // Both clients should receive the event
+    c1.read_events("test.broadcast", 2000);
+    c2.read_events("test.broadcast", 2000);
+    CHECK(events_seen == 2);
+
+    server.stop();
+    srv.join();
 }

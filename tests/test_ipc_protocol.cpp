@@ -288,3 +288,79 @@ TEST_CASE("default_socket_path: returns a non-empty path", "[ipc]") {
     CHECK_FALSE(path.empty());
     CHECK(path.find("daemon.sock") != std::string::npos);
 }
+
+// ---------------------------------------------------------------------------
+// parse_ipc_address
+// ---------------------------------------------------------------------------
+
+TEST_CASE("parse_ipc_address: empty string → default Unix", "[ipc]") {
+    IpcAddress addr;
+    REQUIRE(parse_ipc_address("", addr));
+    CHECK(addr.transport == IpcTransport::Unix);
+    CHECK(addr.socket_path == default_socket_path());
+    CHECK(addr.port == 0);
+}
+
+TEST_CASE("parse_ipc_address: Unix socket path", "[ipc]") {
+    IpcAddress addr;
+    REQUIRE(parse_ipc_address("/tmp/foo.sock", addr));
+    CHECK(addr.transport == IpcTransport::Unix);
+    CHECK(addr.socket_path == "/tmp/foo.sock");
+}
+
+TEST_CASE("parse_ipc_address: host:port → TCP", "[ipc]") {
+    SECTION("IP address") {
+        IpcAddress addr;
+        REQUIRE(parse_ipc_address("192.168.1.5:9090", addr));
+        CHECK(addr.transport == IpcTransport::Tcp);
+        CHECK(addr.host == "192.168.1.5");
+        CHECK(addr.port == 9090);
+    }
+    SECTION("localhost") {
+        IpcAddress addr;
+        REQUIRE(parse_ipc_address("localhost:8080", addr));
+        CHECK(addr.transport == IpcTransport::Tcp);
+        CHECK(addr.host == "localhost");
+        CHECK(addr.port == 8080);
+    }
+    SECTION("bind-all") {
+        IpcAddress addr;
+        REQUIRE(parse_ipc_address("0.0.0.0:5000", addr));
+        CHECK(addr.transport == IpcTransport::Tcp);
+        CHECK(addr.host == "0.0.0.0");
+        CHECK(addr.port == 5000);
+    }
+}
+
+TEST_CASE("parse_ipc_address: port 0 → rejected", "[ipc]") {
+    IpcAddress addr;
+    CHECK_FALSE(parse_ipc_address("localhost:0", addr));
+}
+
+TEST_CASE("parse_ipc_address: port > 65535 → rejected", "[ipc]") {
+    IpcAddress addr;
+    CHECK_FALSE(parse_ipc_address("localhost:70000", addr));
+}
+
+TEST_CASE("parse_ipc_address: no host (:9090) → rejected", "[ipc]") {
+    IpcAddress addr;
+    CHECK_FALSE(parse_ipc_address(":9090", addr));
+}
+
+TEST_CASE("parse_ipc_address: bare IPv6 → rejected", "[ipc]") {
+    IpcAddress addr;
+    CHECK_FALSE(parse_ipc_address("::1:9090", addr));
+    CHECK_FALSE(parse_ipc_address("fe80::1:9090", addr));
+}
+
+TEST_CASE("parse_ipc_address: IPv6 bracket notation → rejected (future)", "[ipc]") {
+    IpcAddress addr;
+    // Bracket notation reserved for future IPv6 support
+    CHECK_FALSE(parse_ipc_address("[::1]:9090", addr));
+}
+
+TEST_CASE("default_ipc_address: returns Unix transport", "[ipc]") {
+    IpcAddress addr = default_ipc_address();
+    CHECK(addr.transport == IpcTransport::Unix);
+    CHECK(addr.socket_path == default_socket_path());
+}

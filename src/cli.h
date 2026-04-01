@@ -19,6 +19,7 @@ struct CliResult {
     bool download_models = false;
     bool update_models = false;
     DaemonMode daemon_mode = DaemonMode::Auto;
+    std::string daemon_addr;  // --daemon-addr ADDRESS (host:port or socket path)
 
     // Speaker enrollment
     std::string enroll_name;     // --enroll "Name"

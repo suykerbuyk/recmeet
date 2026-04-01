@@ -56,8 +56,10 @@ private:
     void send_to(int fd, const std::string& msg);
     void drain_wakeup();
     void run_posted();
+    bool start_unix();
+    bool start_tcp();
 
-    std::string socket_path_;
+    IpcAddress addr_;
     int listen_fd_ = -1;
     int wakeup_read_ = -1;   // self-pipe read end
     int wakeup_write_ = -1;  // self-pipe write end

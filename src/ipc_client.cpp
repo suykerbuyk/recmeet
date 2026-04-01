@@ -3,17 +3,24 @@
 
 #include "ipc_client.h"
 
+#include <cassert>
 #include <chrono>
 #include <cstring>
 #include <sys/socket.h>
 #include <sys/un.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <netdb.h>
 #include <unistd.h>
+#include <fcntl.h>
 #include <poll.h>
 
 namespace recmeet {
 
-IpcClient::IpcClient(const std::string& socket_path)
-    : socket_path_(socket_path.empty() ? default_socket_path() : socket_path) {}
+IpcClient::IpcClient(const std::string& socket_path) {
+    if (!parse_ipc_address(socket_path, addr_))
+        addr_ = default_ipc_address();
+}
 
 IpcClient::~IpcClient() {
     close_connection();
@@ -21,17 +28,22 @@ IpcClient::~IpcClient() {
 
 bool IpcClient::connect() {
     if (fd_ >= 0) return true;
+    if (addr_.transport == IpcTransport::Tcp)
+        return connect_tcp();
+    return connect_unix();
+}
 
+bool IpcClient::connect_unix() {
     fd_ = socket(AF_UNIX, SOCK_STREAM, 0);
     if (fd_ < 0) return false;
 
     struct sockaddr_un addr{};
     addr.sun_family = AF_UNIX;
-    if (socket_path_.size() >= sizeof(addr.sun_path)) {
+    if (addr_.socket_path.size() >= sizeof(addr.sun_path)) {
         close(fd_); fd_ = -1;
         return false;
     }
-    std::strncpy(addr.sun_path, socket_path_.c_str(), sizeof(addr.sun_path) - 1);
+    std::strncpy(addr.sun_path, addr_.socket_path.c_str(), sizeof(addr.sun_path) - 1);
 
     if (::connect(fd_, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) < 0) {
         close(fd_); fd_ = -1;
@@ -39,6 +51,62 @@ bool IpcClient::connect() {
     }
 
     return true;
+}
+
+bool IpcClient::connect_tcp() {
+    struct addrinfo hints{}, *res = nullptr;
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+
+    std::string port_str = std::to_string(addr_.port);
+    if (getaddrinfo(addr_.host.c_str(), port_str.c_str(), &hints, &res) != 0 || !res)
+        return false;
+
+    fd_ = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+    if (fd_ < 0) { freeaddrinfo(res); return false; }
+
+    // Non-blocking connect with 5s timeout (avoids freezing GTK main loop)
+    fcntl(fd_, F_SETFL, O_NONBLOCK);
+    int rc = ::connect(fd_, res->ai_addr, res->ai_addrlen);
+    freeaddrinfo(res);
+
+    if (rc < 0 && errno != EINPROGRESS) {
+        close(fd_); fd_ = -1;
+        return false;
+    }
+    if (rc < 0) {
+        // EINPROGRESS — wait for completion
+        struct pollfd pfd = {fd_, POLLOUT, 0};
+        rc = poll(&pfd, 1, 5000);
+        if (rc <= 0) { close(fd_); fd_ = -1; return false; }
+        int err = 0; socklen_t len = sizeof(err);
+        getsockopt(fd_, SOL_SOCKET, SO_ERROR, &err, &len);
+        if (err) { close(fd_); fd_ = -1; return false; }
+    }
+
+    // Restore blocking mode for read/write
+    fcntl(fd_, F_SETFL, 0);
+
+    // TCP_NODELAY for low-latency NDJSON
+    int yes = 1;
+    setsockopt(fd_, IPPROTO_TCP, TCP_NODELAY, &yes, sizeof(yes));
+
+    // TCP keepalive: detect dead connections in ~60s
+    setsockopt(fd_, SOL_SOCKET, SO_KEEPALIVE, &yes, sizeof(yes));
+    int idle = 30;
+    setsockopt(fd_, IPPROTO_TCP, TCP_KEEPIDLE, &idle, sizeof(idle));
+    int intvl = 10;
+    setsockopt(fd_, IPPROTO_TCP, TCP_KEEPINTVL, &intvl, sizeof(intvl));
+    int cnt = 3;
+    setsockopt(fd_, IPPROTO_TCP, TCP_KEEPCNT, &cnt, sizeof(cnt));
+
+    return true;
+}
+
+void IpcClient::set_address(const std::string& addr) {
+    assert(fd_ == -1 && "set_address() requires disconnected client");
+    if (!parse_ipc_address(addr, addr_))
+        addr_ = default_ipc_address();
 }
 
 void IpcClient::close_connection() {

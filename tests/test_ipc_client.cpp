@@ -181,3 +181,38 @@ TEST_CASE("daemon_running: returns true with running server", "[ipc_client]") {
     server.stop();
     srv.join();
 }
+
+// ---------------------------------------------------------------------------
+// TCP tests
+// ---------------------------------------------------------------------------
+
+TEST_CASE("IpcClient: TCP connect fails without server (fast timeout)", "[ipc_client]") {
+    // Should return false quickly (5s timeout), not hang
+    auto start = std::chrono::steady_clock::now();
+    IpcClient client("127.0.0.1:19876");
+    CHECK(client.is_remote());
+    CHECK_FALSE(client.connect());
+    auto elapsed = std::chrono::steady_clock::now() - start;
+    // Should fail in well under 10 seconds (connect refused is instant on localhost)
+    CHECK(std::chrono::duration_cast<std::chrono::seconds>(elapsed).count() < 10);
+}
+
+TEST_CASE("IpcClient: is_remote() false for Unix, true for TCP", "[ipc_client]") {
+    IpcClient unix_client("/tmp/test.sock");
+    CHECK_FALSE(unix_client.is_remote());
+
+    IpcClient tcp_client("127.0.0.1:9090");
+    CHECK(tcp_client.is_remote());
+}
+
+TEST_CASE("IpcClient: set_address() updates address when disconnected", "[ipc_client]") {
+    IpcClient client;  // default Unix
+    CHECK_FALSE(client.is_remote());
+
+    client.set_address("127.0.0.1:9090");
+    CHECK(client.is_remote());
+
+    // Reset to Unix
+    client.set_address("/tmp/other.sock");
+    CHECK_FALSE(client.is_remote());
+}

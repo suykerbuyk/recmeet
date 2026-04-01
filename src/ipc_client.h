@@ -48,6 +48,12 @@ public:
     // Close the connection.
     void close_connection();
 
+    // Change the target address. Only valid when disconnected.
+    void set_address(const std::string& addr);
+
+    // Whether this client targets a remote (TCP) daemon.
+    bool is_remote() const { return addr_.transport == IpcTransport::Tcp; }
+
     // Get the underlying fd (for integration with external event loops).
     int fd() const { return fd_; }
 
@@ -57,8 +63,10 @@ public:
 
 private:
     void process_line(const std::string& line);
+    bool connect_unix();
+    bool connect_tcp();
 
-    std::string socket_path_;
+    IpcAddress addr_;
     int fd_ = -1;
     int64_t next_id_ = 1;
     std::string read_buf_;

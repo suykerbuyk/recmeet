@@ -99,9 +99,30 @@ double json_val_as_double(const JsonVal& val, double def = 0.0);
 bool json_val_as_bool(const JsonVal& val, bool def = false);
 
 // ---------------------------------------------------------------------------
-// Socket path
+// Socket path / address
 // ---------------------------------------------------------------------------
 
 std::string default_socket_path();
+
+// Transport type for IPC connections
+enum class IpcTransport { Unix, Tcp };
+
+// Parsed IPC address — either a Unix socket path or a TCP host:port
+struct IpcAddress {
+    IpcTransport transport = IpcTransport::Unix;
+    std::string host;          // TCP only
+    uint16_t port = 0;         // TCP only
+    std::string socket_path;   // Unix only
+};
+
+// Parse an address string into an IpcAddress.
+// Heuristic: "host:port" (digits after last colon, 1-65535) → TCP,
+//            otherwise → Unix socket path.
+// Empty string → default Unix socket path.
+// Returns false on invalid input (e.g. port out of range, bare IPv6).
+bool parse_ipc_address(const std::string& addr, IpcAddress& out);
+
+// Default address (Unix socket at default_socket_path()).
+IpcAddress default_ipc_address();
 
 } // namespace recmeet

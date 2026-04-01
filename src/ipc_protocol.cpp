@@ -324,7 +324,7 @@ bool json_val_as_bool(const JsonVal& val, bool def) {
 }
 
 // ---------------------------------------------------------------------------
-// Socket path
+// Socket path / address
 // ---------------------------------------------------------------------------
 
 std::string default_socket_path() {
@@ -332,6 +332,56 @@ std::string default_socket_path() {
     if (runtime)
         return std::string(runtime) + "/recmeet/daemon.sock";
     return "/tmp/recmeet-" + std::to_string(getuid()) + "/daemon.sock";
+}
+
+bool parse_ipc_address(const std::string& addr, IpcAddress& out) {
+    if (addr.empty()) {
+        out = default_ipc_address();
+        return true;
+    }
+
+    // Reject bare IPv6 addresses (multiple colons without bracket notation).
+    // Bracket notation [host]:port is reserved for future IPv6 support.
+    size_t first_colon = addr.find(':');
+    size_t last_colon = addr.rfind(':');
+    if (first_colon != last_colon) {
+        // Multiple colons — only valid if this were IPv6, which we don't support
+        return false;
+    }
+
+    // Check for host:port pattern: last colon followed by all digits (1-65535)
+    if (last_colon != std::string::npos && last_colon + 1 < addr.size()) {
+        std::string port_str = addr.substr(last_colon + 1);
+        bool all_digits = true;
+        for (char c : port_str) {
+            if (c < '0' || c > '9') { all_digits = false; break; }
+        }
+        if (all_digits && !port_str.empty()) {
+            std::string host = addr.substr(0, last_colon);
+            if (host.empty()) return false;  // ":9090" with no host
+            unsigned long port_val = std::stoul(port_str);
+            if (port_val < 1 || port_val > 65535) return false;
+            out.transport = IpcTransport::Tcp;
+            out.host = host;
+            out.port = static_cast<uint16_t>(port_val);
+            out.socket_path.clear();
+            return true;
+        }
+    }
+
+    // Otherwise treat as Unix socket path
+    out.transport = IpcTransport::Unix;
+    out.socket_path = addr;
+    out.host.clear();
+    out.port = 0;
+    return true;
+}
+
+IpcAddress default_ipc_address() {
+    IpcAddress addr;
+    addr.transport = IpcTransport::Unix;
+    addr.socket_path = default_socket_path();
+    return addr;
 }
 
 } // namespace recmeet

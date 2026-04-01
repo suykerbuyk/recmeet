@@ -1912,3 +1912,58 @@ TEST_CASE("job.context with only context_inline (no vocabulary)", "[ipc][integra
     REQUIRE(client->call("record.stop", resp, err));
     REQUIRE(sim.wait_idle());
 }
+
+// ---------------------------------------------------------------------------
+// TCP transport integration test
+// ---------------------------------------------------------------------------
+
+TEST_CASE("TCP reconnect: server restart detected by client", "[ipc][integration]") {
+    const char* TCP_ADDR = "127.0.0.1:19878";
+
+    // Start server
+    auto server = std::make_unique<IpcServer>(TCP_ADDR);
+    server->on("status.get", [](const IpcRequest&, IpcResponse& resp, IpcError&) {
+        resp.result["state"] = std::string("idle");
+        return true;
+    });
+    REQUIRE(server->start());
+    std::thread srv([&server]() { server->run(); });
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+    // Connect client
+    IpcClient client(TCP_ADDR);
+    REQUIRE(client.connect());
+    CHECK(client.is_remote());
+
+    IpcResponse resp;
+    IpcError err;
+    REQUIRE(client.call("status.get", resp, err, 2000));
+    CHECK(json_val_as_string(resp.result["state"]) == "idle");
+
+    // Stop server — client should detect disconnect
+    server->stop();
+    srv.join();
+    server.reset();
+
+    // Client should fail on next call
+    CHECK_FALSE(client.call("status.get", resp, err, 2000));
+    client.close_connection();
+
+    // Restart server on same port
+    server = std::make_unique<IpcServer>(TCP_ADDR);
+    server->on("status.get", [](const IpcRequest&, IpcResponse& resp, IpcError&) {
+        resp.result["state"] = std::string("recording");
+        return true;
+    });
+    REQUIRE(server->start());
+    std::thread srv2([&server]() { server->run(); });
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+    // Client reconnects
+    REQUIRE(client.connect());
+    REQUIRE(client.call("status.get", resp, err, 2000));
+    CHECK(json_val_as_string(resp.result["state"]) == "recording");
+
+    server->stop();
+    srv2.join();
+}

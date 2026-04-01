@@ -143,8 +143,8 @@ static void print_version() {
 // Client mode — talk to the daemon via IPC
 // ---------------------------------------------------------------------------
 
-static int client_status() {
-    IpcClient client;
+static int client_status(const std::string& addr = "") {
+    IpcClient client(addr);
     if (!client.connect()) {
         printf("Daemon: not running\n");
         return 1;
@@ -162,8 +162,8 @@ static int client_status() {
     return 0;
 }
 
-static int client_stop() {
-    IpcClient client;
+static int client_stop(const std::string& addr = "") {
+    IpcClient client(addr);
     if (!client.connect()) {
         fprintf(stderr, "Daemon not running.\n");
         return 1;
@@ -178,8 +178,8 @@ static int client_stop() {
     return 0;
 }
 
-static int client_record(const Config& cfg) {
-    IpcClient client;
+static int client_record(const Config& cfg, const std::string& addr = "") {
+    IpcClient client(addr);
     if (!client.connect()) {
         fprintf(stderr, "Error: daemon not running. Start with: recmeet-daemon\n");
         return 1;
@@ -295,9 +295,17 @@ int main(int argc, char* argv[]) {
     if (cli.show_version) { print_version(); return 0; }
     if (cli.show_help) { print_usage(); return 0; }
 
+    // RECMEET_DAEMON_ADDR env var as fallback for --daemon-addr
+    if (cli.daemon_addr.empty()) {
+        if (const char* env = std::getenv("RECMEET_DAEMON_ADDR")) {
+            cli.daemon_addr = env;
+            cli.daemon_mode = recmeet::DaemonMode::Force;
+        }
+    }
+
     // Status/stop commands always use client mode
-    if (cli.show_status) return client_status();
-    if (cli.send_stop) return client_stop();
+    if (cli.show_status) return client_status(cli.daemon_addr);
+    if (cli.send_stop) return client_stop(cli.daemon_addr);
 
     // Model management commands — always standalone, no daemon needed
     if (cli.download_models) {
@@ -695,12 +703,12 @@ int main(int argc, char* argv[]) {
         use_daemon = false;
     } else {
         // Auto: use daemon if it's running
-        use_daemon = daemon_running();
+        use_daemon = daemon_running(cli.daemon_addr);
     }
 
     if (use_daemon && !list_sources) {
         log_info("Using daemon mode");
-        int rc = client_record(cfg);
+        int rc = client_record(cfg, cli.daemon_addr);
         log_shutdown();
         return rc;
     }
