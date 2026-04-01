@@ -14,6 +14,10 @@ endif()
 add_compile_options(-ffunction-sections -fdata-sections)
 add_link_options(-Wl,--gc-sections)
 
+# Set install RPATH so installed binaries find vendored shared libs (e.g.
+# libonnxruntime.so) relative to themselves: <prefix>/bin/../lib.
+set(CMAKE_INSTALL_RPATH "$ORIGIN/../lib")
+
 # Options
 option(RECMEET_BUILD_TRAY  "Build system tray applet" ON)
 option(RECMEET_USE_LLAMA   "Enable local summarization via llama.cpp" ON)
@@ -265,6 +269,14 @@ include(GNUInstallDirs)
 
 install(TARGETS recmeet RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 install(TARGETS recmeet-daemon RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+
+# Install vendored onnxruntime shared libraries (built by scripts/build-onnxruntime.sh).
+# The binaries link against these at build time; RPATH ($ORIGIN/../lib) finds them at runtime.
+set(_ORT_LOCAL_LIB "${CMAKE_SOURCE_DIR}/vendor/onnxruntime-local/lib")
+if(IS_DIRECTORY "${_ORT_LOCAL_LIB}")
+    file(GLOB _ORT_LIBS "${_ORT_LOCAL_LIB}/libonnxruntime*.so*")
+    install(FILES ${_ORT_LIBS} DESTINATION ${CMAKE_INSTALL_LIBDIR})
+endif()
 
 # systemd user service for daemon
 set(RECMEET_DAEMON_EXEC "${CMAKE_INSTALL_FULL_BINDIR}/recmeet-daemon")
