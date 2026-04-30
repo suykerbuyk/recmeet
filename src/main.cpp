@@ -21,8 +21,10 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <csignal>
+#include <cstdlib>
 #include <cstring>
 #include <cstdio>
 #include <fstream>
@@ -755,16 +757,41 @@ static int subprocess_main(CliResult& cli) {
     sigaction(SIGINT, &sa, nullptr);
     sigaction(SIGTERM, &sa, nullptr);
 
-    // Heartbeat thread — writes periodic NDJSON so the daemon knows we're alive.
-    // Any real progress/phase event also serves as a heartbeat, so the interval
-    // here (10 s) is just a fallback for long-running stages that don't report.
+    // Heartbeat thread — writes periodic NDJSON so the daemon knows we're alive
+    // and can observe RSS growth. Any real progress/phase event also serves as a
+    // heartbeat, so the interval here (10 s) is just a fallback for long-running
+    // stages that don't report.
+    //
+    // Emission path uses write(2) on a stack buffer — NOT fprintf/fflush — to
+    // avoid the libc stdio mutex. The iter 110 OOM showed fprintf can block for
+    // minutes under heavy malloc-arena lock contention from a deadlocked worker,
+    // taking the heartbeat thread (and watchdog visibility) with it.
+    //
+    // RSS self-limit: if RECMEET_RSS_LIMIT_MB is set and our resident set
+    // exceeds it, write a stderr line and _Exit(1). Diagnostic / best-effort
+    // only — under deadlock conditions even write(2) may block. The cgroup
+    // MemoryMax= in the systemd unit is the real backstop.
     std::atomic<bool> heartbeat_stop{false};
     std::thread heartbeat_thread([&heartbeat_stop]() {
+        const long limit_kb = []() {
+            const char* s = std::getenv("RECMEET_RSS_LIMIT_MB");
+            return s ? std::atol(s) * 1024L : 0L;
+        }();
         while (!heartbeat_stop.load(std::memory_order_relaxed)) {
             for (int i = 0; i < 100 && !heartbeat_stop.load(std::memory_order_relaxed); ++i)
                 std::this_thread::sleep_for(std::chrono::milliseconds(100));
-            if (!heartbeat_stop.load(std::memory_order_relaxed))
-                write_ndjson("heartbeat", "{}");
+            if (heartbeat_stop.load(std::memory_order_relaxed)) break;
+
+            long rss_kb = read_self_rss_kb();
+            write_heartbeat_ndjson(STDOUT_FILENO, rss_kb);
+
+            if (limit_kb > 0 && rss_kb > limit_kb) {
+                // Daemon's stderr-capture concatenates this line onto the
+                // user-facing error. Exit 1 (generic error) — daemon doesn't
+                // distinguish exit codes here.
+                write_rss_limit_msg(STDERR_FILENO);
+                std::_Exit(1);
+            }
         }
     });
 

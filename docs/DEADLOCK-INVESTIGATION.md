@@ -246,3 +246,60 @@ first progress event in a new phase is always broadcast immediately.
    During investigation, `sigsuspend` was observed in standalone mode after
    pipeline completion — traced to libnotify/GLib event loop cleanup. The
    subprocess mode avoids this by skipping `notify_init()`.
+
+---
+
+## 2026-04-30 Addendum: Memory growth + heartbeat blocking under contention
+
+A second incident on a 59 min 15 s meeting reproduced the iter-93 deadlock
+pattern but exposed an additional failure mode in the watchdog itself.
+
+**Observed:**
+- Cgroup peak RSS hit ~26 GB before the kernel global OOM-killer reaped
+  `recmeet` PID 1147417.
+- The daemon's heartbeat staleness watchdog (`hb_stale >= 120`, iter 94)
+  reported `child stale for 279s` *before* it could SIGTERM the child —
+  well past the 120 s threshold. The watchdog wasn't slow; the heartbeat
+  thread itself had been silent for ~5 minutes.
+- Most likely cause: `write_ndjson()` (`src/ndjson_parse.h:47-50`) calls
+  `fprintf(stdout, ...)` followed by `fflush(stdout)`, both of which
+  acquire the libc stdio mutex. Under heavy heap fragmentation and
+  glibc malloc-arena lock contention from the deadlocked worker, even
+  `fprintf` was blocked waiting for an arena lock the worker held.
+- Host had no swap configured (zram disabled), and the daemon's systemd
+  unit had no memory caps, so the kernel's global OOM-killer was the
+  only backstop — too coarse for clean recovery.
+
+**Mitigations shipped in iter 111 (T1A of the
+`postprocess-memory-containment` plan):**
+
+1. **systemd unit memory caps** (`dist/recmeet-daemon.service.in`):
+   `MemoryHigh=10G`, `MemoryMax=14G`, `MemorySwapMax=0`. Cgroup-enforced
+   hard cap reaps only this unit's processes if all else fails;
+   subprocess isolation keeps the daemon alive.
+2. **`MALLOC_ARENA_MAX=2`**. Caps glibc arenas to reduce per-thread
+   allocation fragmentation. Zero code change; widely used in
+   production ML deployments.
+3. **`RECMEET_RSS_LIMIT_MB=12288`** + a no-malloc, no-stdio-lock
+   heartbeat path (`src/util.cpp:write_heartbeat_ndjson`,
+   `write_rss_limit_msg`). The heartbeat thread now uses raw
+   `write(2)` on a stack buffer and reads `/proc/self/statm` directly,
+   avoiding the libc stdio mutex. On RSS overflow it writes a stderr
+   line ("child RSS limit exceeded — split audio (ffmpeg) or raise
+   RECMEET_RSS_LIMIT_MB") and `_Exit(1)`. Diagnostic / best-effort
+   only — under uninterruptible kernel sleep even `write(2)` may block,
+   which is why the cgroup cap remains the real backstop.
+4. **Daemon-side RSS visibility** (`src/daemon.cpp` poll loop). Heartbeat
+   events now carry `rss_kb`; the daemon logs it once per minute, warns
+   above 8 GB, errors above 9.5 GB. The next deadlock will produce a
+   growth curve, not a tombstone.
+
+**Open longer-term work (T1B + T2 of the same plan):**
+- T1B: vendored sherpa-onnx patch to call `Ort::SessionOptions::DisableCpuMemArena()`
+  for the CPU provider — the `kCPU` branch of `GetSessionOptionsImpl`
+  currently does nothing. Conditional on T1A measurements showing the
+  arena is the dominant growth source.
+- T2: chunked diarization to bound peak memory by design. Requires a
+  session-reuse refactor (T2.0) before any chunking work — the current
+  `diarize()` reloads pyannote + embedding models on every call, so naive
+  chunking would multiply both wall-clock and overhead.

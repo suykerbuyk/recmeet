@@ -111,6 +111,28 @@ void write_text_file(const fs::path& path, const std::string& content);
 /// Default thread count for inference engines: hardware_concurrency() - 1, minimum 1.
 int default_thread_count();
 
+// ---------------------------------------------------------------------------
+// Process resident-set-size (Linux)
+// ---------------------------------------------------------------------------
+
+/// Read this process's resident set size in kilobytes from /proc/self/statm.
+/// Returns 0 on read failure (non-Linux, transient errors, sandboxed /proc).
+/// Does not allocate beyond a fixed-size stack buffer in the underlying read.
+long read_self_rss_kb();
+
+/// Format a heartbeat NDJSON line for `rss_kb` into a stack buffer and write
+/// it to `fd` via raw write(2). Does not allocate, does not take the libc
+/// stdio mutex - safe to call from a heartbeat thread under malloc-arena
+/// lock contention. Returns the number of bytes written, or 0 on format
+/// failure / partial write to a closed fd.
+size_t write_heartbeat_ndjson(int fd, long rss_kb);
+
+/// Write the canonical RSS-limit-exceeded stderr line to `fd` via raw
+/// write(2). The string is fixed and distinctive ("child RSS limit
+/// exceeded") so the daemon's last_stderr_line capture can surface it
+/// in the user-facing error.
+void write_rss_limit_msg(int fd);
+
 /// Extract date/time from a directory name matching "YYYY-MM-DD_HH-MM" pattern.
 /// Falls back to file mtime of audio_path, then to current time.
 /// Returns {date_str, time_str} like {"2026-02-15", "14:30"}.

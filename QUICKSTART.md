@@ -550,3 +550,21 @@ recmeet --num-speakers 3
 **Tray shows "Disconnected"** — The tray reconnects automatically when the daemon starts. Check `systemctl --user status recmeet-daemon.service`.
 
 **Summary skipped / no API key warning** — Set your API key in the environment (`XAI_API_KEY`, `OPENAI_API_KEY`, or `ANTHROPIC_API_KEY`), in `~/.config/recmeet/config.yaml` under `api_keys:`, or enter it when the tray prompts you. Alternatively, use `--llm-model` for local summarization, or `--no-summary` to suppress the warning.
+
+**Postprocessing fails with `child RSS limit exceeded`** — onnxruntime
+diarization grew the postprocessing subprocess past its 12 GB cap (typical for
+meetings longer than ~45 minutes). The daemon survives via subprocess
+isolation; the audio is preserved. Either split the audio with `ffmpeg` and
+reprocess each chunk:
+
+```bash
+ffmpeg -i meetings/2026-04-29_19-00/audio_2026-04-29_19-00.wav -t 1800 -c copy chunk1.wav
+ffmpeg -i meetings/2026-04-29_19-00/audio_2026-04-29_19-00.wav -ss 1800 -c copy chunk2.wav
+recmeet --reprocess chunk1.wav --num-speakers 2
+recmeet --reprocess chunk2.wav --num-speakers 2
+```
+
+…or raise `RECMEET_RSS_LIMIT_MB` and `MemoryMax` in
+`dist/recmeet-daemon.service.in` and reinstall (`make install` then
+`systemctl --user daemon-reload && systemctl --user restart
+recmeet-daemon.service`).

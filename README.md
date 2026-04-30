@@ -449,6 +449,26 @@ systemctl --user enable --now recmeet-daemon.socket
 
 The tray service is tied to `graphical-session.target` and restarts automatically on crash. On Sway, your config must activate that target — see [BUILD.md](BUILD.md) for details.
 
+### Postprocessing memory limits
+
+The daemon's systemd unit caps memory at `MemoryHigh=10G` / `MemoryMax=14G` and
+sets `MALLOC_ARENA_MAX=2` to reduce malloc-arena fragmentation under
+onnxruntime's threaded ML workload. The postprocessing subprocess additionally
+self-limits at 12 GB (`RECMEET_RSS_LIMIT_MB=12288`); on overflow it exits with
+`child RSS limit exceeded — split audio (ffmpeg) or raise RECMEET_RSS_LIMIT_MB`,
+and the daemon stays alive thanks to subprocess isolation.
+
+If you process audio longer than ~45 minutes and hit this limit, either split
+the file:
+
+```bash
+ffmpeg -i input.wav -t 1800 -c copy chunk1.wav
+ffmpeg -i input.wav -ss 1800 -c copy chunk2.wav
+```
+
+…or raise the limits in `dist/recmeet-daemon.service.in` and reinstall. See
+[BUILD.md](docs/BUILD.md) "Daemon memory tuning" for the full table.
+
 ## Project history
 
 recmeet started as a Python prototype that proved the pipeline in a single session: `pw-record` and `parecord` for capture, `faster-whisper` for transcription, the `requests` library for Grok API calls. Within two hours the core concept was validated — a local Linux box could record, transcribe, and summarize any meeting without cloud dependencies.

@@ -6,7 +6,34 @@ Documentation=https://github.com/suykerbuyk/recmeet
 Type=simple
 ExecStart=@RECMEET_DAEMON_EXEC@
 ExecReload=/bin/kill -HUP $MAINPID
+
+# --- Logging / runtime tuning ---
 Environment=RECMEET_LOG_LEVEL=error
+
+# Cap glibc malloc arenas. onnxruntime spawns many short-lived threads, and
+# glibc's default of one arena per CPU thread fragments allocations heavily on
+# threaded ML workloads. Capping to 2 typically cuts steady-state RSS 2-4x.
+Environment=MALLOC_ARENA_MAX=2
+
+# Diagnostic / best-effort RSS self-limit observed by the postprocessing child
+# (src/main.cpp heartbeat thread). The cgroup MemoryMax= below is the real
+# backstop; the self-limit just lets the child surface a clean error when
+# possible. Headroom math: worst observed growth ~= 850 MB / 10s heartbeat,
+# leaving 2 GB between this and MemoryMax.
+Environment=RECMEET_RSS_LIMIT_MB=12288
+
+# --- Memory containment (cgroup-enforced) ---
+# MemoryHigh: soft cap; kernel begins aggressive reclaim above this and
+# throttles processes without killing them.
+MemoryHigh=10G
+# MemoryMax: hard cap. If the self-limit fails to fire (e.g. heartbeat thread
+# blocked under allocator-lock contention), the cgroup OOM-killer reaps only
+# this unit's processes - the daemon stays alive via subprocess isolation.
+MemoryMax=14G
+# Make the no-swap state explicit at the unit level, independent of host
+# zram configuration.
+MemorySwapMax=0
+
 Restart=on-failure
 RestartSec=5
 

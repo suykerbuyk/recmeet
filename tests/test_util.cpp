@@ -6,6 +6,8 @@
 
 #include <fstream>
 #include <sys/stat.h>
+#include <unistd.h>
+#include <vector>
 
 using namespace recmeet;
 
@@ -433,4 +435,94 @@ TEST_CASE("audio constants are consistent", "[util]") {
     CHECK(SAMPLE_BITS == 16);
     CHECK(BYTES_PER_SAMPLE == 2);
     CHECK(BYTES_PER_SEC == 32000);  // 16000 * 1 * 2
+}
+
+// ---------------------------------------------------------------------------
+// read_self_rss_kb tests
+// ---------------------------------------------------------------------------
+
+TEST_CASE("read_self_rss_kb: returns positive value for current process", "[util]") {
+    long rss = read_self_rss_kb();
+    // Catch2 + linked vendor libs guarantee a non-trivial RSS.
+    CHECK(rss > 0);
+    // Sanity bound — the test process should be well under 8 GB.
+    CHECK(rss < 8L * 1024L * 1024L);
+}
+
+TEST_CASE("read_self_rss_kb: monotonically grows after large allocation", "[util]") {
+    long before = read_self_rss_kb();
+    REQUIRE(before > 0);
+    // Allocate ~64 MB and touch every page so it actually faults in.
+    constexpr size_t bytes = 64L * 1024L * 1024L;
+    std::vector<unsigned char> buf(bytes);
+    long page = sysconf(_SC_PAGESIZE);
+    for (size_t i = 0; i < bytes; i += page) buf[i] = 1;
+    long after = read_self_rss_kb();
+    CHECK(after >= before);
+    // Should observe at least ~32 MB of growth (slop for kernel timing).
+    CHECK(after - before > 32L * 1024L);
+}
+
+// ---------------------------------------------------------------------------
+// write_heartbeat_ndjson / write_rss_limit_msg tests
+// ---------------------------------------------------------------------------
+
+namespace {
+
+std::string read_pipe_to_string(int fd) {
+    std::string out;
+    char buf[256];
+    for (;;) {
+        ssize_t n = ::read(fd, buf, sizeof(buf));
+        if (n > 0) out.append(buf, n);
+        else break;
+    }
+    return out;
+}
+
+}  // namespace
+
+TEST_CASE("write_heartbeat_ndjson: emits expected NDJSON format with rss_kb", "[util]") {
+    int fds[2];
+    REQUIRE(::pipe(fds) == 0);
+
+    size_t written = write_heartbeat_ndjson(fds[1], 12345);
+    CHECK(written > 0);
+    ::close(fds[1]);
+
+    std::string line = read_pipe_to_string(fds[0]);
+    ::close(fds[0]);
+
+    CHECK(line == "{\"event\":\"heartbeat\",\"data\":{\"rss_kb\":12345}}\n");
+}
+
+TEST_CASE("write_heartbeat_ndjson: handles zero rss_kb (read failure)", "[util]") {
+    int fds[2];
+    REQUIRE(::pipe(fds) == 0);
+
+    size_t written = write_heartbeat_ndjson(fds[1], 0);
+    CHECK(written > 0);
+    ::close(fds[1]);
+
+    std::string line = read_pipe_to_string(fds[0]);
+    ::close(fds[0]);
+
+    CHECK(line == "{\"event\":\"heartbeat\",\"data\":{\"rss_kb\":0}}\n");
+}
+
+TEST_CASE("write_rss_limit_msg: writes distinctive marker line", "[util]") {
+    int fds[2];
+    REQUIRE(::pipe(fds) == 0);
+
+    write_rss_limit_msg(fds[1]);
+    ::close(fds[1]);
+
+    std::string line = read_pipe_to_string(fds[0]);
+    ::close(fds[0]);
+
+    // Must contain the distinctive substring the daemon will surface to the user.
+    CHECK(line.find("child RSS limit exceeded") != std::string::npos);
+    // Must end with a newline so it's captured as a single stderr line.
+    CHECK(!line.empty());
+    CHECK(line.back() == '\n');
 }

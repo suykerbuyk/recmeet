@@ -118,3 +118,18 @@ TEST_CASE("parse_ndjson: job.complete event round-trip", "[ndjson]") {
     CHECK(parse_ndjson_string(line, "note_path") == "/tmp/note.md");
     CHECK(parse_ndjson_string(line, "output_dir") == "/tmp/out");
 }
+
+TEST_CASE("parse_ndjson: heartbeat event with rss_kb round-trip", "[ndjson]") {
+    // Format must match exactly what util::write_heartbeat_ndjson emits;
+    // the daemon's poll loop in src/daemon.cpp parses it via the same helpers.
+    std::string line = R"({"event":"heartbeat","data":{"rss_kb":1572864}})";
+    CHECK(parse_ndjson_string(line, "event") == "heartbeat");
+    CHECK(parse_ndjson_int(line, "rss_kb") == 1572864);
+}
+
+TEST_CASE("parse_ndjson: legacy heartbeat without rss_kb returns -1", "[ndjson]") {
+    // Pre-T1A heartbeat format — daemon must treat missing rss_kb gracefully.
+    std::string line = R"({"event":"heartbeat","data":{}})";
+    CHECK(parse_ndjson_string(line, "event") == "heartbeat");
+    CHECK(parse_ndjson_int(line, "rss_kb") == -1);
+}

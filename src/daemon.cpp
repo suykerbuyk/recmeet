@@ -347,6 +347,17 @@ static void pp_worker_loop(IpcServer& server) {
             std::string captured_note_path;
             std::string captured_output_dir;
 
+            // RSS tracking from heartbeat events — thresholded logging only,
+            // no behavior change. The cgroup MemoryMax= in the systemd unit
+            // is the real backstop.
+            int64_t last_rss_kb = 0;
+            int64_t peak_rss_kb = 0;
+            auto last_rss_log = std::chrono::steady_clock::time_point{};
+            constexpr int64_t RSS_WARN_KB  = 8L * 1024L * 1024L;   //  8 GiB
+            constexpr int64_t RSS_ERROR_KB = 9L * 1024L * 1024L + 512L * 1024L;  // 9.5 GiB
+            bool warned_rss = false;
+            bool errored_rss = false;
+
             // Poll loop on both pipes
             struct pollfd pfds[2] = {
                 {stdout_pipe[0], POLLIN, 0},
@@ -419,7 +430,32 @@ static void pp_worker_loop(IpcServer& server) {
                             // Phase/progress events prove forward motion
                             if (event == "phase" || event == "progress")
                                 last_progress = last_heartbeat;
-                            if (event == "phase") {
+                            if (event == "heartbeat") {
+                                int64_t rss_kb = parse_ndjson_int(line, "rss_kb");
+                                if (rss_kb > 0) {
+                                    last_rss_kb = rss_kb;
+                                    if (rss_kb > peak_rss_kb) peak_rss_kb = rss_kb;
+                                    auto now_rss = std::chrono::steady_clock::now();
+                                    int since_log_s = std::chrono::duration_cast<std::chrono::seconds>(
+                                        now_rss - last_rss_log).count();
+                                    bool first_log = (last_rss_log.time_since_epoch().count() == 0);
+                                    if (first_log || since_log_s >= 60) {
+                                        last_rss_log = now_rss;
+                                        log_info("daemon: pp child RSS=%lld MB (peak=%lld MB)",
+                                                 (long long)(rss_kb / 1024),
+                                                 (long long)(peak_rss_kb / 1024));
+                                    }
+                                    if (!errored_rss && rss_kb > RSS_ERROR_KB) {
+                                        errored_rss = true;
+                                        log_error("daemon: pp child RSS=%lld MB exceeds 9.5 GB - approaching MemoryMax cap",
+                                                  (long long)(rss_kb / 1024));
+                                    } else if (!warned_rss && rss_kb > RSS_WARN_KB) {
+                                        warned_rss = true;
+                                        log_warn("daemon: pp child RSS=%lld MB exceeds 8 GB - past MemoryHigh soft cap",
+                                                 (long long)(rss_kb / 1024));
+                                    }
+                                }
+                            } else if (event == "phase") {
                                 last_percent = -1;  // Reset throttle on phase change
                                 std::string name = parse_ndjson_string(line, "name");
                                 server.post([&server, name]() {

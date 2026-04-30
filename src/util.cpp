@@ -4,7 +4,9 @@
 #include "util.h"
 #include "log.h"
 
+#include <cerrno>
 #include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
@@ -12,6 +14,7 @@
 #include <iomanip>
 #include <sstream>
 #include <thread>
+#include <unistd.h>
 
 namespace recmeet {
 
@@ -88,6 +91,52 @@ void write_text_file(const fs::path& path, const std::string& content) {
 int default_thread_count() {
     unsigned n = std::thread::hardware_concurrency();
     return (n > 1) ? static_cast<int>(n - 1) : 1;
+}
+
+long read_self_rss_kb() {
+    FILE* f = std::fopen("/proc/self/statm", "r");
+    if (!f) return 0;
+    long pages_total = 0;
+    long pages_resident = 0;
+    int n = std::fscanf(f, "%ld %ld", &pages_total, &pages_resident);
+    std::fclose(f);
+    if (n != 2 || pages_resident <= 0) return 0;
+    long page_kb = ::sysconf(_SC_PAGESIZE) / 1024;
+    if (page_kb <= 0) return 0;
+    return pages_resident * page_kb;
+}
+
+size_t write_heartbeat_ndjson(int fd, long rss_kb) {
+    char buf[96];
+    int n = std::snprintf(buf, sizeof(buf),
+        "{\"event\":\"heartbeat\",\"data\":{\"rss_kb\":%ld}}\n", rss_kb);
+    if (n <= 0 || static_cast<size_t>(n) >= sizeof(buf)) return 0;
+    ssize_t written = 0;
+    while (written < n) {
+        ssize_t w = ::write(fd, buf + written, n - written);
+        if (w < 0) {
+            if (errno == EINTR) continue;
+            break;
+        }
+        written += w;
+    }
+    return written > 0 ? static_cast<size_t>(written) : 0;
+}
+
+void write_rss_limit_msg(int fd) {
+    static const char msg[] =
+        "child RSS limit exceeded - split audio (ffmpeg) "
+        "or raise RECMEET_RSS_LIMIT_MB\n";
+    ssize_t mw = 0;
+    ssize_t mlen = static_cast<ssize_t>(sizeof(msg) - 1);
+    while (mw < mlen) {
+        ssize_t w = ::write(fd, msg + mw, mlen - mw);
+        if (w < 0) {
+            if (errno == EINTR) continue;
+            break;
+        }
+        mw += w;
+    }
 }
 
 std::pair<std::string, std::string> resolve_meeting_time(
