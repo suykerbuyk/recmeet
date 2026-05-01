@@ -139,4 +139,14 @@ void write_rss_limit_msg(int fd);
 std::pair<std::string, std::string> resolve_meeting_time(
     const fs::path& out_dir, const fs::path& audio_path);
 
+// ---------------------------------------------------------------------------
+// systemd property line parser (T1C.2)
+// ---------------------------------------------------------------------------
+
+/// Parse a single line of `systemctl show -p MemoryX` output, of the form
+/// "MemoryHigh=<value>\n". Returns LONG_MAX for "infinity", >=0 for byte
+/// counts, or -1 on malformed input. Pure parsing — no I/O. Exposed for
+/// unit testing of the daemon's MemoryHigh restore path.
+long parse_memory_property_line(const char* line);
+
 } // namespace recmeet

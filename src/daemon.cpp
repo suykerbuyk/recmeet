@@ -20,9 +20,11 @@
 
 #include <atomic>
 #include <chrono>
+#include <climits>
 #include <condition_variable>
 #include <csignal>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <mutex>
@@ -225,6 +227,137 @@ static fs::path write_job_config(const PostprocessJob& job) {
 }
 
 // ---------------------------------------------------------------------------
+// T1C.2 helpers — cgroup-aware kill grace machine
+// ---------------------------------------------------------------------------
+//
+// Background: under cgroup MemoryHigh-driven reclaim with no swap, all of
+// the postprocess child's worker threads can park in D (uninterruptible) state
+// simultaneously. SIGKILL is queued but signal delivery stalls until the
+// kernel can reclaim memory — which it can't, because the cgroup is at the
+// soft cap and there's no swap. T1A field measurements (2026-04-30) observed
+// SIGKILL stall for ~30 minutes until MemoryHigh was raised manually.
+//
+// The kill grace machine: SIGTERM → 5s grace → SIGKILL → 30s grace →
+// MemoryHigh=infinity → 30s grace → restore. Liveness uses waitpid(WNOHANG)
+// so we both detect death AND reap the zombie atomically (avoids the
+// kill(pid, 0) anti-pattern which reports zombies as alive).
+
+// Read a systemd memory property via `systemctl show`. Returns the parsed
+// value or -1 on failure. Parsing logic is in recmeet::parse_memory_property_line
+// (util.cpp) so unit tests can drive synthetic input without spawning systemctl.
+static long read_systemd_memory_property(const char* prop) {
+    char cmd[256];
+    std::snprintf(cmd, sizeof(cmd),
+                  "systemctl --user show recmeet-daemon.service -p %s 2>/dev/null", prop);
+    FILE* f = ::popen(cmd, "r");
+    if (!f) return -1;
+    char buf[256] = {0};
+    char* got = std::fgets(buf, sizeof(buf), f);
+    int rc = ::pclose(f);
+    if (!got || rc != 0) return -1;
+    return recmeet::parse_memory_property_line(buf);
+}
+
+// Set a systemd memory property via `systemctl set-property`. Returns the
+// shell exit code; non-zero indicates failure (e.g. unknown property,
+// invalid value, dbus unreachable).
+static int set_systemd_memory_property(const char* prop, const char* value) {
+    char cmd[256];
+    std::snprintf(cmd, sizeof(cmd),
+                  "systemctl --user set-property recmeet-daemon.service %s=%s",
+                  prop, value);
+    return std::system(cmd);
+}
+
+// Liveness check that ALSO reaps the zombie if the child has exited.
+// Returns true if the child is still running, false if dead (reaped or
+// already gone). On false, callers MUST NOT call waitpid() again for this
+// pid.
+static bool poll_child_alive(pid_t pid) {
+    int status = 0;
+    pid_t r = ::waitpid(pid, &status, WNOHANG);
+    if (r == pid) return false;       // dead and reaped
+    if (r == 0)  return true;         // still alive (no state change yet)
+    return false;                      // ECHILD or error → treat as dead
+}
+
+// Helpers for the deferred-restore guard on the MemoryHigh bump.
+// pp_worker_loop is currently single-threaded sequential, so checking
+// queue + child running covers all in-flight postprocess work.
+static bool pp_queue_empty() {
+    std::lock_guard<std::mutex> lk(g_queue_mu);
+    return g_job_queue.empty();
+}
+static bool pp_child_running() {
+    return g_pp_child_pid.load() > 0;
+}
+
+// Kill the postprocess child with the cgroup-aware grace ladder.
+// On return, the child has been reaped (or logged as unkillable). Caller
+// MUST NOT call waitpid() for this pid afterward.
+static void kill_pp_child_with_grace(pid_t pid) {
+    log_warn("daemon: watchdog timeout — killing pp child pid=%d", (int)pid);
+
+    // Stage 1: SIGTERM, 5 s grace.
+    ::kill(pid, SIGTERM);
+    for (int i = 0; i < 5; ++i) {
+        if (!poll_child_alive(pid)) return;
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+    }
+
+    // Stage 2: SIGKILL, 30 s grace. Under cgroup MemoryHigh throttling all
+    // worker threads can park in D state; signal delivery stalls until
+    // reclaim releases. The cgroup may also OOM-kill during this window —
+    // poll_child_alive reaps either way.
+    log_warn("daemon: SIGTERM ignored — escalating to SIGKILL");
+    ::kill(pid, SIGKILL);
+    for (int i = 0; i < 30; ++i) {
+        if (!poll_child_alive(pid)) return;
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+    }
+
+    // Stage 3: SIGKILL stalled — release reclaim pressure. Save current
+    // MemoryHigh first so we can restore it (operator may have customized).
+    log_warn("daemon: SIGKILL stalled 30s — bumping MemoryHigh=infinity to unblock D-state threads");
+    long original_high = read_systemd_memory_property("MemoryHigh");
+    int rc = set_systemd_memory_property("MemoryHigh", "infinity");
+    if (rc != 0) log_warn("daemon: set-property MemoryHigh=infinity rc=%d", rc);
+
+    // Stage 4: post-bump 30 s grace. Signal should land within seconds.
+    bool reaped = false;
+    for (int i = 0; i < 30; ++i) {
+        if (!poll_child_alive(pid)) { reaped = true; break; }
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+    }
+
+    // Stage 5: restore MemoryHigh — but only if no concurrent postprocess
+    // job would suddenly hit reclaim throttling. If we can't safely restore
+    // now, leave it at infinity; the cgroup MemoryMax (hard cap) still
+    // bounds the unit.
+    if (original_high > 0 && pp_queue_empty() && !pp_child_running()) {
+        if (original_high == LONG_MAX) {
+            rc = set_systemd_memory_property("MemoryHigh", "infinity");
+        } else {
+            char val[32];
+            std::snprintf(val, sizeof(val), "%ld", original_high);
+            rc = set_systemd_memory_property("MemoryHigh", val);
+        }
+        if (rc != 0) log_warn("daemon: restore MemoryHigh rc=%d", rc);
+    } else {
+        log_info("daemon: deferring MemoryHigh restore (queue_nonempty=%d, child_running=%d)",
+                 (int)!pp_queue_empty(), (int)pp_child_running());
+    }
+
+    if (!reaped) {
+        log_error("daemon: child pid=%d unkillable after MemoryHigh bump — manual intervention required",
+                  (int)pid);
+        // Don't block on waitpid(); leave it as a zombie under the process
+        // table rather than risk hanging the watchdog forever. Operator-
+        // visible via `ps` and the daemon error log.
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Postprocessing worker loop (long-lived thread, fork/exec subprocess)
 // ---------------------------------------------------------------------------
 
@@ -343,6 +476,13 @@ static void pp_worker_loop(IpcServer& server) {
             std::string last_stderr_line;
             auto last_heartbeat = std::chrono::steady_clock::now();
             auto last_progress = last_heartbeat;  // track forward motion separately
+            // T1C.1: track most recent phase event so the heartbeat handler
+            // can recognize the identify-speakers phase (which has no
+            // progress events of its own — sherpa-onnx's embedding extractor
+            // exposes no progress callback) and reset last_progress on
+            // heartbeat. The 120s heartbeat-staleness watchdog still catches
+            // a child that has actually stopped emitting heartbeats.
+            std::string last_known_phase;
             bool killed_stale = false;
             std::string captured_note_path;
             std::string captured_output_dir;
@@ -400,7 +540,7 @@ static void pp_worker_loop(IpcServer& server) {
                         killed_stale = true;
                     }
                     if (killed_stale) {
-                        kill(pid, SIGTERM);
+                        kill_pp_child_with_grace(pid);
                         for (auto& pfd : pfds) {
                             if (pfd.fd >= 0) close(pfd.fd);
                             pfd.fd = -1;
@@ -455,9 +595,22 @@ static void pp_worker_loop(IpcServer& server) {
                                                  (long long)(rss_kb / 1024));
                                     }
                                 }
+                                // T1C.1: identify-speakers emits no progress
+                                // events of its own (per-cluster blocking
+                                // calls into sherpa-onnx with no callback
+                                // hook). Treat any heartbeat received during
+                                // this phase as a liveness signal and reset
+                                // the progress-staleness watchdog. The 120s
+                                // heartbeat-staleness watchdog above is
+                                // independent and still catches a child that
+                                // has stopped emitting heartbeats entirely.
+                                if (last_known_phase == "identifying speakers") {
+                                    last_progress = last_heartbeat;
+                                }
                             } else if (event == "phase") {
                                 last_percent = -1;  // Reset throttle on phase change
                                 std::string name = parse_ndjson_string(line, "name");
+                                last_known_phase = name;  // T1C.1
                                 server.post([&server, name]() {
                                     IpcEvent ev;
                                     ev.event = "phase";

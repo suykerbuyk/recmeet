@@ -294,12 +294,90 @@ pattern but exposed an additional failure mode in the watchdog itself.
    above 8 GB, errors above 9.5 GB. The next deadlock will produce a
    growth curve, not a tombstone.
 
-**Open longer-term work (T1B + T2 of the same plan):**
-- T1B: vendored sherpa-onnx patch to call `Ort::SessionOptions::DisableCpuMemArena()`
-  for the CPU provider — the `kCPU` branch of `GetSessionOptionsImpl`
-  currently does nothing. Conditional on T1A measurements showing the
-  arena is the dominant growth source.
+**Open longer-term work (T2 of the same plan):**
 - T2: chunked diarization to bound peak memory by design. Requires a
   session-reuse refactor (T2.0) before any chunking work — the current
   `diarize()` reloads pyannote + embedding models on every call, so naive
   chunking would multiply both wall-clock and overhead.
+
+---
+
+## T1A Field Measurements (2026-04-30)
+
+Reprocessing the actual iter-110 audio under T1A produced a complete RSS
+time series. Findings flipped the original hypothesis:
+
+| t+ | Phase | Child VmRSS |
+|----|-------|-------------|
+| 0:00:10 → 1:40:16 | transcribe (~70 min) | flat at 2220 MB ± 50 |
+| 1:40:20 | diarize start | **596 MB** (whisper RAII + ARENA_MAX returned ~1.7 GB) |
+| 1:40:20 → 1:45:20 | diarize | flat at 608 MB |
+| 1:45:10 | **identify-speakers start** | **10399 MB** (jump 17× in <60 s) |
+| 1:46:21 → 1:49:26 | identify | 10415 → 10748 MB |
+| 1:49:46 | watchdog kill | 11186 MB (NOT RSS limit — 300 s no progress) |
+
+**The OOM mechanism is the diarize → identify-speakers session
+boundary, not diarize itself.** VmPeak hit 21.3 GB while VmRSS was 10.7 GB
+— the 10.6 GB gap is anonymous mappings allocated and freed but not
+returned to the OS. Classic onnxruntime CPU memory arena fingerprint:
+per-session arenas pool allocations and don't release across
+`Ort::Session` destruction. `MALLOC_ARENA_MAX=2` (T1A) caps glibc's
+malloc, but the onnxruntime arena is internal to ORT and unaffected.
+
+Two additional gaps surfaced:
+1. **identify-speakers emits no progress events.** It's a per-cluster
+   loop where each cluster makes one blocking
+   `SherpaOnnxSpeakerEmbeddingExtractorComputeEmbedding()` call with no
+   callback hook. The 300 s progress-staleness watchdog (iter 95) fires
+   on a child that's busy, not stuck.
+2. **SIGKILL stalls under cgroup MemoryHigh throttling.** All worker
+   threads parked in D state under no-swap reclaim contention; signal
+   delivery stalled for ~30 minutes until `MemoryHigh` was raised
+   manually.
+
+Full artifacts: `agentctx/notes/t1a-validation-2026-04-30/{journal,cli}.log`
+in the project's vibe-vault project dir.
+
+## T1B + T1C — Containment Round 2
+
+**T1B (build/CMakeLists.txt + cmake/sherpa-onnx-patches/):** vendored
+patch adds `sess_opts.DisableCpuMemArena()` to sherpa-onnx's
+`GetSessionOptionsImpl` for the `kCPU` provider. Applied via
+FetchContent's `PATCH_COMMAND` with a `git apply --reverse --check`
+idempotency wrapper (plain `patch -N` exits 1 on already-applied
+patches, which FetchContent treats as failure on each reconfigure).
+Gated behind `RECMEET_PATCH_SHERPA_ARENA=ON` (default ON).
+
+**T1C.1 (src/pipeline.cpp + src/daemon.cpp):** the daemon's poll loop
+now tracks `last_known_phase` from `phase` events. When a `heartbeat`
+arrives during `last_known_phase == "identifying speakers"`, it resets
+`last_progress` — treating the heartbeat itself as the liveness signal
+for a phase that has no per-segment callback. The 120 s heartbeat-
+staleness watchdog is independent and still fires if the heartbeat
+thread itself stops. `pipeline.cpp` also emits matching
+`progress("identifying speakers", 0/100)` brackets so the existing CLI
+phase-rendering switch shows `identifying speakers... 0% / 100%`
+following the established pattern.
+
+**T1C.2 (src/daemon.cpp + src/util.h/cpp):** new
+`kill_pp_child_with_grace()` ladder: SIGTERM → 5 s → SIGKILL → 30 s →
+`MemoryHigh=infinity` → 30 s → restore. Liveness uses
+`waitpid(WNOHANG)` to both detect death AND reap the zombie atomically
+(the `kill(pid, 0)` anti-pattern reports zombies as alive forever
+because they remain in the process table until reaped). Restore is
+deferred while the postprocess queue/child is non-empty so a healthy
+concurrent child doesn't suddenly hit reclaim throttling. Helper
+`parse_memory_property_line` (in `util.cpp`) parses both numeric byte
+counts and the literal `"infinity"` sentinel; restore branches on the
+parsed value so `MemoryHigh=infinity` round-trips correctly (a
+`snprintf("%ld", LONG_MAX)` would clobber the no-limit semantic by
+writing a finite number that systemd silently clamps).
+
+### Manual reproduction of the kill grace machine
+
+To exercise the SIGKILL-stall fallback path (without arena fix), build
+with `-DRECMEET_PATCH_SHERPA_ARENA=OFF` (after `make clean-deps`) and
+reprocess the iter-110 audio. The pre-T1B RSS curve still triggers the
+watchdog at the diarize → identify boundary; the kill grace machine
+fires, bumps `MemoryHigh=infinity`, and the child is reaped within
+~60 s instead of the manual 30-minute wait observed under T1A.

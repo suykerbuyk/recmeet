@@ -1,0 +1,35 @@
+From: recmeet
+Subject: [PATCH] Disable onnxruntime CPU memory arena for the CPU provider
+
+The onnxruntime CPU memory arena pools allocations across inference calls,
+and on long pipelines (recmeet's full transcribe + diarize + identify chain
+on a 60-min meeting) does not release memory across session boundaries.
+T1A field measurements (2026-04-30) showed RSS jump 17x at the diarize ->
+identify-speakers transition with VmPeak 21.3 GB vs VmRSS 10.7 GB - the
+classic arena fingerprint.
+
+DisableCpuMemArena() is session-scope; this is the only public knob in the
+ONNX Runtime API. There is no global env var equivalent (verified against
+onnxruntime_env_config_keys.h - only kOrtEnvAllowVirtualDevices exists).
+
+This patch is applied via FetchContent's PATCH_COMMAND in the recmeet build
+system (see recmeet's CMakeLists.txt, RECMEET_PATCH_SHERPA_ARENA option).
+
+An upstream PR is open against k2-fsa/sherpa-onnx adding a config flag
+(enable_cpu_mem_arena, default true) so this can be expressed without a
+vendored patch.
+---
+ sherpa-onnx/csrc/session.cc | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/sherpa-onnx/csrc/session.cc b/sherpa-onnx/csrc/session.cc
+--- a/sherpa-onnx/csrc/session.cc
++++ b/sherpa-onnx/csrc/session.cc
+@@ -67,6 +67,7 @@ Ort::SessionOptions GetSessionOptionsImpl(
+
+   switch (p) {
+     case Provider::kCPU:
++      sess_opts.DisableCpuMemArena();
+       break;  // nothing to do for the CPU provider
+     case Provider::kXnnpack: {
+ #if ORT_API_VERSION >= 12

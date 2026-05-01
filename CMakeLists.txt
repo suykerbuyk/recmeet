@@ -88,10 +88,37 @@ endif()
 if(RECMEET_USE_SHERPA)
     recmeet_check_onnxruntime()
     include(FetchContent)
+
+    # T1B: disable the onnxruntime CPU memory arena. The arena pools
+    # allocations across inference calls and does not release across session
+    # boundaries; on a full transcribe+diarize+identify pipeline this manifests
+    # as a 17x RSS jump at the diarize->identify handover (T1A field
+    # measurements, 2026-04-30). DisableCpuMemArena() is session-scope and the
+    # only public knob; sherpa-onnx's session factory does not expose it, so
+    # we patch its default. Toggle off for A/B benchmarking; requires
+    # `make clean-deps` between toggles because FetchContent caches populate.
+    option(RECMEET_PATCH_SHERPA_ARENA
+           "Disable onnxruntime CPU mem arena via sherpa-onnx patch" ON)
+    set(_sherpa_patch_args "")
+    if(RECMEET_PATCH_SHERPA_ARENA)
+        # Idempotent patch application. The FetchContent populate sub-build
+        # re-runs PATCH_COMMAND every time `cmake -B build` is invoked (its
+        # stamp files are wiped on each configure). Plain `patch -N` exits 1
+        # on already-applied patches, which FetchContent treats as failure.
+        # Use `git apply --reverse --check` to detect already-applied state
+        # (the populate dir is a git checkout); apply only when the reverse
+        # check fails. Real apply failures (genuine conflicts) propagate.
+        set(_arena_patch ${CMAKE_CURRENT_SOURCE_DIR}/cmake/sherpa-onnx-patches/0001-disable-cpu-arena.patch)
+        set(_sherpa_patch_args
+            PATCH_COMMAND sh -c "git apply --reverse --check ${_arena_patch} 2>/dev/null || git apply ${_arena_patch}"
+        )
+    endif()
+
     FetchContent_Declare(sherpa-onnx
         GIT_REPOSITORY https://github.com/k2-fsa/sherpa-onnx.git
         GIT_TAG v1.12.27
         EXCLUDE_FROM_ALL
+        ${_sherpa_patch_args}
     )
     set(SHERPA_ONNX_ENABLE_TTS OFF CACHE BOOL "" FORCE)
     set(SHERPA_ONNX_ENABLE_WEBSOCKET OFF CACHE BOOL "" FORCE)

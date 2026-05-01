@@ -495,8 +495,14 @@ PipelineResult run_postprocessing(const Config& cfg, const PostprocessInput& inp
 
                     // Always extract embeddings for speakers.json; match only if DB non-empty
                     auto model_paths = ensure_sherpa_models();
+                    // Phase event fires regardless of db state — the embedding
+                    // extraction call below is the long-running step and the
+                    // daemon's progress-staleness watchdog needs the phase
+                    // marker to recognize identify-speakers and apply the
+                    // heartbeat-as-liveness rule (T1C.1).
+                    phase("identifying speakers");
+                    if (on_progress) on_progress("identifying speakers", 0);
                     if (!db.empty()) {
-                        phase("identifying speakers");
                         notify("Identifying speakers...",
                                std::to_string(db.size()) + " enrolled");
                     }
@@ -504,6 +510,7 @@ PipelineResult run_postprocessing(const Config& cfg, const PostprocessInput& inp
                     auto id_result = identify_speakers(
                         samples.data(), samples.size(), diar, db,
                         model_paths.embedding, cfg.speaker_threshold, threads);
+                    if (on_progress) on_progress("identifying speakers", 100);
                     log_debug("pipeline: speaker ID complete");
                     speaker_names = id_result.names;
 

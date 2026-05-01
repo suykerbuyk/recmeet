@@ -4,6 +4,7 @@
 #include <catch2/catch_test_macros.hpp>
 #include "util.h"
 
+#include <climits>
 #include <fstream>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -525,4 +526,34 @@ TEST_CASE("write_rss_limit_msg: writes distinctive marker line", "[util]") {
     // Must end with a newline so it's captured as a single stderr line.
     CHECK(!line.empty());
     CHECK(line.back() == '\n');
+}
+
+// -------------------------------------------------------------------------
+// T1C.2: parse_memory_property_line — drives the daemon's MemoryHigh
+// restore path. Must round-trip both numeric byte counts and the literal
+// "infinity" sentinel.
+// -------------------------------------------------------------------------
+
+TEST_CASE("parse_memory_property_line: numeric bytes", "[util][t1c]") {
+    CHECK(parse_memory_property_line("MemoryHigh=10737418240\n") == 10737418240L);
+    CHECK(parse_memory_property_line("MemoryMax=15032385536\n") == 15032385536L);
+    CHECK(parse_memory_property_line("MemoryHigh=0\n") == 0L);
+    // No trailing newline (some systemd builds omit it).
+    CHECK(parse_memory_property_line("MemoryHigh=10737418240") == 10737418240L);
+}
+
+TEST_CASE("parse_memory_property_line: infinity sentinel", "[util][t1c]") {
+    CHECK(parse_memory_property_line("MemoryHigh=infinity\n") == LONG_MAX);
+    CHECK(parse_memory_property_line("MemoryMax=infinity") == LONG_MAX);
+    // The "infinity" token is matched as a prefix; trailing whitespace
+    // or null fill from a fixed-size read buffer is acceptable.
+    CHECK(parse_memory_property_line("MemoryHigh=infinity ") == LONG_MAX);
+}
+
+TEST_CASE("parse_memory_property_line: malformed input", "[util][t1c]") {
+    CHECK(parse_memory_property_line(nullptr) == -1);
+    CHECK(parse_memory_property_line("") == -1);
+    CHECK(parse_memory_property_line("MemoryHigh") == -1);   // no '='
+    CHECK(parse_memory_property_line("MemoryHigh=") == -1);  // empty value
+    CHECK(parse_memory_property_line("garbage") == -1);
 }

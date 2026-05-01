@@ -179,6 +179,13 @@ clean:
 clean-ort:
 	rm -rf vendor/onnxruntime-local
 
+# Wipes only the FetchContent populate dirs (sherpa-onnx, catch2) so the next
+# build re-fetches and re-applies any FetchContent PATCH_COMMAND. Use this
+# when toggling RECMEET_PATCH_SHERPA_ARENA — `make clean` would do the same
+# but also wipes compile artifacts, costing a full recmeet rebuild.
+clean-deps:
+	rm -rf $(BUILD_DIR)/_deps $(BUILD_DIR)/CMakeCache.txt $(BUILD_DIR)/CMakeFiles
+
 help:
 	@echo "recmeet build targets:"
 	@echo ""

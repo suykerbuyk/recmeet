@@ -6,6 +6,7 @@
 
 #include <cerrno>
 #include <chrono>
+#include <climits>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -193,6 +194,29 @@ std::pair<std::string, std::string> resolve_meeting_time(
     std::strftime(date_buf, sizeof(date_buf), "%Y-%m-%d", &tm);
     std::strftime(time_buf, sizeof(time_buf), "%H:%M", &tm);
     return {date_buf, time_buf};
+}
+
+// ---------------------------------------------------------------------------
+// systemd property line parser (T1C.2)
+// ---------------------------------------------------------------------------
+//
+// `systemctl show -p MemoryHigh` emits one line of the form:
+//   MemoryHigh=10737418240\n          (numeric, always in bytes)
+//   MemoryHigh=infinity\n             (no limit; literal string)
+// Both must round-trip through the daemon's restore path: numeric values
+// pass through as bytes, infinity must be restored as the literal string
+// (snprintf("%ld", LONG_MAX) would clobber the "no limit" semantic by
+// writing a finite number above MemoryMax that systemd silently clamps).
+
+long parse_memory_property_line(const char* line) {
+    if (!line) return -1;
+    const char* eq = std::strchr(line, '=');
+    if (!eq) return -1;
+    eq++;
+    if (std::strncmp(eq, "infinity", 8) == 0) return LONG_MAX;
+    char* end = nullptr;
+    long v = std::strtol(eq, &end, 10);
+    return (end == eq) ? -1 : v;
 }
 
 } // namespace recmeet

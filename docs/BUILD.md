@@ -239,7 +239,7 @@ ls -lh ~/.local/share/recmeet/models/llama/   # optional
 
 ## CMake options
 
-recmeet has four build options you can toggle at configure time. All features
+recmeet has five build options you can toggle at configure time. All features
 default to ON and the build type defaults to Release, so a plain
 `cmake -B build -G Ninja` gives you a fully-featured optimized build.
 
@@ -256,6 +256,13 @@ cmake -B build -G Ninja -DRECMEET_USE_SHERPA=OFF
 # Disable building tests (skips Catch2 download)
 cmake -B build -G Ninja -DRECMEET_BUILD_TESTS=OFF
 
+# Disable the vendored sherpa-onnx CPU memory arena patch (T1B; for A/B
+# benchmarking only — the patch is a memory containment fix on long
+# meetings, see docs/DEADLOCK-INVESTIGATION.md). Toggling requires
+# `make clean-deps` between runs because FetchContent caches populate
+# state across reconfigures.
+cmake -B build -G Ninja -DRECMEET_PATCH_SHERPA_ARENA=OFF
+
 # Combine multiple options
 cmake -B build -G Ninja -DRECMEET_BUILD_TRAY=OFF -DRECMEET_USE_LLAMA=OFF
 ```
@@ -265,6 +272,22 @@ After changing options, rebuild:
 ```bash
 ninja -C build
 ```
+
+A/B testing the sherpa-onnx arena patch:
+
+```bash
+# Baseline (patch ON) → measurement → toggle → re-measurement
+make clean-deps && cmake -B build -G Ninja -DRECMEET_PATCH_SHERPA_ARENA=ON  && ninja -C build
+# ... run measurement ...
+make clean-deps && cmake -B build -G Ninja -DRECMEET_PATCH_SHERPA_ARENA=OFF && ninja -C build
+# ... re-run measurement ...
+```
+
+`make clean-deps` wipes only the FetchContent populate dirs (sherpa-onnx,
+catch2) — compile artifacts for recmeet itself are preserved. As a faster
+alternative for in-place toggle without a re-fetch, you can run
+`git -C build/_deps/sherpa-onnx-src checkout sherpa-onnx/csrc/session.cc`
+to revert the patched source manually.
 
 ---
 
