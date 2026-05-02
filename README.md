@@ -451,15 +451,23 @@ The tray service is tied to `graphical-session.target` and restarts automaticall
 
 ### Postprocessing memory limits
 
-The daemon's systemd unit caps memory at `MemoryHigh=10G` / `MemoryMax=14G` and
-sets `MALLOC_ARENA_MAX=2` to reduce malloc-arena fragmentation under
-onnxruntime's threaded ML workload. The postprocessing subprocess additionally
-self-limits at 12 GB (`RECMEET_RSS_LIMIT_MB=12288`); on overflow it exits with
-`child RSS limit exceeded — split audio (ffmpeg) or raise RECMEET_RSS_LIMIT_MB`,
-and the daemon stays alive thanks to subprocess isolation.
+**Target:** process up to **4 hours of audio plus context notes on a host
+with a hard 16 GB memory ceiling**. This is a stated requirement; the
+roadmap (`docs/ROADMAP.md` "Long-Audio Containment") tracks the
+engineering path to meeting it. Current effective limit is ~45 minutes of
+audio, dominated by sherpa-onnx's speaker-identification phase whose
+working set scales with per-speaker audio length.
 
-If you process audio longer than ~45 minutes and hit this limit, either split
-the file:
+The daemon's systemd unit caps memory at `MemoryHigh=10G` / `MemoryMax=14G`
+and sets `MALLOC_ARENA_MAX=2` to reduce malloc-arena fragmentation under
+onnxruntime's threaded ML workload. The postprocessing subprocess
+additionally self-limits at 12 GB (`RECMEET_RSS_LIMIT_MB=12288`); on
+overflow it exits with `child RSS limit exceeded — split audio (ffmpeg)
+or raise RECMEET_RSS_LIMIT_MB`, and the daemon stays alive thanks to
+subprocess isolation.
+
+If you process audio longer than ~45 minutes and hit this limit today,
+either split the file:
 
 ```bash
 ffmpeg -i input.wav -t 1800 -c copy chunk1.wav
@@ -467,7 +475,11 @@ ffmpeg -i input.wav -ss 1800 -c copy chunk2.wav
 ```
 
 …or raise the limits in `dist/recmeet-daemon.service.in` and reinstall. See
-[BUILD.md](docs/BUILD.md) "Daemon memory tuning" for the full table.
+[BUILD.md](docs/BUILD.md) "Daemon memory tuning" for the full table. The
+underlying fix — chunked diarization that bounds peak memory by chunk size
+rather than file length — is tracked in
+[ROADMAP.md](docs/ROADMAP.md) and
+[agentctx/tasks/postprocess-memory-containment.md](agentctx/tasks/postprocess-memory-containment.md).
 
 ## Project history
 

@@ -110,6 +110,115 @@ This leaves ample headroom for the OS, desktop, and even concurrent batch transc
 - Should captions be persisted (written to a `.vtt` or `.srt` file) or treated as ephemeral? Persistence is cheap and useful for accessibility.
 - How to handle CPU contention on 2-core systems? Cap inference threads and use `SCHED_BATCH` priority; disable captioning automatically if capture buffer health degrades.
 
+## Phase 2c: Long-Audio Containment (4 hours on 16 GB)
+
+### What it enables
+
+Process up to **4 hours of meeting audio plus context notes on a host
+with a hard 16 GB total memory ceiling**, end-to-end through transcription,
+diarization, speaker identification, and summarization, without OOM and
+without the operator pre-splitting the file. This is a stated product
+requirement.
+
+### What exists today
+
+- **Transcription scales fine.** Whisper steady-states at ~2.2 GB regardless
+  of audio length, validated empirically on 60-min audio (T1A field
+  measurements 2026-04-30; see `docs/DEADLOCK-INVESTIGATION.md`). Whisper
+  destroys its context cleanly between phases, returning memory to the OS
+  under `MALLOC_ARENA_MAX=2`.
+- **Containment is correct end-to-end.** T1A (commit b5c2264, iter 113):
+  systemd cgroup caps + RSS-aware heartbeat with no-malloc emission path
+  + dual-timestamp watchdog. T1B+T1C (commit 828d6ea): vendored sherpa-onnx
+  patch disables onnxruntime CPU memory arena (cuts VmPeak ~40%);
+  identify-phase heartbeat-as-liveness rule prevents the previously-observed
+  watchdog false-positive; cgroup-aware kill-grace machine handles
+  SIGKILL stalls. Failure mode is now a clean error message, not a global
+  OOM kill.
+- **Subprocess isolation.** Postprocessing crashes do not take the daemon
+  with them; the audio file is preserved, the user gets a precise error.
+
+### Technical delta
+
+The remaining gap is **VmRSS, not VmPeak**. Validated end-to-end run
+(T1B+T1C iter-110 audio, 2026-05-01) showed identify-speakers' resident
+working set growing past 12 GB on 60-min audio because sherpa-onnx's
+embedding extractor processes all per-speaker audio in one streaming
+call. For 4-hour audio, the per-speaker buffer would be 4× larger.
+The path:
+
+- **T2.0 — Session-reuse refactor (prerequisite).**
+  Today `diarize()` reloads ~45 MB of pyannote and embedding models on
+  every call. A naive 16-chunk run would reload models 16 times, blowing
+  the wall-clock budget. Wrap `SherpaOnnxOfflineSpeakerDiarization*` and
+  `SherpaOnnxSpeakerEmbeddingExtractor*` in RAII `DiarizeSession` /
+  `SpeakerEmbeddingSession` classes; refactor `diarize()` and
+  `extract_speaker_embedding()` to accept a session reference. Behavior
+  unchanged for existing callers; new chunked code path reuses one
+  session across all chunks.
+
+- **T2 — Chunked diarization with stitching.**
+  Split audio into ~15-minute chunks with ~30-second overlap. For each
+  chunk: diarize using the shared session, extract one centroid per
+  chunk-local speaker, match against a global registry by cosine
+  similarity (threshold 0.6, matching the existing voiceprint-match
+  default), update the matched centroid via running weighted mean
+  (re-normalized to unit norm), rewrite all segments with global IDs.
+  Boundary segments deduplicated by midpoint distance from chunk center.
+  Stitching is deterministic (sort chunks by start time, sort centroids
+  by chunk-local ID, tie-break global registry by ID order).
+
+- **Memory math for 4 hours on 16 GB.** Whisper transcribe: ~2.5 GB
+  steady-state (no scaling with length). Diarize a 15-min chunk: ~600
+  MB working set (matches T1A measurements). Identify a 15-min chunk:
+  estimated ~3 GB working set (linear scaling from 60-min ~10 GB).
+  Peak overlap during the diarize → identify handover within a chunk:
+  ~3.6 GB. Adding daemon overhead and headroom, total peak ≤ 6 GB —
+  comfortably under `MemoryHigh=10G` with no throttling, well under the
+  16 GB host limit.
+
+- **Wall-clock budget.** With session reuse, a 16-chunk run incurs zero
+  model-reload overhead; total wall clock stays within ~1.5× the
+  single-call equivalent (the chunking gate). Without session reuse this
+  is unachievable, hence T2.0 as prerequisite.
+
+### Test surface
+
+- `test_session_reuse_diarize` / `test_session_reuse_embedding`: verify
+  no model reloads across consecutive calls (instrumentation counter).
+- `test_stitch_basic` / `test_stitch_disjoint` / `test_stitch_one_new_speaker`:
+  centroid matching across two chunks.
+- `test_stitch_threshold_boundary`: cosine similarity 0.59 → split, 0.61
+  → merged.
+- `test_stitch_running_mean_normalized`: weighted-mean centroid stays
+  unit-norm.
+- `test_diarize_chunked_short_audio_fallback`: audio under threshold uses
+  single-call path (instrumentation-verified).
+- `test_diarize_chunked_overlap_dedup`: synthetic two-chunk audio with
+  deliberate boundary segment appears once.
+- Integration: full reprocess of a 4-hour synthetic / real meeting on a
+  16 GB-capped VM. Peak RSS ≤ 6 GB, no T1A self-limit fire, sensible
+  speaker assignment across all chunks.
+
+### Open questions
+
+- 15-min chunk vs 10-min vs 20-min: chunk size trades stitching error
+  rate (smaller windows = less per-speaker centroid stability) against
+  peak memory. Default tunable per-meeting.
+- Stitch threshold 0.6 follows the existing voiceprint default; tighten
+  for short windows? Leave as a config knob, not bake a guess.
+- Long meetings with mid-meeting voice changes (illness, mic swap) will
+  fragment a single speaker across chunks. WebUI batch re-identify (iter
+  75) handles this manually; an automatic merge pass is out of scope for
+  T2.
+
+### Acceptance for the stated requirement
+
+A 4-hour audio plus context notes file completes reprocess on a VM with
+`MemoryMax=16G` (and no swap) without `child RSS limit exceeded` or
+watchdog kill. Detailed plan: `agentctx/tasks/postprocess-memory-containment.md`
+"Tier 2".
+
 ## Phase 3: Multi-Client Session Management
 
 ### What it enables
