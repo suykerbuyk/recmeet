@@ -30,6 +30,9 @@ static Config make_test_config() {
     cfg.diarize = false;
     cfg.num_speakers = 3;
     cfg.cluster_threshold = 0.8f;
+    cfg.chunk_minutes = 10.0f;
+    cfg.chunk_overlap_sec = 25.0f;
+    cfg.stitch_threshold = 0.55f;
     cfg.vad = false;
     cfg.vad_threshold = 0.6f;
     cfg.vad_min_silence = 0.3f;
@@ -75,6 +78,12 @@ TEST_CASE("config_to_json + config_from_json round-trip", "[config_json]") {
     CHECK(loaded.num_speakers == original.num_speakers);
     CHECK_THAT(loaded.cluster_threshold,
                Catch::Matchers::WithinAbs(original.cluster_threshold, 0.01));
+    CHECK_THAT(loaded.chunk_minutes,
+               Catch::Matchers::WithinAbs(original.chunk_minutes, 0.01));
+    CHECK_THAT(loaded.chunk_overlap_sec,
+               Catch::Matchers::WithinAbs(original.chunk_overlap_sec, 0.01));
+    CHECK_THAT(loaded.stitch_threshold,
+               Catch::Matchers::WithinAbs(original.stitch_threshold, 0.01));
     CHECK(loaded.vad == original.vad);
     CHECK_THAT(loaded.vad_threshold,
                Catch::Matchers::WithinAbs(original.vad_threshold, 0.01));

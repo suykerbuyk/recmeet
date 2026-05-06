@@ -37,6 +37,9 @@ JsonMap config_to_map(const Config& cfg) {
     m["diarize"]             = cfg.diarize;
     m["num_speakers"]        = static_cast<int64_t>(cfg.num_speakers);
     m["cluster_threshold"]   = static_cast<double>(cfg.cluster_threshold);
+    m["chunk_minutes"]       = static_cast<double>(cfg.chunk_minutes);
+    m["chunk_overlap_sec"]   = static_cast<double>(cfg.chunk_overlap_sec);
+    m["stitch_threshold"]    = static_cast<double>(cfg.stitch_threshold);
 
     // Speaker identification
     m["speaker_id"]          = cfg.speaker_id;
@@ -147,6 +150,9 @@ Config config_from_map(const JsonMap& m) {
     b("diarize", cfg.diarize);
     i("num_speakers", cfg.num_speakers);
     f("cluster_threshold", cfg.cluster_threshold);
+    f("chunk_minutes", cfg.chunk_minutes);
+    f("chunk_overlap_sec", cfg.chunk_overlap_sec);
+    f("stitch_threshold", cfg.stitch_threshold);
 
     b("speaker_id", cfg.speaker_id);
     f("speaker_threshold", cfg.speaker_threshold);

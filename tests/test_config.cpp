@@ -294,6 +294,123 @@ TEST_CASE("resolve_api_key priority: env > api_keys > legacy > empty", "[config]
         setenv("XAI_API_KEY", saved.c_str(), 1);
 }
 
+// ---------------------------------------------------------------------------
+// T2.2 Phase C — chunked-diarize persistent config (M-3' + M-5')
+// ---------------------------------------------------------------------------
+
+TEST_CASE("load_config: chunked-diarize defaults when keys absent",
+          "[config][t2-2]") {
+    fs::path path = fs::temp_directory_path() / "recmeet_test_cfg_chunk_def" / "config.yaml";
+    fs::remove_all(path.parent_path());
+
+    Config cfg = load_config(path);
+    CHECK(cfg.chunk_minutes == 15.0f);
+    CHECK(cfg.chunk_overlap_sec == 30.0f);
+    CHECK(cfg.stitch_threshold == 0.6f);
+}
+
+TEST_CASE("save_config + load_config: chunked-diarize fields round-trip",
+          "[config][t2-2]") {
+    fs::path dir = fs::temp_directory_path() / "recmeet_test_cfg_chunk_rt";
+    fs::remove_all(dir);
+    fs::path path = dir / "config.yaml";
+
+    Config cfg;
+    cfg.chunk_minutes = 12.5f;
+    cfg.chunk_overlap_sec = 45.0f;
+    cfg.stitch_threshold = 0.55f;
+    save_config(cfg, path);
+    REQUIRE(fs::exists(path));
+
+    // Verify on-disk YAML lives under the [diarization] section (M-3').
+    std::ifstream in(path);
+    std::ostringstream buf;
+    buf << in.rdbuf();
+    std::string content = buf.str();
+    auto diar_pos = content.find("diarization:");
+    REQUIRE(diar_pos != std::string::npos);
+    CHECK(content.find("chunk_minutes: 12.5", diar_pos) != std::string::npos);
+    CHECK(content.find("chunk_overlap_sec: 45", diar_pos) != std::string::npos);
+    CHECK(content.find("stitch_threshold: 0.55", diar_pos) != std::string::npos);
+    // No parallel [diarize] section per M-3'.
+    CHECK(content.find("\ndiarize:\n") == std::string::npos);
+
+    Config loaded = load_config(path);
+    CHECK(loaded.chunk_minutes == 12.5f);
+    CHECK(loaded.chunk_overlap_sec == 45.0f);
+    CHECK(loaded.stitch_threshold == 0.55f);
+
+    fs::remove_all(dir);
+}
+
+TEST_CASE("save_config: chunked-diarize fields omitted at defaults",
+          "[config][t2-2]") {
+    fs::path dir = fs::temp_directory_path() / "recmeet_test_cfg_chunk_omit";
+    fs::remove_all(dir);
+    fs::path path = dir / "config.yaml";
+
+    Config cfg;  // all defaults
+    save_config(cfg, path);
+
+    std::ifstream in(path);
+    std::ostringstream buf;
+    buf << in.rdbuf();
+    std::string content = buf.str();
+    CHECK(content.find("chunk_minutes") == std::string::npos);
+    CHECK(content.find("chunk_overlap_sec") == std::string::npos);
+    CHECK(content.find("stitch_threshold") == std::string::npos);
+
+    fs::remove_all(dir);
+}
+
+TEST_CASE("load_config: M-5' invalid persisted values fall back to defaults",
+          "[config][t2-2]") {
+    fs::path dir = fs::temp_directory_path() / "recmeet_test_cfg_chunk_invalid";
+    fs::remove_all(dir);
+    fs::path path = dir / "config.yaml";
+
+    {
+        fs::create_directories(dir);
+        std::ofstream out(path);
+        // chunk_minutes=0.5 → 0.5*60=30 ≤ 60+60=120 → invalid
+        out << "diarization:\n"
+            << "  chunk_minutes: 0.5\n"
+            << "  chunk_overlap_sec: 60.0\n"
+            << "  stitch_threshold: 0.42\n";
+    }
+
+    Config cfg = load_config(path);
+    // Falls back to defaults rather than crashing the daemon at startup.
+    CHECK(cfg.chunk_minutes == 15.0f);
+    CHECK(cfg.chunk_overlap_sec == 30.0f);
+    // Stitch threshold is independent of the spacing invariant — honoured.
+    CHECK(cfg.stitch_threshold == 0.42f);
+
+    fs::remove_all(dir);
+}
+
+TEST_CASE("load_config: M-5' boundary equal-to-zero spacing falls back",
+          "[config][t2-2]") {
+    fs::path dir = fs::temp_directory_path() / "recmeet_test_cfg_chunk_eq";
+    fs::remove_all(dir);
+    fs::path path = dir / "config.yaml";
+
+    {
+        fs::create_directories(dir);
+        std::ofstream out(path);
+        // 1.0 * 60 = 60, vs 0 + 60 = 60 → equal, fails strict-greater check
+        out << "diarization:\n"
+            << "  chunk_minutes: 1.0\n"
+            << "  chunk_overlap_sec: 0.0\n";
+    }
+
+    Config cfg = load_config(path);
+    CHECK(cfg.chunk_minutes == 15.0f);
+    CHECK(cfg.chunk_overlap_sec == 30.0f);
+
+    fs::remove_all(dir);
+}
+
 TEST_CASE("backward compat: legacy api_key in config used as fallback", "[config]") {
     fs::path dir = fs::temp_directory_path() / "recmeet_test_legacy_compat";
     fs::remove_all(dir);

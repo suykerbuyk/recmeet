@@ -107,7 +107,10 @@ static void print_usage() {
         "  --mmap               Use mmap for LLM model loading (faster load, may cause swap)\n"
         "  --no-mmap            Disable mmap for LLM model loading (default, avoids swap thrashing)\n"
         "  --no-diarize         Disable speaker diarization\n"
-        "  --num-speakers N     Number of speakers (0 = auto-detect, default: 0)\n"
+        "  --num-speakers N     Number of speakers (0 = auto-detect, default: 0).\n"
+        "                       For long audio that runs the chunked path, this is\n"
+        "                       enforced post-stitch as a global count limit via\n"
+        "                       sample-weighted greedy-merge (not per-chunk).\n"
         "  --cluster-threshold F  Clustering distance threshold (default: 1.18, higher = fewer speakers)\n"
         "  --no-vad             Disable VAD segmentation (transcribe full audio)\n"
         "  --vad-threshold F    VAD speech detection threshold (default: 0.5)\n"
@@ -296,6 +299,10 @@ int main(int argc, char* argv[]) {
     auto cli = recmeet::parse_cli(argc, argv);
     if (cli.show_version) { print_version(); return 0; }
     if (cli.show_help) { print_usage(); return 0; }
+    if (!cli.parse_error.empty()) {
+        fprintf(stderr, "Error: %s\n", cli.parse_error.c_str());
+        return 2;  // CLI usage error
+    }
 
     // RECMEET_DAEMON_ADDR env var as fallback for --daemon-addr
     if (cli.daemon_addr.empty()) {

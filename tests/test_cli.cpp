@@ -324,3 +324,75 @@ TEST_CASE("parse_cli: --context-text and --context-file can coexist", "[cli]") {
     CHECK(cli.cfg.context_inline == "inline notes");
     CHECK(cli.cfg.context_file == "/tmp/agenda.txt");
 }
+
+// ---------------------------------------------------------------------------
+// T2.2 Phase C — chunked-diarize CLI flags + M-5' validation
+// ---------------------------------------------------------------------------
+
+TEST_CASE("parse_cli: --diarize-chunk-minutes sets value", "[cli][t2-2]") {
+    auto cli = run_cli({"recmeet", "--diarize-chunk-minutes", "10.0"});
+    CHECK(cli.cfg.chunk_minutes == 10.0f);
+    CHECK(cli.parse_error.empty());
+}
+
+TEST_CASE("parse_cli: --diarize-chunk-overlap-sec sets value", "[cli][t2-2]") {
+    auto cli = run_cli({"recmeet", "--diarize-chunk-overlap-sec", "45.0"});
+    CHECK(cli.cfg.chunk_overlap_sec == 45.0f);
+    CHECK(cli.parse_error.empty());
+}
+
+TEST_CASE("parse_cli: --diarize-stitch-threshold sets value", "[cli][t2-2]") {
+    auto cli = run_cli({"recmeet", "--diarize-stitch-threshold", "0.55"});
+    CHECK(cli.cfg.stitch_threshold == 0.55f);
+    CHECK(cli.parse_error.empty());
+}
+
+TEST_CASE("parse_cli: chunked-diarize defaults are 15min / 30s / 0.6", "[cli][t2-2]") {
+    auto cli = run_cli({"recmeet"});
+    CHECK(cli.cfg.chunk_minutes == 15.0f);
+    CHECK(cli.cfg.chunk_overlap_sec == 30.0f);
+    CHECK(cli.cfg.stitch_threshold == 0.6f);
+    CHECK(cli.parse_error.empty());
+}
+
+TEST_CASE("parse_cli: combined chunked flags accepted with valid spacing",
+          "[cli][t2-2]") {
+    auto cli = run_cli({"recmeet",
+                         "--diarize-chunk-minutes", "5.0",
+                         "--diarize-chunk-overlap-sec", "30.0",
+                         "--diarize-stitch-threshold", "0.7"});
+    // 5*60 = 300 > 30 + 60 = 90 → valid
+    CHECK(cli.cfg.chunk_minutes == 5.0f);
+    CHECK(cli.cfg.chunk_overlap_sec == 30.0f);
+    CHECK(cli.cfg.stitch_threshold == 0.7f);
+    CHECK(cli.parse_error.empty());
+}
+
+TEST_CASE("parse_cli: M-5' rejects chunk_minutes too small for overlap",
+          "[cli][t2-2]") {
+    // 0.5 * 60 = 30, vs overlap 60 + 60 = 120 → invalid
+    auto cli = run_cli({"recmeet",
+                         "--diarize-chunk-minutes", "0.5",
+                         "--diarize-chunk-overlap-sec", "60.0"});
+    REQUIRE_FALSE(cli.parse_error.empty());
+    CHECK(cli.parse_error.find("--diarize-chunk-minutes") != std::string::npos);
+    CHECK(cli.parse_error.find("--diarize-chunk-overlap-sec") != std::string::npos);
+}
+
+TEST_CASE("parse_cli: M-5' rejects boundary equal-to-zero spacing",
+          "[cli][t2-2]") {
+    // 1.0 * 60 = 60, overlap 0 + 60 = 60 → equal, must be strict > → invalid
+    auto cli = run_cli({"recmeet",
+                         "--diarize-chunk-minutes", "1.0",
+                         "--diarize-chunk-overlap-sec", "0.0"});
+    REQUIRE_FALSE(cli.parse_error.empty());
+}
+
+TEST_CASE("parse_cli: M-5' accepts just-above-threshold spacing",
+          "[cli][t2-2]") {
+    // 2.0 * 60 = 120, overlap 30 + 60 = 90 → 120 > 90 → valid
+    auto cli = run_cli({"recmeet",
+                         "--diarize-chunk-minutes", "2.0",
+                         "--diarize-chunk-overlap-sec", "30.0"});
+    CHECK(cli.parse_error.empty());
+}

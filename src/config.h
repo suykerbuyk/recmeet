@@ -60,6 +60,20 @@ struct Config {
     int num_speakers = 0;  // 0 = auto-detect
     float cluster_threshold = 1.18f;  // clustering distance threshold (lower = more splitting)
 
+    // Chunked diarization (T2.1/T2.2 — engaged when audio length exceeds the
+    // pipeline threshold; otherwise the single-call path is used). Defaults
+    // sized to keep each chunk's peak working set well under the iter-110
+    // ~10 GB single-call boundary while still giving each chunk enough audio
+    // to produce well-separated clusters. `chunk_minutes * 60` must exceed
+    // `chunk_overlap_sec + 60` (positive spacing with ≥ 60 s minimum core);
+    // load_config() falls back to defaults with a warning if the persisted
+    // values violate this invariant.
+    float chunk_minutes = 15.0f;
+    float chunk_overlap_sec = 30.0f;
+    /// Cosine-similarity floor for stitching chunk-local centroids into the
+    /// global registry (matches the SherpaOnnxSpeakerEmbeddingManager metric).
+    float stitch_threshold = 0.6f;
+
     // Speaker identification (cross-session voiceprint matching)
     bool speaker_id = true;  // enabled when speaker DB exists
     float speaker_threshold = 0.6f;  // cosine similarity threshold

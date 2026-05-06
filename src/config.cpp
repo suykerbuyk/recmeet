@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 #include "config.h"
+#include "log.h"
 
 #include <cstdlib>
 #include <fstream>
@@ -171,6 +172,39 @@ Config load_config(const fs::path& config_path) {
     std::string ct = get_val(entries, "diarization", "cluster_threshold", "");
     if (!ct.empty()) cfg.cluster_threshold = std::atof(ct.c_str());
 
+    // Chunked diarization parameters (T2.1/T2.2 — same [diarization] section,
+    // single source of truth per M-3'). Validate `chunk_minutes * 60 >
+    // chunk_overlap_sec + 60` per M-5'; on violation, log a warning and fall
+    // back to defaults rather than crashing the daemon at startup.
+    {
+        float cm = cfg.chunk_minutes;
+        float co = cfg.chunk_overlap_sec;
+        float st_thr = cfg.stitch_threshold;
+        std::string cm_s = get_val(entries, "diarization", "chunk_minutes", "");
+        std::string co_s = get_val(entries, "diarization", "chunk_overlap_sec", "");
+        std::string st_s = get_val(entries, "diarization", "stitch_threshold", "");
+        if (!cm_s.empty()) cm = static_cast<float>(std::atof(cm_s.c_str()));
+        if (!co_s.empty()) co = static_cast<float>(std::atof(co_s.c_str()));
+        if (!st_s.empty()) st_thr = static_cast<float>(std::atof(st_s.c_str()));
+
+        bool any_loaded = !cm_s.empty() || !co_s.empty();
+        if (any_loaded && cm * 60.0f <= co + 60.0f) {
+            log_warn("config: invalid chunked-diarize values "
+                     "(chunk_minutes=%.3f, chunk_overlap_sec=%.3f); "
+                     "chunk_minutes*60 must exceed chunk_overlap_sec+60. "
+                     "Falling back to defaults (15.0, 30.0).",
+                     cm, co);
+            // Keep struct defaults (already in cfg.chunk_minutes /
+            // cfg.chunk_overlap_sec). Stitch threshold is independent of the
+            // spacing invariant, so honour the loaded value if present.
+            if (!st_s.empty()) cfg.stitch_threshold = st_thr;
+        } else {
+            cfg.chunk_minutes = cm;
+            cfg.chunk_overlap_sec = co;
+            cfg.stitch_threshold = st_thr;
+        }
+    }
+
     // Speaker identification section
     cfg.speaker_id = get_bool(entries, "speaker_id", "enabled", true);
     std::string st = get_val(entries, "speaker_id", "threshold", "");
@@ -286,7 +320,9 @@ void save_config(const Config& cfg, const fs::path& config_path) {
         }
     }
 
-    if (!cfg.diarize || cfg.num_speakers > 0 || cfg.cluster_threshold != 1.18f) {
+    if (!cfg.diarize || cfg.num_speakers > 0 || cfg.cluster_threshold != 1.18f ||
+        cfg.chunk_minutes != 15.0f || cfg.chunk_overlap_sec != 30.0f ||
+        cfg.stitch_threshold != 0.6f) {
         out << "\ndiarization:\n";
         if (!cfg.diarize)
             out << "  enabled: false\n";
@@ -294,6 +330,12 @@ void save_config(const Config& cfg, const fs::path& config_path) {
             out << "  num_speakers: " << cfg.num_speakers << "\n";
         if (cfg.cluster_threshold != 1.18f)
             out << "  cluster_threshold: " << cfg.cluster_threshold << "\n";
+        if (cfg.chunk_minutes != 15.0f)
+            out << "  chunk_minutes: " << cfg.chunk_minutes << "\n";
+        if (cfg.chunk_overlap_sec != 30.0f)
+            out << "  chunk_overlap_sec: " << cfg.chunk_overlap_sec << "\n";
+        if (cfg.stitch_threshold != 0.6f)
+            out << "  stitch_threshold: " << cfg.stitch_threshold << "\n";
     }
 
     if (!cfg.speaker_id || cfg.speaker_threshold != 0.6f || !cfg.speaker_db.empty()) {

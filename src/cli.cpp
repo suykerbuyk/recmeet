@@ -3,6 +3,7 @@
 
 #include "cli.h"
 
+#include <cstdio>
 #include <cstdlib>
 #include <getopt.h>
 
@@ -64,6 +65,9 @@ CliResult parse_cli(int argc, char* argv[]) {
         {"daemon-addr",    required_argument, nullptr, 1028},
         {"progress-json",  no_argument,       nullptr, 1025},
         {"config-json",    required_argument, nullptr, 1026},
+        {"diarize-chunk-minutes",     required_argument, nullptr, 1029},
+        {"diarize-chunk-overlap-sec", required_argument, nullptr, 1030},
+        {"diarize-stitch-threshold",  required_argument, nullptr, 1031},
         {"help",           no_argument,       nullptr, 'h'},
         {"version",        no_argument,       nullptr, 'v'},
         {nullptr, 0, nullptr, 0},
@@ -130,9 +134,31 @@ CliResult parse_cli(int argc, char* argv[]) {
             case 1027: result.cfg.log_retention_hours = std::atoi(optarg); break;
             case 1028: result.daemon_addr = optarg;
                        result.daemon_mode = DaemonMode::Force; break;
+            case 1029: result.cfg.chunk_minutes = static_cast<float>(std::atof(optarg)); break;
+            case 1030: result.cfg.chunk_overlap_sec = static_cast<float>(std::atof(optarg)); break;
+            case 1031: result.cfg.stitch_threshold = static_cast<float>(std::atof(optarg)); break;
             case 'v': result.show_version = true; return result;
             case 'h': result.show_help = true; return result;
             default:  result.show_help = true; return result;
+        }
+    }
+
+    // M-5' validation: chunk_minutes * 60 must exceed chunk_overlap_sec + 60
+    // (positive spacing with ≥ 60 s minimum core size). Mirrors the same check
+    // inside `diarize_chunked` so misconfiguration fails fast at the surface
+    // where the user can fix it, not deep in the pipeline. Caller (main.cpp)
+    // surfaces the error to stderr and exits with code 2 (CLI usage error).
+    {
+        float cm = result.cfg.chunk_minutes;
+        float co = result.cfg.chunk_overlap_sec;
+        if (cm * 60.0f <= co + 60.0f) {
+            char buf[256];
+            std::snprintf(buf, sizeof(buf),
+                "--diarize-chunk-minutes (%.3f) * 60 must exceed "
+                "--diarize-chunk-overlap-sec (%.3f) + 60 "
+                "(positive chunk spacing with at least 60 s of core)",
+                cm, co);
+            result.parse_error = buf;
         }
     }
 

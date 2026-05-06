@@ -479,11 +479,48 @@ PipelineResult run_postprocessing(const Config& cfg, const PostprocessInput& inp
                         on_progress("diarizing", total > 0 ? done * 100 / total : 0);
                     };
                 }
-                log_debug("pipeline: diarizing (%d speakers)", cfg.num_speakers);
-                auto diar = diarize(samples.data(), samples.size(),
-                                    cfg.num_speakers, threads, cfg.cluster_threshold,
-                                    diar_progress);
-                log_debug("pipeline: diarization complete (%zu segments)", diar.segments.size());
+
+                // T2.2 dispatch: chunked path triggers when audio is large
+                // enough to actually produce ≥ 2 real chunks plus 2 minutes
+                // of headroom. Below the threshold the single-call path runs
+                // unchanged. Threshold formula pinned in plan rev 7 line 429.
+                DiarizeChunkConfig chunk_cfg;
+                chunk_cfg.chunk_minutes = cfg.chunk_minutes;
+                chunk_cfg.overlap_seconds = cfg.chunk_overlap_sec;
+                chunk_cfg.stitch_threshold = cfg.stitch_threshold;
+                const size_t chunk_threshold_samples = static_cast<size_t>(
+                    (chunk_cfg.chunk_minutes * 60.0f
+                     + chunk_cfg.overlap_seconds + 120.0f)
+                    * static_cast<float>(SAMPLE_RATE));
+                const bool use_chunked =
+                    samples.size() > chunk_threshold_samples;
+
+                DiarizeResult diar;
+                std::map<int, std::vector<float>> chunked_centroids;
+                if (use_chunked) {
+                    log_debug("pipeline: diarizing chunked "
+                              "(%d speakers, %.1f min chunks, %.1f s overlap, "
+                              "stitch %.2f, threshold %.2f)",
+                              cfg.num_speakers, chunk_cfg.chunk_minutes,
+                              chunk_cfg.overlap_seconds,
+                              chunk_cfg.stitch_threshold, cfg.cluster_threshold);
+                    auto chunked = diarize_chunked(
+                        samples.data(), samples.size(),
+                        cfg.num_speakers, threads, cfg.cluster_threshold,
+                        chunk_cfg, diar_progress);
+                    diar = std::move(chunked.diar);
+                    chunked_centroids = std::move(chunked.centroids);
+                    log_debug("pipeline: chunked diarization complete "
+                              "(%zu segments, %zu centroids)",
+                              diar.segments.size(), chunked_centroids.size());
+                } else {
+                    log_debug("pipeline: diarizing (%d speakers)", cfg.num_speakers);
+                    diar = diarize(samples.data(), samples.size(),
+                                   cfg.num_speakers, threads, cfg.cluster_threshold,
+                                   diar_progress);
+                    log_debug("pipeline: diarization complete (%zu segments)",
+                              diar.segments.size());
+                }
 
                 // Speaker identification + embedding extraction
                 std::map<int, std::string> speaker_names;
@@ -493,8 +530,6 @@ PipelineResult run_postprocessing(const Config& cfg, const PostprocessInput& inp
                     auto db = cfg.speaker_id ? load_speaker_db(db_dir)
                                              : std::vector<SpeakerProfile>{};
 
-                    // Always extract embeddings for speakers.json; match only if DB non-empty
-                    auto model_paths = ensure_sherpa_models();
                     // Phase event fires regardless of db state — the embedding
                     // extraction call below is the long-running step and the
                     // daemon's progress-staleness watchdog needs the phase
@@ -506,10 +541,22 @@ PipelineResult run_postprocessing(const Config& cfg, const PostprocessInput& inp
                         notify("Identifying speakers...",
                                std::to_string(db.size()) + " enrolled");
                     }
-                    log_debug("pipeline: identifying speakers");
-                    auto id_result = identify_speakers(
-                        samples.data(), samples.size(), diar, db,
-                        model_paths.embedding, cfg.speaker_threshold, threads);
+                    log_debug("pipeline: identifying speakers (%s)",
+                              use_chunked ? "centroid bypass" : "audio re-extract");
+                    IdentifyResult id_result;
+                    if (use_chunked) {
+                        // Reuse centroids already extracted during chunked
+                        // diarization — no second pass over the audio. This
+                        // is the bypass T2.2 H1 added to skip the ~10 GB
+                        // working-set spike of the per-cluster re-extraction.
+                        id_result = identify_speakers_with_centroids(
+                            chunked_centroids, db, cfg.speaker_threshold);
+                    } else {
+                        auto model_paths = ensure_sherpa_models();
+                        id_result = identify_speakers(
+                            samples.data(), samples.size(), diar, db,
+                            model_paths.embedding, cfg.speaker_threshold, threads);
+                    }
                     if (on_progress) on_progress("identifying speakers", 100);
                     log_debug("pipeline: speaker ID complete");
                     speaker_names = id_result.names;

@@ -39,6 +39,11 @@ struct CliResult {
     // Subprocess mode (daemon-internal, undocumented)
     bool progress_json = false;          // --progress-json
     std::string config_json_path;        // --config-json <path>
+
+    // CLI usage error (e.g. invalid flag combination). When non-empty, main()
+    // prints this to stderr and exits with code 2 (CLI usage error). Empty
+    // means parse succeeded.
+    std::string parse_error;
 };
 
 /// Parse command-line arguments. Loads config file as defaults, then applies flag overrides.
