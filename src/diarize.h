@@ -73,6 +73,97 @@ DiarizeResult diarize_with_session(DiarizeSession& session,
                                    const float* samples, size_t num_samples,
                                    DiarizeProgressCallback on_progress = nullptr);
 
+// ---------------------------------------------------------------------------
+// T2.1 — chunked diarization with stitching
+// ---------------------------------------------------------------------------
+
+/// Configuration for chunked diarization. Defaults sized to keep each chunk's
+/// peak working set well under the iter-110 ~10 GB single-call boundary while
+/// still giving each chunk enough audio to produce well-separated clusters.
+struct DiarizeChunkConfig {
+    float chunk_minutes = 15.0f;
+    float overlap_seconds = 30.0f;
+    /// Cosine-similarity floor for stitching chunk-local centroids into the
+    /// global registry. Matches the SherpaOnnxSpeakerEmbeddingManager metric
+    /// (Q4 spike): 0.6 on L2-normalized unit vectors.
+    float stitch_threshold = 0.6f;
+};
+
+/// Result of chunked diarization. `centroids` maps each global speaker ID
+/// (0..N-1 contiguous after compaction) to the **raw** (non-L2-normalized)
+/// running-mean embedding for that speaker. The chunked pipeline feeds this
+/// directly into `identify_speakers_with_centroids` to skip a second
+/// extractor pass over the audio.
+struct DiarizeChunkedResult {
+    DiarizeResult diar;
+    std::map<int, std::vector<float>> centroids;
+};
+
+/// Per-chunk PCM extents and core regions. Pinned exactly per the plan's
+/// "Stitching algorithm" step 1. Cores tile [0, total_seconds] with no gaps;
+/// PCM extends overlap_seconds/2 past each side of the core (clipped at audio
+/// boundaries for first/last chunk). The core determines which segments the
+/// chunk owns at emission time; PCM regions outside the core inform stitching
+/// only. Exposed in the public header so the stitch helper is unit-testable
+/// with handcrafted DiarizeResult inputs (rev 7 L-4').
+struct ChunkExtents {
+    size_t pcm_start_samples;   // inclusive
+    size_t pcm_end_samples;     // exclusive
+    double core_start_sec;
+    double core_end_sec;
+    double offset_sec;          // == pcm_start_samples / SAMPLE_RATE
+};
+
+/// Stitch a sequence of per-chunk DiarizeResult objects into one global
+/// DiarizeChunkedResult. Each `chunk_results[i]` carries chunk-local segment
+/// times (relative to the chunk PCM start) and chunk-local speaker IDs.
+/// `chunk_centroids[i]` maps each chunk-local speaker ID present in
+/// `chunk_results[i].segments` to its raw (non-normalized) embedding vector.
+/// `extents[i]` gives the chunk's PCM/core layout in global coordinates.
+///
+/// Returns a DiarizeChunkedResult whose segment timestamps are in **global**
+/// coordinates and whose speaker IDs and centroid keys are the **compacted**
+/// global IDs (0..N-1 contiguous). Implements:
+///   - on-demand cosine matching against the global registry (raw vectors,
+///     L2-normalized transiently for the dot product);
+///   - sample-weighted running-mean update on raw centroids;
+///   - midpoint-in-core ownership with full-extent emit (no trim);
+///   - post-stitch greedy-merge to enforce `num_speakers > 0` count limit;
+///   - deterministic ascending-current-ID compaction.
+///
+/// Sample counts are derived from chunk-local segment durations in samples
+/// (so two chunks contributing the same speaker for 5 s and 10 s produce a
+/// 10-weighted-vs-5-weighted running mean). Exposed for unit tests; the
+/// in-process orchestrator `diarize_chunked` calls this same helper.
+DiarizeChunkedResult stitch_chunks(
+    const std::vector<DiarizeResult>& chunk_results,
+    const std::vector<std::map<int, std::vector<float>>>& chunk_centroids,
+    const std::vector<ChunkExtents>& extents,
+    const DiarizeChunkConfig& cfg,
+    int num_speakers);
+
+/// Run chunked diarization on a pre-loaded audio buffer (16kHz float32 mono).
+/// Slices the audio into overlapping chunks of `cfg.chunk_minutes` width with
+/// `cfg.overlap_seconds` of shared audio between adjacent chunks, runs one
+/// `diarize_with_session` pass per chunk (single shared DiarizeSession +
+/// SpeakerEmbeddingSession), then stitches per-chunk speaker IDs into a
+/// global registry via `stitch_chunks`.
+///
+/// `num_speakers`: 0 = auto-detect (per-chunk -1 → globals are whatever
+/// stitching produces); >0 = post-stitch global count limit (sample-weighted
+/// greedy-merge until count ≤ N).
+/// `threshold`: per-chunk clustering threshold (sherpa default 1.18); distinct
+/// from `cfg.stitch_threshold`.
+///
+/// Throws `RecmeetError` if `cfg.chunk_minutes * 60 <= cfg.overlap_seconds + 60`
+/// (M-5'). Emits one `on_progress("diarizing", overall_pct)` call per
+/// `extract_speaker_embedding` invocation (M-3'/L-4' progress granularity).
+DiarizeChunkedResult diarize_chunked(
+    const float* samples, size_t num_samples,
+    int num_speakers, int threads, float threshold,
+    const DiarizeChunkConfig& chunk_cfg,
+    DiarizeProgressCallback on_progress = nullptr);
+
 /// Run speaker diarization on a pre-loaded audio buffer (16kHz float32 mono).
 /// num_speakers: 0 = auto-detect, >0 = force N clusters.
 /// threads: number of CPU threads (0 = use default_thread_count()).
