@@ -127,6 +127,22 @@ IdentifyResult identify_speakers(
     float threshold = 0.6f,
     int threads = 0);
 
+/// Match pre-computed cluster centroids against enrolled speakers without
+/// instantiating an embedding extractor. Bypass entry point for the chunked
+/// diarization pipeline (T2.1), which has already extracted one centroid per
+/// global cluster during stitching — re-extracting here would re-stream audio
+/// through the model and reintroduce the memory peak T2 is meant to avoid.
+///
+/// `dim` is derived from the first non-empty centroid; centroids whose size
+/// differs are passed through as-is (verbatim) into `result.embeddings` but
+/// are not registered with the matcher. Centroids are stored verbatim (no
+/// normalization) to keep the persisted MeetingSpeaker.embedding format
+/// byte-shape-compatible with the legacy single-call path.
+IdentifyResult identify_speakers_with_centroids(
+    const std::map<int, std::vector<float>>& centroids,
+    const std::vector<SpeakerProfile>& db,
+    float threshold = 0.6f);
+
 /// Re-identify meeting speakers against current DB using saved embeddings.
 /// Speakers with confidence == 1.0 (manually corrected) are preserved.
 /// Returns updated speaker list if anything changed, empty if unchanged.

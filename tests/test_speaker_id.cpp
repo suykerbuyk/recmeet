@@ -5,6 +5,7 @@
 #include <catch2/catch_approx.hpp>
 #include "speaker_id.h"
 
+#include <cmath>
 #include <fstream>
 
 using namespace recmeet;
@@ -693,6 +694,111 @@ TEST_CASE("re_identify_meeting: mixed manual + auto + unidentified", "[speaker_i
     CHECK(result[1].identified == true);
     // Unknown stays unidentified (orthogonal to both profiles)
     CHECK(result[2].identified == false);
+}
+
+// ---------------------------------------------------------------------------
+// identify_speakers_with_centroids tests (T2.2 H1 bypass)
+// ---------------------------------------------------------------------------
+
+TEST_CASE("identify_speakers_with_centroids: matches clusters and preserves embeddings",
+          "[speaker_id][speaker-id][identify-centroids]") {
+    // Build a 3-cluster centroid map with synthetic dim=192 vectors. Two clusters
+    // align tightly with two enrolled DB profiles; the third is orthogonal so
+    // it has no match.
+    constexpr int DIM = 192;
+
+    auto make_pattern = [](int seed) {
+        std::vector<float> v(DIM, 0.0f);
+        // Deterministic, non-trivial pattern. Different seeds → orthogonal
+        // (mostly) supports along disjoint dim subsets so cosine ≈ 0 between
+        // distinct seeds and ≈ 1 between identical seeds.
+        for (int i = 0; i < DIM; ++i) {
+            if ((i % 3) == seed)
+                v[i] = 1.0f + 0.001f * static_cast<float>(i);  // non-unit norm
+        }
+        return v;
+    };
+
+    auto alice_emb = make_pattern(0);
+    auto bob_emb   = make_pattern(1);
+    auto unknown_emb = make_pattern(2);  // no DB match
+
+    std::map<int, std::vector<float>> centroids;
+    centroids[0] = alice_emb;        // should match Alice
+    centroids[1] = bob_emb;          // should match Bob
+    centroids[2] = unknown_emb;      // no match
+
+    std::vector<SpeakerProfile> db = {
+        {"Alice", {alice_emb}, "", ""},
+        {"Bob",   {bob_emb},   "", ""},
+    };
+
+    auto result = identify_speakers_with_centroids(centroids, db, 0.6f);
+
+    // All three centroids preserved verbatim in result.embeddings
+    REQUIRE(result.embeddings.size() == 3);
+    REQUIRE(result.embeddings.count(0) == 1);
+    REQUIRE(result.embeddings.count(1) == 1);
+    REQUIRE(result.embeddings.count(2) == 1);
+    REQUIRE(result.embeddings.at(0) == alice_emb);
+    REQUIRE(result.embeddings.at(1) == bob_emb);
+    REQUIRE(result.embeddings.at(2) == unknown_emb);
+
+    // Two clusters matched, one not
+    CHECK(result.names.size() == 2);
+    CHECK(result.names.count(0) == 1);
+    CHECK(result.names.count(1) == 1);
+    CHECK(result.names.count(2) == 0);
+    CHECK(result.names.at(0) == "Alice");
+    CHECK(result.names.at(1) == "Bob");
+
+    // Scores: matched ≥ threshold; unmatched is 0.0
+    CHECK(result.scores.at(0) >= 0.6f);
+    CHECK(result.scores.at(1) >= 0.6f);
+    CHECK(result.scores.at(2) == 0.0f);
+}
+
+TEST_CASE("identify_speakers_with_centroids: preserves raw (non-normalized) format",
+          "[speaker_id][speaker-id][identify-centroids]") {
+    // Centroid with deliberately large L2 norm (~10.0). Empty DB → no manager
+    // path is taken, but result.embeddings must still pass the centroid
+    // through verbatim. This guards persisted-format compatibility with the
+    // legacy single-call path: any silent normalize-on-store would diverge
+    // MeetingSpeaker.embedding shape between paths and break remove_embedding
+    // (which uses raw L2 distance with epsilon=1e-6).
+    constexpr int DIM = 192;
+    constexpr float TARGET_NORM = 10.0f;
+
+    // Build a vector with known L2 norm == TARGET_NORM. With DIM equal entries
+    // each of value v, norm = v * sqrt(DIM); so v = TARGET_NORM / sqrt(DIM).
+    float entry = TARGET_NORM / std::sqrt(static_cast<float>(DIM));
+    std::vector<float> centroid(DIM, entry);
+
+    // Verify input has the expected norm (sanity).
+    double sum_sq_in = 0.0;
+    for (float v : centroid) sum_sq_in += static_cast<double>(v) * v;
+    double norm_in = std::sqrt(sum_sq_in);
+    REQUIRE(norm_in == Catch::Approx(TARGET_NORM).margin(1e-3));
+
+    std::map<int, std::vector<float>> centroids = {{0, centroid}};
+    std::vector<SpeakerProfile> empty_db;
+
+    auto result = identify_speakers_with_centroids(centroids, empty_db, 0.6f);
+
+    REQUIRE(result.embeddings.count(0) == 1);
+    const auto& out = result.embeddings.at(0);
+    REQUIRE(out.size() == centroid.size());
+
+    // Compute output L2 norm — must equal input norm (no normalization applied).
+    double sum_sq_out = 0.0;
+    for (float v : out) sum_sq_out += static_cast<double>(v) * v;
+    double norm_out = std::sqrt(sum_sq_out);
+    CHECK(norm_out == Catch::Approx(TARGET_NORM).margin(1e-3));
+
+    // Empty DB → no matches; scores entry exists at 0.0; no names entry.
+    CHECK(result.names.count(0) == 0);
+    CHECK(result.scores.count(0) == 1);
+    CHECK(result.scores.at(0) == 0.0f);
 }
 
 #endif // RECMEET_USE_SHERPA

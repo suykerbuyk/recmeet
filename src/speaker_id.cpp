@@ -649,6 +649,111 @@ IdentifyResult identify_speakers(
     return result;
 }
 
+IdentifyResult identify_speakers_with_centroids(
+    const std::map<int, std::vector<float>>& centroids,
+    const std::vector<SpeakerProfile>& db,
+    float threshold) {
+
+    IdentifyResult result;
+    log_debug("speaker-id: identify_with_centroids ENTER (clusters=%zu, db=%zu)",
+              centroids.size(), db.size());
+
+    // Derive embedding dimension from the first non-empty centroid (mirrors
+    // re_identify_meeting's pattern). If all centroids are empty, return an
+    // empty result.
+    int dim = 0;
+    for (const auto& kv : centroids) {
+        if (!kv.second.empty()) {
+            dim = static_cast<int>(kv.second.size());
+            break;
+        }
+    }
+    if (dim == 0) {
+        log_debug("speaker-id: identify_with_centroids EXIT (no non-empty centroids)");
+        return result;
+    }
+
+    // Always preserve input centroids verbatim in result.embeddings — this
+    // keeps the persisted MeetingSpeaker.embedding format byte-shape-compatible
+    // with the legacy single-call path (raw, non-normalized vectors).
+    for (const auto& kv : centroids) {
+        result.embeddings[kv.first] = kv.second;
+        result.scores[kv.first] = 0.0f;
+    }
+
+    // No DB → nothing to match against; return centroids-only result.
+    if (db.empty()) {
+        log_debug("speaker-id: identify_with_centroids EXIT (empty db, %zu centroids preserved)",
+                  result.embeddings.size());
+        return result;
+    }
+
+    // Build manager sized to dim and register all DB profiles whose embedding
+    // size matches.
+    const auto* mgr = SherpaOnnxCreateSpeakerEmbeddingManager(dim);
+    if (!mgr) {
+        log_warn("Failed to create speaker embedding manager");
+        return result;
+    }
+    for (const auto& profile : db) {
+        for (const auto& emb : profile.embeddings) {
+            if (static_cast<int>(emb.size()) == dim) {
+                SherpaOnnxSpeakerEmbeddingManagerAdd(mgr, profile.name.c_str(),
+                                                     emb.data());
+            }
+        }
+    }
+
+    // For each centroid, query best match. Mirrors lines 597-620 of
+    // identify_speakers — manager normalizes both stored and query vectors
+    // internally so raw centroids are correct here.
+    std::vector<std::pair<int, std::string>> candidates;  // {cluster_id, name}
+    std::vector<float> candidate_scores;
+
+    for (const auto& kv : centroids) {
+        int cid = kv.first;
+        const auto& emb = kv.second;
+        if (static_cast<int>(emb.size()) != dim) continue;
+
+        const auto* best = SherpaOnnxSpeakerEmbeddingManagerGetBestMatches(
+            mgr, emb.data(), threshold, 1);
+        if (best && best->count > 0 && best->matches[0].name) {
+            candidates.push_back({cid, best->matches[0].name});
+            candidate_scores.push_back(best->matches[0].score);
+        }
+        if (best)
+            SherpaOnnxSpeakerEmbeddingManagerFreeBestMatches(best);
+    }
+
+    // Conflict resolution — sort candidates by score desc, greedy-assign,
+    // skip names already taken. Mirrors lines 624-642 of identify_speakers.
+    std::vector<size_t> order(candidates.size());
+    for (size_t i = 0; i < order.size(); ++i) order[i] = i;
+    std::sort(order.begin(), order.end(), [&](size_t a, size_t b) {
+        return candidate_scores[a] > candidate_scores[b];
+    });
+
+    std::map<std::string, bool> used_names;
+    for (size_t idx : order) {
+        const auto& name = candidates[idx].second;
+        if (used_names.count(name)) continue;
+        int cid = candidates[idx].first;
+        result.names[cid] = name;
+        result.scores[cid] = candidate_scores[idx];
+        used_names[name] = true;
+        log_debug("speaker-id: matched cluster %d -> '%s' (score=%.3f)",
+                  cid, name.c_str(), candidate_scores[idx]);
+        log_info("Speaker %d identified as '%s' (score: %.3f)",
+                 cid, name.c_str(), candidate_scores[idx]);
+    }
+
+    SherpaOnnxDestroySpeakerEmbeddingManager(mgr);
+
+    log_debug("speaker-id: identify_with_centroids EXIT (matched=%zu/%zu)",
+              result.names.size(), centroids.size());
+    return result;
+}
+
 std::vector<MeetingSpeaker> re_identify_meeting(
     const std::vector<MeetingSpeaker>& speakers,
     const std::vector<SpeakerProfile>& db,
