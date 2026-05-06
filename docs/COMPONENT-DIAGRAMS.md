@@ -14,6 +14,7 @@ source code implementation, not aspirational design.
 6. [IPC Protocol Wire Format](#6-ipc-protocol-wire-format)
 7. [Recording Pipeline](#7-recording-pipeline)
 8. [Postprocessing Pipeline](#8-postprocessing-pipeline)
+   - [8a. Chunked Diarization + Stitching](#8a-chunked-diarization--stitching)
 9. [Tray Applet](#9-tray-applet)
 10. [CLI Mode Selection](#10-cli-mode-selection)
 11. [Subprocess Postprocessing](#11-subprocess-postprocessing)
@@ -772,6 +773,57 @@ flowchart TD
     RESULT["Return PipelineResult<br/>{note_path, output_dir, transcript_text}"]
     NOTE --> RESULT
 ```
+
+---
+
+## 8a. Chunked Diarization + Stitching
+
+When audio length exceeds `chunk_minutes*60 + chunk_overlap_sec + 120` seconds the dispatch in `pipeline.cpp` switches from `diarize()` to `diarize_chunked()`. The chunked path keeps one `DiarizeSession` and one `SpeakerEmbeddingSession` alive across all chunks (T2.0a/T2.0b session-reuse refactor) and stitches per-chunk speaker IDs into a global registry. The pipeline then bypasses the second extractor pass via `identify_speakers_with_centroids()` (T2.2 H1), avoiding the multi-GB working-set spike that re-streaming the audio would cost on long recordings.
+
+```mermaid
+flowchart TD
+    BUF["samples (float32 16 kHz mono)<br/>length > threshold"]
+    SLICE["Slice into chunks N=ceil(length / chunk_minutes)<br/>Each chunk: pcm_start, pcm_end, core_start, core_end"]
+
+    subgraph PER_CHUNK["For each chunk i in 0..N-1"]
+        DSESS["DiarizeSession<br/>(loaded once)"]
+        ESESS["SpeakerEmbeddingSession<br/>(loaded once)"]
+        CHUNK_DIAR["diarize_with_session(session, samples+offset, len)<br/>→ chunk-local DiarizeResult"]
+        CHUNK_EMB["For each chunk-local speaker:<br/>extract_speaker_embedding(esess, samples+offset, ...)<br/>→ raw centroid (non-unit-norm)"]
+
+        DSESS --> CHUNK_DIAR
+        CHUNK_DIAR --> CHUNK_EMB
+        ESESS --> CHUNK_EMB
+    end
+
+    STITCH["stitch_chunks(chunk_results, chunk_centroids, extents, cfg, num_speakers)"]
+    REG["Global registry<br/>(raw centroid, sample_count) per global ID"]
+    MATCH["Per chunk-local centroid:<br/>L2-normalize transiently → cosine vs registry<br/>≥ stitch_threshold → merge (sample-weighted mean)<br/>else → new global ID"]
+    OWN["Midpoint-in-core ownership:<br/>emit segment in full extent, rewrite times to global coords"]
+    CAP["if num_speakers > 0: greedy-merge most-similar pairs<br/>until count ≤ num_speakers"]
+    COMPACT["ID compaction pass:<br/>renumber globals to 0..N-1 contiguous"]
+
+    RESULT["DiarizeChunkedResult {<br/>  diar: DiarizeResult (global coords),<br/>  centroids: map&lt;global_id, raw_vec&gt;<br/>}"]
+
+    BYPASS["identify_speakers_with_centroids(<br/>  result.centroids, db, threshold)<br/>(no extractor instantiated)"]
+
+    MS["MeetingSpeaker {<br/>  cluster_id (compacted),<br/>  embedding (raw, byte-shape compatible),<br/>  label, identified, confidence<br/>}"]
+
+    BUF --> SLICE
+    SLICE --> PER_CHUNK
+    PER_CHUNK --> STITCH
+    STITCH --> REG --> MATCH --> OWN --> CAP --> COMPACT --> RESULT
+    RESULT --> BYPASS --> MS
+```
+
+**Key invariants enforced by stitch_chunks:**
+
+- **Raw centroid storage (T2.1 H1).** Centroids are kept as raw model output throughout — L2-normalization happens transiently for the cosine dot product only. Persisted `MeetingSpeaker.embedding` therefore stays byte-shape compatible with the legacy single-call path; `remove_embedding` and the `--enroll` matcher still work.
+- **Full-extent segment emit (rev 7 M-1').** A boundary segment owned by chunk[i] is emitted with its full duration, not trimmed to the core. Adjacent-chunk benign overlap is handled by `merge_speakers`'s max-overlap rule. Trim-to-core was vulnerable to silent speech loss across chunk boundaries.
+- **Sample-weighted greedy-merge.** The post-stitch count limit merges the most-similar pair using `(count_a*centroid_a + count_b*centroid_b) / (count_a+count_b)`, preserving the relative voice contribution rather than averaging blindly.
+- **ID compaction (rev 7 M-2').** After all merges complete, surviving global IDs are renumbered to `0..N-1` so transcripts never show gaps like `Speaker_01, Speaker_02, Speaker_04`.
+
+The peak-RSS gate `tests/test_benchmark.cpp` ([benchmark][t2-1]) head-to-heads `diarize()` vs `diarize_chunked()` on the same buffer, sampling `recmeet::read_self_rss_kb()` at 1 Hz; pinned thresholds are `< 4 GB` peak on 30-min synthetic and `< 6 GB` on the iter-110 60-min real fixture.
 
 ---
 

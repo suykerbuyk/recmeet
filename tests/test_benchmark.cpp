@@ -12,10 +12,14 @@
 #include "audio_file.h"
 #include "util.h"
 
+#include <atomic>
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <fstream>
 #include <string>
+#include <thread>
+#include <vector>
 
 using namespace recmeet;
 using namespace recmeet::test_helpers;
@@ -464,6 +468,234 @@ TEST_CASE("extract_speaker_embedding: raw output not unit-norm",
     // this fires and T2.1's normalization step can be revisited.
     CHECK(std::abs(norm - 1.0) > 0.01);
 }
+
+// ---------------------------------------------------------------------------
+// T2.3 — chunked-vs-single head-to-head with peak-RSS sampling (rev 7 M-4')
+// ---------------------------------------------------------------------------
+//
+// These cases bypass the pipeline-threshold dispatch in `pipeline.cpp` and
+// invoke `diarize()` and `diarize_chunked()` directly on the same input
+// buffer in the same TEST_CASE. A 1 Hz sampler thread reads
+// `recmeet::read_self_rss_kb()` for the duration of each call and reports
+// the running max via INFO so Catch2 prints both wall-clock and peak-RSS
+// next to the assertion summary.
+//
+// Pinned regression gates:
+//   - 30-min synthetic: chunked peak < 4 GB (4 194 304 KB)
+//   - 30-min synthetic: chunked wall-clock < 1.5× single-call wall-clock
+//   - iter-110 60-min:  chunked peak < 6 GB (6 291 456 KB)  [slow]
+//
+// Both cases SKIP gracefully when models or fixtures are absent.
+
+namespace {
+
+// Run `fn` while a background thread polls /proc/self/statm at 1 Hz and
+// tracks the running max. Returns (wall_clock_secs, peak_rss_kb).
+template <typename Fn>
+std::pair<double, long> measure_with_rss(Fn&& fn) {
+    std::atomic<bool> stop{false};
+    std::atomic<long> peak{0};
+    // Seed with the entry-point reading so we always report at least the
+    // current RSS, even if `fn` returns in under 1 second.
+    long seed = read_self_rss_kb();
+    peak.store(seed);
+    std::thread sampler([&]() {
+        while (!stop.load(std::memory_order_relaxed)) {
+            long now_kb = read_self_rss_kb();
+            long prev = peak.load(std::memory_order_relaxed);
+            while (now_kb > prev &&
+                   !peak.compare_exchange_weak(prev, now_kb)) {}
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+        }
+    });
+    auto t0 = std::chrono::steady_clock::now();
+    fn();
+    auto t1 = std::chrono::steady_clock::now();
+    stop.store(true);
+    sampler.join();
+    return {std::chrono::duration<double>(t1 - t0).count(), peak.load()};
+}
+
+// Simple 16 kHz mono synthetic audio: alternating sine wave + silence to
+// give the diarizer something to segment. Roughly mimics the structure of
+// the existing assets without bringing in a 30-min recording.
+std::vector<float> make_synthetic_audio(double minutes,
+                                        float voice1_hz = 200.0f,
+                                        float voice2_hz = 350.0f) {
+    constexpr int kSampleRate = 16000;
+    size_t total = static_cast<size_t>(minutes * 60.0 * kSampleRate);
+    std::vector<float> samples(total, 0.0f);
+    // 4-second cycle: 1.5s voice A, 0.4s pause, 1.5s voice B, 0.6s pause.
+    constexpr size_t kCycleSamples =
+        static_cast<size_t>(4.0 * kSampleRate);
+    for (size_t i = 0; i < total; ++i) {
+        size_t pos = i % kCycleSamples;
+        double t = static_cast<double>(i) / kSampleRate;
+        if (pos < 1.5 * kSampleRate) {
+            samples[i] = 0.4f *
+                static_cast<float>(std::sin(2.0 * M_PI * voice1_hz * t));
+        } else if (pos < (1.5 + 0.4) * kSampleRate) {
+            // silence
+        } else if (pos < (1.5 + 0.4 + 1.5) * kSampleRate) {
+            samples[i] = 0.4f *
+                static_cast<float>(std::sin(2.0 * M_PI * voice2_hz * t));
+        } else {
+            // silence
+        }
+    }
+    return samples;
+}
+
+// Search order matches test_integration_pipeline.cpp.
+fs::path find_iter110_fixture_bench() {
+    if (const char* env = std::getenv("RECMEET_T2_1_FIXTURE")) {
+        if (env[0] && fs::exists(env)) return fs::path(env);
+    }
+    fs::path root = find_project_root();
+    if (!root.empty()) {
+        fs::path p1 = root / "notes" / "t1b-t1c-validation-2026-05-01" / "iter-110.wav";
+        if (fs::exists(p1)) return p1;
+        fs::path p2 = root / "notes" / "iter-110" / "audio.wav";
+        if (fs::exists(p2)) return p2;
+    }
+    if (const char* home = std::getenv("HOME")) {
+        fs::path p3 = fs::path(home) / "recordings" / "iter-110.wav";
+        if (fs::exists(p3)) return p3;
+    }
+    return {};
+}
+
+} // anonymous namespace
+
+TEST_CASE("Chunked vs single diarize: 30-min synthetic peak-RSS bench",
+          "[benchmark][t2-1]") {
+    if (!is_sherpa_model_cached())
+        SKIP("Sherpa diarization models not cached — run: ./build/recmeet --download-models");
+
+    INFO("Generating 30-min synthetic 16 kHz mono audio (~1.8 GB float32)…");
+    auto samples = make_synthetic_audio(30.0);
+    REQUIRE(samples.size() == 30u * 60u * 16000u);
+
+    // --- Single-call baseline -------------------------------------------
+    DiarizeResult single_diar;
+    auto [single_secs, single_peak_kb] = measure_with_rss([&]() {
+        single_diar = diarize(samples.data(), samples.size(),
+                              /*num_speakers=*/0, /*threads=*/0,
+                              /*threshold=*/1.18f);
+    });
+
+    // --- Chunked head-to-head -------------------------------------------
+    DiarizeChunkConfig chunk_cfg;  // defaults: 15 min / 30 s / 0.6
+    DiarizeChunkedResult chunked;
+    auto [chunked_secs, chunked_peak_kb] = measure_with_rss([&]() {
+        chunked = diarize_chunked(samples.data(), samples.size(),
+                                  /*num_speakers=*/0, /*threads=*/0,
+                                  /*threshold=*/1.18f, chunk_cfg);
+    });
+
+    INFO("single-call: " << single_secs << " s, peak "
+         << single_peak_kb << " KB (" << (single_peak_kb / 1024) << " MB), "
+         << single_diar.segments.size() << " segments, "
+         << single_diar.num_speakers << " speakers");
+    INFO("chunked:     " << chunked_secs << " s, peak "
+         << chunked_peak_kb << " KB (" << (chunked_peak_kb / 1024) << " MB), "
+         << chunked.diar.segments.size() << " segments, "
+         << chunked.diar.num_speakers << " speakers, "
+         << chunked.centroids.size() << " centroids");
+    INFO("ratio:       " << (chunked_secs / std::max(single_secs, 1e-6))
+         << "x wall-clock, "
+         << (static_cast<double>(chunked_peak_kb) /
+             std::max(single_peak_kb, 1L)) << "x peak RSS");
+
+    char buf[768];
+    std::snprintf(buf, sizeof(buf),
+        "\n      \"test\": \"chunked_vs_single_30min_synthetic\","
+        "\n      \"single_secs\": %.1f,"
+        "\n      \"single_peak_kb\": %ld,"
+        "\n      \"single_segments\": %zu,"
+        "\n      \"single_speakers\": %d,"
+        "\n      \"chunked_secs\": %.1f,"
+        "\n      \"chunked_peak_kb\": %ld,"
+        "\n      \"chunked_segments\": %zu,"
+        "\n      \"chunked_speakers\": %d,"
+        "\n      \"chunked_centroids\": %zu,"
+        "\n      \"wall_clock_ratio\": %.2f,"
+        "\n      \"peak_rss_ratio\": %.2f",
+        single_secs, single_peak_kb, single_diar.segments.size(),
+        single_diar.num_speakers,
+        chunked_secs, chunked_peak_kb, chunked.diar.segments.size(),
+        chunked.diar.num_speakers, chunked.centroids.size(),
+        chunked_secs / std::max(single_secs, 1e-6),
+        static_cast<double>(chunked_peak_kb) /
+            std::max(single_peak_kb, 1L));
+    BenchmarkResults::add(buf);
+
+    // --- Pinned regression gates ----------------------------------------
+    // Peak RSS gate is the primary signal (rev 7 M-4').
+    REQUIRE(chunked_peak_kb < 4L * 1024L * 1024L);
+    // Wall-clock gate is secondary; ~1.5× model-reload-free single-call.
+    REQUIRE(chunked_secs < 1.5 * single_secs);
+}
+
+TEST_CASE("Chunked vs single diarize: iter-110 60-min fixture peak-RSS bench",
+          "[benchmark][t2-1][slow]") {
+    if (!is_sherpa_model_cached())
+        SKIP("Sherpa diarization models not cached — run: ./build/recmeet --download-models");
+
+    fs::path audio_path = find_iter110_fixture_bench();
+    if (audio_path.empty()) {
+        SKIP("iter-110 long-audio fixture not found. Provide via "
+             "RECMEET_T2_1_FIXTURE=/path/to.wav (16 kHz mono PCM, ~60 min).");
+    }
+
+    INFO("Loading iter-110 fixture: " << audio_path.string());
+    auto samples = read_wav_float(audio_path);
+    REQUIRE(!samples.empty());
+
+    DiarizeResult single_diar;
+    auto [single_secs, single_peak_kb] = measure_with_rss([&]() {
+        single_diar = diarize(samples.data(), samples.size(),
+                              /*num_speakers=*/0, /*threads=*/0,
+                              /*threshold=*/1.18f);
+    });
+
+    DiarizeChunkConfig chunk_cfg;
+    DiarizeChunkedResult chunked;
+    auto [chunked_secs, chunked_peak_kb] = measure_with_rss([&]() {
+        chunked = diarize_chunked(samples.data(), samples.size(),
+                                  /*num_speakers=*/0, /*threads=*/0,
+                                  /*threshold=*/1.18f, chunk_cfg);
+    });
+
+    INFO("single-call: " << single_secs << " s, peak "
+         << single_peak_kb << " KB (" << (single_peak_kb / 1024) << " MB), "
+         << single_diar.segments.size() << " segments, "
+         << single_diar.num_speakers << " speakers");
+    INFO("chunked:     " << chunked_secs << " s, peak "
+         << chunked_peak_kb << " KB (" << (chunked_peak_kb / 1024) << " MB), "
+         << chunked.diar.segments.size() << " segments, "
+         << chunked.diar.num_speakers << " speakers, "
+         << chunked.centroids.size() << " centroids");
+
+    char buf[768];
+    std::snprintf(buf, sizeof(buf),
+        "\n      \"test\": \"chunked_vs_single_iter110_60min\","
+        "\n      \"audio\": \"%s\","
+        "\n      \"single_secs\": %.1f,"
+        "\n      \"single_peak_kb\": %ld,"
+        "\n      \"chunked_secs\": %.1f,"
+        "\n      \"chunked_peak_kb\": %ld,"
+        "\n      \"wall_clock_ratio\": %.2f",
+        audio_path.filename().c_str(),
+        single_secs, single_peak_kb,
+        chunked_secs, chunked_peak_kb,
+        chunked_secs / std::max(single_secs, 1e-6));
+    BenchmarkResults::add(buf);
+
+    // Pinned regression gate: < 6 GB peak (rev 7 M-4', iter-110 fixture row).
+    REQUIRE(chunked_peak_kb < 6L * 1024L * 1024L);
+}
+
 #endif
 
 #if RECMEET_USE_SHERPA

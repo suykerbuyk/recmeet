@@ -63,7 +63,7 @@ endif
 endif
 
 # ── Targets ─────────────────────────────────────────────────────────
-.PHONY: build build-onnxruntime test integration benchmark full-stack install uninstall package-deb package-rpm package-arch clean coverage help daemon-start daemon-stop daemon-status
+.PHONY: build build-onnxruntime test integration integration-t2-1 benchmark full-stack install uninstall package-deb package-rpm package-arch clean coverage help daemon-start daemon-stop daemon-status
 
 build-onnxruntime:
 	./scripts/build-onnxruntime.sh
@@ -84,6 +84,15 @@ integration:
 	cmake -B $(BUILD_DIR) -G Ninja $(CMAKE_OPTS) -DRECMEET_BUILD_TESTS=ON
 	ninja -C $(BUILD_DIR)
 	./$(BUILD_DIR)/recmeet_tests "[integration]"
+
+# T2.3 integration gate: chunked-diarize end-to-end on the iter-110 fixture
+# under a cgroup MemoryMax=8G cap. Requires systemd user instance + cgroup v2.
+# Provide the fixture path via RECMEET_T2_1_FIXTURE=/path/to/iter-110.wav.
+integration-t2-1:
+	cmake -B $(BUILD_DIR) -G Ninja $(CMAKE_OPTS) -DRECMEET_BUILD_TESTS=ON
+	ninja -C $(BUILD_DIR)
+	systemd-run --user --scope -p MemoryMax=8G -p MemorySwapMax=0 \
+	    ./$(BUILD_DIR)/recmeet_tests "[integration][t2-1]"
 
 benchmark:
 	cmake -B $(BUILD_DIR) -G Ninja $(CMAKE_OPTS) -DRECMEET_BUILD_TESTS=ON
@@ -193,6 +202,7 @@ help:
 	@echo "  make build         Configure + build (Release)"
 	@echo "  make test          Build + run unit tests"
 	@echo "  make integration   Build + run integration tests"
+	@echo "  make integration-t2-1  T2.3 chunked-diarize gate under MemoryMax=8G cgroup"
 	@echo "  make benchmark     Build + run benchmark tests"
 	@echo "  make full-stack    Build + run end-to-end pipeline tests"
 	@echo "  make install       Build + install to PREFIX (default: ~/.local)"

@@ -249,6 +249,47 @@ The postprocessing phase uses nested scopes to minimize peak memory:
 
 This matters because whisper models (75 MB–1.5 GB) and audio buffers (16-bit, 16 kHz) can be large.
 
+## Diarization
+
+Speaker diarization labels each transcript segment with `Speaker_01`, `Speaker_02`, etc. before speaker identification (or `merge_speakers()`) renames them. recmeet has two diarization paths that share the same `DiarizeResult` data shape; the pipeline picks one based on audio length.
+
+**Source:** `src/diarize.h`, `src/diarize.cpp`, `src/pipeline.cpp` dispatch.
+
+### Single-call path (default for short audio)
+
+Below the chunked-path threshold (~17.5 minutes at default settings) the pipeline calls `diarize(samples, ...)` once. sherpa-onnx loads the pyannote segmentation + 3D-Speaker embedding models (~45 MB), processes the entire buffer in one streaming pass, and returns `{segments, num_speakers}`. Speaker identification then re-extracts one centroid per cluster from the audio. This path was the only one available before iter 121 and remains the lowest-overhead choice for typical meetings.
+
+### Chunked path (long audio, T2.1)
+
+When audio length exceeds `chunk_minutes * 60 + chunk_overlap_sec + 120` seconds the pipeline switches to `diarize_chunked()`. The implementation:
+
+1. **Slices** the buffer into overlapping windows. Each chunk has a *core* region (the segment-ownership zone) and an *overlap* region (extra audio so adjacent chunks see context across boundaries).
+2. **Reuses one `DiarizeSession` + `SpeakerEmbeddingSession`** across every chunk. Models stay loaded; only the cheap clustering object rebuilds when `set_clustering()` runs (T2.0a/T2.0b refactor).
+3. **Runs `diarize_with_session` per chunk**, then extracts one raw embedding centroid per chunk-local speaker via `extract_speaker_embedding(session, ...)`.
+4. **Stitches** chunk-local IDs into a global registry by cosine similarity on L2-normalized centroids (threshold `stitch_threshold`, default `0.6`). Centroids themselves are stored *raw* (non-normalized) so the persisted `MeetingSpeaker.embedding` format is byte-shape compatible with the legacy single-call path.
+5. **Owns segments by midpoint-in-core** with full-extent emit. A boundary segment whose midpoint falls inside chunk[i]'s core is emitted by chunk[i] in full, even if its trailing edge spills into chunk[i+1]. `merge_speakers`'s max-overlap rule absorbs the benign duplicate.
+6. **Compacts global IDs to `0..N-1` contiguous** after the post-stitch greedy-merge that enforces the optional `num_speakers` ceiling. Without this pass `merge(1, 2)` of `{0,1,2,3}` would leave `{0,1,3}`, surfacing as `Speaker_01, Speaker_02, Speaker_04` in transcripts.
+7. **Bypasses re-extraction in identify-speakers.** The chunked diarize already produced one centroid per global cluster; the pipeline calls `identify_speakers_with_centroids(centroids, db, threshold)` instead of `identify_speakers(samples, ...)`. This skips the ~10 GB working-set spike (iter 110 / iter 114 measurements) the second extractor pass would otherwise cost on long audio.
+
+### Configuration
+
+| Config field | CLI flag | Default | Description |
+|---|---|---|---|
+| `diarization.chunk_minutes` | `--diarize-chunk-minutes` | `15.0` | Window width in minutes; threshold = `chunk_minutes*60 + chunk_overlap_sec + 120` s |
+| `diarization.chunk_overlap_sec` | `--diarize-chunk-overlap-sec` | `30.0` | Overlap between adjacent chunks (positive spacing required: `chunk_minutes*60 > chunk_overlap_sec + 60`) |
+| `diarization.stitch_threshold` | `--diarize-stitch-threshold` | `0.6` | Cosine-similarity floor for merging chunk-local centroids into the global registry |
+| `diarization.num_speakers` | `--num-speakers` | `0` (auto) | Post-stitch global count limit; sample-weighted greedy-merge enforces |
+| `diarization.cluster_threshold` | `--cluster-threshold` | `1.18` | Per-chunk clustering threshold forwarded to `set_clustering()` |
+
+### Memory + wall-clock budget
+
+The chunked path is gated by the `[benchmark][t2-1]` head-to-head bench (`tests/test_benchmark.cpp`), which runs `diarize()` and `diarize_chunked()` against the same input buffer with a 1 Hz `recmeet::read_self_rss_kb()` sampler thread. Pinned regression gates:
+
+- 30-min synthetic: chunked **peak RSS < 4 GB**, chunked wall-clock < 1.5× single-call.
+- iter-110 60-min real fixture: chunked peak RSS < 6 GB (vs un-chunked ~11 GB iter-114 baseline). Tagged `[slow]`; skip-on-missing-fixture.
+
+The end-to-end integration gate `make integration-t2-1` reprocesses the iter-110 fixture under `systemd-run --user --scope -p MemoryMax=8G` to verify the cgroup containment goal.
+
 ## Vocabulary Hints
 
 Vocabulary hints improve transcription accuracy for unusual names and domain-specific terms by biasing whisper's decoder via its `initial_prompt` parameter.

@@ -110,7 +110,16 @@ This leaves ample headroom for the OS, desktop, and even concurrent batch transc
 - Should captions be persisted (written to a `.vtt` or `.srt` file) or treated as ephemeral? Persistence is cheap and useful for accessibility.
 - How to handle CPU contention on 2-core systems? Cap inference threads and use `SCHED_BATCH` priority; disable captioning automatically if capture buffer health degrades.
 
-## Phase 2c: Long-Audio Containment (4 hours on 16 GB)
+## Phase 2c: Long-Audio Containment (4 hours on 16 GB) — DELIVERED
+
+**Status: shipped iter 121** — T1A/B/C (containment + arena disable +
+identify-phase watchdog liveness) plus T2.0a/b (session-reuse refactor),
+T2.1 (chunked diarization + stitching), T2.2 (`identify_speakers_with_centroids`
+bypass + pipeline dispatch + CLI/config), T2.3 (peak-RSS bench under
+`MemoryMax=8G` cgroup), and T2.4 (these docs) all shipped on
+`feat/postprocess-memory-containment-t2`. The original "long audio risk"
+entry is closed; the design is preserved below as the historical record
+of what was built and why.
 
 ### What it enables
 
