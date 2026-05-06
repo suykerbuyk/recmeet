@@ -7,10 +7,14 @@
 #include <cctype>
 #include <chrono>
 #include <fstream>
+#include <optional>
 #include <sstream>
 #include <string>
 #include <filesystem>
+#include <system_error>
 #include <vector>
+
+#include <sndfile.h>
 
 namespace recmeet {
 
@@ -89,6 +93,54 @@ inline fs::path find_project_root() {
         dir = dir.parent_path();
     }
     return {};
+}
+
+/// Probe an audio file's duration via libsndfile. Returns nullopt if the
+/// file cannot be opened or has an invalid sample rate.
+inline std::optional<double> probe_audio_duration_sec(const fs::path& p) {
+    SF_INFO info{};
+    SNDFILE* sf = sf_open(p.string().c_str(), SFM_READ, &info);
+    if (!sf) return std::nullopt;
+    std::optional<double> dur;
+    if (info.samplerate > 0)
+        dur = static_cast<double>(info.frames) / info.samplerate;
+    sf_close(sf);
+    return dur;
+}
+
+/// Scan `~/meetings/<dir>/audio_*.wav` for the longest WAV whose duration
+/// meets or exceeds `min_seconds`. Returns the empty path on no match. Used
+/// as a fallback fixture-discovery step for `[integration][t2-1]` and
+/// `[benchmark][t2-1][slow]` so any sufficiently-long meeting recording in
+/// the operator's standard recmeet output directory works without an
+/// explicit `RECMEET_T2_1_FIXTURE` override.
+inline fs::path find_long_meetings_audio(double min_seconds) {
+    const char* home = std::getenv("HOME");
+    if (!home || !home[0]) return {};
+    fs::path meetings = fs::path(home) / "meetings";
+    std::error_code ec;
+    if (!fs::is_directory(meetings, ec)) return {};
+
+    fs::path best;
+    double best_dur = 0.0;
+    for (const auto& dir_entry : fs::directory_iterator(meetings, ec)) {
+        if (ec) break;
+        if (!dir_entry.is_directory(ec)) continue;
+        for (const auto& wav_entry : fs::directory_iterator(dir_entry.path(), ec)) {
+            if (ec) break;
+            const auto& p = wav_entry.path();
+            if (p.extension() != ".wav") continue;
+            const std::string name = p.filename().string();
+            if (name.rfind("audio_", 0) != 0) continue;  // require audio_*.wav
+            auto dur = probe_audio_duration_sec(p);
+            if (!dur || *dur < min_seconds) continue;
+            if (*dur > best_dur) {
+                best_dur = *dur;
+                best = p;
+            }
+        }
+    }
+    return best;
 }
 
 /// Strip markdown formatting from the reference transcript to plain text.

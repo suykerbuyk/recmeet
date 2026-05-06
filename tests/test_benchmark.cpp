@@ -562,7 +562,9 @@ fs::path find_iter110_fixture_bench() {
         fs::path p3 = fs::path(home) / "recordings" / "iter-110.wav";
         if (fs::exists(p3)) return p3;
     }
-    return {};
+    // Fallback: scan ~/meetings/<dir>/audio_*.wav for the longest recording
+    // ≥ 17.5 min (the chunked-path threshold at defaults).
+    return find_long_meetings_audio(17.5 * 60.0);
 }
 
 } // anonymous namespace

@@ -39,6 +39,10 @@
 //   2. <project_root>/notes/t1b-t1c-validation-2026-05-01/iter-110.wav
 //   3. <project_root>/notes/iter-110/audio.wav
 //   4. ~/recordings/iter-110.wav
+//   5. ~/meetings/<dir>/audio_*.wav — longest recording ≥ 17.5 min (the
+//      chunked-path threshold at defaults). Picks any sufficiently-long
+//      recmeet output so the operator does not need to copy or symlink the
+//      iter-110 WAV to a fixed path.
 //
 // If none exist the test SKIPs cleanly with the expected paths logged. The
 // fixture is a recorded artifact and is not committed to the repository.
@@ -97,6 +101,19 @@ fs::path find_iter110_fixture(std::string& out_searched_summary) {
         }
         summary += " [missing]\n";
     }
+
+    // Fallback: scan ~/meetings/<dir>/audio_*.wav for the longest recording
+    // ≥ 17.5 min (the chunked-path threshold at default settings). Any
+    // sufficiently-long recmeet output works as a fixture for this test.
+    fs::path meetings_match = find_long_meetings_audio(17.5 * 60.0);
+    if (!meetings_match.empty()) {
+        summary += "  - " + meetings_match.string()
+                 + " [FOUND via ~/meetings scan, longest >17.5 min]";
+        out_searched_summary = summary;
+        return meetings_match;
+    }
+    summary += "  - ~/meetings/<dir>/audio_*.wav [no recording ≥ 17.5 min]\n";
+
     out_searched_summary = summary;
     return {};
 }
