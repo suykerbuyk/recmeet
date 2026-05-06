@@ -9,6 +9,10 @@
 #include <string>
 #include <vector>
 
+#if RECMEET_USE_SHERPA
+struct SherpaOnnxSpeakerEmbeddingExtractor;
+#endif
+
 namespace recmeet {
 
 /// A single enrolled speaker with one or more voiceprint embeddings.
@@ -69,8 +73,44 @@ struct IdentifyResult {
     std::map<int, float> scores;                  // cluster_id → confidence (0.0 if unmatched)
 };
 
+/// RAII wrapper around `SherpaOnnxSpeakerEmbeddingExtractor`. Loads the
+/// embedding model on construction and keeps it loaded across multiple
+/// extraction calls. Required by chunked-diarization (T2.1) to avoid
+/// reloading ~28 MB of model on every chunk; usable directly by callers
+/// that need to extract embeddings for several speakers in sequence.
+class SpeakerEmbeddingSession {
+public:
+    SpeakerEmbeddingSession(const fs::path& model_path, int threads = 0);
+    ~SpeakerEmbeddingSession();
+
+    SpeakerEmbeddingSession(const SpeakerEmbeddingSession&) = delete;
+    SpeakerEmbeddingSession& operator=(const SpeakerEmbeddingSession&) = delete;
+    SpeakerEmbeddingSession(SpeakerEmbeddingSession&& other) noexcept;
+    SpeakerEmbeddingSession& operator=(SpeakerEmbeddingSession&& other) noexcept;
+
+    /// Embedding dimension reported by the loaded model. Cached at ctor.
+    int dim() const noexcept { return dim_; }
+
+    /// Opaque sherpa handle. Returns nullptr after a move-from.
+    const SherpaOnnxSpeakerEmbeddingExtractor* handle() const noexcept { return extractor_; }
+
+private:
+    const SherpaOnnxSpeakerEmbeddingExtractor* extractor_ = nullptr;
+    int dim_ = 0;
+    int threads_ = 0;
+};
+
 /// Extract a speaker embedding from audio segments belonging to a specific
-/// diarization cluster. Returns a single averaged embedding vector.
+/// diarization cluster, reusing a pre-built session. Returns the raw
+/// (non-L2-normalized) embedding vector; callers comparing with cosine
+/// similarity must normalize first.
+std::vector<float> extract_speaker_embedding(
+    SpeakerEmbeddingSession& session,
+    const float* samples, size_t num_samples,
+    const DiarizeResult& diar, int speaker_id);
+
+/// Extract a speaker embedding by constructing a one-shot session from the
+/// model path. Preserved for callers that don't need session reuse.
 std::vector<float> extract_speaker_embedding(
     const float* samples, size_t num_samples,
     const DiarizeResult& diar, int speaker_id,

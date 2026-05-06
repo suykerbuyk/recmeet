@@ -416,12 +416,8 @@ std::vector<MeetingSpeaker> load_meeting_speakers(const fs::path& meeting_dir) {
 
 #if RECMEET_USE_SHERPA
 
-std::vector<float> extract_speaker_embedding(
-    const float* samples, size_t num_samples,
-    const DiarizeResult& diar, int speaker_id,
-    const fs::path& model_path, int threads) {
-
-    log_debug("speaker-id: extract_embedding ENTER (samples=%zu)", num_samples);
+SpeakerEmbeddingSession::SpeakerEmbeddingSession(const fs::path& model_path, int threads)
+    : threads_(threads) {
     int t = std::min(threads > 0 ? threads : default_thread_count(), 4);
 
     SherpaOnnxSpeakerEmbeddingExtractorConfig cfg{};
@@ -430,17 +426,53 @@ std::vector<float> extract_speaker_embedding(
     cfg.debug = 0;
     cfg.provider = "cpu";
 
-    const auto* extractor = SherpaOnnxCreateSpeakerEmbeddingExtractor(&cfg);
-    if (!extractor)
+    log_debug("SpeakerEmbeddingSession: creating sherpa extractor (threads=%d)", t);
+    extractor_ = SherpaOnnxCreateSpeakerEmbeddingExtractor(&cfg);
+    if (!extractor_)
         throw RecmeetError("Failed to create speaker embedding extractor");
 
-    log_debug("speaker-id: extractor created");
-    // Feed all segments belonging to this speaker into a single stream
-    auto* stream = SherpaOnnxSpeakerEmbeddingExtractorCreateStream(extractor);
-    if (!stream) {
-        SherpaOnnxDestroySpeakerEmbeddingExtractor(extractor);
-        throw RecmeetError("Failed to create embedding extractor stream");
+    dim_ = SherpaOnnxSpeakerEmbeddingExtractorDim(extractor_);
+    if (dim_ <= 0) {
+        SherpaOnnxDestroySpeakerEmbeddingExtractor(extractor_);
+        extractor_ = nullptr;
+        throw RecmeetError("Speaker embedding extractor reported non-positive dim");
     }
+}
+
+SpeakerEmbeddingSession::~SpeakerEmbeddingSession() {
+    if (extractor_) SherpaOnnxDestroySpeakerEmbeddingExtractor(extractor_);
+}
+
+SpeakerEmbeddingSession::SpeakerEmbeddingSession(SpeakerEmbeddingSession&& other) noexcept
+    : extractor_(other.extractor_), dim_(other.dim_), threads_(other.threads_) {
+    other.extractor_ = nullptr;
+    other.dim_ = 0;
+}
+
+SpeakerEmbeddingSession& SpeakerEmbeddingSession::operator=(SpeakerEmbeddingSession&& other) noexcept {
+    if (this != &other) {
+        if (extractor_) SherpaOnnxDestroySpeakerEmbeddingExtractor(extractor_);
+        extractor_ = other.extractor_;
+        dim_ = other.dim_;
+        threads_ = other.threads_;
+        other.extractor_ = nullptr;
+        other.dim_ = 0;
+    }
+    return *this;
+}
+
+std::vector<float> extract_speaker_embedding(
+    SpeakerEmbeddingSession& session,
+    const float* samples, size_t num_samples,
+    const DiarizeResult& diar, int speaker_id) {
+
+    log_debug("speaker-id: extract_embedding ENTER (samples=%zu)", num_samples);
+    if (!session.handle())
+        throw RecmeetError("extract_speaker_embedding: empty (moved-from) session");
+
+    auto* stream = SherpaOnnxSpeakerEmbeddingExtractorCreateStream(session.handle());
+    if (!stream)
+        throw RecmeetError("Failed to create embedding extractor stream");
 
     for (const auto& seg : diar.segments) {
         if (seg.speaker != speaker_id) continue;
@@ -460,21 +492,27 @@ std::vector<float> extract_speaker_embedding(
 
     std::vector<float> embedding;
 
-    if (SherpaOnnxSpeakerEmbeddingExtractorIsReady(extractor, stream)) {
-        int dim = SherpaOnnxSpeakerEmbeddingExtractorDim(extractor);
+    if (SherpaOnnxSpeakerEmbeddingExtractorIsReady(session.handle(), stream)) {
         const float* raw = SherpaOnnxSpeakerEmbeddingExtractorComputeEmbedding(
-            extractor, stream);
+            session.handle(), stream);
         if (raw) {
-            embedding.assign(raw, raw + dim);
+            embedding.assign(raw, raw + session.dim());
             SherpaOnnxSpeakerEmbeddingExtractorDestroyEmbedding(raw);
         }
     }
 
     SherpaOnnxDestroyOnlineStream(stream);
-    SherpaOnnxDestroySpeakerEmbeddingExtractor(extractor);
 
     log_debug("speaker-id: extract_embedding EXIT (dims=%d)", static_cast<int>(embedding.size()));
     return embedding;
+}
+
+std::vector<float> extract_speaker_embedding(
+    const float* samples, size_t num_samples,
+    const DiarizeResult& diar, int speaker_id,
+    const fs::path& model_path, int threads) {
+    SpeakerEmbeddingSession session(model_path, threads);
+    return extract_speaker_embedding(session, samples, num_samples, diar, speaker_id);
 }
 
 IdentifyResult identify_speakers(

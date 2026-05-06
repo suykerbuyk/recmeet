@@ -4,6 +4,7 @@
 #include <catch2/catch_test_macros.hpp>
 #include "test_helpers.h"
 #include "diarize.h"
+#include "speaker_id.h"
 #include "transcribe.h"
 #include "vad.h"
 #include "summarize.h"
@@ -12,6 +13,7 @@
 #include "util.h"
 
 #include <chrono>
+#include <cmath>
 #include <fstream>
 #include <string>
 
@@ -340,6 +342,127 @@ TEST_CASE("DiarizeSession: set_clustering round-trip",
                                            samples.data(), samples.size());
     CHECK(autodetect.num_speakers >= 2);
     CHECK(!autodetect.segments.empty());
+}
+
+// ---------------------------------------------------------------------------
+// T2.0b regression tests — SpeakerEmbeddingSession + session-overload
+// ---------------------------------------------------------------------------
+
+// The legacy `extract_speaker_embedding(samples, ..., model_path)` overload
+// must produce a byte-identical embedding to the session-overload — the
+// legacy path is now a thin wrapper that constructs a session and forwards.
+// Catches accidental divergence in the wrapper (parameter passing, defaults).
+TEST_CASE("SpeakerEmbeddingSession: legacy-vs-session parity on debate audio",
+          "[benchmark][t2-0b]") {
+    fs::path root = find_project_root();
+    if (root.empty())
+        SKIP("Project root with assets/ not found");
+
+    fs::path audio_path = root / "assets" / "biden_trump_debate_2020.wav";
+    if (!fs::exists(audio_path))
+        SKIP("Reference audio not found: " + audio_path.string());
+    if (!is_sherpa_model_cached())
+        SKIP("Sherpa diarization models not cached");
+
+    auto samples = read_wav_float(audio_path);
+    REQUIRE(!samples.empty());
+
+    // Need a DiarizeResult to drive the segment selection inside extraction.
+    auto diar = diarize(samples.data(), samples.size(), 3, 0, 1.18f);
+    REQUIRE(!diar.segments.empty());
+    REQUIRE(diar.num_speakers >= 1);
+
+    auto model_paths = ensure_sherpa_models();
+
+    // Path A: legacy wrapper.
+    auto legacy = extract_speaker_embedding(
+        samples.data(), samples.size(), diar, 0, model_paths.embedding);
+
+    // Path B: explicit session.
+    SpeakerEmbeddingSession session(model_paths.embedding, 0);
+    auto via_session = extract_speaker_embedding(
+        session, samples.data(), samples.size(), diar, 0);
+
+    REQUIRE(!legacy.empty());
+    REQUIRE(legacy.size() == via_session.size());
+    REQUIRE(static_cast<int>(legacy.size()) == session.dim());
+    for (size_t i = 0; i < legacy.size(); ++i) {
+        CHECK(legacy[i] == via_session[i]);
+    }
+}
+
+// Two back-to-back extractions on one session must both succeed and produce
+// identical output. Structural guarantee that lets T2.1 reuse one embedding
+// session across chunks (one extract per chunk-local speaker).
+TEST_CASE("SpeakerEmbeddingSession: back-to-back calls deterministic",
+          "[benchmark][t2-0b]") {
+    fs::path root = find_project_root();
+    if (root.empty())
+        SKIP("Project root with assets/ not found");
+
+    fs::path audio_path = root / "assets" / "biden_trump_debate_2020.wav";
+    if (!fs::exists(audio_path))
+        SKIP("Reference audio not found: " + audio_path.string());
+    if (!is_sherpa_model_cached())
+        SKIP("Sherpa diarization models not cached");
+
+    auto samples = read_wav_float(audio_path);
+    REQUIRE(!samples.empty());
+
+    auto diar = diarize(samples.data(), samples.size(), 3, 0, 1.18f);
+    REQUIRE(!diar.segments.empty());
+
+    auto model_paths = ensure_sherpa_models();
+    SpeakerEmbeddingSession session(model_paths.embedding, 0);
+
+    auto first  = extract_speaker_embedding(session, samples.data(), samples.size(), diar, 0);
+    auto second = extract_speaker_embedding(session, samples.data(), samples.size(), diar, 0);
+
+    REQUIRE(first.size() == second.size());
+    REQUIRE(!first.empty());
+    for (size_t i = 0; i < first.size(); ++i) {
+        CHECK(first[i] == second[i]);
+    }
+}
+
+// `ComputeEmbedding` returns *raw* model output, not L2-normalized. T2.1's
+// stitching threshold (cosine similarity ≥ 0.6 on unit vectors) only holds
+// if callers normalize first — this test codifies the spike finding as an
+// executable invariant so a future sherpa upgrade that silently switches to
+// pre-normalized output is caught by the test suite.
+TEST_CASE("extract_speaker_embedding: raw output not unit-norm",
+          "[benchmark][t2-0b]") {
+    fs::path root = find_project_root();
+    if (root.empty())
+        SKIP("Project root with assets/ not found");
+
+    fs::path audio_path = root / "assets" / "biden_trump_debate_2020.wav";
+    if (!fs::exists(audio_path))
+        SKIP("Reference audio not found: " + audio_path.string());
+    if (!is_sherpa_model_cached())
+        SKIP("Sherpa diarization models not cached");
+
+    auto samples = read_wav_float(audio_path);
+    REQUIRE(!samples.empty());
+
+    auto diar = diarize(samples.data(), samples.size(), 3, 0, 1.18f);
+    REQUIRE(!diar.segments.empty());
+
+    auto model_paths = ensure_sherpa_models();
+    SpeakerEmbeddingSession session(model_paths.embedding, 0);
+    auto embedding = extract_speaker_embedding(
+        session, samples.data(), samples.size(), diar, 0);
+
+    REQUIRE(!embedding.empty());
+
+    double sum_sq = 0.0;
+    for (float v : embedding) sum_sq += static_cast<double>(v) * v;
+    double norm = std::sqrt(sum_sq);
+
+    // Raw embeddings observed at norms ~5–25 across speakers; assert clearly
+    // distinguishable from unit norm. If sherpa upstream starts pre-normalizing,
+    // this fires and T2.1's normalization step can be revisited.
+    CHECK(std::abs(norm - 1.0) > 0.01);
 }
 #endif
 
