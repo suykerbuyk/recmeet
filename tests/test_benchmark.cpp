@@ -227,6 +227,120 @@ TEST_CASE("Diarize debate audio with buffer overload", "[benchmark]") {
     CHECK(result.num_speakers == file_result.num_speakers);
     CHECK(result.segments.size() == file_result.segments.size());
 }
+
+// ---------------------------------------------------------------------------
+// T2.0a regression tests — DiarizeSession + diarize_with_session
+// ---------------------------------------------------------------------------
+
+// The legacy `diarize()` wrapper and `diarize_with_session()` must produce
+// identical output for the same audio + clustering parameters. Catches
+// accidental divergence in the wrapper (parameter passing, defaults).
+TEST_CASE("DiarizeSession: wrapper-vs-session parity on debate audio",
+          "[benchmark][t2-0a]") {
+    fs::path root = find_project_root();
+    if (root.empty())
+        SKIP("Project root with assets/ not found");
+
+    fs::path audio_path = root / "assets" / "biden_trump_debate_2020.wav";
+    if (!fs::exists(audio_path))
+        SKIP("Reference audio not found: " + audio_path.string());
+    if (!is_sherpa_model_cached())
+        SKIP("Sherpa diarization models not cached");
+
+    auto samples = read_wav_float(audio_path);
+    REQUIRE(!samples.empty());
+
+    // Path A: legacy wrapper.
+    auto wrapper_result = diarize(samples.data(), samples.size(),
+                                  3, 0, 1.18f);
+
+    // Path B: explicit session.
+    DiarizeSession session(0);
+    session.set_clustering(3, 1.18f);
+    auto session_result = diarize_with_session(session,
+                                               samples.data(), samples.size());
+
+    REQUIRE(session_result.num_speakers == wrapper_result.num_speakers);
+    REQUIRE(session_result.segments.size() == wrapper_result.segments.size());
+    for (size_t i = 0; i < wrapper_result.segments.size(); ++i) {
+        CHECK(session_result.segments[i].start ==
+              wrapper_result.segments[i].start);
+        CHECK(session_result.segments[i].end ==
+              wrapper_result.segments[i].end);
+        CHECK(session_result.segments[i].speaker ==
+              wrapper_result.segments[i].speaker);
+    }
+}
+
+// Two back-to-back diarize calls on one session must both succeed and produce
+// identical output (deterministic, no hidden state mutated by Process). This
+// is the structural guarantee that lets T2.1 reuse one session across chunks.
+TEST_CASE("DiarizeSession: back-to-back calls deterministic",
+          "[benchmark][t2-0a]") {
+    fs::path root = find_project_root();
+    if (root.empty())
+        SKIP("Project root with assets/ not found");
+
+    fs::path audio_path = root / "assets" / "biden_trump_debate_2020.wav";
+    if (!fs::exists(audio_path))
+        SKIP("Reference audio not found: " + audio_path.string());
+    if (!is_sherpa_model_cached())
+        SKIP("Sherpa diarization models not cached");
+
+    auto samples = read_wav_float(audio_path);
+    REQUIRE(!samples.empty());
+
+    DiarizeSession session(0);
+    session.set_clustering(3, 1.18f);
+
+    auto first  = diarize_with_session(session, samples.data(), samples.size());
+    auto second = diarize_with_session(session, samples.data(), samples.size());
+
+    REQUIRE(first.num_speakers == second.num_speakers);
+    REQUIRE(first.segments.size() == second.segments.size());
+    for (size_t i = 0; i < first.segments.size(); ++i) {
+        CHECK(first.segments[i].start   == second.segments[i].start);
+        CHECK(first.segments[i].end     == second.segments[i].end);
+        CHECK(first.segments[i].speaker == second.segments[i].speaker);
+    }
+}
+
+// `set_clustering` must round-trip: forcing a specific cluster count then
+// switching back to auto-detect should be honored on each subsequent
+// Process call. Validates the SherpaOnnxOfflineSpeakerDiarizationSetConfig
+// path the chunked-diarization design relies on.
+TEST_CASE("DiarizeSession: set_clustering round-trip",
+          "[benchmark][t2-0a]") {
+    fs::path root = find_project_root();
+    if (root.empty())
+        SKIP("Project root with assets/ not found");
+
+    fs::path audio_path = root / "assets" / "biden_trump_debate_2020.wav";
+    if (!fs::exists(audio_path))
+        SKIP("Reference audio not found: " + audio_path.string());
+    if (!is_sherpa_model_cached())
+        SKIP("Sherpa diarization models not cached");
+
+    auto samples = read_wav_float(audio_path);
+    REQUIRE(!samples.empty());
+
+    DiarizeSession session(0);
+
+    // Force exactly 2 clusters.
+    session.set_clustering(2, 1.18f);
+    auto forced = diarize_with_session(session,
+                                       samples.data(), samples.size());
+    CHECK(forced.num_speakers == 2);
+
+    // Switch to auto-detect — should yield ≥ 2 speakers on this fixture
+    // (debate audio is multi-speaker). Importantly, the session must accept
+    // a second SetConfig call without crashing or leaking the prior state.
+    session.set_clustering(-1, 1.18f);
+    auto autodetect = diarize_with_session(session,
+                                           samples.data(), samples.size());
+    CHECK(autodetect.num_speakers >= 2);
+    CHECK(!autodetect.segments.empty());
+}
 #endif
 
 #if RECMEET_USE_SHERPA

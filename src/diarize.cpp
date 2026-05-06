@@ -56,16 +56,14 @@ std::vector<TranscriptSegment> merge_speakers(
 }
 
 #if RECMEET_USE_SHERPA
-DiarizeResult diarize(const float* samples, size_t num_samples,
-                      int num_speakers, int threads, float threshold,
-                      DiarizeProgressCallback on_progress) {
-    log_debug("diarize: ENTER (samples=%zu, speakers=%d, threads=%d)", num_samples, num_speakers, threads);
-    if (!samples || num_samples == 0)
-        throw RecmeetError("Cannot diarize: empty audio buffer");
+namespace {
 
-    auto model_paths = ensure_sherpa_models();
-
-    // Configure segmentation model
+// Build a full SherpaOnnxOfflineSpeakerDiarizationConfig. The returned struct
+// holds non-owning C-string pointers into `model_paths`; caller must ensure
+// `model_paths` outlives any sherpa call that reads the config.
+SherpaOnnxOfflineSpeakerDiarizationConfig
+make_diarize_config(const SherpaModelPaths& model_paths, int threads,
+                    int num_clusters, float threshold) {
     SherpaOnnxOfflineSpeakerSegmentationPyannoteModelConfig pyannote{};
     pyannote.model = model_paths.segmentation.c_str();
 
@@ -76,33 +74,82 @@ DiarizeResult diarize(const float* samples, size_t num_samples,
     seg_cfg.debug = 0;
     seg_cfg.provider = "cpu";
 
-    // Configure embedding extractor
     SherpaOnnxSpeakerEmbeddingExtractorConfig emb_cfg{};
     emb_cfg.model = model_paths.embedding.c_str();
     emb_cfg.num_threads = t;
     emb_cfg.debug = 0;
     emb_cfg.provider = "cpu";
 
-    // Configure clustering
     SherpaOnnxFastClusteringConfig cluster_cfg{};
-    cluster_cfg.num_clusters = num_speakers > 0 ? num_speakers : -1;
+    cluster_cfg.num_clusters = num_clusters;
     cluster_cfg.threshold = threshold;
 
-    // Build top-level config
     SherpaOnnxOfflineSpeakerDiarizationConfig config{};
     config.segmentation = seg_cfg;
     config.embedding = emb_cfg;
     config.clustering = cluster_cfg;
     config.min_duration_on = 0.3f;
     config.min_duration_off = 0.5f;
+    return config;
+}
 
-    log_debug("diarize: models configured");
-    const auto* sd = SherpaOnnxCreateOfflineSpeakerDiarization(&config);
-    if (!sd)
+} // namespace
+
+DiarizeSession::DiarizeSession(int threads) : threads_(threads) {
+    model_paths_ = ensure_sherpa_models();
+    // Initial clustering is sentinel auto-detect at the sherpa default
+    // threshold; callers must invoke set_clustering() before each Process to
+    // pin per-call params. We build with sane defaults so the session is
+    // immediately usable for tests that exercise the construction path alone.
+    auto config = make_diarize_config(model_paths_, threads_, -1, 1.18f);
+    log_debug("DiarizeSession: creating sherpa diarization (threads=%d)", threads_);
+    sd_ = SherpaOnnxCreateOfflineSpeakerDiarization(&config);
+    if (!sd_)
         throw RecmeetError("Failed to create sherpa-onnx speaker diarization");
+}
+
+DiarizeSession::~DiarizeSession() {
+    if (sd_) SherpaOnnxDestroyOfflineSpeakerDiarization(sd_);
+}
+
+DiarizeSession::DiarizeSession(DiarizeSession&& other) noexcept
+    : sd_(other.sd_),
+      model_paths_(std::move(other.model_paths_)),
+      threads_(other.threads_) {
+    other.sd_ = nullptr;
+}
+
+DiarizeSession& DiarizeSession::operator=(DiarizeSession&& other) noexcept {
+    if (this != &other) {
+        if (sd_) SherpaOnnxDestroyOfflineSpeakerDiarization(sd_);
+        sd_ = other.sd_;
+        model_paths_ = std::move(other.model_paths_);
+        threads_ = other.threads_;
+        other.sd_ = nullptr;
+    }
+    return *this;
+}
+
+void DiarizeSession::set_clustering(int num_clusters, float threshold) {
+    if (!sd_)
+        throw RecmeetError("DiarizeSession::set_clustering on moved-from session");
+    auto config = make_diarize_config(model_paths_, threads_, num_clusters, threshold);
+    SherpaOnnxOfflineSpeakerDiarizationSetConfig(sd_, &config);
+    log_debug("DiarizeSession::set_clustering(num_clusters=%d, threshold=%.3f)",
+              num_clusters, threshold);
+}
+
+DiarizeResult diarize_with_session(DiarizeSession& session,
+                                   const float* samples, size_t num_samples,
+                                   DiarizeProgressCallback on_progress) {
+    log_debug("diarize_with_session: ENTER (samples=%zu)", num_samples);
+    if (!samples || num_samples == 0)
+        throw RecmeetError("Cannot diarize: empty audio buffer");
+    if (!session.handle())
+        throw RecmeetError("diarize_with_session: empty (moved-from) session");
 
     log_info("Diarizing %zu samples (%.1fs)...",
-            num_samples, num_samples / 16000.0);
+             num_samples, num_samples / 16000.0);
 
     const SherpaOnnxOfflineSpeakerDiarizationResult* raw_result;
     if (on_progress) {
@@ -111,21 +158,19 @@ DiarizeResult diarize(const float* samples, size_t num_samples,
             (*fn)(done, total);
             return 0;
         };
-        log_debug("diarize: calling ProcessWithCallback (this may deadlock)...");
+        log_debug("diarize_with_session: calling ProcessWithCallback (this may deadlock)...");
         raw_result = SherpaOnnxOfflineSpeakerDiarizationProcessWithCallback(
-            sd, samples, static_cast<int32_t>(num_samples), c_callback, &on_progress);
+            session.handle(), samples, static_cast<int32_t>(num_samples),
+            c_callback, &on_progress);
     } else {
         raw_result = SherpaOnnxOfflineSpeakerDiarizationProcess(
-            sd, samples, static_cast<int32_t>(num_samples));
+            session.handle(), samples, static_cast<int32_t>(num_samples));
     }
 
-    log_debug("diarize: ProcessWithCallback returned (result=%p)", (void*)raw_result);
-    if (!raw_result) {
-        SherpaOnnxDestroyOfflineSpeakerDiarization(sd);
+    log_debug("diarize_with_session: Process returned (result=%p)", (void*)raw_result);
+    if (!raw_result)
         throw RecmeetError("Speaker diarization processing failed");
-    }
 
-    // Extract results
     DiarizeResult result;
     result.num_speakers = SherpaOnnxOfflineSpeakerDiarizationResultGetNumSpeakers(raw_result);
     int32_t num_segments = SherpaOnnxOfflineSpeakerDiarizationResultGetNumSegments(raw_result);
@@ -144,14 +189,26 @@ DiarizeResult diarize(const float* samples, size_t num_samples,
     }
 
     SherpaOnnxOfflineSpeakerDiarizationDestroyResult(raw_result);
-    SherpaOnnxDestroyOfflineSpeakerDiarization(sd);
 
-    log_debug("diarize: extracted %zu segments from %d speakers", result.segments.size(), result.num_speakers);
+    log_debug("diarize_with_session: extracted %zu segments from %d speakers",
+              result.segments.size(), result.num_speakers);
     log_info("Diarization complete: %d speakers, %zu segments",
-            result.num_speakers, result.segments.size());
-    log_debug("diarize: EXIT (%zu segments)", result.segments.size());
+             result.num_speakers, result.segments.size());
+    log_debug("diarize_with_session: EXIT (%zu segments)", result.segments.size());
 
     return result;
+}
+
+DiarizeResult diarize(const float* samples, size_t num_samples,
+                      int num_speakers, int threads, float threshold,
+                      DiarizeProgressCallback on_progress) {
+    log_debug("diarize: ENTER (samples=%zu, speakers=%d, threads=%d)",
+              num_samples, num_speakers, threads);
+    if (!samples || num_samples == 0)
+        throw RecmeetError("Cannot diarize: empty audio buffer");
+    DiarizeSession session(threads);
+    session.set_clustering(num_speakers > 0 ? num_speakers : -1, threshold);
+    return diarize_with_session(session, samples, num_samples, std::move(on_progress));
 }
 
 DiarizeResult diarize(const fs::path& audio_path, int num_speakers, int threads,
