@@ -1,7 +1,8 @@
 {
-  "iter_n": 126,
-  "anchor_sha": "0484282da10fbdca82b07eb7617fca7860cc6e94",
+  "iter_n": 127,
+  "anchor_sha": "c35d7d9205c388a4ef6e5cd4403bbaba8d764529",
   "active": [
+    "reprocess-batch-cli",
     "thin-client-recording-server"
   ],
   "done": [
