@@ -52,8 +52,8 @@ void save_meeting_context(const fs::path& out_dir, const std::string& context_in
 }
 
 std::string load_meeting_context(const fs::path& out_dir) {
-    fs::path path = out_dir / "context.json";
-    if (!fs::exists(path)) return "";
+    fs::path path = find_context_file(out_dir);
+    if (path.empty()) return "";
     std::ifstream in(path);
     if (!in) return "";
     std::ostringstream buf;

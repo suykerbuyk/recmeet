@@ -393,7 +393,7 @@ function renderMeetings() {
         onclick: () => showReprocessDialog(mtg.name)
       }, 'Reprocess'),
       html('span', { className: 'card-date' },
-        mtg.has_speakers_json
+        mtg.has_speakers
           ? `${mtg.speaker_count} speaker(s)`
           : 'No speaker data'
       )
@@ -405,7 +405,7 @@ function renderMeetings() {
       )
     );
 
-    if (mtg.has_speakers_json) {
+    if (mtg.has_speakers) {
       const speakersDiv = html('div', { className: 'meeting-speakers' });
       speakersDiv.textContent = 'Loading...';
       card.appendChild(speakersDiv);

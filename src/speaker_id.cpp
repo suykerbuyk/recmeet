@@ -396,8 +396,8 @@ void save_meeting_speakers(const fs::path& meeting_dir,
 }
 
 std::vector<MeetingSpeaker> load_meeting_speakers(const fs::path& meeting_dir) {
-    fs::path path = meeting_dir / "speakers.json";
-    if (!fs::exists(path)) return {};
+    fs::path path = find_speakers_file(meeting_dir);
+    if (path.empty()) return {};
 
     std::ifstream in(path);
     if (!in) return {};

@@ -132,7 +132,7 @@ static std::string speaker_profile_detail_to_json(const SpeakerProfile& p) {
 
 struct MeetingInfo {
     std::string name;
-    bool has_speakers_json;
+    bool has_speakers;
     int speaker_count;
     std::string date;
 };
@@ -141,7 +141,7 @@ static std::string meeting_info_to_json(const MeetingInfo& m) {
     std::ostringstream out;
     out << "{";
     out << "\"name\":\"" << escape_json(m.name) << "\",";
-    out << "\"has_speakers_json\":" << (m.has_speakers_json ? "true" : "false") << ",";
+    out << "\"has_speakers\":" << (m.has_speakers ? "true" : "false") << ",";
     out << "\"speaker_count\":" << m.speaker_count << ",";
     out << "\"date\":\"" << escape_json(m.date) << "\"";
     out << "}";
@@ -179,12 +179,12 @@ static std::vector<MeetingInfo> discover_meetings(const fs::path& output_dir) {
         MeetingInfo info;
         info.name = entry.path().filename().string();
 
-        auto spk_path = entry.path() / "speakers.json";
-        info.has_speakers_json = fs::exists(spk_path);
+        auto spk_path = find_speakers_file(entry.path());
+        info.has_speakers = !spk_path.empty();
         info.speaker_count = 0;
 
 #if RECMEET_USE_SHERPA
-        if (info.has_speakers_json) {
+        if (info.has_speakers) {
             auto spks = load_meeting_speakers(entry.path());
             info.speaker_count = static_cast<int>(spks.size());
         }
@@ -559,7 +559,7 @@ int main(int argc, char* argv[]) {
         int scanned = 0, updated = 0;
 
         for (const auto& mtg : meetings) {
-            if (!mtg.has_speakers_json) continue;
+            if (!mtg.has_speakers) continue;
             auto meeting_path = output_dir / mtg.name;
             auto spks = load_meeting_speakers(meeting_path);
             if (spks.empty()) continue;
