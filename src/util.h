@@ -71,11 +71,34 @@ fs::path models_dir();
 
 constexpr const char* AUDIO_PREFIX = "audio_";
 constexpr const char* LEGACY_AUDIO_NAME = "audio.wav";
+constexpr const char* CONTEXT_PREFIX = "context_";
+constexpr const char* LEGACY_CONTEXT_NAME = "context.json";
+constexpr const char* SPEAKERS_PREFIX = "speakers_";
+constexpr const char* LEGACY_SPEAKERS_NAME = "speakers.json";
 
 /// Find the audio file in a meeting directory.
 /// Prefers audio_YYYY-MM-DD_HH-MM.wav, falls back to audio.wav.
 /// Returns empty path if dir doesn't exist or no audio file found.
 fs::path find_audio_file(const fs::path& dir);
+
+/// Find the context.json file in a meeting directory.
+/// Prefers context_YYYY-MM-DD_HH-MM.json, falls back to context.json.
+/// Returns empty path if dir doesn't exist or no matching file found.
+fs::path find_context_file(const fs::path& dir);
+
+/// Find the speakers.json file in a meeting directory.
+/// Prefers speakers_YYYY-MM-DD_HH-MM.json, falls back to speakers.json.
+/// Returns empty path if dir doesn't exist or no matching file found.
+fs::path find_speakers_file(const fs::path& dir);
+
+/// Derive the YYYY-MM-DD_HH-MM timestamp for a meeting directory.
+/// Strategy:
+///   1. If dir.filename() matches the YYYY-MM-DD_HH-MM pattern, return it
+///      (collision suffix `_N` stripped).
+///   2. Otherwise, parse the discovered audio filename via find_audio_file()
+///      (strip "audio_" prefix and ".wav" suffix).
+///   3. Otherwise, return "".
+std::string derive_meeting_timestamp(const fs::path& dir);
 
 // ---------------------------------------------------------------------------
 // Output directory creation

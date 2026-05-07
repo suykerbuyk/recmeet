@@ -53,6 +53,83 @@ fs::path find_audio_file(const fs::path& dir) {
     return {};
 }
 
+namespace {
+
+/// Generic helper: find a file in `dir` whose name starts with `prefix` and
+/// ends with `.json`. Falls back to `dir / legacy_name` if it exists.
+/// Returns empty path if no match.
+fs::path find_json_file(const fs::path& dir, const char* prefix, const char* legacy_name) {
+    if (!fs::is_directory(dir)) return {};
+
+    const size_t prefix_len = std::strlen(prefix);
+    const std::string ext = ".json";
+
+    // Prefer timestamped <prefix>YYYY-MM-DD_HH-MM.json
+    for (const auto& entry : fs::directory_iterator(dir)) {
+        if (!entry.is_regular_file()) continue;
+        const auto& name = entry.path().filename().string();
+        if (name.size() > prefix_len + ext.size() &&
+            name.compare(0, prefix_len, prefix) == 0 &&
+            name.compare(name.size() - ext.size(), ext.size(), ext) == 0) {
+            return entry.path();
+        }
+    }
+
+    // Fall back to legacy filename
+    fs::path legacy = dir / legacy_name;
+    if (fs::exists(legacy)) return legacy;
+
+    return {};
+}
+
+} // anonymous namespace
+
+fs::path find_context_file(const fs::path& dir) {
+    return find_json_file(dir, CONTEXT_PREFIX, LEGACY_CONTEXT_NAME);
+}
+
+fs::path find_speakers_file(const fs::path& dir) {
+    return find_json_file(dir, SPEAKERS_PREFIX, LEGACY_SPEAKERS_NAME);
+}
+
+std::string derive_meeting_timestamp(const fs::path& dir) {
+    // Strategy 1: parse the directory name itself.
+    // Accept canonical "YYYY-MM-DD_HH-MM" and collision-suffixed
+    // "YYYY-MM-DD_HH-MM_N" — strip the suffix and return the leading 16 chars.
+    std::string dirname = dir.filename().string();
+    if (dirname.size() >= 16) {
+        int y, mo, d, h, mi;
+        if (std::sscanf(dirname.c_str(), "%4d-%2d-%2d_%2d-%2d", &y, &mo, &d, &h, &mi) == 5 &&
+            y >= 1970 && y <= 9999 && mo >= 1 && mo <= 12 &&
+            d >= 1 && d <= 31 && h >= 0 && h <= 23 && mi >= 0 && mi <= 59) {
+            char buf[17];
+            std::snprintf(buf, sizeof(buf), "%04d-%02d-%02d_%02d-%02d", y, mo, d, h, mi);
+            return std::string(buf);
+        }
+    }
+
+    // Strategy 2: parse the discovered audio filename.
+    fs::path audio = find_audio_file(dir);
+    if (!audio.empty()) {
+        std::string stem = audio.stem().string();
+        const size_t prefix_len = std::strlen(AUDIO_PREFIX);
+        if (stem.size() >= prefix_len + 16 &&
+            stem.compare(0, prefix_len, AUDIO_PREFIX) == 0) {
+            int y, mo, d, h, mi;
+            if (std::sscanf(stem.c_str() + prefix_len, "%4d-%2d-%2d_%2d-%2d",
+                            &y, &mo, &d, &h, &mi) == 5 &&
+                y >= 1970 && y <= 9999 && mo >= 1 && mo <= 12 &&
+                d >= 1 && d <= 31 && h >= 0 && h <= 23 && mi >= 0 && mi <= 59) {
+                char buf[17];
+                std::snprintf(buf, sizeof(buf), "%04d-%02d-%02d_%02d-%02d", y, mo, d, h, mi);
+                return std::string(buf);
+            }
+        }
+    }
+
+    return "";
+}
+
 OutputDir create_output_dir(const fs::path& base_dir) {
     auto now = std::chrono::system_clock::now();
     auto time = std::chrono::system_clock::to_time_t(now);

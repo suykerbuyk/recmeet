@@ -23,6 +23,7 @@ struct PostprocessInput {
     fs::path out_dir;
     fs::path audio_path;
     std::string transcript_text;  ///< If empty, postprocessing will transcribe from audio_path.
+    std::string timestamp;  ///< YYYY-MM-DD_HH-MM form. Empty if dir/audio doesn't match the canonical pattern.
 };
 
 /// Phase callback — called with phase name: "recording", "transcribing", "diarizing", "summarizing", "complete".

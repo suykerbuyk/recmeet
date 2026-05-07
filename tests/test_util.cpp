@@ -557,3 +557,132 @@ TEST_CASE("parse_memory_property_line: malformed input", "[util][t1c]") {
     CHECK(parse_memory_property_line("MemoryHigh=") == -1);  // empty value
     CHECK(parse_memory_property_line("garbage") == -1);
 }
+
+// ---------------------------------------------------------------------------
+// [meeting-files] find_context_file / find_speakers_file / derive_meeting_timestamp
+// ---------------------------------------------------------------------------
+
+namespace {
+
+/// RAII unique-temp-dir helper for the meeting-files test group.
+/// Creates a fresh empty directory on construction and removes it on destruction.
+class ScopedTempDir {
+public:
+    explicit ScopedTempDir(const std::string& tag) {
+        path_ = fs::temp_directory_path() / ("recmeet_test_" + tag + "_" +
+                                              std::to_string(::getpid()));
+        fs::remove_all(path_);
+        fs::create_directories(path_);
+    }
+    ~ScopedTempDir() {
+        std::error_code ec;
+        fs::remove_all(path_, ec);
+    }
+    ScopedTempDir(const ScopedTempDir&) = delete;
+    ScopedTempDir& operator=(const ScopedTempDir&) = delete;
+    const fs::path& path() const { return path_; }
+private:
+    fs::path path_;
+};
+
+}  // namespace
+
+TEST_CASE("find_context_file: prefers timestamped over none", "[meeting-files]") {
+    ScopedTempDir tmp("ctx_ts");
+    fs::path ts = tmp.path() / "context_2026-05-06_12-00.json";
+    std::ofstream(ts) << "{}";
+
+    auto result = find_context_file(tmp.path());
+    CHECK(result == ts);
+}
+
+TEST_CASE("find_context_file: falls back to legacy context.json", "[meeting-files]") {
+    ScopedTempDir tmp("ctx_legacy");
+    fs::path legacy = tmp.path() / "context.json";
+    std::ofstream(legacy) << "{}";
+
+    auto result = find_context_file(tmp.path());
+    CHECK(result == legacy);
+}
+
+TEST_CASE("find_context_file: prefers timestamped when both present", "[meeting-files]") {
+    ScopedTempDir tmp("ctx_both");
+    fs::path ts = tmp.path() / "context_2026-05-06_12-00.json";
+    fs::path legacy = tmp.path() / "context.json";
+    std::ofstream(ts) << "{}";
+    std::ofstream(legacy) << "{}";
+
+    auto result = find_context_file(tmp.path());
+    CHECK(result == ts);
+    CHECK(result != legacy);
+}
+
+TEST_CASE("find_context_file: returns empty when neither present", "[meeting-files]") {
+    ScopedTempDir tmp("ctx_none");
+    // Drop an unrelated file so the directory isn't empty.
+    std::ofstream(tmp.path() / "other.txt") << "data";
+
+    auto result = find_context_file(tmp.path());
+    CHECK(result.empty());
+}
+
+TEST_CASE("find_speakers_file: prefers timestamped when both present", "[meeting-files]") {
+    ScopedTempDir tmp("spk_both");
+    fs::path ts = tmp.path() / "speakers_2026-05-06_12-00.json";
+    fs::path legacy = tmp.path() / "speakers.json";
+    std::ofstream(ts) << "{}";
+    std::ofstream(legacy) << "{}";
+
+    auto result = find_speakers_file(tmp.path());
+    CHECK(result == ts);
+    CHECK(result != legacy);
+}
+
+TEST_CASE("derive_meeting_timestamp: clean dir name returns canonical timestamp",
+          "[meeting-files]") {
+    auto base = fs::temp_directory_path() / ("recmeet_test_dmt_clean_" +
+                                              std::to_string(::getpid()));
+    fs::path dir = base / "2026-05-06_12-00";
+    fs::remove_all(base);
+    fs::create_directories(dir);
+
+    CHECK(derive_meeting_timestamp(dir) == "2026-05-06_12-00");
+
+    fs::remove_all(base);
+}
+
+TEST_CASE("derive_meeting_timestamp: collision-suffix dir strips _N",
+          "[meeting-files]") {
+    auto base = fs::temp_directory_path() / ("recmeet_test_dmt_collision_" +
+                                              std::to_string(::getpid()));
+    fs::path dir = base / "2026-05-06_12-00_2";
+    fs::remove_all(base);
+    fs::create_directories(dir);
+
+    CHECK(derive_meeting_timestamp(dir) == "2026-05-06_12-00");
+
+    fs::remove_all(base);
+}
+
+TEST_CASE("derive_meeting_timestamp: audio fallback when dir name unrelated",
+          "[meeting-files]") {
+    auto base = fs::temp_directory_path() / ("recmeet_test_dmt_audio_" +
+                                              std::to_string(::getpid()));
+    fs::path dir = base / "random_dir_name";
+    fs::remove_all(base);
+    fs::create_directories(dir);
+    std::ofstream(dir / "audio_2026-05-06_12-00.wav") << "RIFF";
+
+    CHECK(derive_meeting_timestamp(dir) == "2026-05-06_12-00");
+
+    fs::remove_all(base);
+}
+
+TEST_CASE("derive_meeting_timestamp: empty when no match anywhere",
+          "[meeting-files]") {
+    ScopedTempDir tmp("dmt_empty");
+    // unrelated dir name, no audio_*.wav, only an unrelated file
+    std::ofstream(tmp.path() / "transcript.txt") << "hello";
+
+    CHECK(derive_meeting_timestamp(tmp.path()) == "");
+}

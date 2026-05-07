@@ -119,6 +119,7 @@ PostprocessInput run_recording(const Config& cfg, StopToken& stop, PhaseCallback
             pp.out_dir = fs::canonical(pp.audio_path.parent_path());
         }
         fs::create_directories(pp.out_dir);
+        pp.timestamp = derive_meeting_timestamp(pp.out_dir);
         log_info("Reprocessing: %s", pp.out_dir.c_str());
     } else {
         // --- Normal mode: detect sources, record audio ---
@@ -162,6 +163,7 @@ PostprocessInput run_recording(const Config& cfg, StopToken& stop, PhaseCallback
         // --- Create output directory ---
         auto out = create_output_dir(cfg.output_dir);
         pp.out_dir = fs::weakly_canonical(out.path);
+        pp.timestamp = out.timestamp;
         log_info("Output directory: %s", pp.out_dir.c_str());
 
         pp.audio_path = pp.out_dir / (std::string(AUDIO_PREFIX) + out.timestamp + ".wav");
