@@ -65,6 +65,9 @@ JsonMap config_to_map(const Config& cfg) {
     m["output_dir"]       = cfg.output_dir.string();
     m["note_dir"]         = cfg.note_dir.string();
     m["reprocess_dir"]    = cfg.reprocess_dir.string();
+    m["reprocess_batch_dir"]     = cfg.reprocess_batch_dir.string();
+    m["reprocess_batch_dry_run"] = cfg.reprocess_batch_dry_run;
+    m["batch_mode"]              = cfg.batch_mode;
 
     // Context
     m["context_file"]     = cfg.context_file.string();
@@ -173,6 +176,9 @@ Config config_from_map(const JsonMap& m) {
     path("output_dir", cfg.output_dir);
     path("note_dir", cfg.note_dir);
     path("reprocess_dir", cfg.reprocess_dir);
+    path("reprocess_batch_dir", cfg.reprocess_batch_dir);
+    b("reprocess_batch_dry_run", cfg.reprocess_batch_dry_run);
+    b("batch_mode", cfg.batch_mode);
 
     path("context_file", cfg.context_file);
     str("context_inline", cfg.context_inline);

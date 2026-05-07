@@ -3,6 +3,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 #include "cli.h"
+#include "config_json.h"
 
 #include <cstdlib>
 #include <getopt.h>
@@ -395,4 +396,52 @@ TEST_CASE("parse_cli: M-5' accepts just-above-threshold spacing",
                          "--diarize-chunk-minutes", "2.0",
                          "--diarize-chunk-overlap-sec", "30.0"});
     CHECK(cli.parse_error.empty());
+}
+
+// ---------------------------------------------------------------------------
+// Phase 1 — reprocess-batch CLI plumbing
+// ---------------------------------------------------------------------------
+
+TEST_CASE("parse_cli: accepts --reprocess-batch with required path",
+          "[reprocess-batch][cli]") {
+    auto cli = run_cli({"recmeet", "--reprocess-batch", "/some/parent/dir"});
+    CHECK(cli.cfg.reprocess_batch_dir == "/some/parent/dir");
+    CHECK(cli.cfg.reprocess_dir.empty());
+    CHECK(cli.cfg.reprocess_batch_dry_run == false);
+    CHECK(cli.parse_error.empty());
+}
+
+TEST_CASE("parse_cli: rejects --reprocess-batch with --reprocess",
+          "[reprocess-batch][cli]") {
+    auto cli = run_cli({"recmeet",
+                         "--reprocess", "/single/meeting",
+                         "--reprocess-batch", "/parent/dir"});
+    REQUIRE_FALSE(cli.parse_error.empty());
+    CHECK(cli.parse_error.find("--reprocess") != std::string::npos);
+    CHECK(cli.parse_error.find("--reprocess-batch") != std::string::npos);
+}
+
+TEST_CASE("parse_cli: --dry-run sets the flag",
+          "[reprocess-batch][cli]") {
+    auto cli = run_cli({"recmeet",
+                         "--reprocess-batch", "/parent/dir",
+                         "--dry-run"});
+    CHECK(cli.cfg.reprocess_batch_dry_run == true);
+    CHECK(cli.cfg.reprocess_batch_dir == "/parent/dir");
+    CHECK(cli.parse_error.empty());
+}
+
+TEST_CASE("parse_cli: config_json round-trips batch_mode",
+          "[reprocess-batch][cli]") {
+    Config cfg;
+    cfg.batch_mode = true;
+    cfg.reprocess_batch_dir = "/home/user/meetings";
+    cfg.reprocess_batch_dry_run = true;
+
+    std::string json = config_to_json(cfg);
+    Config loaded = config_from_json(json);
+
+    CHECK(loaded.batch_mode == true);
+    CHECK(loaded.reprocess_batch_dir == fs::path("/home/user/meetings"));
+    CHECK(loaded.reprocess_batch_dry_run == true);
 }

@@ -108,6 +108,14 @@ struct Config {
 
     // Reprocess
     fs::path reprocess_dir;
+    fs::path reprocess_batch_dir;
+    bool reprocess_batch_dry_run = false;
+
+    // Batch mode flag — propagates through IPC + subprocess JSON; daemon stores
+    // per-job; tray reads via job.complete event. Suppresses per-meeting
+    // notifications during a batch reprocess so the operator sees only the
+    // end-of-batch summary notification.
+    bool batch_mode = false;
 
     // Web server
     int web_port = 8384;

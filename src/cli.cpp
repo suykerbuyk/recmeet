@@ -68,6 +68,8 @@ CliResult parse_cli(int argc, char* argv[]) {
         {"diarize-chunk-minutes",     required_argument, nullptr, 1029},
         {"diarize-chunk-overlap-sec", required_argument, nullptr, 1030},
         {"diarize-stitch-threshold",  required_argument, nullptr, 1031},
+        {"reprocess-batch", required_argument, nullptr, 1032},
+        {"dry-run",         no_argument,       nullptr, 1033},
         {"help",           no_argument,       nullptr, 'h'},
         {"version",        no_argument,       nullptr, 'v'},
         {nullptr, 0, nullptr, 0},
@@ -137,6 +139,8 @@ CliResult parse_cli(int argc, char* argv[]) {
             case 1029: result.cfg.chunk_minutes = static_cast<float>(std::atof(optarg)); break;
             case 1030: result.cfg.chunk_overlap_sec = static_cast<float>(std::atof(optarg)); break;
             case 1031: result.cfg.stitch_threshold = static_cast<float>(std::atof(optarg)); break;
+            case 1032: result.cfg.reprocess_batch_dir = optarg; break;
+            case 1033: result.cfg.reprocess_batch_dry_run = true; break;
             case 'v': result.show_version = true; return result;
             case 'h': result.show_help = true; return result;
             default:  result.show_help = true; return result;
@@ -160,6 +164,20 @@ CliResult parse_cli(int argc, char* argv[]) {
                 cm, co);
             result.parse_error = buf;
         }
+    }
+
+    // Mutual exclusion: --reprocess (single dir) and --reprocess-batch (parent
+    // dir) target different code paths and cannot be combined. Reject early
+    // with a clear message so the operator picks one. Mirrors the surfacing
+    // convention of the chunk-validation block above; main.cpp prints
+    // result.parse_error to stderr and exits 2.
+    if (!result.cfg.reprocess_dir.empty()
+        && !result.cfg.reprocess_batch_dir.empty()
+        && result.parse_error.empty()) {
+        result.parse_error =
+            "--reprocess and --reprocess-batch are mutually exclusive "
+            "(single-meeting reprocess vs. parent-dir batch reprocess); "
+            "pass exactly one";
     }
 
     return result;
