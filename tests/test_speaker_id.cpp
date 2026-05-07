@@ -279,6 +279,49 @@ TEST_CASE("speaker_id: save meeting speakers to empty vector writes valid file",
     fs::remove_all(tmp);
 }
 
+TEST_CASE("speaker_id: save_meeting_speakers timestamp arg writes per-instance file",
+          "[speaker_id]") {
+    auto tmp = fs::temp_directory_path() / "recmeet_test_meeting_spk_per_instance";
+    fs::remove_all(tmp);
+
+    std::vector<MeetingSpeaker> speakers = {
+        {0, "Alice", true, {0.1f, 0.2f, -0.3f}, 12.5f, 0.91f},
+    };
+
+    save_meeting_speakers(tmp, speakers, "2026-05-07_10-30");
+
+    // Per-instance file is written; legacy filename is NOT.
+    CHECK(fs::exists(tmp / "speakers_2026-05-07_10-30.json"));
+    CHECK_FALSE(fs::exists(tmp / "speakers.json"));
+
+    // load_meeting_speakers (uses find_speakers_file) resolves the per-instance file.
+    auto loaded = load_meeting_speakers(tmp);
+    REQUIRE(loaded.size() == 1);
+    CHECK(loaded[0].label == "Alice");
+
+    fs::remove_all(tmp);
+}
+
+TEST_CASE("speaker_id: load_meeting_speakers prefers per-instance over legacy",
+          "[speaker_id]") {
+    auto tmp = fs::temp_directory_path() / "recmeet_test_meeting_spk_prefer";
+    fs::remove_all(tmp);
+
+    // Write legacy first.
+    save_meeting_speakers(tmp, {{0, "OldLabel", true, {0.0f}, 1.0f, 0.5f}});
+    REQUIRE(fs::exists(tmp / "speakers.json"));
+
+    // Then write per-instance with different content.
+    save_meeting_speakers(tmp, {{0, "NewLabel", true, {0.0f}, 1.0f, 0.5f}}, "2026-05-07_10-30");
+    REQUIRE(fs::exists(tmp / "speakers_2026-05-07_10-30.json"));
+
+    auto loaded = load_meeting_speakers(tmp);
+    REQUIRE(loaded.size() == 1);
+    CHECK(loaded[0].label == "NewLabel");
+
+    fs::remove_all(tmp);
+}
+
 // ---------------------------------------------------------------------------
 // reset_speakers tests
 // ---------------------------------------------------------------------------

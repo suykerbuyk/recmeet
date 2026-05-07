@@ -104,8 +104,40 @@ TEST_CASE("save_meeting_context with context_file", "[pipeline]") {
     std::string loaded = load_meeting_context(dir);
     CHECK(loaded == "inline notes");
 
-    // Verify context.json exists
+    // Verify context.json exists (legacy filename written when timestamp empty)
     CHECK(fs::exists(dir / "context.json"));
+
+    fs::remove_all(dir);
+}
+
+TEST_CASE("save_meeting_context: timestamp arg writes per-instance file", "[pipeline]") {
+    auto dir = tmp_dir();
+
+    save_meeting_context(dir, "Standup notes", {}, "2026-05-07_10-30");
+
+    // Per-instance file is written; legacy filename is NOT.
+    CHECK(fs::exists(dir / "context_2026-05-07_10-30.json"));
+    CHECK_FALSE(fs::exists(dir / "context.json"));
+
+    // load_meeting_context resolves the per-instance file.
+    CHECK(load_meeting_context(dir) == "Standup notes");
+
+    fs::remove_all(dir);
+}
+
+TEST_CASE("load_meeting_context: prefers per-instance over legacy", "[pipeline]") {
+    auto dir = tmp_dir();
+
+    // Write legacy first.
+    save_meeting_context(dir, "older legacy context");
+    REQUIRE(fs::exists(dir / "context.json"));
+
+    // Write per-instance with newer content.
+    save_meeting_context(dir, "newer per-instance context", {}, "2026-05-07_10-30");
+    REQUIRE(fs::exists(dir / "context_2026-05-07_10-30.json"));
+
+    // load_meeting_context (which uses find_context_file) prefers the per-instance file.
+    CHECK(load_meeting_context(dir) == "newer per-instance context");
 
     fs::remove_all(dir);
 }

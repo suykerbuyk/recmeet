@@ -109,7 +109,16 @@ DebateResult run_debate_pipeline(bool use_local_llm, const fs::path& llm_model_p
     PostprocessInput input;
     input.out_dir = out_dir;
     input.audio_path = audio_path;
+    input.timestamp = "2020-09-29_21-00";  // matches audio filename
     // transcript_text empty — triggers full transcription
+
+    // Mirror the production parent-process save (daemon::rec_worker /
+    // pipeline::run_pipeline). This test calls run_postprocessing directly,
+    // so we replicate the rec_worker pattern: save context before postprocessing.
+    if (cfg.reprocess_dir.empty()) {
+        save_meeting_context(input.out_dir, cfg.context_inline, cfg.context_file,
+                             input.timestamp);
+    }
 
     auto result = run_postprocessing(cfg, input, on_phase);
 
@@ -228,8 +237,8 @@ TEST_CASE("Full pipeline: debate audio with API summary", "[full-stack][benchmar
     CHECK(dr.note_content.find("2020 Presidential Debate") != std::string::npos);
 
     // --- 7. Context persistence ---
-    INFO("Checking context.json persistence");
-    CHECK(fs::exists(dr.out_dir / "context.json"));
+    INFO("Checking context persistence (filename-agnostic)");
+    CHECK(!find_context_file(dr.out_dir).empty());
     std::string loaded_ctx = load_meeting_context(dr.out_dir);
     CHECK(!loaded_ctx.empty());
 
@@ -324,7 +333,7 @@ TEST_CASE("Full pipeline: debate audio with local LLM summary", "[full-stack][be
     CHECK(dr.note_content.find("Pre-Meeting Context") != std::string::npos);
     CHECK(dr.note_content.find("2020 Presidential Debate") != std::string::npos);
 
-    CHECK(fs::exists(dr.out_dir / "context.json"));
+    CHECK(!find_context_file(dr.out_dir).empty());
     CHECK(!load_meeting_context(dr.out_dir).empty());
 
     for (const auto& [phase, secs] : dr.phase_durations) {
@@ -403,5 +412,64 @@ TEST_CASE("Reprocess with context.json fallback", "[full-stack]") {
     CHECK(!result.transcript_text.empty());
 
     // Cleanup
+    fs::remove_all(out_dir);
+}
+
+
+// ---------------------------------------------------------------------------
+// TEST_CASE 4: Reprocess with per-instance context_<ts>.json fallback
+// (parallel to TEST_CASE 3, but exercises the new-style filename read path)
+// ---------------------------------------------------------------------------
+
+TEST_CASE("Reprocess with per-instance context_<ts>.json fallback", "[full-stack]") {
+    fs::path root = find_project_root();
+    if (root.empty())
+        SKIP("Project root with assets/ not found");
+    if (!fs::exists(root / "assets" / "biden_trump_debate_2020.wav"))
+        SKIP("Debate audio asset not found");
+    if (!is_whisper_model_cached("base"))
+        SKIP("Whisper base model not cached");
+
+    auto out_dir = fs::temp_directory_path() / "2020-09-29_21-00";
+    fs::remove_all(out_dir);
+    fs::create_directories(out_dir);
+
+    fs::path audio_src = root / "assets" / "biden_trump_debate_2020.wav";
+    fs::path audio_path = out_dir / "audio_2020-09-29_21-00.wav";
+    fs::copy_file(audio_src, audio_path);
+
+    // Write per-instance context (NOT legacy) — exercises the new-style read path.
+    save_meeting_context(out_dir, "Per-instance reprocess context", {}, "2020-09-29_21-00");
+    REQUIRE(fs::exists(out_dir / "context_2020-09-29_21-00.json"));
+    REQUIRE_FALSE(fs::exists(out_dir / "context.json"));
+
+    Config cfg;
+    cfg.whisper_model = "base";
+    cfg.language = "en";
+    cfg.reprocess_dir = out_dir;
+    cfg.output_dir = out_dir;
+    cfg.output_dir_explicit = true;
+    cfg.note_dir = out_dir;
+    cfg.no_summary = true;
+    cfg.diarize = false;
+    cfg.vad = false;
+    cfg.speaker_id = false;
+    cfg.context_inline = "";  // empty — should pick up context_<ts>.json
+
+    PostprocessInput input;
+    input.out_dir = out_dir;
+    input.audio_path = audio_path;
+    input.timestamp = "2020-09-29_21-00";
+
+    auto result = run_postprocessing(cfg, input);
+
+    REQUIRE(fs::exists(result.note_path));
+    std::ifstream f(result.note_path);
+    std::string note((std::istreambuf_iterator<char>(f)),
+                      std::istreambuf_iterator<char>());
+
+    CHECK(note.find("Pre-Meeting Context") != std::string::npos);
+    CHECK(note.find("Per-instance reprocess context") != std::string::npos);
+
     fs::remove_all(out_dir);
 }

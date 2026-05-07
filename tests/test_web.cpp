@@ -195,13 +195,13 @@ struct TestServer {
                     if (!first) out += ",";
                     first = false;
                     auto p = output_dir / d;
-                    bool has_spk = fs::exists(p / "speakers.json");
+                    bool has_spk = !find_speakers_file(p).empty();
                     int spk_count = 0;
 #if RECMEET_USE_SHERPA
                     if (has_spk) spk_count = static_cast<int>(load_meeting_speakers(p).size());
 #endif
                     std::string date = (d.size() >= 10 && d[4] == '-' && d[7] == '-') ? d.substr(0, 10) : "";
-                    out += "{\"name\":\"" + d + "\",\"has_speakers_json\":" +
+                    out += "{\"name\":\"" + d + "\",\"has_speakers\":" +
                            (has_spk ? "true" : "false") +
                            ",\"speaker_count\":" + std::to_string(spk_count) +
                            ",\"date\":\"" + date + "\"}";
@@ -379,7 +379,7 @@ struct TestServer {
             spk->label = new_label;
             spk->identified = true;
             spk->confidence = 1.0f;
-            save_meeting_speakers(meeting_path, meeting_speakers);
+            save_meeting_speakers(meeting_path, meeting_speakers, derive_meeting_timestamp(meeting_path));
 
             res.set_content(R"({"ok":true,"old_label":")" + old_label + R"("})", "application/json");
 #else
@@ -403,13 +403,13 @@ struct TestServer {
             if (fs::is_directory(output_dir)) {
                 for (const auto& entry : fs::directory_iterator(output_dir)) {
                     if (!entry.is_directory()) continue;
-                    if (!fs::exists(entry.path() / "speakers.json")) continue;
+                    if (find_speakers_file(entry.path()).empty()) continue;
                     auto spks = load_meeting_speakers(entry.path());
                     if (spks.empty()) continue;
                     ++scanned;
                     auto result = re_identify_meeting(spks, db);
                     if (!result.empty()) {
-                        save_meeting_speakers(entry.path(), result);
+                        save_meeting_speakers(entry.path(), result, derive_meeting_timestamp(entry.path()));
                         ++updated;
                     }
                 }
