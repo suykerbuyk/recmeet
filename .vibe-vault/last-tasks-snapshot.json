@@ -1,8 +1,8 @@
 {
-  "iter_n": 122,
-  "anchor_sha": "a1e404044c2efc3aca6d605fe503a4a664c0d686",
+  "iter_n": 123,
+  "anchor_sha": "acd6de12f786fe4c2f43d541d8ad9c26a2f07ebf",
   "active": [
-    "remote-tray-tcp-ipc"
+    "thin-client-recording-server"
   ],
   "done": [
     "audio-buffer-bounds",
@@ -51,6 +51,7 @@
     "radiant-bubbling-nova",
     "radiant-toasting-lightning",
     "remote-tray-tcp-ipc-phase1-plan",
+    "remote-tray-tcp-ipc",
     "reprocess-robustness",
     "serene-plotting-engelbart",
     "sherpa-onnx-cmake-warnings",
