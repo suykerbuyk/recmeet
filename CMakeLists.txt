@@ -196,6 +196,7 @@ set(CORE_SOURCES
     src/note.cpp
     src/pipeline.cpp
     src/cli.cpp
+    src/reprocess_batch.cpp
     src/diarize.cpp
     src/speaker_id.cpp
     src/vad.cpp
@@ -279,6 +280,7 @@ if(RECMEET_BUILD_TESTS)
         tests/test_summarize_prompt.cpp
         tests/test_pipeline_helpers.cpp
         tests/test_cli.cpp
+        tests/test_reprocess_batch.cpp
         tests/test_benchmark.cpp
         tests/test_diarize.cpp
         tests/test_speaker_id.cpp

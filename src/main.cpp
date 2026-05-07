@@ -13,6 +13,7 @@
 #include "ndjson_parse.h"
 #include "notify.h"
 #include "pipeline.h"
+#include "reprocess_batch.h"
 #include "speaker_id.h"
 #include "util.h"
 #include "version.h"
@@ -40,40 +41,15 @@ static void signal_handler(int) {
     g_stop.request();
 }
 
-// Whisper log callback for interactive CLI use.
-// On a TTY, INFO-level messages (model loading, "auto-detected language", etc.)
-// overwrite in place via \r so they don't scroll the terminal.  WARN/ERROR
-// messages print normally so they remain visible.
-static bool g_whisper_overwrote = false;
-
-static void whisper_cli_log(enum ggml_log_level level, const char* text, void*) {
-    if (!text || !*text) return;
-    static const bool is_tty = isatty(STDERR_FILENO);
-
-    if (is_tty && (level <= GGML_LOG_LEVEL_INFO || level == GGML_LOG_LEVEL_CONT)) {
-        size_t len = std::strlen(text);
-        while (len > 0 && (text[len - 1] == '\n' || text[len - 1] == '\r'))
-            --len;
-        if (len > 0) {
-            fprintf(stderr, "\r\033[K%.*s", (int)len, text);
-            g_whisper_overwrote = true;
-        }
-    } else {
-        if (g_whisper_overwrote) {
-            fprintf(stderr, "\n");
-            g_whisper_overwrote = false;
-        }
-        fprintf(stderr, "%s", text);
-    }
-}
-
-// Clear any pending in-place whisper line before printing other output.
-static void whisper_flush_line() {
-    if (g_whisper_overwrote) {
-        fprintf(stderr, "\r\033[K");
-        g_whisper_overwrote = false;
-    }
-}
+// Whisper log callback + flush helper now live in src/reprocess_batch.cpp
+// so they can be shared between main.cpp's standalone path and the
+// reprocess-batch driver. They were originally file-static here in main.cpp;
+// moved during Phase 2 because reprocess_batch.cpp links into recmeet_core
+// (whereas main.cpp does not — it's in the recmeet binary only).
+namespace recmeet {
+extern "C" void whisper_cli_log_shim(enum ggml_log_level level, const char* text, void* user);
+void whisper_flush_line_shim();
+}  // namespace recmeet
 
 static void print_usage() {
     fprintf(stderr,
@@ -116,6 +92,12 @@ static void print_usage() {
         "  --vad-threshold F    VAD speech detection threshold (default: 0.5)\n"
         "  --threads N          Number of CPU threads for inference (0 = auto-detect, default: 0)\n"
         "  --reprocess PATH     Reprocess audio file or directory containing audio\n"
+        "  --reprocess-batch DIR  Reprocess every meeting subdir under DIR that has\n"
+        "                       no corresponding note (skip-detection vs note-dir).\n"
+        "                       Mutually exclusive with --reprocess.\n"
+        "  --dry-run            With --reprocess-batch: print the would-process list\n"
+        "                       (per-meeting reason: SKIP-note-exists / SKIP-no-audio /\n"
+        "                       WILL-REPROCESS) and exit without doing any work.\n"
         "  --log-level LEVEL    Log level: none, error, warn, info (default: none)\n"
         "  --log-dir DIR        Log file directory (default: ~/.local/share/recmeet/logs/)\n"
         "  --list-sources       List available audio sources and exit\n"
@@ -143,6 +125,10 @@ static void print_usage() {
 static void print_version() {
     printf("recmeet %s\n", RECMEET_VERSION);
 }
+
+// `ensure_models_cached_or_fail` and `client_record_no_sigaction` live in
+// src/reprocess_batch.cpp (so they end up in recmeet_core, where the test
+// binary can link them). Declared in reprocess_batch.h.
 
 // ---------------------------------------------------------------------------
 // Client mode — talk to the daemon via IPC
@@ -183,110 +169,47 @@ static int client_stop(const std::string& addr = "") {
     return 0;
 }
 
+// `client_record_no_sigaction` lives in src/reprocess_batch.cpp (recmeet_core).
+// The thin `client_record` wrapper below uses it for the single-meeting CLI
+// path with its own SIGINT/SIGTERM handlers installed.
+
 static int client_record(const Config& cfg, const std::string& addr = "") {
-    IpcClient client(addr);
-    if (!client.connect()) {
-        fprintf(stderr, "Error: daemon not running. Start with: recmeet-daemon\n");
-        return 1;
-    }
+    using namespace recmeet;
 
-    bool is_reprocess = !cfg.reprocess_dir.empty();
+    // Save previous SIGINT/SIGTERM so we don't clobber the batch-level
+    // handler when this thin wrapper is called from the single-meeting CLI
+    // path. (Iter-126 bug: the original client_record installed its handler
+    // unconditionally and never restored, breaking iterations 2..N for any
+    // outer code that had its own handler installed.)
+    struct sigaction prev_int{};
+    struct sigaction prev_term{};
+    sigaction(SIGINT, nullptr, &prev_int);
+    sigaction(SIGTERM, nullptr, &prev_term);
 
-    // Build params from config overrides
-    JsonMap params = config_to_map(cfg);
-
-    static int last_cli_progress = -1;
-    static const bool cli_tty = isatty(STDERR_FILENO);
-    static int client_exit_code = 0;
-    int64_t my_job_id = 0;  // assigned after record.start response
-
-    client.set_event_callback([&client, &my_job_id](const IpcEvent& ev) {
-        if (ev.event == "phase") {
-            std::string name = json_val_as_string(ev.data.at("name"));
-            if (cli_tty && last_cli_progress >= 0)
-                fprintf(stderr, "\n");  // newline after progress line
-            last_cli_progress = -1;
-            fprintf(stderr, "Phase: %s\n", name.c_str());
-        } else if (ev.event == "progress") {
-            std::string phase = json_val_as_string(ev.data.at("phase"));
-            int percent = static_cast<int>(json_val_as_int(ev.data.at("percent")));
-            if (cli_tty) {
-                fprintf(stderr, "\r\033[K%s... %d%%",
-                        phase.c_str(), percent);
-                last_cli_progress = percent;
-            } else if (percent - last_cli_progress >= 10 || last_cli_progress < 0) {
-                fprintf(stderr, "%s... %d%%\n", phase.c_str(), percent);
-                last_cli_progress = percent;
-            }
-        } else if (ev.event == "state.changed") {
-            std::string state = json_val_as_string(ev.data.at("state"));
-            auto err_it = ev.data.find("error");
-            if (err_it != ev.data.end()) {
-                std::string error = json_val_as_string(err_it->second);
-                if (!error.empty()) {
-                    if (cli_tty && last_cli_progress >= 0)
-                        fprintf(stderr, "\n");
-                    last_cli_progress = -1;
-                    fprintf(stderr, "Error: %s\n", error.c_str());
-                    client_exit_code = 1;
-                    // Force exit from read_events by closing connection
-                    client.close_connection();
-                }
-            }
-        } else if (ev.event == "job.complete") {
-            // Filter by our job_id if we have one (ignore completions from other jobs)
-            auto jid_it = ev.data.find("job_id");
-            if (my_job_id > 0 && jid_it != ev.data.end()
-                && json_val_as_int(jid_it->second) != my_job_id)
-                return;
-            if (cli_tty && last_cli_progress >= 0)
-                fprintf(stderr, "\n");
-            last_cli_progress = -1;
-            std::string note = json_val_as_string(ev.data.at("note_path"));
-            std::string dir = json_val_as_string(ev.data.at("output_dir"));
-            if (!note.empty())
-                printf("Note: %s\n", note.c_str());
-            printf("Output: %s\n", dir.c_str());
-        }
-    });
-
-    IpcResponse resp;
-    IpcError err;
-    if (!client.call("record.start", params, resp, err)) {
-        fprintf(stderr, "Error: %s\n", err.message.c_str());
-        return 1;
-    }
-
-    // Capture job_id for filtering job.complete events
-    {
-        auto jid_it = resp.result.find("job_id");
-        if (jid_it != resp.result.end())
-            my_job_id = json_val_as_int(jid_it->second);
-    }
-
-    if (is_reprocess)
-        fprintf(stderr, "Reprocessing %s\n", cfg.reprocess_dir.c_str());
-    else
-        fprintf(stderr, "Recording started. Press Ctrl+C to stop.\n");
-
-    // Install signal handler to send stop on Ctrl+C
-    static IpcClient* g_client = &client;
+    // Single-meeting SIGINT handler: forwards to record.stop on the live
+    // socket. Reads g_active_ipc_client (set by client_record_no_sigaction)
+    // so we don't need a separate function-static client pointer.
     struct sigaction sa{};
     sa.sa_handler = [](int) {
-        if (g_client && g_client->connected()) {
-            IpcResponse r; IpcError e;
-            g_client->call("record.stop", r, e, 5000);
+        IpcClient* c = g_active_ipc_client.load(std::memory_order_acquire);
+        if (c && c->connected()) {
+            IpcResponse r;
+            IpcError e;
+            c->call("record.stop", r, e, 5000);
         }
     };
     sigemptyset(&sa.sa_mask);
     sigaction(SIGINT, &sa, nullptr);
     sigaction(SIGTERM, &sa, nullptr);
 
-    // Wait for job completion, error, or disconnect
-    client.read_events("job.complete");
+    int rc = client_record_no_sigaction(cfg, addr);
 
-    g_client = nullptr;
-    return client_exit_code;
+    sigaction(SIGINT, &prev_int, nullptr);
+    sigaction(SIGTERM, &prev_term, nullptr);
+
+    // Map the connect-failed sentinel to the user-facing exit code (1).
+    // Single-meeting CLI users don't need the DaemonUnreachable distinction.
+    return rc == kClientConnectFailedExitCode ? 1 : rc;
 }
 
 // ---------------------------------------------------------------------------
@@ -704,6 +627,18 @@ int main(int argc, char* argv[]) {
         }
     }
 
+    // --reprocess-batch dispatch — runs entirely in this process (talks to
+    // daemon if available, otherwise runs the pipeline directly per-meeting).
+    // Mutual exclusion with --reprocess is enforced by the CLI parser.
+    if (!cli.cfg.reprocess_batch_dir.empty()) {
+        // Mirror the api-key resolution we just did into cli.cfg so the
+        // batch driver sees it (run_reprocess_batch reads from cli.cfg).
+        cli.cfg = cfg;
+        int rc = run_reprocess_batch(cli);
+        log_shutdown();
+        return rc;
+    }
+
     // Determine whether to use daemon
     bool use_daemon = false;
     if (cli.daemon_mode == DaemonMode::Force) {
@@ -1011,20 +946,20 @@ static int standalone_main(CliResult& cli) {
         fprintf(stderr, "Press Ctrl+C to stop recording.\n\n");
 
     // On a TTY, whisper INFO messages overwrite in place instead of scrolling
-    whisper_log_set(whisper_cli_log, nullptr);
+    whisper_log_set(whisper_cli_log_shim, nullptr);
 
     try {
         auto result = run_pipeline(cfg, g_stop);
-        whisper_flush_line();
+        whisper_flush_line_shim();
         (void)result;
     } catch (const RecmeetError& e) {
-        whisper_flush_line();
+        whisper_flush_line_shim();
         fprintf(stderr, "Error: %s\n", e.what());
         log_shutdown();
         notify_cleanup();
         return 1;
     } catch (const std::exception& e) {
-        whisper_flush_line();
+        whisper_flush_line_shim();
         fprintf(stderr, "Unexpected error: %s\n", e.what());
         log_shutdown();
         notify_cleanup();

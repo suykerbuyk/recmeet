@@ -709,12 +709,14 @@ static void pp_worker_loop(IpcServer& server) {
             // Interpret result
             if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
                 int64_t jid = job.job_id;
-                server.post([&server, captured_note_path, captured_output_dir, jid]() {
+                bool batch_job = job.cfg.batch_mode;
+                server.post([&server, captured_note_path, captured_output_dir, jid, batch_job]() {
                     IpcEvent ev;
                     ev.event = "job.complete";
                     ev.data["note_path"] = captured_note_path;
                     ev.data["output_dir"] = captured_output_dir;
                     ev.data["job_id"] = jid;
+                    ev.data["batch_job"] = batch_job;
                     server.broadcast(ev);
                 });
             } else if (WIFEXITED(status) && WEXITSTATUS(status) == 2) {

@@ -229,7 +229,15 @@ static void handle_ipc_event(const IpcEvent& ev) {
     } else if (ev.event == "job.complete") {
         std::string note = json_val_as_string(ev.data.at("note_path"));
         std::string dir = json_val_as_string(ev.data.at("output_dir"));
-        if (!note.empty())
+        // Suppress per-meeting notifications during a reprocess-batch run; the
+        // batch driver process emits a single end-of-batch summary instead.
+        // Failure notifications above (state.changed with error) keep firing
+        // regardless — operator attention is wanted on failures.
+        bool batch_job = false;
+        auto bj_it = ev.data.find("batch_job");
+        if (bj_it != ev.data.end())
+            batch_job = json_val_as_bool(bj_it->second);
+        if (!note.empty() && !batch_job)
             notify("Meeting note ready", note);
         // Don't reset state here — the subsequent state.changed event handles it
     } else if (ev.event == "model.downloading") {

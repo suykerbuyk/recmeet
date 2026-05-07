@@ -640,7 +640,7 @@ PipelineResult run_postprocessing(const Config& cfg, const PostprocessInput& inp
 #if RECMEET_USE_LLAMA
         if (!cfg.llm_model.empty()) {  // NOLINT(readability-misleading-indentation)
             // Local summarization
-            notify("Summarizing...", "Local LLM");
+            if (!cfg.batch_mode) notify("Summarizing...", "Local LLM");
             log_debug("pipeline: summarizing (provider=local)");
             try {
                 fs::path llm_path = ensure_llama_model(cfg.llm_model);
@@ -658,7 +658,7 @@ PipelineResult run_postprocessing(const Config& cfg, const PostprocessInput& inp
                 if (prov) url = std::string(prov->base_url) + "/chat/completions";
                 else url = "https://api.x.ai/v1/chat/completions";
             }
-            notify("Summarizing...", "Sending to " + cfg.api_model);
+            if (!cfg.batch_mode) notify("Summarizing...", "Sending to " + cfg.api_model);
             log_debug("pipeline: summarizing (provider=%s)", cfg.provider.c_str());
             try {
                 summary_text = summarize_http(transcript_text, url,
@@ -714,7 +714,7 @@ PipelineResult run_postprocessing(const Config& cfg, const PostprocessInput& inp
 
     // --- Done ---
     phase("complete");
-    notify("Meeting complete", input.out_dir.string());
+    if (!cfg.batch_mode) notify("Meeting complete", input.out_dir.string());
     fprintf(stderr, "\nDone! Files in: %s\n", input.out_dir.c_str());
     log_debug("pipeline: run_postprocessing EXIT");
     return pipe_result;
