@@ -1,8 +1,7 @@
 {
-  "iter_n": 124,
-  "anchor_sha": "af80fe54751eaa3d1b001b3be7aab977eff179cf",
+  "iter_n": 126,
+  "anchor_sha": "0484282da10fbdca82b07eb7617fca7860cc6e94",
   "active": [
-    "persist-meeting-context-per-instance-file-naming",
     "thin-client-recording-server"
   ],
   "done": [
@@ -45,6 +44,7 @@
     "obsidian-plugin",
     "open-latest-session",
     "optimized-dancing-pearl",
+    "persist-meeting-context-per-instance-file-naming",
     "pipeline-write-error-checks",
     "portable-onnxruntime-build-detail",
     "postprocess-memory-containment",
