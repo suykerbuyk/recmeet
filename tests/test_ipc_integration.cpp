@@ -5,7 +5,9 @@
 #include "ipc_server.h"
 #include "ipc_client.h"
 #include "ipc_protocol.h"
+#include "pipeline.h"
 #include "speaker_id.h"
+#include "util.h"
 
 #include <atomic>
 #include <chrono>
@@ -81,6 +83,13 @@ struct DaemonSim {
     std::mutex context_mu;
     std::string pending_context;
     std::string pending_vocab;
+
+    // Per-recording output dir + timestamp (mirrors PostprocessInput).
+    // Set by record.start (from `output_dir` param when provided), consumed
+    // by rec_worker to call save_meeting_context() — mirroring the
+    // production fix in daemon::rec_worker.
+    fs::path current_out_dir;
+    std::string current_timestamp;
 
     // For legacy wait_for_state compatibility
     std::atomic<int> state{SIdle};
@@ -202,6 +211,23 @@ struct DaemonSim {
                 }
             }
 
+            // Optional `output_dir` param — used by [context-persist] tests to
+            // exercise the save_meeting_context() path inside rec_worker.
+            // When provided, derive_meeting_timestamp() resolves the canonical
+            // YYYY-MM-DD_HH-MM stamp from the dir basename.
+            fs::path out_dir;
+            std::string out_timestamp;
+            {
+                auto it = req.params.find("output_dir");
+                if (it != req.params.end()) {
+                    std::string val = json_val_as_string(it->second);
+                    if (!val.empty()) {
+                        out_dir = val;
+                        out_timestamp = derive_meeting_timestamp(out_dir);
+                    }
+                }
+            }
+
             // Guard: !recording && !downloading (allow during postprocessing)
             {
                 std::lock_guard<std::mutex> lock(state_mu);
@@ -212,6 +238,8 @@ struct DaemonSim {
                 }
                 recording.store(true);
                 is_reprocess = reprocess;
+                current_out_dir = out_dir;
+                current_timestamp = out_timestamp;
                 update_legacy_state();
             }
 
@@ -242,6 +270,28 @@ struct DaemonSim {
                         broadcast_state_inline("simulated pipeline error");
                     });
                     return;
+                }
+
+                // Drain pending context under context_mu (mirrors production daemon::rec_worker).
+                std::string ctx_inline;
+                {
+                    std::lock_guard<std::mutex> ctx_lock(context_mu);
+                    if (!pending_context.empty()) {
+                        ctx_inline = pending_context;
+                        pending_context.clear();
+                    }
+                    pending_vocab.clear();
+                }
+
+                // Persist context for future reprocessing — outside context_mu, mirroring
+                // the production fix. File I/O must not block concurrent job.context IPC.
+                if (!reprocess && !current_out_dir.empty()) {
+                    try {
+                        save_meeting_context(current_out_dir, ctx_inline, fs::path{},
+                                             current_timestamp);
+                    } catch (...) {
+                        // Mirror production: log_warn but don't fail the worker.
+                    }
                 }
 
                 // Enqueue postprocessing job
@@ -1966,4 +2016,141 @@ TEST_CASE("TCP reconnect: server restart detected by client", "[ipc][integration
 
     server->stop();
     srv2.join();
+}
+
+// ===========================================================================
+// Category: Context persistence (regression for the production bug where
+// context.json was never written for tray-driven recordings).
+//
+// Production root cause: pipeline.cpp had the save site guarded on
+// `cfg.reprocess_dir.empty()`, but daemon.cpp:399 mutates that flag to
+// non-empty before the postprocess subprocess is forked — making the save
+// dead code on every daemon path.
+//
+// Fix: save_meeting_context() is now called from daemon::rec_worker outside
+// the g_context_mu lock scope. DaemonSim's record.start handler mirrors the
+// fix (drain pending_context, then call save_meeting_context outside the
+// mutex), so these tests exercise the same control flow.
+// ===========================================================================
+
+namespace {
+// RAII tmpdir helper for [context-persist] tests.
+//
+// The meeting-dir basename MUST match the canonical YYYY-MM-DD_HH-MM pattern
+// — derive_meeting_timestamp() parses the basename via sscanf, so a prefix
+// like "recmeet_..." would push the canonical chars out of range. We nest
+// the canonical-named meeting dir under a uniquely-named parent so multiple
+// tests can run in parallel without colliding.
+struct TmpMeetingDir {
+    fs::path parent;
+    fs::path path;
+    std::string timestamp;
+
+    explicit TmpMeetingDir(const std::string& ts = "2026-05-07_10-30")
+        : timestamp(ts)
+    {
+        // Unique parent (per-PID + nanos) avoids collisions between tests.
+        auto now = std::chrono::steady_clock::now().time_since_epoch().count();
+        parent = fs::temp_directory_path()
+            / ("recmeet_test_ctx_persist_" + std::to_string(getpid()) + "_" + std::to_string(now));
+        path = parent / ts;
+        fs::remove_all(parent);
+        fs::create_directories(path);
+    }
+    ~TmpMeetingDir() { fs::remove_all(parent); }
+};
+} // anonymous namespace
+
+TEST_CASE("record.start -> job.context -> record.stop persists context_<ts>.json",
+          "[context-persist][ipc][integration]") {
+    TmpMeetingDir tmp;
+    DaemonSim sim;
+    sim.start();
+
+    auto client = make_client();
+    IpcResponse resp;
+    IpcError err;
+
+    // Start recording with explicit output_dir so DaemonSim can save context there.
+    JsonMap start_params;
+    start_params["output_dir"] = tmp.path.string();
+    REQUIRE(client->call("record.start", start_params, resp, err));
+    REQUIRE(sim.recording.load());
+
+    // Send context mid-recording.
+    JsonMap ctx_params;
+    const std::string subject = "Subject: Standup\nParticipants: Alice, Bob";
+    ctx_params["context_inline"] = subject;
+    REQUIRE(client->call("job.context", ctx_params, resp, err));
+
+    // Stop — rec_worker should drain pending_context and call save_meeting_context.
+    REQUIRE(client->call("record.stop", resp, err));
+    REQUIRE(sim.wait_idle());
+
+    // Verify context_<ts>.json appeared with the expected timestamp.
+    fs::path expected = tmp.path / (std::string(CONTEXT_PREFIX) + tmp.timestamp + ".json");
+    CHECK(fs::exists(expected));
+
+    // Verify the legacy filename is NOT used when timestamp is canonical.
+    CHECK_FALSE(fs::exists(tmp.path / LEGACY_CONTEXT_NAME));
+
+    // Cross-check: find_context_file resolves the timestamped variant.
+    fs::path found = find_context_file(tmp.path);
+    CHECK(found == expected);
+}
+
+TEST_CASE("record.start -> record.stop with no job.context writes no context file",
+          "[context-persist][ipc][integration]") {
+    TmpMeetingDir tmp;
+    DaemonSim sim;
+    sim.start();
+
+    auto client = make_client();
+    IpcResponse resp;
+    IpcError err;
+
+    JsonMap start_params;
+    start_params["output_dir"] = tmp.path.string();
+    REQUIRE(client->call("record.start", start_params, resp, err));
+    REQUIRE(sim.recording.load());
+
+    // No job.context — straight to stop.
+    REQUIRE(client->call("record.stop", resp, err));
+    REQUIRE(sim.wait_idle());
+
+    // Verify NO context file was written (empty inline + empty file = no save).
+    fs::path stamped = tmp.path / (std::string(CONTEXT_PREFIX) + tmp.timestamp + ".json");
+    CHECK_FALSE(fs::exists(stamped));
+    CHECK_FALSE(fs::exists(tmp.path / LEGACY_CONTEXT_NAME));
+    CHECK(find_context_file(tmp.path).empty());
+}
+
+TEST_CASE("record.start -> job.context (empty string) -> record.stop writes no context file",
+          "[context-persist][ipc][integration]") {
+    TmpMeetingDir tmp;
+    DaemonSim sim;
+    sim.start();
+
+    auto client = make_client();
+    IpcResponse resp;
+    IpcError err;
+
+    JsonMap start_params;
+    start_params["output_dir"] = tmp.path.string();
+    REQUIRE(client->call("record.start", start_params, resp, err));
+    REQUIRE(sim.recording.load());
+
+    // Send empty context — save_meeting_context's "both empty" guard should skip the write.
+    JsonMap ctx_params;
+    ctx_params["context_inline"] = std::string("");
+    REQUIRE(client->call("job.context", ctx_params, resp, err));
+
+    REQUIRE(client->call("record.stop", resp, err));
+    REQUIRE(sim.wait_idle());
+
+    // Verify NO context file was written.
+    fs::path stamped = tmp.path / (std::string(CONTEXT_PREFIX) + tmp.timestamp + ".json");
+    CHECK_FALSE(fs::exists(stamped));
+    CHECK_FALSE(fs::exists(tmp.path / LEGACY_CONTEXT_NAME));
+    CHECK(find_context_file(tmp.path).empty());
 }

@@ -1032,6 +1032,16 @@ int main(int argc, char* argv[]) {
                         g_pending_vocab.clear();
                     }
                 }
+                // Persist context for future reprocessing.
+                // Outside g_context_mu — file I/O must not block concurrent job.context IPC.
+                if (cfg.reprocess_dir.empty()) {
+                    try {
+                        save_meeting_context(input.out_dir, job_cfg.context_inline,
+                                             job_cfg.context_file, input.timestamp);
+                    } catch (const std::exception& e) {
+                        log_warn("save_meeting_context failed: %s", e.what());
+                    }
+                }
 
                 // Enqueue postprocessing job
                 PostprocessJob job;

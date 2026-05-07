@@ -42,9 +42,11 @@ std::string build_initial_prompt(const std::vector<std::string>& speaker_names,
 /// Read entire file as string. Returns empty if missing or unreadable.
 std::string read_context_file(const fs::path& path);
 
-/// Save inline context as context.json in the meeting output directory.
+/// Save inline context as context_<timestamp>.json in the meeting output directory.
+/// If timestamp is empty, falls back to the legacy filename `context.json`.
 void save_meeting_context(const fs::path& out_dir, const std::string& context_inline,
-                          const fs::path& context_file = {});
+                          const fs::path& context_file = {},
+                          const std::string& timestamp = "");
 
 /// Load context string from context.json in a meeting directory.
 /// Returns empty if file doesn't exist.

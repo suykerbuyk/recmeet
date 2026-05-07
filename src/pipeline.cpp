@@ -38,17 +38,19 @@ std::string read_context_file(const fs::path& path) {
 }
 
 void save_meeting_context(const fs::path& out_dir, const std::string& context_inline,
-                          const fs::path& context_file) {
+                          const fs::path& context_file, const std::string& timestamp) {
     if (context_inline.empty() && context_file.empty()) return;
-    fs::path path = out_dir / "context.json";
+    fs::path path = timestamp.empty()
+        ? out_dir / LEGACY_CONTEXT_NAME
+        : out_dir / (std::string(CONTEXT_PREFIX) + timestamp + ".json");
     std::ofstream out(path);
     if (!out) {
-        log_warn("Failed to write context.json: %s", path.c_str());
+        log_warn("Failed to write %s: %s", path.filename().c_str(), path.c_str());
         return;
     }
     out << "{\"context\":\"" << json_escape(context_inline)
         << "\",\"context_file\":\"" << json_escape(context_file.string()) << "\"}";
-    log_info("Saved context.json");
+    log_info("Saved %s", path.filename().c_str());
 }
 
 std::string load_meeting_context(const fs::path& out_dir) {
@@ -592,7 +594,7 @@ PipelineResult run_postprocessing(const Config& cfg, const PostprocessInput& inp
 
                     if (!meeting_speakers.empty()) {
                         try {
-                            save_meeting_speakers(input.out_dir, meeting_speakers);
+                            save_meeting_speakers(input.out_dir, meeting_speakers, input.timestamp);
                             log_info("Saved speakers.json with %zu speaker(s)",
                                      meeting_speakers.size());
                         } catch (const std::exception& e) {
@@ -628,11 +630,6 @@ PipelineResult run_postprocessing(const Config& cfg, const PostprocessInput& inp
     }
     if (context_text.empty() && !cfg.reprocess_dir.empty()) {
         context_text = load_meeting_context(input.out_dir);
-    }
-
-    // Persist context for future reprocessing
-    if (!context_text.empty() && cfg.reprocess_dir.empty()) {
-        save_meeting_context(input.out_dir, cfg.context_inline, cfg.context_file);
     }
 
     MeetingMetadata metadata;
@@ -725,6 +722,9 @@ PipelineResult run_postprocessing(const Config& cfg, const PostprocessInput& inp
 
 PipelineResult run_pipeline(const Config& cfg, StopToken& stop, PhaseCallback on_phase) {
     auto input = run_recording(cfg, stop, on_phase);
+    if (cfg.reprocess_dir.empty()) {
+        save_meeting_context(input.out_dir, cfg.context_inline, cfg.context_file, input.timestamp);
+    }
     return run_postprocessing(cfg, input, on_phase);
 }
 

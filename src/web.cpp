@@ -567,7 +567,7 @@ int main(int argc, char* argv[]) {
 
             auto result = re_identify_meeting(spks, db);
             if (!result.empty()) {
-                save_meeting_speakers(meeting_path, result);
+                save_meeting_speakers(meeting_path, result, derive_meeting_timestamp(meeting_path));
                 ++updated;
             }
         }
@@ -702,7 +702,7 @@ int main(int argc, char* argv[]) {
         spk->label = new_label;
         spk->identified = true;
         spk->confidence = 1.0f;
-        save_meeting_speakers(meeting_path, meeting_speakers);
+        save_meeting_speakers(meeting_path, meeting_speakers, derive_meeting_timestamp(meeting_path));
 
         res.set_content(R"({"ok":true,"old_label":")" + escape_json(old_label) + R"("})",
                         "application/json");

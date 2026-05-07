@@ -59,9 +59,12 @@ struct MeetingSpeaker {
     float confidence;                       // identification confidence (0 if unknown)
 };
 
-/// Save per-meeting speaker data to <meeting_dir>/speakers.json.
+/// Save per-meeting speaker data to <meeting_dir>/speakers_<timestamp>.json.
+/// If timestamp is empty, falls back to the legacy filename `speakers.json`
+/// (used by older fixtures and migration paths).
 void save_meeting_speakers(const fs::path& meeting_dir,
-                           const std::vector<MeetingSpeaker>& speakers);
+                           const std::vector<MeetingSpeaker>& speakers,
+                           const std::string& timestamp = "");
 
 /// Load per-meeting speaker data from <meeting_dir>/speakers.json.
 std::vector<MeetingSpeaker> load_meeting_speakers(const fs::path& meeting_dir);

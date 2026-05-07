@@ -247,7 +247,7 @@ bool relabel_meeting_speaker(const fs::path& meeting_dir, int cluster_id,
     }
     if (!found) return false;
 
-    save_meeting_speakers(meeting_dir, speakers);
+    save_meeting_speakers(meeting_dir, speakers, derive_meeting_timestamp(meeting_dir));
     return true;
 }
 
@@ -386,9 +386,12 @@ static bool parse_meeting_speakers(const std::string& json, std::vector<MeetingS
 }
 
 void save_meeting_speakers(const fs::path& meeting_dir,
-                           const std::vector<MeetingSpeaker>& speakers) {
+                           const std::vector<MeetingSpeaker>& speakers,
+                           const std::string& timestamp) {
     fs::create_directories(meeting_dir);
-    fs::path path = meeting_dir / "speakers.json";
+    fs::path path = timestamp.empty()
+        ? meeting_dir / LEGACY_SPEAKERS_NAME
+        : meeting_dir / (std::string(SPEAKERS_PREFIX) + timestamp + ".json");
     std::ofstream out(path);
     if (!out)
         throw RecmeetError("Cannot write speakers.json: " + path.string());
