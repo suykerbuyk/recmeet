@@ -67,6 +67,16 @@ endif()
 set(CMAKE_WARN_DEPRECATED OFF CACHE BOOL "" FORCE)
 set(CMAKE_POLICY_VERSION_MINIMUM 3.10 CACHE STRING "" FORCE)
 
+# GGML compute backends shared by whisper.cpp and llama.cpp. Vulkan covers
+# AMD/Intel/NVIDIA on Linux via the ICD loader (no vendor SDK required) and
+# falls back to CPU at runtime if no Vulkan device is enumerated. Default
+# OFF so packaged builds stay portable to systems without libvulkan.so.1;
+# enable at configure time with `cmake -DRECMEET_GGML_VULKAN=ON`.
+option(RECMEET_GGML_VULKAN "Enable Vulkan compute backend in ggml" OFF)
+if(RECMEET_GGML_VULKAN)
+    set(GGML_VULKAN ON CACHE BOOL "" FORCE)
+endif()
+
 # Vendor: whisper.cpp
 set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
 set(WHISPER_BUILD_TESTS OFF CACHE BOOL "" FORCE)
