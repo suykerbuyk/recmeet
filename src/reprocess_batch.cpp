@@ -266,10 +266,40 @@ extern "C" void batch_daemon_sigint_handler(int) {
     }
 }
 
-// Phase 3 will add `batch_sigint_handler` (standalone-mode equivalent) and
-// install/restore both handlers at batch entry/exit. Declaration left here
-// so the symbol can be wired without re-touching this file's structure.
-extern "C" void batch_sigint_handler(int);  // Phase 3 owns the body
+// Standalone-mode batch-level SIGINT/SIGTERM handler. Trips the batch-stop
+// flag and (if an iteration is in flight) requests cancellation on its
+// StopToken. No mutex, no IPC call — daemon-mode iterations install
+// `batch_daemon_sigint_handler` per-iteration via dispatch_one_reprocess
+// (which nests under this batch-level handler when also installed).
+//
+// Both atomics use release/acquire so the loop's between-iteration check
+// and the in-flight pipeline's StopToken poll both observe the flip
+// without locking. StopToken::request() is itself an atomic store
+// (util.h:40), so this whole handler stays inside the POSIX
+// async-signal-safe set.
+extern "C" void batch_sigint_handler(int) {
+    g_batch_stop_requested.store(true, std::memory_order_release);
+    StopToken* tok = g_active_iter_stop.load(std::memory_order_acquire);
+    if (tok) tok->request();
+}
+
+// Test-only hooks. Defined here so the Catch2 binary can invoke the handler
+// against this translation unit's file-static atomics (otherwise the test
+// would only see its own copy). Production code never touches these.
+namespace test_hooks {
+extern "C" void test_batch_sigint_handler(int sig) {
+    ::recmeet::batch_sigint_handler(sig);
+}
+void set_active_iter_stop(StopToken* tok) {
+    g_active_iter_stop.store(tok, std::memory_order_release);
+}
+bool batch_stop_requested() {
+    return g_batch_stop_requested.load(std::memory_order_acquire);
+}
+void reset_batch_stop_requested() {
+    g_batch_stop_requested.store(false, std::memory_order_release);
+}
+} // namespace test_hooks
 
 // ---------------------------------------------------------------------------
 // Classification — enumerate immediate subdirs matching the meeting-dir
@@ -580,18 +610,45 @@ int run_reprocess_batch(const CliResult& cli) {
     Config cfg_for_iter = orig_cfg;
     cfg_for_iter.batch_mode = true;
 
-    // 11. Save previous SIGACTION for SIGINT/SIGTERM. Phase 3 will install
-    //     `batch_sigint_handler` here (standalone-mode batch-level handler).
-    //     For now we only save+restore so daemon-mode `dispatch_one_reprocess`
-    //     can rely on a stable starting state.
-    struct sigaction prev_int{};
-    struct sigaction prev_term{};
-    sigaction(SIGINT, nullptr, &prev_int);
-    sigaction(SIGTERM, nullptr, &prev_term);
-
-    // TODO(Phase 3): install `batch_sigint_handler` here for standalone-mode
-    // batches so SIGINT between iterations / during a standalone-mode
-    // iteration trips iter_stop and sets g_batch_stop_requested.
+    // 11. Install batch-level SIGINT/SIGTERM handler for standalone mode.
+    //     Daemon mode's `dispatch_one_reprocess` installs the hybrid daemon
+    //     handler per iteration, so between iterations the default
+    //     disposition is in effect (Ctrl-C terminates — acceptable; no work
+    //     in flight). The standalone path needs the handler installed once
+    //     for the entire batch so SIGINT during run_pipeline trips iter_stop
+    //     and SIGINT between iterations trips g_batch_stop_requested for the
+    //     loop's between-iteration check.
+    //
+    //     RAII guard restores the previous sigaction on any exit path
+    //     (normal return, exception, early return below).
+    struct SigGuard {
+        struct sigaction prev_int{};
+        struct sigaction prev_term{};
+        bool installed = false;
+        SigGuard(bool install) {
+            sigaction(SIGINT, nullptr, &prev_int);
+            sigaction(SIGTERM, nullptr, &prev_term);
+            if (install) {
+                struct sigaction sa{};
+                sa.sa_handler = batch_sigint_handler;
+                sigemptyset(&sa.sa_mask);
+                sa.sa_flags = 0;
+                sigaction(SIGINT, &sa, nullptr);
+                sigaction(SIGTERM, &sa, nullptr);
+                installed = true;
+            }
+        }
+        ~SigGuard() {
+            sigaction(SIGINT, &prev_int, nullptr);
+            sigaction(SIGTERM, &prev_term, nullptr);
+        }
+        SigGuard(const SigGuard&) = delete;
+        SigGuard& operator=(const SigGuard&) = delete;
+    };
+    // Reset the batch-stop flag so a re-entrant call (e.g. tests, or a
+    // future daemonised batch driver) sees a clean slate.
+    g_batch_stop_requested.store(false, std::memory_order_release);
+    SigGuard sig_guard(mode == BatchDispatchMode::Standalone);
 
     // 12. Loop over WILL-REPROCESS meetings.
     struct IterReport {
@@ -600,7 +657,7 @@ int run_reprocess_batch(const CliResult& cli) {
     };
     std::vector<IterReport> reports;
     bool aborted_daemon_unreachable = false;
-    size_t failed = 0, ok = 0;
+    size_t failed = 0, ok = 0, cancelled = 0;
     size_t idx = 0;
     bool any_started = false;
 
@@ -643,6 +700,19 @@ int run_reprocess_batch(const CliResult& cli) {
             break;
         }
 
+        // If SIGINT tripped iter_stop mid-flight, the dispatch path will have
+        // returned Failed (run_pipeline throws RecmeetError("Cancelled"); the
+        // daemon path returns the exit code from client_record_no_sigaction).
+        // Re-classify those as Cancelled so the summary reads correctly and
+        // exit code 130 is reported, not 1. Note: this checks BOTH the
+        // per-iteration token AND the batch flag — either being tripped
+        // implies the user hit Ctrl-C during this iteration.
+        if (o.kind == Outcome::Kind::Failed
+            && (iter_stop.stop_requested()
+                || g_batch_stop_requested.load(std::memory_order_acquire))) {
+            o.kind = Outcome::Kind::Cancelled;
+        }
+
         if (o.kind == Outcome::Kind::Ok) {
             ++ok;
             fprintf(stderr, "[%zu/%zu] %s — DONE",
@@ -651,6 +721,11 @@ int run_reprocess_batch(const CliResult& cli) {
                 fprintf(stderr, " -> %s", o.note_path.c_str());
             }
             fprintf(stderr, " (%s)\n\n", format_duration(o.duration_seconds).c_str());
+        } else if (o.kind == Outcome::Kind::Cancelled) {
+            ++cancelled;
+            fprintf(stderr, "[%zu/%zu] %s — CANCELLED (%s)\n\n",
+                    idx, will_count, e.timestamp.c_str(),
+                    format_duration(o.duration_seconds).c_str());
         } else {
             ++failed;
             fprintf(stderr, "[%zu/%zu] %s — FAIL: %s (%s)\n\n",
@@ -664,14 +739,21 @@ int run_reprocess_batch(const CliResult& cli) {
 
     (void)any_started;
 
-    // 13. Restore previous SIGACTION. Phase 3 owns the install side.
-    // TODO(Phase 3): pair this restore with the Phase-3 install above.
-    sigaction(SIGINT, &prev_int, nullptr);
-    sigaction(SIGTERM, &prev_term, nullptr);
+    // 13. Previous SIGACTION restore is handled by sig_guard's destructor
+    //     when this function returns (covers normal return, early return,
+    //     and exception unwind paths uniformly).
 
     // 14. Final tally + single end-of-batch desktop notification.
-    fprintf(stderr, "Summary: %zu ok, %zu failed, %zu skipped (out of %zu to process)\n",
-            ok, failed, will_count - ok - failed, will_count);
+    //     "skipped" here means meetings inside the WILL-REPROCESS set that
+    //     never started because the loop bailed early (SIGINT between
+    //     iterations or daemon disappearance). Cancelled is reported
+    //     separately so the operator can tell partial work apart from
+    //     not-yet-attempted.
+    size_t not_started = will_count - ok - failed - cancelled;
+    fprintf(stderr,
+            "Summary: %zu ok, %zu failed, %zu cancelled, %zu skipped "
+            "(out of %zu to process)\n",
+            ok, failed, cancelled, not_started, will_count);
     if (failed > 0) {
         fprintf(stderr, "Failed:\n");
         for (const auto& r : reports) {
@@ -682,12 +764,20 @@ int run_reprocess_batch(const CliResult& cli) {
             }
         }
     }
+    if (cancelled > 0) {
+        fprintf(stderr, "Cancelled:\n");
+        for (const auto& r : reports) {
+            if (r.outcome.kind == Outcome::Kind::Cancelled) {
+                fprintf(stderr, "  %s\n", r.entry->timestamp.c_str());
+            }
+        }
+    }
 
     {
         char body[256];
         std::snprintf(body, sizeof(body),
-                      "%zu ok, %zu failed, %zu skipped",
-                      ok, failed, will_count - ok - failed);
+                      "%zu ok, %zu failed, %zu cancelled, %zu skipped",
+                      ok, failed, cancelled, not_started);
         notify("Reprocess batch complete", body);
     }
 

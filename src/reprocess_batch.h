@@ -68,6 +68,21 @@ std::vector<BatchEntry> classify_batch_entries(
 /// mutexes — signal-handler safety.
 extern std::atomic<IpcClient*> g_active_ipc_client;
 
+/// Test-only hooks for Phase 3 SIGINT plumbing. Not part of the public
+/// API surface; declared here so the Catch2 unit test can invoke the
+/// handler in-process and inspect the atomics without poking file-static
+/// state. Production callers go through signal delivery, not these.
+/// (Renamed to avoid colliding with the `extern "C"` production handler
+/// of the same base name in the same translation unit.)
+namespace test_hooks {
+/// `extern "C"` so it can be passed directly as `sa.sa_handler`. Forwards
+/// to the production `batch_sigint_handler` in this TU.
+extern "C" void test_batch_sigint_handler(int);
+void set_active_iter_stop(StopToken* tok);
+bool batch_stop_requested();
+void reset_batch_stop_requested();
+} // namespace test_hooks
+
 /// Sentinel exit code returned by `client_record_no_sigaction` when the IPC
 /// connect() call fails. Mapped to `Outcome::DaemonUnreachable` by the batch
 /// dispatcher (which aborts the batch). The single-meeting wrapper masks

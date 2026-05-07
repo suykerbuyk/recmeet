@@ -19,6 +19,7 @@
 #include "reprocess_batch.h"
 #include "util.h"
 
+#include <csignal>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
@@ -328,4 +329,94 @@ TEST_CASE("daemon disappearance: connect-failed sentinel is wired",
                   "client_record_no_sigaction connect-failure to "
                   "Outcome::DaemonUnreachable");
     SUCCEED("Manual verification only — see comment above.");
+}
+
+// Phase 3 — SIGINT mid-iteration aborts current and stops loop.
+//
+// We use approach (c) from the plan: install batch_sigint_handler in this
+// process, simulate a multi-iteration batch loop with a stub StopToken
+// playing the role of g_active_iter_stop, raise(SIGINT) to self mid-
+// iteration, and verify:
+//   1. The iteration's StopToken sees stop_requested()==true (so a real
+//      run_pipeline would throw RecmeetError("Cancelled")).
+//   2. test_hooks::batch_stop_requested() returns true (so the batch loop
+//      hits its between-iteration check and breaks out).
+//   3. The loop's between-iteration check actually breaks the simulated
+//      loop on the next pass (no second iteration runs).
+//   4. Previous sigaction is restored on test exit so other tests aren't
+//      affected.
+//
+// Approach rationale: option (a) fork-based requires a stub batch binary
+// or static-linking to the test process; option (b) handler-only doesn't
+// exercise the loop's stop check. Option (c) covers both the handler and
+// the loop check in a single deterministic in-process test, which is the
+// most reliable choice on Linux/Catch2 and what the prompt prefers.
+TEST_CASE("SIGINT mid-iteration aborts current and stops loop",
+          "[reprocess-batch]") {
+    // Save the test process's current SIGINT/SIGTERM disposition. Catch2's
+    // default is unmodified — likely SIG_DFL — but we save+restore
+    // unconditionally so this test can never leak handler state.
+    struct sigaction prev_int{};
+    struct sigaction prev_term{};
+    REQUIRE(sigaction(SIGINT, nullptr, &prev_int) == 0);
+    REQUIRE(sigaction(SIGTERM, nullptr, &prev_term) == 0);
+
+    // Install batch_sigint_handler exactly as run_reprocess_batch's
+    // standalone-mode SigGuard would. The hook forwards to the same
+    // ::recmeet::batch_sigint_handler that production installs.
+    struct sigaction sa{};
+    sa.sa_handler = test_hooks::test_batch_sigint_handler;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+    REQUIRE(sigaction(SIGINT, &sa, nullptr) == 0);
+    REQUIRE(sigaction(SIGTERM, &sa, nullptr) == 0);
+
+    // Pre-state: batch flag clean, no active iter_stop.
+    test_hooks::reset_batch_stop_requested();
+    test_hooks::set_active_iter_stop(nullptr);
+    REQUIRE_FALSE(test_hooks::batch_stop_requested());
+
+    // Simulate 3 iterations. In iteration 1 we publish iter_stop, raise
+    // SIGINT (synchronous on Linux for the calling thread — handler
+    // returns before raise() does), verify both atomics flipped, then
+    // unpublish iter_stop (the real loop does this at end of iteration).
+    // The between-iteration check should then break the loop on iteration
+    // 2's entry.
+    int iterations_attempted = 0;
+    bool iter1_stop_observed = false;
+    for (int i = 0; i < 3; ++i) {
+        // Between-iteration check (mirrors reprocess_batch.cpp:611).
+        if (test_hooks::batch_stop_requested()) {
+            break;
+        }
+        ++iterations_attempted;
+
+        StopToken iter_stop;
+        test_hooks::set_active_iter_stop(&iter_stop);
+
+        if (i == 0) {
+            // Mid-iteration SIGINT.
+            REQUIRE(raise(SIGINT) == 0);
+            iter1_stop_observed = iter_stop.stop_requested();
+        }
+
+        test_hooks::set_active_iter_stop(nullptr);
+    }
+
+    // 1. iter_stop saw the request mid-iteration 1 (so run_pipeline would
+    //    throw Cancelled).
+    CHECK(iter1_stop_observed);
+    // 2. Batch flag is set (so loop bails on the next between-iteration
+    //    check).
+    CHECK(test_hooks::batch_stop_requested());
+    // 3. Only iteration 1 ran. Iteration 2 was skipped by the
+    //    between-iteration check.
+    CHECK(iterations_attempted == 1);
+
+    // Restore previous sigaction so subsequent tests run with whatever
+    // disposition they expect. Reset the batch flag too.
+    sigaction(SIGINT, &prev_int, nullptr);
+    sigaction(SIGTERM, &prev_term, nullptr);
+    test_hooks::reset_batch_stop_requested();
+    test_hooks::set_active_iter_stop(nullptr);
 }
