@@ -198,11 +198,17 @@ Any GGUF-format model compatible with llama.cpp will work. Download quantized ve
 
 ```
 meetings/2026-02-20_14-30/
-  audio_2026-02-20_14-30.wav  # Mixed mic + monitor (16kHz mono S16LE)
+  audio_2026-02-20_14-30.wav      # Mixed mic + monitor (16kHz mono S16LE)
+  context_2026-02-20_14-30.json   # Pre-recording context note (only if provided)
+  speakers_2026-02-20_14-30.json  # Per-meeting speaker data (only if --diarize)
   Meeting_2026-02-20_14-30_Project_Kickoff.md  # Meeting note
 ```
 
-Two files per meeting. The meeting note contains the transcript, summary, and action items — no separate `transcript.txt` or `summary.md`. Source WAVs (`mic.wav`, `monitor.wav`) are deleted after mixing; use `--keep-sources` to retain them.
+Up to four files per meeting. The audio + meeting note are always present. The context file is written only when the user provided context (via the tray dialog, `--context-text`, or `--context-file`) — it persists the prompt across reprocess. The speakers file is written only when diarization runs.
+
+Every artifact carries the meeting's `YYYY-MM-DD_HH-MM` timestamp suffix. Older meetings written before this convention used unsuffixed names (`audio.wav`, `context.json`, `speakers.json`); they continue to read correctly via legacy-name fallback, and reprocessing them writes the new per-instance filenames alongside.
+
+The meeting note contains the transcript, summary, and action items — no separate `transcript.txt` or `summary.md`. Source WAVs (`mic.wav`, `monitor.wav`) are deleted after mixing; use `--keep-sources` to retain them.
 
 ### Transcript format
 

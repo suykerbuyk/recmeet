@@ -240,6 +240,21 @@ flowchart TD
     DIARIZE --> IDENTIFY --> FREE_AUDIO --> SUMMARIZE --> NOTE
 ```
 
+### Meeting directory layout
+
+Every recording lives in `meetings/<YYYY-MM-DD_HH-MM>/`. All persisted artifacts inside that directory carry the meeting's timestamp as a per-instance suffix:
+
+| File | Written when | Notes |
+|---|---|---|
+| `audio_<ts>.wav` | Always (live recording or pre-existing on reprocess) | 16 kHz mono S16LE |
+| `context_<ts>.json` | Only when context_inline or context_file is non-empty | Persisted by the parent process before postprocessing |
+| `speakers_<ts>.json` | Only when diarization ran and emitted speakers | Per-meeting voiceprint + label cache |
+| `Meeting_<ts>_<title>.md` | Always | The meeting note (transcript, summary, action items) |
+
+**Legacy-name fallback.** Meetings created before the per-instance naming convention used unsuffixed filenames (`audio.wav`, `context.json`, `speakers.json`). All read paths fall back to the legacy filenames via `find_audio_file()` / `find_context_file()` / `find_speakers_file()` (see `src/util.{h,cpp}`), so old meetings keep loading. Write paths always emit the per-instance form when a canonical timestamp is available; reprocessing a legacy meeting writes new-style files alongside the audio without renaming the audio itself.
+
+**Save site placement.** `context_<ts>.json` is persisted in the **parent process** — `daemon::rec_worker` (after the pending-context drain, outside the `g_context_mu` lock scope) and `pipeline::run_pipeline` (between `run_recording` and `run_postprocessing`) — never inside `run_postprocessing`. The reason is that the daemon path forks a postprocess subprocess for memory containment, and the subprocess always runs with `cfg.reprocess_dir` set to the captured audio directory; an in-postprocess save guarded on `cfg.reprocess_dir.empty()` would be dead code on every daemon path. `speakers_<ts>.json` is still written from inside `run_postprocessing` because it's downstream of diarization (which only runs in postprocessing), and the same subprocess writes it before exit.
+
 ### Memory scoping strategy
 
 The postprocessing phase uses nested scopes to minimize peak memory:

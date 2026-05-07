@@ -730,13 +730,17 @@ flowchart TD
 
     AUDIO_FREE --> TRANSCRIPT --> EMPTY_CHECK
 
-    subgraph CONTEXT["Context Resolution"]
+    subgraph CONTEXT["Context Resolution (read-only inside run_postprocessing)"]
         CTX_INLINE["1. cfg.context_inline"]
         CTX_FILE["2. cfg.context_file (read from disk)"]
-        CTX_REPROC["3. load_meeting_context(out_dir)<br/>   (context.json fallback for reprocess)"]
-        CTX_SAVE["Persist context.json if new recording"]
-        CTX_INLINE --> CTX_FILE --> CTX_REPROC --> CTX_SAVE
+        CTX_REPROC["3. load_meeting_context(out_dir)<br/>   (find_context_file: prefers<br/>   context_&lt;ts&gt;.json, falls back<br/>   to legacy context.json)"]
+        CTX_INLINE --> CTX_FILE --> CTX_REPROC
     end
+
+    %% Note: persistence of context_<ts>.json now happens in the PARENT process
+    %% (daemon::rec_worker or pipeline::run_pipeline) BEFORE run_postprocessing
+    %% is invoked — never inside run_postprocessing. See ARCHITECTURE.md
+    %% "Meeting directory layout" for the rationale.
 
     SUMM_CHECK{"cfg.no_summary?"}
     CONTEXT --> SUMM_CHECK

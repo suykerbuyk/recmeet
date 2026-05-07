@@ -169,8 +169,12 @@ Each recording creates a directory under `meetings/`:
 ```
 meetings/2026-03-05_10-30/
   audio_2026-03-05_10-30.wav                   # Mixed audio (16kHz mono)
+  context_2026-03-05_10-30.json                # Pre-recording context (only if provided)
+  speakers_2026-03-05_10-30.json               # Per-meeting speaker data (only if --diarize)
   Meeting_2026-03-05_10-30_Sprint_Review.md    # Meeting note
 ```
+
+All artifacts share the meeting's `YYYY-MM-DD_HH-MM` timestamp suffix.
 
 The meeting note contains:
 - YAML frontmatter (date, participants, tags, duration)
