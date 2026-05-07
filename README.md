@@ -226,6 +226,45 @@ When speakers are enrolled via `--enroll`, their real names replace generic `Spe
 
 Filename includes an AI-derived title (e.g. `Meeting_2026-02-20_14-30_Project_Kickoff.md`). Contains YAML frontmatter with enriched metadata (date, time, type, domain, status, tags, participants, duration), a summary callout, action item checkboxes, and a foldable transcript section. Compatible with Obsidian Dataview.
 
+## Reprocess
+
+Re-run the postprocessing pipeline (transcription, diarization, summarization, note generation) on an existing recording without re-recording. The audio file stays untouched; everything downstream is regenerated from the current model + config.
+
+```bash
+# Reprocess a single meeting directory
+./build/recmeet --reprocess meetings/2026-02-21_17-34/ --num-speakers 2
+```
+
+Useful after upgrading whisper / diarization models, tweaking summary prompts, or recovering meetings whose original postprocessing failed (e.g. OOM on long audio before chunked diarization).
+
+### Batch reprocess
+
+To reprocess every meeting under a parent directory in one pass:
+
+```bash
+./build/recmeet --reprocess-batch ~/meetings/
+```
+
+Inspect what would be done first:
+
+```bash
+./build/recmeet --reprocess-batch ~/meetings/ --dry-run
+```
+
+The batch driver:
+
+- enumerates immediate subdirs matching `YYYY-MM-DD_HH-MM` (with optional `_N` suffix);
+- skips any meeting that already has a `Meeting_<ts>*.md` note in `--note-dir` (or in the meeting dir itself if `--note-dir` is unset);
+- skips any directory without a usable WAV file;
+- runs all remaining meetings serially (diarization and transcription each saturate cores; parallelism would thrash);
+- locks daemon vs. standalone dispatch once at start, so a daemon dying mid-batch aborts cleanly with a clear error rather than silently switching modes;
+- prints a per-meeting status line and an end-of-batch summary;
+- emits exactly one desktop notification (the summary) instead of one per meeting.
+
+A single Ctrl-C aborts the current meeting, stops the loop, prints what completed, and exits 130. Per-meeting failures are reported in the summary but do not abort the batch; the exit code is 1 if any meeting failed, 0 otherwise.
+
+`--reprocess-batch` is mutually exclusive with `--reprocess`. To re-process a single meeting that already has a note, delete the note manually and re-run; v1 has no `--force` overwrite (frontmatter and manual body edits warrant a deliberate design — tracked as follow-up).
+
 ## CLI reference
 
 ### recmeet (CLI)
@@ -275,6 +314,8 @@ Options:
   --vad-threshold F    VAD speech detection threshold (default: 0.5)
   --threads N          Number of CPU threads for inference (0 = auto-detect, default: 0)
   --reprocess DIR      Reprocess existing recording directory
+  --reprocess-batch DIR  Reprocess every meeting subdir under DIR (skips meetings with existing notes)
+  --dry-run            With --reprocess-batch: classify and tally only, don't run any pipeline work
   --log-level LEVEL    Log level: none, error, warn, info (default: none)
   --log-dir DIR        Log file directory (default: ~/.local/share/recmeet/logs/)
   --list-sources       List available audio sources and exit

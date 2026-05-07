@@ -3,7 +3,9 @@
 
 #include <catch2/catch_test_macros.hpp>
 #include "test_helpers.h"
+#include "cli.h"
 #include "pipeline.h"
+#include "reprocess_batch.h"
 #include "speaker_id.h"
 #include "model_manager.h"
 #include "config.h"
@@ -472,4 +474,154 @@ TEST_CASE("Reprocess with per-instance context_<ts>.json fallback", "[full-stack
     CHECK(note.find("Per-instance reprocess context") != std::string::npos);
 
     fs::remove_all(out_dir);
+}
+
+
+// ---------------------------------------------------------------------------
+// TEST_CASE 5: Reprocess-batch end-to-end (Phase 4)
+//
+// Builds two synthetic meeting directories that share a single (cheap) audio
+// asset, pre-creates a note for meeting #1, and runs `run_reprocess_batch`
+// against the parent. Verifies:
+//
+//   - meeting #1 is left untouched (its pre-existing note still has its
+//     original sentinel content; no new note is written for that timestamp);
+//   - meeting #2 produces a Meeting_2026-01-02_10-00_*.md note under
+//     <note-dir>/2026/01/ with non-empty transcript content.
+//
+// Forces standalone dispatch (`DaemonMode::Disable`) and `--no-summary` so
+// the test stays self-contained — no daemon, no API key, no llama model
+// required. Whisper + sherpa + VAD are still exercised through run_pipeline,
+// matching the existing [full-stack] tests' gating.
+// ---------------------------------------------------------------------------
+
+TEST_CASE("Reprocess-batch: skip-existing + reprocess-missing end-to-end",
+          "[full-stack][reprocess-batch][slow]") {
+    fs::path root = find_project_root();
+    if (root.empty())
+        SKIP("Project root with assets/ not found");
+    fs::path audio_src = root / "assets" / "biden_trump_debate_2020.wav";
+    if (!fs::exists(audio_src))
+        SKIP("Debate audio asset not found");
+    if (!is_whisper_model_cached("base"))
+        SKIP("Whisper base model not cached");
+    if (!is_sherpa_model_cached())
+        SKIP("Sherpa diarization models not cached");
+    if (!is_vad_model_cached())
+        SKIP("VAD model not cached");
+
+    // Workspace: parent dir holds the two meeting subdirs; note_dir is a
+    // sibling so the skip-rule's <note-dir>/YYYY/MM/Meeting_<ts>*.md glob
+    // is exercised exactly as in production.
+    auto workspace = fs::temp_directory_path() / "recmeet_reprocess_batch_full_stack";
+    fs::remove_all(workspace);
+    fs::create_directories(workspace);
+    fs::path parent_dir = workspace / "meetings";
+    fs::path note_dir = workspace / "notes";
+    fs::create_directories(parent_dir);
+    fs::create_directories(note_dir);
+
+    // Two meeting subdirs matching the canonical YYYY-MM-DD_HH-MM regex.
+    // Per-instance audio filenames mirror the iter-125 convention
+    // (audio_<ts>.wav inside <ts>/), which is what find_audio_file()
+    // prefers and what the production write paths emit.
+    const std::string ts1 = "2026-01-01_10-00";
+    const std::string ts2 = "2026-01-02_10-00";
+    fs::path meeting1 = parent_dir / ts1;
+    fs::path meeting2 = parent_dir / ts2;
+    fs::create_directories(meeting1);
+    fs::create_directories(meeting2);
+    fs::copy_file(audio_src, meeting1 / ("audio_" + ts1 + ".wav"));
+    fs::copy_file(audio_src, meeting2 / ("audio_" + ts2 + ".wav"));
+
+    // Pre-existing note for meeting #1, exactly where the skip rule looks:
+    // <note-dir>/<yyyy>/<mm>/Meeting_<ts>*.md.
+    fs::path m1_note_dir = note_dir / "2026" / "01";
+    fs::create_directories(m1_note_dir);
+    fs::path m1_note_path = m1_note_dir / ("Meeting_" + ts1 + "_existing.md");
+    const std::string sentinel = "SENTINEL_PRE_EXISTING_NOTE_DO_NOT_OVERWRITE";
+    {
+        std::ofstream out(m1_note_path);
+        out << "---\ntitle: stub\nstatus: processed\n---\n\n" << sentinel << "\n";
+    }
+    REQUIRE(fs::exists(m1_note_path));
+
+    // Drive run_reprocess_batch directly. Standalone mode (no daemon),
+    // no summary (no API key / no llama dependency), diarize + VAD on so
+    // the [full-stack] gating actually exercises the pipeline this test
+    // claims to cover.
+    CliResult cli;
+    cli.daemon_mode = DaemonMode::Disable;
+    cli.cfg.reprocess_batch_dir = parent_dir;
+    cli.cfg.note_dir = note_dir;
+    cli.cfg.output_dir = parent_dir;
+    cli.cfg.output_dir_explicit = true;
+    cli.cfg.whisper_model = "base";
+    cli.cfg.language = "en";
+    cli.cfg.diarize = true;
+    cli.cfg.num_speakers = 0;
+    cli.cfg.speaker_id = false;
+    cli.cfg.vad = true;
+    cli.cfg.no_summary = true;
+
+    auto t0 = std::chrono::steady_clock::now();
+    int rc = run_reprocess_batch(cli);
+    auto t1 = std::chrono::steady_clock::now();
+    double elapsed = std::chrono::duration<double>(t1 - t0).count();
+    fprintf(stderr, "\n[full-stack][reprocess-batch] run_reprocess_batch rc=%d in %.1fs\n",
+            rc, elapsed);
+
+    // Exit code must be 0 (one meeting reprocessed ok, one skipped).
+    CHECK(rc == 0);
+
+    // --- Meeting #1: untouched ---
+    INFO("Meeting #1 must be skipped (pre-existing note preserved verbatim)");
+    REQUIRE(fs::exists(m1_note_path));
+    {
+        std::ifstream f(m1_note_path);
+        std::string body((std::istreambuf_iterator<char>(f)),
+                          std::istreambuf_iterator<char>());
+        CHECK(body.find(sentinel) != std::string::npos);
+    }
+    // No new Meeting_<ts1>_*.md was written next to it (skip means skip).
+    {
+        size_t m1_notes = 0;
+        for (const auto& e : fs::directory_iterator(m1_note_dir)) {
+            const std::string name = e.path().filename().string();
+            if (name.rfind("Meeting_" + ts1, 0) == 0 &&
+                name.size() >= 3 &&
+                name.compare(name.size() - 3, 3, ".md") == 0) {
+                ++m1_notes;
+            }
+        }
+        CHECK(m1_notes == 1);  // only the pre-existing note
+    }
+
+    // --- Meeting #2: produced a note with non-empty transcript content ---
+    INFO("Meeting #2 must have a freshly-generated Meeting_<ts2>_*.md note");
+    fs::path m2_note;
+    for (const auto& e : fs::directory_iterator(m1_note_dir)) {
+        const std::string name = e.path().filename().string();
+        if (name.rfind("Meeting_" + ts2, 0) == 0 &&
+            name.size() >= 3 &&
+            name.compare(name.size() - 3, 3, ".md") == 0) {
+            m2_note = e.path();
+            break;
+        }
+    }
+    REQUIRE(!m2_note.empty());
+    REQUIRE(fs::exists(m2_note));
+
+    std::ifstream m2f(m2_note);
+    std::string m2_body((std::istreambuf_iterator<char>(m2f)),
+                         std::istreambuf_iterator<char>());
+    CHECK(!m2_body.empty());
+    // Frontmatter + transcript section markers — same shape every meeting note carries.
+    CHECK(m2_body.find("type: meeting") != std::string::npos);
+    CHECK(m2_body.find("date: 2026-01-02") != std::string::npos);
+    // The transcript section is always written; require some bracketed
+    // timestamp line, which is the non-empty-transcript signal.
+    CHECK(m2_body.find("[00:") != std::string::npos);
+
+    fs::remove_all(workspace);
 }

@@ -525,6 +525,17 @@ recmeet --source alsa_input.usb-Blue_Yeti --monitor alsa_output.pci-0000.monitor
 recmeet --reprocess meetings/2026-02-21_17-34/ --num-speakers 2
 ```
 
+To reprocess every meeting under a parent directory in one pass, with a
+dry-run preview first:
+
+```bash
+recmeet --reprocess-batch ~/meetings/ --dry-run
+recmeet --reprocess-batch ~/meetings/
+```
+
+See README "Batch reprocess" for full semantics (skip rule, partial-failure
+behaviour, and the Ctrl-C contract).
+
 ### Mic-only recording (no speaker output)
 
 ```bash

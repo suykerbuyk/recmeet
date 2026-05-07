@@ -264,6 +264,14 @@ The postprocessing phase uses nested scopes to minimize peak memory:
 
 This matters because whisper models (75 MB–1.5 GB) and audio buffers (16-bit, 16 kHz) can be large.
 
+### Reprocess flow
+
+Single-meeting (`--reprocess <dir>`) and batch (`--reprocess-batch <parent>`) share the same per-meeting code path: `run_pipeline` (standalone) or the daemon's `record.start` IPC + postprocess subprocess. The batch driver only adds orchestration and signal plumbing on top.
+
+- **`run_reprocess_batch`** (`src/reprocess_batch.cpp`) classifies immediate `YYYY-MM-DD_HH-MM(_N)?` subdirs into `WillReprocess` / `SkipNoteExists` / `SkipNoAudio` (`classify_batch_entries`), runs `ensure_models_cached_or_fail` once before the loop so a missing whisper/sherpa/VAD/llama model fails fast, locks the dispatch mode (`BatchDispatchMode::Daemon` or `Standalone`) at batch entry, and dispatches each meeting serially via `dispatch_one_reprocess`.
+- **Per-iteration `StopToken` plumbing** — each iteration owns a fresh `StopToken iter_stop`. Before dispatch the driver publishes `&iter_stop` into `g_active_iter_stop` (atomic, release-store); the standalone-mode `batch_sigint_handler` and the daemon-mode `batch_daemon_sigint_handler` (installed per-iteration around the IPC call by `dispatch_one_reprocess_daemon`) read it via acquire-load and trip the token without ever touching a mutex (POSIX async-signal-safety). The handlers also set `g_batch_stop_requested` so the loop's between-iteration check breaks out cleanly. A `SigGuard` RAII helper saves and restores the previous `sigaction` on every exit path.
+- **IPC `batch_job` propagation** — the `record.start` request carries `cfg.batch_mode`; the daemon stores it on the per-job state and stamps it onto the `job.complete` event as `batch_job: <bool>`. The tray (`tray.cpp`) gates its "Meeting note ready" desktop notification on `!batch_job` so a 30-meeting batch produces a single end-of-batch summary notification (emitted by the batch driver itself in the operator's terminal), not one per meeting. Pipeline-error notifications stay unconditional — failures want operator attention regardless of mode.
+
 ## Diarization
 
 Speaker diarization labels each transcript segment with `Speaker_01`, `Speaker_02`, etc. before speaker identification (or `merge_speakers()`) renames them. recmeet has two diarization paths that share the same `DiarizeResult` data shape; the pipeline picks one based on audio length.
