@@ -229,6 +229,162 @@ fs::path download_vad_model() {
 }
 #endif
 
+// ---------------------------------------------------------------------------
+// Phase 4 — streaming caption (online ASR) models.
+//
+// Layout mirrors the sherpa-onnx model zoo: each curated model has a
+// `.tar.bz2` whose top-level dir matches the repo name. Extraction strips
+// one directory component so the files land directly in
+// `<models>/sherpa/online/<short-name>/`.
+//
+// **Download URL provenance.** Tarballs live on the sherpa-onnx project's
+// GitHub Releases (`asr-models` release) — the canonical mirror that the
+// upstream sherpa-onnx project itself documents. The corresponding
+// HuggingFace repos host the individual ONNX files but no longer ship a
+// tarball, so we fetch from GitHub Releases. URL was relocated 2026-05-09;
+// see CHANGELOG entry under v1.0.0 for details. Switch to per-file
+// HuggingFace fetches is a possible future optimization (would shrink the
+// download from ~310 MB to ~74 MB by skipping the fp32 weights we don't
+// load), tracked as a follow-up.
+//
+// The two models we surface for V1:
+//   * en-2023-06-26 — Phase 0.2-locked Zipformer, the default.
+//                     Tarball ships both int8 (~74 MB runtime) and fp32
+//                     (~262 MB) weights; ~310 MB download.
+//   * en-small      — 20 M-param fast Zipformer, low-end-host fallback.
+//                     Same dual-precision packaging; ~128 MB download.
+//
+// `is_caption_model_cached()` is deliberately resilient: model-zoo entries
+// don't all use the same `encoder-epoch-99-avg-1.onnx` filename, so we
+// prefix-match on `encoder/decoder/joiner` and accept any `*.onnx`
+// variant. The same logic gates download skip in `ensure_caption_model`.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+struct CaptionModelInfo {
+    std::string url;        // tarball URL (sherpa-onnx asr-models GH release)
+    std::string size_hint;  // human-readable download size for the prompt
+};
+
+const std::map<std::string, CaptionModelInfo>& caption_models_table() {
+    static const std::map<std::string, CaptionModelInfo> models = {
+        {"en-2023-06-26",
+            {"https://github.com/k2-fsa/sherpa-onnx/releases/download/"
+             "asr-models/sherpa-onnx-streaming-zipformer-en-2023-06-26.tar.bz2",
+             "~310 MB"}},
+        {"en-small",
+            {"https://github.com/k2-fsa/sherpa-onnx/releases/download/"
+             "asr-models/sherpa-onnx-streaming-zipformer-en-20M-2023-02-17.tar.bz2",
+             "~128 MB"}},
+    };
+    return models;
+}
+
+constexpr const char* DEFAULT_CAPTION_MODEL = "en-2023-06-26";
+
+std::string resolve_caption_model_name(const std::string& name) {
+    return name.empty() ? std::string(DEFAULT_CAPTION_MODEL) : name;
+}
+
+} // anonymous namespace
+
+std::vector<std::string> known_caption_models() {
+    std::vector<std::string> out;
+    out.reserve(caption_models_table().size());
+    for (const auto& [k, _v] : caption_models_table())
+        out.push_back(k);
+    return out;
+}
+
+std::string caption_model_size_hint(const std::string& name) {
+    std::string canonical = resolve_caption_model_name(name);
+    const auto& table = caption_models_table();
+    auto it = table.find(canonical);
+    return it == table.end() ? std::string{} : it->second.size_hint;
+}
+
+fs::path caption_model_dir(const std::string& name) {
+    return models_dir() / "sherpa" / "online" / resolve_caption_model_name(name);
+}
+
+bool is_caption_model_cached(const std::string& name) {
+    fs::path dir = caption_model_dir(name);
+    std::error_code ec;
+    if (!fs::is_directory(dir, ec)) return false;
+
+    bool has_enc = false, has_dec = false, has_join = false, has_tok = false;
+    for (auto& e : fs::directory_iterator(dir, ec)) {
+        if (ec) return false;
+        if (!e.is_regular_file()) continue;
+        if (fs::file_size(e.path()) == 0) continue;
+        std::string n = e.path().filename().string();
+        bool is_onnx = n.size() >= 5 &&
+                       n.compare(n.size() - 5, 5, ".onnx") == 0;
+        if (is_onnx && n.compare(0, 7, "encoder") == 0) has_enc = true;
+        if (is_onnx && n.compare(0, 7, "decoder") == 0) has_dec = true;
+        if (is_onnx && n.compare(0, 6, "joiner")  == 0) has_join = true;
+        if (n == "tokens.txt") has_tok = true;
+    }
+    return has_enc && has_dec && has_join && has_tok;
+}
+
+#if RECMEET_USE_SHERPA
+fs::path ensure_caption_model(const std::string& name) {
+    std::string canonical = resolve_caption_model_name(name);
+    const auto& table = caption_models_table();
+    auto it = table.find(canonical);
+    if (it == table.end()) {
+        std::string available;
+        for (const auto& [k, _v] : table) {
+            if (!available.empty()) available += ", ";
+            available += k;
+        }
+        throw RecmeetError("Unknown caption model: " + canonical +
+                           ". Available: " + available);
+    }
+
+    fs::path dir = caption_model_dir(canonical);
+    if (is_caption_model_cached(canonical))
+        return dir;
+
+    fs::create_directories(dir);
+    download_and_extract_tarball(it->second.url, dir);
+
+    if (!is_caption_model_cached(canonical)) {
+        throw RecmeetError(
+            "Caption model files not found after extraction in: " + dir.string() +
+            " (expected encoder-*.onnx, decoder-*.onnx, joiner-*.onnx, tokens.txt)");
+    }
+    return dir;
+}
+
+fs::path download_caption_model(const std::string& name) {
+    std::string canonical = resolve_caption_model_name(name);
+    const auto& table = caption_models_table();
+    auto it = table.find(canonical);
+    if (it == table.end()) {
+        std::string available;
+        for (const auto& [k, _v] : table) {
+            if (!available.empty()) available += ", ";
+            available += k;
+        }
+        throw RecmeetError("Unknown caption model: " + canonical +
+                           ". Available: " + available);
+    }
+    fs::path dir = caption_model_dir(canonical);
+    fs::create_directories(dir);
+    download_and_extract_tarball(it->second.url, dir);
+    return dir;
+}
+#else
+fs::path ensure_caption_model(const std::string& /*name*/) {
+    throw RecmeetError(
+        "captions require RECMEET_USE_SHERPA=ON build "
+        "(rebuild with: cmake -B build -DRECMEET_USE_SHERPA=ON)");
+}
+#endif
+
 std::vector<ModelStatus> list_cached_models() {
     std::vector<ModelStatus> result;
 
@@ -279,6 +435,28 @@ std::vector<ModelStatus> list_cached_models() {
         result.push_back(std::move(s));
     }
 #endif
+
+    // Phase 4 — streaming caption models. Surfaced in both build flavors so
+    // operators on a no-sherpa build still see the cache layout (the
+    // download/run path is sherpa-only, gated above by ensure_caption_model).
+    for (const auto& name : known_caption_models()) {
+        ModelStatus s;
+        s.name = name;
+        s.category = "caption";
+        s.path = caption_model_dir(name).string();
+        s.cached = is_caption_model_cached(name);
+        if (s.cached) {
+            // Sum size of *.onnx + tokens.txt for the report.
+            int64_t total = 0;
+            std::error_code ec;
+            for (auto& e : fs::directory_iterator(s.path, ec)) {
+                if (ec) break;
+                if (e.is_regular_file()) total += static_cast<int64_t>(fs::file_size(e.path()));
+            }
+            s.size_bytes = total;
+        }
+        result.push_back(std::move(s));
+    }
 
     return result;
 }

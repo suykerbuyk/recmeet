@@ -39,7 +39,7 @@ do not exist on the other side. This shapes everything below.
 ## The split decision
 
 **Single repo, V1 on a long-lived `v1-maintenance` branch from the
-`v1.0.0` tag, V2 on `main`.**
+`v1.5.0` tag, V2 on `main`.**
 
 ### Considered alternatives
 
@@ -70,14 +70,16 @@ do not exist on the other side. This shapes everything below.
    latency, model choice, and quality tradeoffs in the simpler V1
    single-process context before V2 inherits them in a more complex
    client/server context.
-2. **Tag `v1.0.0` from `main`** once live captioning is shipped and any
-   release-blocking polish lands.
-3. **Cut `v1-maintenance` from `v1.0.0`.** This branch is the V1 line
+2. **Tag `v1.5.0` from `main`** once live captioning is shipped and any
+   release-blocking polish lands. (1.5.0 follows the existing 1.3.x and
+   1.4.x V1 lineage; it is the V1 capstone, not the inaugural V1 release.)
+3. **Cut `v1-maintenance` from `v1.5.0`.** This branch is the V1 line
    forever after.
 4. **`main` becomes V2 development trunk.** First V2 commit is the
    start of the thin-client work (Phase A: security foundation).
-5. **V1 patch releases** tagged from `v1-maintenance` as `v1.0.x`,
-   `v1.1.x`, etc.
+5. **V1 patch releases** tagged from `v1-maintenance` as `v1.5.x`. The
+   maintenance policy is patches only; future minor bumps are
+   intentionally not anticipated (see "Maintenance commitment" below).
 6. **V2 releases** tagged from `main` as `v2.0.0`, `v2.1.0`, etc.
 
 Per-branch build state is kept in distinct CMake build directories
@@ -308,7 +310,7 @@ indefinitely.
 **Maintenance commitment** for `v1-maintenance`: dep bumps and security
 fixes for as long as upstream support for the dependency stack
 continues. Feature work does not happen on `v1-maintenance` after
-`v1.0.0` ships.
+`v1.5.0` ships.
 
 ---
 

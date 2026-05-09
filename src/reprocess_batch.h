@@ -93,7 +93,14 @@ constexpr int kClientConnectFailedExitCode = 2;
 /// the reprocess-batch dispatcher's daemon-mode path. Does NOT install
 /// signal handlers (callers do that around it). Returns 0 on success, 1 on
 /// iteration error, or `kClientConnectFailedExitCode` (2) on connect failure.
-int client_record_no_sigaction(const Config& cfg, const std::string& addr);
+///
+/// `show_captions_on_stderr` (Phase 5.2) — when true, `caption` and
+/// `caption.degraded` events are rendered to stderr alongside phase / progress
+/// lines. Reads `cfg.caption_normalize_display` to decide whether to apply
+/// `normalize_caption()` before printing. Defaults to false; the
+/// reprocess-batch driver leaves it off (no captions during reprocess).
+int client_record_no_sigaction(const Config& cfg, const std::string& addr,
+                               bool show_captions_on_stderr = false);
 
 /// Once-per-batch model precheck. Validates that all models any iteration
 /// might need (whisper, sherpa, VAD, llama, summary readiness) are cached

@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.28)
-project(recmeet VERSION 0.9.0 LANGUAGES C CXX)
+project(recmeet VERSION 1.5.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -165,6 +165,7 @@ set(IPC_SOURCES
     src/config_json.cpp
     src/ipc_client.cpp
     src/ipc_server.cpp
+    src/caption_format.cpp
 )
 
 add_library(recmeet_ipc STATIC ${IPC_SOURCES})
@@ -200,6 +201,7 @@ set(CORE_SOURCES
     src/diarize.cpp
     src/speaker_id.cpp
     src/vad.cpp
+    src/caption_vtt.cpp
 )
 
 add_library(recmeet_core STATIC ${CORE_SOURCES})
@@ -221,6 +223,15 @@ if(RECMEET_USE_SHERPA)
     target_link_libraries(recmeet_core PUBLIC sherpa-onnx-c-api)
     target_compile_definitions(recmeet_core PUBLIC RECMEET_USE_SHERPA=1)
 endif()
+
+# Phase 2 — streaming caption engine. Compiled in both build flavors:
+#  - With RECMEET_USE_SHERPA=ON the .cpp pulls in <sherpa-onnx/c-api/c-api.h>
+#    and builds the real recognizer-backed engine.
+#  - With RECMEET_USE_SHERPA=OFF the same .cpp compiles to stub bodies; the
+#    only side effect of start() is to set last_error() to
+#    "captions require RECMEET_USE_SHERPA=ON build" and return false. The
+#    header is single-source-of-truth so callers compile uniformly.
+target_sources(recmeet_core PRIVATE src/caption_engine.cpp)
 
 # CLI binary
 add_executable(recmeet src/main.cpp)
@@ -292,7 +303,15 @@ if(RECMEET_BUILD_TESTS)
         tests/test_ipc_integration.cpp
         tests/test_ndjson_parse.cpp
         tests/test_full_stack.cpp
+        tests/test_full_stack_captions.cpp
         tests/test_integration_pipeline.cpp
+        tests/streaming_capture_tests.cpp
+        tests/streaming_engine_tests.cpp
+        tests/test_caption_ipc_integration.cpp
+        tests/test_caption_model_manager.cpp
+        tests/test_caption_format.cpp
+        tests/test_caption_render.cpp
+        tests/test_caption_vtt.cpp
     )
     target_link_libraries(recmeet_tests PRIVATE recmeet_core Catch2::Catch2WithMain)
     if(RECMEET_BUILD_WEB)

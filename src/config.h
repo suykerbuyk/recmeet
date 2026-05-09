@@ -86,6 +86,29 @@ struct Config {
     float vad_min_speech = 0.25f;
     float vad_max_speech = 30.0f;
 
+    // Live captions (Phase 3 daemon wiring + Phase 4 surface). When
+    // `captions_enabled` is true on a `record.start`, pipeline.cpp wires a
+    // CaptionEngine to the live capture and broadcasts `caption` /
+    // `caption.degraded` IPC events. `caption_model` names the streaming
+    // model directory (under `~/.local/share/recmeet/models/sherpa/online/`);
+    // empty resolves to the Phase-0.2-locked default at use time so a future
+    // pin change picks up automatically.
+    //
+    // The default for `captions_enabled` is `false` — captions are an
+    // explicit opt-in (CLI: `--show-captions`; tray: checkbox). The default
+    // for `caption_model` is left as the empty string here; the resolver
+    // (resolve_caption_model_dir / model_manager) treats empty as
+    // "en-2023-06-26", keeping the lock in one place.
+    bool captions_enabled = false;
+    std::string caption_model;
+
+    // Phase 5.5 — render-time caption normalization. The IPC `caption`
+    // event payload always carries the raw engine output (ALL-CAPS, no
+    // punctuation for the en-2023-06-26 streaming Zipformer); CLI / tray
+    // pass it through `normalize_caption()` before display when this is
+    // true. Disable for transcript-fidelity debugging.
+    bool caption_normalize_display = true;
+
     // Performance
     int threads = 0;  // 0 = auto-detect (hardware_concurrency - 1)
 

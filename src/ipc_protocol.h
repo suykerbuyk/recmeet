@@ -125,4 +125,29 @@ bool parse_ipc_address(const std::string& addr, IpcAddress& out);
 // Default address (Unix socket at default_socket_path()).
 IpcAddress default_ipc_address();
 
+// ---------------------------------------------------------------------------
+// Caption event helpers (Phase 3)
+//
+// The streaming caption engine emits `CaptionResult` and degraded signals on
+// its own worker thread. These helpers build IPC events with a stable wire
+// shape so daemon and clients agree on the field set:
+//
+//   {"event":"caption","data":{"job_id":N,"text":"...","is_partial":true|false,"timestamp_ms":N}}
+//   {"event":"caption.degraded","data":{"job_id":N,"reason":"buffer_overrun","timestamp_ms":N}}
+//
+// `text` is the recognizer's raw hypothesis (ALL-CAPS for the en-2023-06-26
+// streaming zipformer); rendering normalization is Phase 5's job.
+// `timestamp_ms` is wall-clock since the caption engine started; clients
+// treat it as a monotonic ordering hint, not an absolute meeting time.
+// ---------------------------------------------------------------------------
+
+IpcEvent make_caption_event(int64_t job_id,
+                            const std::string& text,
+                            bool is_partial,
+                            int64_t timestamp_ms);
+
+IpcEvent make_caption_degraded_event(int64_t job_id,
+                                     const std::string& reason,
+                                     int64_t timestamp_ms);
+
 } // namespace recmeet

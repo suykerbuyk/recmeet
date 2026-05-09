@@ -384,4 +384,32 @@ IpcAddress default_ipc_address() {
     return addr;
 }
 
+// ---------------------------------------------------------------------------
+// Caption event builders
+// ---------------------------------------------------------------------------
+
+IpcEvent make_caption_event(int64_t job_id,
+                            const std::string& text,
+                            bool is_partial,
+                            int64_t timestamp_ms) {
+    IpcEvent ev;
+    ev.event = "caption";
+    ev.data["job_id"]       = job_id;
+    ev.data["text"]         = text;
+    ev.data["is_partial"]   = is_partial;
+    ev.data["timestamp_ms"] = timestamp_ms;
+    return ev;
+}
+
+IpcEvent make_caption_degraded_event(int64_t job_id,
+                                     const std::string& reason,
+                                     int64_t timestamp_ms) {
+    IpcEvent ev;
+    ev.event = "caption.degraded";
+    ev.data["job_id"]       = job_id;
+    ev.data["reason"]       = reason;
+    ev.data["timestamp_ms"] = timestamp_ms;
+    return ev;
+}
+
 } // namespace recmeet

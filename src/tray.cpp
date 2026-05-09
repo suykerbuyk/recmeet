@@ -1,6 +1,7 @@
 // Copyright (c) 2026 John Suykerbuyk and SykeTech LTD
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+#include "caption_format.h"
 #include "config.h"
 #include "config_json.h"
 #include "device_enum.h"
@@ -106,6 +107,19 @@ struct TrayState {
         GtkWidget* participants_entry = nullptr;
         GtkWidget* notes_view = nullptr;
     } ctx;
+
+    // Phase 5.1 — Live captions overlay. The GtkWindow is created lazily on
+    // the first `caption` event of a recording (or up-front on `record.start`
+    // when captions were enabled in the params); destroyed on tray exit. The
+    // CaptionRenderState holds the rolling caption buffer; tick_id drives
+    // periodic auto-hide checks while a recording is active.
+    struct {
+        GtkWidget* window = nullptr;
+        GtkWidget* label  = nullptr;
+        recmeet::CaptionRenderState state;
+        guint tick_id = 0;        // GLib timer for auto-hide ticks
+        bool captions_enabled_for_recording = false;  // honored at record.start
+    } cap;
 };
 
 static TrayState g_tray;
@@ -152,6 +166,21 @@ static void update_state(bool rec, bool pp, bool dl, bool reproc = false) {
     if (was_recording && !rec)
         close_context_window();
 
+    // Phase 5.1 — hide and reset the captions overlay when recording ends.
+    // (We don't destroy the GtkWindow here; recreating costs more than the
+    // tiny widget retained between recordings. The destroy path runs at
+    // tray exit.)
+    if (was_recording && !rec) {
+        g_tray.cap.captions_enabled_for_recording = false;
+        if (g_tray.cap.window) {
+            gtk_widget_hide(g_tray.cap.window);
+            g_tray.cap.state.clear();
+            // Re-render to clear out any leftover label content.
+            if (g_tray.cap.label)
+                gtk_label_set_markup(GTK_LABEL(g_tray.cap.label), "");
+        }
+    }
+
     if (!rec && !pp && !dl) {
         g_tray.progress_percent = -1;
         g_tray.current_phase.clear();
@@ -171,6 +200,103 @@ static void update_state(bool rec, bool pp, bool dl, bool reproc = false) {
     }
     app_indicator_set_icon_full(g_tray.indicator, icon, desc);
     build_menu();
+}
+
+// --- Phase 5.1 — Live captions overlay ---
+
+static void caption_overlay_apply_markup() {
+    if (!g_tray.cap.label) return;
+    std::string markup = g_tray.cap.state.to_label_markup();
+    if (markup.empty())
+        gtk_label_set_markup(GTK_LABEL(g_tray.cap.label), "");
+    else
+        gtk_label_set_markup(GTK_LABEL(g_tray.cap.label), markup.c_str());
+}
+
+static gboolean caption_overlay_tick(gpointer) {
+    auto now = recmeet::CaptionRenderState::Clock::now();
+    if (!g_tray.cap.window) return G_SOURCE_CONTINUE;
+
+    // Expire degraded marker when its TTL passes. The state machine keeps
+    // the reason string until explicitly cleared — `degraded("")` resets it
+    // and a re-apply of the markup drops the banner.
+    static bool last_degraded_active = false;
+    bool now_active = g_tray.cap.state.degraded_active(now);
+    if (last_degraded_active && !now_active) {
+        g_tray.cap.state.degraded("", now);   // clear marker
+        caption_overlay_apply_markup();
+    }
+    last_degraded_active = now_active;
+
+    // Auto-hide check.
+    if (g_tray.cap.state.tick(now))
+        gtk_widget_hide(g_tray.cap.window);
+
+    return G_SOURCE_CONTINUE;
+}
+
+static void caption_overlay_create() {
+    if (g_tray.cap.window) return;
+
+    auto* win = gtk_window_new(GTK_WINDOW_POPUP);
+    gtk_window_set_title(GTK_WINDOW(win), "recmeet captions");
+    gtk_window_set_decorated(GTK_WINDOW(win), FALSE);
+    gtk_window_set_resizable(GTK_WINDOW(win), FALSE);
+    gtk_window_set_default_size(GTK_WINDOW(win), 600, 80);
+    gtk_window_set_keep_above(GTK_WINDOW(win), TRUE);
+    gtk_window_stick(GTK_WINDOW(win));
+    gtk_window_set_skip_taskbar_hint(GTK_WINDOW(win), TRUE);
+    gtk_window_set_skip_pager_hint(GTK_WINDOW(win), TRUE);
+    gtk_window_set_accept_focus(GTK_WINDOW(win), FALSE);
+    // Anchor near the bottom of the screen by default — most desktops
+    // accept POPUP windows even with explicit x,y. If the WM ignores
+    // these hints the window simply lands at the WM's default position.
+    gtk_window_set_position(GTK_WINDOW(win), GTK_WIN_POS_CENTER);
+
+    auto* label = gtk_label_new("");
+    gtk_label_set_use_markup(GTK_LABEL(label), TRUE);
+    gtk_label_set_line_wrap(GTK_LABEL(label), TRUE);
+    gtk_label_set_line_wrap_mode(GTK_LABEL(label), PANGO_WRAP_WORD_CHAR);
+    gtk_label_set_max_width_chars(GTK_LABEL(label), 80);
+    gtk_label_set_xalign(GTK_LABEL(label), 0.5f);
+    gtk_label_set_yalign(GTK_LABEL(label), 0.5f);
+    gtk_widget_set_margin_start(label, 12);
+    gtk_widget_set_margin_end(label, 12);
+    gtk_widget_set_margin_top(label, 8);
+    gtk_widget_set_margin_bottom(label, 8);
+    gtk_container_add(GTK_CONTAINER(win), label);
+
+    g_tray.cap.window = win;
+    g_tray.cap.label = label;
+
+    // 500ms tick — drives auto-hide and degraded-banner expiration.
+    if (!g_tray.cap.tick_id) {
+        g_tray.cap.tick_id = g_timeout_add(500, caption_overlay_tick, nullptr);
+    }
+}
+
+static void caption_overlay_show_with_markup() {
+    if (!g_tray.cap.window) caption_overlay_create();
+    caption_overlay_apply_markup();
+    gtk_widget_show_all(g_tray.cap.window);
+}
+
+static void caption_overlay_hide() {
+    if (g_tray.cap.window)
+        gtk_widget_hide(g_tray.cap.window);
+}
+
+static void caption_overlay_destroy() {
+    if (g_tray.cap.tick_id) {
+        g_source_remove(g_tray.cap.tick_id);
+        g_tray.cap.tick_id = 0;
+    }
+    if (g_tray.cap.window) {
+        gtk_widget_destroy(g_tray.cap.window);
+        g_tray.cap.window = nullptr;
+        g_tray.cap.label = nullptr;
+    }
+    g_tray.cap.state.clear();
 }
 
 static void handle_ipc_event(const IpcEvent& ev) {
@@ -240,6 +366,22 @@ static void handle_ipc_event(const IpcEvent& ev) {
         if (!note.empty() && !batch_job)
             notify("Meeting note ready", note);
         // Don't reset state here — the subsequent state.changed event handles it
+    } else if (ev.event == "caption") {
+        // Phase 5.1 — only render captions if this recording was started
+        // with captions_enabled=true. The flag is captured at record.start.
+        // Defensive: if the daemon ever forwards a caption without us
+        // having opted in, drop it silently.
+        if (!g_tray.cap.captions_enabled_for_recording) return;
+        std::string text = json_val_as_string(ev.data.at("text"));
+        bool is_partial = json_val_as_bool(ev.data.at("is_partial"));
+        g_tray.cap.state.update(text, is_partial,
+                                g_tray.cfg.caption_normalize_display);
+        caption_overlay_show_with_markup();
+    } else if (ev.event == "caption.degraded") {
+        if (!g_tray.cap.captions_enabled_for_recording) return;
+        std::string reason = json_val_as_string(ev.data.at("reason"));
+        g_tray.cap.state.degraded(reason);
+        caption_overlay_show_with_markup();
     } else if (ev.event == "model.downloading") {
         std::string status = json_val_as_string(ev.data.at("status"));
         if (status == "downloading") {
@@ -581,6 +723,17 @@ static void on_record(GtkMenuItem*, gpointer) {
         return;
     }
 
+    // Phase 5.1 — captions are bound to the record.start params at recording
+    // start. Toggling the menu mid-recording does NOT take effect until the
+    // next recording. Snapshot the param value here so caption events know
+    // whether to render.
+    g_tray.cap.captions_enabled_for_recording = run_cfg.captions_enabled;
+    if (run_cfg.captions_enabled) {
+        // Pre-create the overlay window so the first caption event has
+        // somewhere to render. Stays hidden until the first event arrives.
+        caption_overlay_create();
+    }
+
     bool reproc = !g_tray.cfg.reprocess_dir.empty();
     update_state(true, g_tray.postprocessing, false, reproc);
 
@@ -694,6 +847,14 @@ static void on_diarize_toggled(GtkCheckMenuItem* item, gpointer) {
 
 static void on_vad_toggled(GtkCheckMenuItem* item, gpointer) {
     g_tray.cfg.vad = gtk_check_menu_item_get_active(item);
+    save_config(g_tray.cfg);
+}
+
+// Phase 5.4 — Live captions toggle. Persists to config and applies to the
+// NEXT recording (captions are bound to record.start params; mid-recording
+// toggles do not take effect — the menu's tooltip makes this explicit).
+static void on_captions_enabled_toggled(GtkCheckMenuItem* item, gpointer) {
+    g_tray.cfg.captions_enabled = gtk_check_menu_item_get_active(item);
     save_config(g_tray.cfg);
 }
 
@@ -1313,6 +1474,23 @@ static void build_menu() {
         if (!is_idle) gtk_widget_set_sensitive(item, FALSE);
         gtk_menu_shell_append(GTK_MENU_SHELL(menu), item);
     }
+    // Phase 5.4 — single check-menu-item (NOT a radio submenu — caption-on
+    // is binary; the existing build_source_submenu helper at line ~1113 is
+    // for multi-choice radio cases like Mic Source / Whisper Model).
+    {
+        auto* item = gtk_check_menu_item_new_with_label("Show Live Captions");
+        gtk_check_menu_item_set_active(GTK_CHECK_MENU_ITEM(item),
+                                       g_tray.cfg.captions_enabled);
+        gtk_widget_set_tooltip_text(item,
+            "Live captions appear in a small overlay during recording. "
+            "Toggling this applies to the NEXT recording (captions are "
+            "bound to record.start parameters).");
+        g_signal_connect(item, "toggled",
+                         G_CALLBACK(on_captions_enabled_toggled), nullptr);
+        // Always toggleable — even mid-recording, since the change only
+        // applies to the next recording. The tooltip explains.
+        gtk_menu_shell_append(GTK_MENU_SHELL(menu), item);
+    }
 
     gtk_menu_shell_append(GTK_MENU_SHELL(menu), gtk_separator_menu_item_new());
 
@@ -1587,6 +1765,7 @@ int main(int argc, char* argv[]) {
     teardown_ipc_watch();
     g_tray.ipc.close_connection();
     stop_web_server();
+    caption_overlay_destroy();   // Phase 5.1 — release overlay window/timer
 
     if (g_tray.reconnect_timer)
         g_source_remove(g_tray.reconnect_timer);

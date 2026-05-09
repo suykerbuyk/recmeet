@@ -47,8 +47,6 @@ bool remove_embedding(const fs::path& db_dir, const std::string& name,
 bool relabel_meeting_speaker(const fs::path& meeting_dir, int cluster_id,
                              const std::string& new_label, float confidence = 1.0f);
 
-#if RECMEET_USE_SHERPA
-
 /// Per-meeting speaker data persisted as speakers.json alongside audio artifacts.
 struct MeetingSpeaker {
     int cluster_id;                         // diarization cluster index
@@ -75,6 +73,8 @@ struct IdentifyResult {
     std::map<int, std::vector<float>> embeddings; // cluster_id → embedding vector
     std::map<int, float> scores;                  // cluster_id → confidence (0.0 if unmatched)
 };
+
+#if RECMEET_USE_SHERPA
 
 /// RAII wrapper around `SherpaOnnxSpeakerEmbeddingExtractor`. Loads the
 /// embedding model on construction and keeps it loaded across multiple

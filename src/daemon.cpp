@@ -1017,8 +1017,68 @@ int main(int argc, char* argv[]) {
                 });
             };
 
+            // Caption hooks. Captions fire on the engine's worker thread, so
+            // every callback marshals onto the IPC poll thread via post()
+            // before touching server.broadcast() (which is not thread-safe).
+            // The CaptionBroadcastCtx is heap-allocated and outlives both the
+            // engine and this stack frame because run_recording() may
+            // post-and-return before the engine's worker has fully drained;
+            // the unique_ptr keeps the daemon clean of leak warnings.
+            struct CaptionBroadcastCtx {
+                IpcServer* server;
+                int64_t job_id;
+            };
+            auto ctx = std::make_unique<CaptionBroadcastCtx>(
+                CaptionBroadcastCtx{&server, job_id});
+
+            CaptionHooks hooks;
+            hooks.result_ud = ctx.get();
+            hooks.degraded_ud = ctx.get();
+            hooks.engine_error_ud = ctx.get();
+            hooks.on_result = +[](const CaptionResult& r, void* ud) {
+                auto* c = static_cast<CaptionBroadcastCtx*>(ud);
+                IpcServer* s = c->server;
+                int64_t jid = c->job_id;
+                std::string text = r.text;
+                bool is_partial = r.is_partial;
+                int64_t ts = r.timestamp_ms;
+                s->post([s, jid, text, is_partial, ts]() {
+                    s->broadcast(make_caption_event(jid, text, is_partial, ts));
+                });
+            };
+            hooks.on_degraded = +[](CaptionDegradedReason reason, void* ud) {
+                auto* c = static_cast<CaptionBroadcastCtx*>(ud);
+                IpcServer* s = c->server;
+                int64_t jid = c->job_id;
+                const char* reason_str =
+                    (reason == CaptionDegradedReason::BufferOverrun) ? "buffer_overrun"
+                                                                     : "unknown";
+                int64_t ts = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now().time_since_epoch()).count();
+                std::string r_str(reason_str);
+                s->post([s, jid, r_str, ts]() {
+                    s->broadcast(make_caption_degraded_event(jid, r_str, ts));
+                });
+            };
+            hooks.on_engine_error = +[](const std::string& msg, void* ud) {
+                auto* c = static_cast<CaptionBroadcastCtx*>(ud);
+                IpcServer* s = c->server;
+                int64_t jid = c->job_id;
+                int64_t ts = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now().time_since_epoch()).count();
+                std::string m = msg;
+                s->post([s, jid, m, ts]() {
+                    // One-shot degraded event with reason=engine_error and the
+                    // message attached so clients can show the operator why.
+                    IpcEvent ev = make_caption_degraded_event(jid, "engine_error", ts);
+                    ev.data["error"] = m;
+                    s->broadcast(ev);
+                });
+            };
+
             try {
-                auto input = run_recording(cfg, g_rec_stop, on_phase);
+                auto input = run_recording(cfg, g_rec_stop, on_phase,
+                                           cfg.captions_enabled ? &hooks : nullptr);
 
                 // Apply any context sent by tray before stop
                 Config job_cfg = cfg;

@@ -3,6 +3,7 @@
 
 #include "reprocess_batch.h"
 
+#include "caption_format.h"
 #include "cli.h"
 #include "config.h"
 #include "config_json.h"
@@ -135,7 +136,8 @@ std::string ensure_models_cached_or_fail(const Config& cfg) {
 // abort.
 // ---------------------------------------------------------------------------
 
-int client_record_no_sigaction(const Config& cfg, const std::string& addr) {
+int client_record_no_sigaction(const Config& cfg, const std::string& addr,
+                               bool show_captions_on_stderr) {
     IpcClient client(addr);
     if (!client.connect()) {
         fprintf(stderr, "Error: daemon not running. Start with: recmeet-daemon\n");
@@ -160,9 +162,31 @@ int client_record_no_sigaction(const Config& cfg, const std::string& addr) {
 
     int64_t my_job_id = 0;
 
-    client.set_event_callback([&client, &my_job_id](const IpcEvent& ev) {
+    // Phase 5.2: snapshot the normalize-display knob into a const local so
+    // the lambda doesn't need to re-read mutable config.
+    const bool normalize_caption_display = cfg.caption_normalize_display;
+
+    // Tracks whether the most recently-printed caption line was a partial
+    // (uses \r + clear-EOL so successive partials overwrite). On a final
+    // we emit \n so finals scroll. Resets on phase / progress / error
+    // lines so they don't end up overwritten by a stale partial.
+    static bool caption_partial_pending = false;
+    caption_partial_pending = false;
+
+    auto clear_pending_caption = [&]() {
+        if (cli_tty && caption_partial_pending) {
+            fputc('\n', stderr);
+            caption_partial_pending = false;
+        }
+    };
+
+    client.set_event_callback([&client, &my_job_id,
+                               show_captions_on_stderr,
+                               normalize_caption_display,
+                               clear_pending_caption](const IpcEvent& ev) {
         if (ev.event == "phase") {
             std::string name = json_val_as_string(ev.data.at("name"));
+            clear_pending_caption();
             if (cli_tty && last_cli_progress >= 0)
                 fprintf(stderr, "\n");
             last_cli_progress = -1;
@@ -170,6 +194,7 @@ int client_record_no_sigaction(const Config& cfg, const std::string& addr) {
         } else if (ev.event == "progress") {
             std::string phase = json_val_as_string(ev.data.at("phase"));
             int percent = static_cast<int>(json_val_as_int(ev.data.at("percent")));
+            clear_pending_caption();
             if (cli_tty) {
                 fprintf(stderr, "\r\033[K%s... %d%%",
                         phase.c_str(), percent);
@@ -178,12 +203,42 @@ int client_record_no_sigaction(const Config& cfg, const std::string& addr) {
                 fprintf(stderr, "%s... %d%%\n", phase.c_str(), percent);
                 last_cli_progress = percent;
             }
+        } else if (ev.event == "caption" && show_captions_on_stderr) {
+            std::string text = json_val_as_string(ev.data.at("text"));
+            bool is_partial = json_val_as_bool(ev.data.at("is_partial"));
+            std::string line = format_caption_for_cli(
+                text, is_partial, normalize_caption_display);
+            // Don't tangle with the elapsed-time / progress \r line.
+            if (cli_tty && last_cli_progress >= 0) {
+                fprintf(stderr, "\r\033[K");
+                last_cli_progress = -1;
+            }
+            if (cli_tty && is_partial) {
+                fprintf(stderr, "\r\033[K%s", line.c_str());
+                caption_partial_pending = true;
+            } else {
+                if (caption_partial_pending) {
+                    fprintf(stderr, "\r\033[K");
+                }
+                fprintf(stderr, "%s\n", line.c_str());
+                caption_partial_pending = false;
+            }
+        } else if (ev.event == "caption.degraded" && show_captions_on_stderr) {
+            std::string reason = json_val_as_string(ev.data.at("reason"));
+            clear_pending_caption();
+            if (cli_tty && last_cli_progress >= 0) {
+                fprintf(stderr, "\r\033[K");
+                last_cli_progress = -1;
+            }
+            fprintf(stderr, "%s\n",
+                    format_caption_degraded_for_cli(reason).c_str());
         } else if (ev.event == "state.changed") {
             std::string state = json_val_as_string(ev.data.at("state"));
             auto err_it = ev.data.find("error");
             if (err_it != ev.data.end()) {
                 std::string error = json_val_as_string(err_it->second);
                 if (!error.empty()) {
+                    clear_pending_caption();
                     if (cli_tty && last_cli_progress >= 0)
                         fprintf(stderr, "\n");
                     last_cli_progress = -1;
@@ -197,6 +252,7 @@ int client_record_no_sigaction(const Config& cfg, const std::string& addr) {
             if (my_job_id > 0 && jid_it != ev.data.end()
                 && json_val_as_int(jid_it->second) != my_job_id)
                 return;
+            clear_pending_caption();
             if (cli_tty && last_cli_progress >= 0)
                 fprintf(stderr, "\n");
             last_cli_progress = -1;

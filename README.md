@@ -192,6 +192,84 @@ Any GGUF-format model compatible with llama.cpp will work. Download quantized ve
 | **Setup** | API key | Download a ~4 GB GGUF file |
 | **Network** | Required | Not required |
 
+## Live Captioning
+
+Real-time English captions during recording, displayed on the connected tray
+client and (optionally) on stderr from the CLI. Captions appear with
+~200-700 ms latency and are persisted as a `.vtt` sidecar alongside the
+meeting audio.
+
+Captions are **opt-in per recording** — they consume CPU that some users
+want reserved for other workloads. The post-recording batch transcript
+(produced by whisper) remains the authoritative record; live captions are
+approximate and complementary.
+
+### Enable
+
+```bash
+# CLI: opt in for this recording only
+./build/recmeet --mic-only --show-captions
+
+# CLI: choose a different streaming model (defaults to en-2023-06-26)
+./build/recmeet --show-captions --caption-model en-small
+
+# CLI: list cached + available streaming caption models
+./build/recmeet --list-caption-models
+
+# CLI: explicitly disable captions even if config has them on
+./build/recmeet --no-captions
+```
+
+The tray applet has a **"Show Live Captions"** checkbox in its menu;
+ticking it persists the preference in `~/.config/recmeet/config.yaml` and
+opens a small caption overlay window during the next recording.
+
+### Default model
+
+`sherpa-onnx-streaming-zipformer-en-2023-06-26` (~74 MB int8,
+Apache-2.0, English-only). Auto-downloaded on first use into
+`~/.local/share/recmeet/models/sherpa/online/en-2023-06-26/`. The CLI / tray
+prompts before downloading if the model isn't cached. A smaller
+`en-small` (~28 MB) variant is available via `--caption-model en-small`
+for low-end hosts.
+
+### Output
+
+The engine emits raw ALL-CAPS hypotheses with no punctuation
+(architectural property of the streaming Zipformer). recmeet's clients
+pass each caption through `normalize_caption()` before display, which
+lowercases and capitalizes sentence boundaries — so what you see on the
+tray overlay and on stderr is human-readable, not raw engine output.
+
+Each finalized cue is appended to `<meeting_dir>/captions.vtt` as a
+WebVTT block. Partial (mid-utterance) hypotheses are streamed to clients
+but NOT persisted — the sidecar holds endpoint-finalized text only,
+exactly the same shape ffmpeg / VLC / browser `<track>` elements expect.
+
+```
+WEBVTT
+
+00:00:01.240 --> 00:00:04.020
+hello and welcome to the meeting
+
+00:00:04.020 --> 00:00:07.500
+let's start with the status update
+```
+
+### Limitations (V1)
+
+- **English-only.** Captions emit only when `language` is `en` (or unset
+  with English audio). Setting `--language` to anything else disables
+  captions with a warning.
+- **Approximate.** The streaming Zipformer is smaller and less accurate
+  than whisper-medium/large. Use the post-recording batch transcript for
+  quotable text.
+- **Partial captions are ephemeral.** Only finalized cues land in the
+  `.vtt`. Mid-utterance hypotheses fly past the IPC and disappear.
+- **Requires `RECMEET_USE_SHERPA=ON`.** Sherpa-OFF builds compile
+  cleanly but `--show-captions` is a no-op (the engine reports a
+  one-shot degraded event and recording continues without captions).
+
 ## Output
 
 ### Directory structure
