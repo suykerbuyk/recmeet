@@ -3,6 +3,7 @@
 
 #include "pipeline.h"
 #include "caption_engine.h"
+#include "caption_vtt.h"
 #include "config.h"
 #include "diarize.h"
 #include "ipc_protocol.h"
@@ -119,11 +120,55 @@ namespace {
 // Two convenience overloads cover the dual-mode (mic + monitor) and
 // single-mode (mic only) capture topologies. The engine is wired to the
 // mic capture only — monitor audio is recorded but not captioned in V1.
+//
+// Phase 6 — the engine's single result callback is fanned out via a
+// `CaptionFanoutAdapter` heap-owned by this RAII wrapper: it forwards every
+// result to the daemon-supplied hook (IPC broadcast) and additionally
+// appends finalized cues to a `VttWriter` (sidecar persistence). The
+// adapter's lifetime tracks ActiveCaptionEngine, which is reset BEFORE the
+// capture is drained — so the adapter outlives every callback the engine
+// might post.
+struct CaptionFanoutAdapter {
+    // Daemon-supplied hooks (forwarded verbatim). May be null when running
+    // a writer-only test setup, but in production both are set.
+    CaptionResultCallback   downstream_on_result   = nullptr;
+    void*                   downstream_result_ud   = nullptr;
+
+    // Sidecar writer + per-cue (start_ms, end_ms) tracker. The writer is
+    // owned by the adapter so the destruction order is deterministic:
+    // engine.stop() (joins the worker) -> adapter dtor (closes the file).
+    std::unique_ptr<VttWriter> vtt;
+    VttCueTimer cue_timer;
+};
+
+// Engine result callback installed by try_start_caption_engine when the
+// caller has a writable meeting directory. Forwards to the daemon's hook,
+// then appends finalized cues to the VTT sidecar. Partials skip the writer
+// (the writer also has its own defensive partial filter).
+inline void caption_fanout_on_result(const CaptionResult& r, void* ud) {
+    auto* a = static_cast<CaptionFanoutAdapter*>(ud);
+    if (a->downstream_on_result) {
+        a->downstream_on_result(r, a->downstream_result_ud);
+    }
+    if (!r.is_partial && a->vtt) {
+        auto [start_ms, end_ms] = a->cue_timer.next(r.timestamp_ms);
+        // append() returns false on I/O error and sets last_error(); we
+        // log and continue — captions are non-critical and must never abort
+        // recording.
+        if (!a->vtt->append(start_ms, end_ms, r.text, /*is_partial=*/false)) {
+            log_warn("captions: VTT append failed (%s) — continuing without sidecar",
+                     a->vtt->last_error().c_str());
+        }
+    }
+}
+
 template <typename Capture>
 class ActiveCaptionEngine {
 public:
-    ActiveCaptionEngine(std::unique_ptr<CaptionEngine> engine, Capture* capture)
-        : engine_(std::move(engine)), capture_(capture) {
+    ActiveCaptionEngine(std::unique_ptr<CaptionEngine> engine, Capture* capture,
+                        std::unique_ptr<CaptionFanoutAdapter> adapter = nullptr)
+        : engine_(std::move(engine)), capture_(capture),
+          adapter_(std::move(adapter)) {
         if (capture_ && engine_) {
             capture_->set_audio_callback(&CaptionEngine::on_audio_chunk, engine_.get());
         }
@@ -139,6 +184,8 @@ public:
         if (engine_) {
             engine_->stop();
         }
+        // Adapter (and its VttWriter, if any) destroyed last — closes the
+        // sidecar fd after the engine worker has joined.
     }
     ActiveCaptionEngine(const ActiveCaptionEngine&) = delete;
     ActiveCaptionEngine& operator=(const ActiveCaptionEngine&) = delete;
@@ -148,20 +195,46 @@ public:
 private:
     std::unique_ptr<CaptionEngine> engine_;
     Capture* capture_ = nullptr;
+    std::unique_ptr<CaptionFanoutAdapter> adapter_;
 };
 
 // Try to start a CaptionEngine. On any failure we DO NOT throw — captions
 // are non-critical and recording must continue. Caller-provided
 // `on_engine_error` (if any) gets a one-shot notification.
+//
+// Phase 6: when `meeting_dir` is non-empty, the engine's result callback is
+// wrapped with a `CaptionFanoutAdapter` that ALSO appends finalized cues to
+// `<meeting_dir>/captions.vtt`. The adapter is returned via `out_adapter`
+// so the caller can hand its lifetime to ActiveCaptionEngine. When
+// `meeting_dir` is empty (e.g. a test that doesn't want a sidecar) the
+// engine is wired directly to the daemon's hooks — no adapter, no writer.
 std::unique_ptr<CaptionEngine> try_start_caption_engine(
-        const Config& cfg, const CaptionHooks* hooks) {
+        const Config& cfg, const CaptionHooks* hooks,
+        const fs::path& meeting_dir,
+        std::unique_ptr<CaptionFanoutAdapter>& out_adapter) {
+    out_adapter.reset();
     if (!hooks) return nullptr;
     auto engine = std::make_unique<CaptionEngine>();
     CaptionEngine::Options opts;
     opts.model_dir = resolve_caption_model_dir(cfg.caption_model).string();
     opts.num_threads = 1;  // Phase 4 will surface a config knob.
+
+    // Choose the result-callback wiring: direct (no sidecar) or fan-out.
+    CaptionResultCallback result_cb = hooks->on_result;
+    void* result_ud = hooks->result_ud;
+    std::unique_ptr<CaptionFanoutAdapter> adapter;
+    if (!meeting_dir.empty()) {
+        adapter = std::make_unique<CaptionFanoutAdapter>();
+        adapter->downstream_on_result = hooks->on_result;
+        adapter->downstream_result_ud = hooks->result_ud;
+        adapter->vtt = std::make_unique<VttWriter>(
+            meeting_dir / "captions.vtt", cfg.caption_normalize_display);
+        result_cb = &caption_fanout_on_result;
+        result_ud = adapter.get();
+    }
+
     bool ok = engine->start(opts,
-                            hooks->on_result,   hooks->result_ud,
+                            result_cb,          result_ud,
                             hooks->on_degraded, hooks->degraded_ud);
     if (!ok) {
         std::string err = engine->last_error();
@@ -174,6 +247,7 @@ std::unique_ptr<CaptionEngine> try_start_caption_engine(
     }
     log_info("captions: streaming engine started (model=%s)",
              opts.model_dir.c_str());
+    out_adapter = std::move(adapter);
     return engine;
 }
 
@@ -286,9 +360,11 @@ PostprocessInput run_recording(const Config& cfg, StopToken& stop, PhaseCallback
             // explicit `caption.reset()` after `mic_cap.stop()`.
             std::unique_ptr<ActiveCaptionEngine<PipeWireCapture>> caption;
             if (want_captions) {
-                if (auto eng = try_start_caption_engine(cfg, caption_hooks)) {
+                std::unique_ptr<CaptionFanoutAdapter> adapter;
+                if (auto eng = try_start_caption_engine(cfg, caption_hooks,
+                                                        pp.out_dir, adapter)) {
                     caption = std::make_unique<ActiveCaptionEngine<PipeWireCapture>>(
-                        std::move(eng), &mic_cap);
+                        std::move(eng), &mic_cap, std::move(adapter));
                 }
             }
 
@@ -394,9 +470,11 @@ PostprocessInput run_recording(const Config& cfg, StopToken& stop, PhaseCallback
             // cap.drain().
             std::unique_ptr<ActiveCaptionEngine<PipeWireCapture>> caption;
             if (want_captions) {
-                if (auto eng = try_start_caption_engine(cfg, caption_hooks)) {
+                std::unique_ptr<CaptionFanoutAdapter> adapter;
+                if (auto eng = try_start_caption_engine(cfg, caption_hooks,
+                                                        pp.out_dir, adapter)) {
                     caption = std::make_unique<ActiveCaptionEngine<PipeWireCapture>>(
-                        std::move(eng), &cap);
+                        std::move(eng), &cap, std::move(adapter));
                 }
             }
 

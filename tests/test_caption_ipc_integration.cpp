@@ -20,6 +20,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include "caption_engine.h"
+#include "caption_vtt.h"
 #include "ipc_client.h"
 #include "ipc_protocol.h"
 #include "ipc_server.h"
@@ -29,9 +30,12 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <filesystem>
+#include <fstream>
 #include <memory>
 #include <mutex>
 #include <signal.h>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <unistd.h>
@@ -59,6 +63,28 @@ struct CaptionBroadcastCtx {
     IpcServer* server;
     int64_t job_id;
 };
+
+// Mirrors pipeline.cpp's CaptionFanoutAdapter for daemon-sim integration
+// tests. The on_result function pointer below forwards to the broadcast hook
+// AND, when `vtt` is non-null, appends finalized cues to the sidecar — same
+// behaviour as the production fan-out installed by try_start_caption_engine.
+struct CaptionFanoutSimAdapter {
+    CaptionResultCallback downstream_on_result = nullptr;
+    void*                 downstream_result_ud = nullptr;
+    std::unique_ptr<VttWriter> vtt;
+    VttCueTimer cue_timer;
+};
+
+inline void caption_fanout_sim_on_result(const CaptionResult& r, void* ud) {
+    auto* a = static_cast<CaptionFanoutSimAdapter*>(ud);
+    if (a->downstream_on_result) {
+        a->downstream_on_result(r, a->downstream_result_ud);
+    }
+    if (!r.is_partial && a->vtt) {
+        auto [s, e] = a->cue_timer.next(r.timestamp_ms);
+        a->vtt->append(s, e, r.text, /*is_partial=*/false);
+    }
+}
 
 struct CaptionDaemonSim {
     IpcServer server;
@@ -700,4 +726,109 @@ TEST_CASE("caption.degraded is rate-limited under sustained overflow",
     CHECK(n <= 4);
 
     client->call("record.stop", params, resp, err);
+}
+
+// ===========================================================================
+// 10. Phase 6 — captions_enabled=true produces a captions.vtt in the meeting
+//     dir; captions_enabled=false does not. We mirror pipeline.cpp's fan-out
+//     adapter directly here (the daemon-sim doesn't drive run_recording, so
+//     we wire the writer alongside the broadcast hook the same way
+//     try_start_caption_engine does in production) and assert the file
+//     existence + contents.
+// ===========================================================================
+TEST_CASE("captions_enabled=true creates captions.vtt with finals only",
+          "[ipc][integration][captions]") {
+    namespace fs = std::filesystem;
+    fs::path meeting_dir = fs::temp_directory_path()
+                         / ("recmeet_vtt_ipc_"
+                            + std::to_string(::getpid()) + "_on");
+    fs::remove_all(meeting_dir);
+    fs::create_directories(meeting_dir);
+    fs::path vtt_path = meeting_dir / "captions.vtt";
+
+    CaptionDaemonSim sim;
+    sim.start();
+
+    auto starter = caption_client();
+    auto observer = caption_client();
+    CaptionEventCollector evs;
+    observer->set_event_callback(evs.callback());
+
+    IpcResponse resp;
+    IpcError err;
+    JsonMap params;
+    params["captions_enabled"] = true;
+    REQUIRE(starter->call("record.start", params, resp, err));
+    REQUIRE(sim.captions_enabled_for_active);
+    REQUIRE(sim.hooks.on_result != nullptr);
+
+    // Wrap the daemon-sim's broadcast hook with the fan-out adapter (same
+    // shape as pipeline.cpp's CaptionFanoutAdapter). The writer's lifetime
+    // spans the in-flight recording.
+    CaptionFanoutSimAdapter adapter;
+    adapter.downstream_on_result = sim.hooks.on_result;
+    adapter.downstream_result_ud = sim.hooks.result_ud;
+    adapter.vtt = std::make_unique<VttWriter>(vtt_path,
+                                              /*normalize_display=*/true);
+
+    // Drive engine emissions through the wrapped callback. One partial,
+    // then two finals — the partial must not appear in the .vtt.
+    CaptionResult p{"PARTIAL HYP", true, 100};
+    CaptionResult f1{"HELLO WORLD", false, 500};
+    CaptionResult f2{"AND ANOTHER", false, 1200};
+    caption_fanout_sim_on_result(p,  &adapter);
+    caption_fanout_sim_on_result(f1, &adapter);
+    caption_fanout_sim_on_result(f2, &adapter);
+
+    drain_caption_events(*observer, 200);
+    starter->call("record.stop", params, resp, err);
+    adapter.vtt.reset();  // close fd
+
+    // File exists and starts with the WEBVTT header.
+    REQUIRE(fs::exists(vtt_path));
+    std::ifstream in(vtt_path, std::ios::binary);
+    std::ostringstream ss; ss << in.rdbuf();
+    std::string contents = ss.str();
+    REQUIRE(contents.rfind("WEBVTT\n\n", 0) == 0);
+
+    // Both finals are present (normalized: first letter capitalized).
+    REQUIRE(contents.find("Hello world") != std::string::npos);
+    REQUIRE(contents.find("And another") != std::string::npos);
+    // Partial must NOT appear.
+    REQUIRE(contents.find("Partial") == std::string::npos);
+    REQUIRE(contents.find("PARTIAL") == std::string::npos);
+
+    // Cleanup.
+    fs::remove_all(meeting_dir);
+}
+
+TEST_CASE("captions_enabled=false produces no captions.vtt sidecar",
+          "[ipc][integration][captions]") {
+    namespace fs = std::filesystem;
+    fs::path meeting_dir = fs::temp_directory_path()
+                         / ("recmeet_vtt_ipc_"
+                            + std::to_string(::getpid()) + "_off");
+    fs::remove_all(meeting_dir);
+    fs::create_directories(meeting_dir);
+    fs::path vtt_path = meeting_dir / "captions.vtt";
+
+    CaptionDaemonSim sim;
+    sim.start();
+
+    auto client = caption_client();
+
+    IpcResponse resp;
+    IpcError err;
+    JsonMap params;
+    params["captions_enabled"] = false;
+    REQUIRE(client->call("record.start", params, resp, err));
+
+    // No engine, no hooks, no fan-out adapter → no writer, no file.
+    REQUIRE_FALSE(sim.captions_enabled_for_active);
+    REQUIRE_FALSE(fs::exists(vtt_path));
+
+    client->call("record.stop", params, resp, err);
+    REQUIRE_FALSE(fs::exists(vtt_path));
+
+    fs::remove_all(meeting_dir);
 }
