@@ -83,7 +83,7 @@ test:
 integration:
 	cmake -B $(BUILD_DIR) -G Ninja $(CMAKE_OPTS) -DRECMEET_BUILD_TESTS=ON
 	ninja -C $(BUILD_DIR)
-	./$(BUILD_DIR)/recmeet_tests "[integration]"
+	./$(BUILD_DIR)/recmeet_tests "[integration]~[t2-1]"
 
 # T2.3 integration gate: chunked-diarize end-to-end on the iter-110 fixture
 # under a cgroup MemoryMax=8G cap. Requires systemd user instance + cgroup v2.
