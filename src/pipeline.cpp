@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 #include "pipeline.h"
+#include "caption_engine.h"
 #include "config.h"
 #include "diarize.h"
 #include "ipc_protocol.h"
@@ -21,7 +22,9 @@
 
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <fstream>
+#include <memory>
 #include <sstream>
 #include <thread>
 #include <unistd.h>
@@ -91,7 +94,93 @@ void display_elapsed(StopToken& stop) {
 
 } // anonymous namespace
 
-PostprocessInput run_recording(const Config& cfg, StopToken& stop, PhaseCallback on_phase) {
+fs::path resolve_caption_model_dir(const std::string& name) {
+    // Default model directory name pinned by Phase 0.2. Phase 4 will
+    // expand this into proper config plumbing; for now this string is the
+    // single source of truth.
+    constexpr const char* kDefaultCaptionModel = "en-2023-06-26";
+    std::string subdir = name.empty() ? std::string(kDefaultCaptionModel) : name;
+
+    const char* home = std::getenv("HOME");
+    fs::path base = home && home[0]
+        ? fs::path(home) / ".local" / "share" / "recmeet"
+        : fs::path("/tmp") / "recmeet";
+    return base / "models" / "sherpa" / "online" / subdir;
+}
+
+namespace {
+
+// Owner of an active streaming caption engine + its capture-side
+// subscription. Construction wires the engine to the capture's
+// set_audio_callback; the destructor enforces the Phase 3 teardown
+// ordering: the producer-side callback is unsubscribed first, THEN the
+// engine is stopped (which joins its worker after draining the ring).
+//
+// Two convenience overloads cover the dual-mode (mic + monitor) and
+// single-mode (mic only) capture topologies. The engine is wired to the
+// mic capture only — monitor audio is recorded but not captioned in V1.
+template <typename Capture>
+class ActiveCaptionEngine {
+public:
+    ActiveCaptionEngine(std::unique_ptr<CaptionEngine> engine, Capture* capture)
+        : engine_(std::move(engine)), capture_(capture) {
+        if (capture_ && engine_) {
+            capture_->set_audio_callback(&CaptionEngine::on_audio_chunk, engine_.get());
+        }
+    }
+    ~ActiveCaptionEngine() {
+        // Belt-and-braces — capture has already been .stop()'d at the
+        // call site so no more callbacks fire. Unsubscribe first so the
+        // capture's atomic callback ptr can never observe a destroyed
+        // engine even on a misordered teardown path.
+        if (capture_) {
+            capture_->set_audio_callback(nullptr, nullptr);
+        }
+        if (engine_) {
+            engine_->stop();
+        }
+    }
+    ActiveCaptionEngine(const ActiveCaptionEngine&) = delete;
+    ActiveCaptionEngine& operator=(const ActiveCaptionEngine&) = delete;
+
+    bool engine_running() const { return engine_ && engine_->is_running(); }
+
+private:
+    std::unique_ptr<CaptionEngine> engine_;
+    Capture* capture_ = nullptr;
+};
+
+// Try to start a CaptionEngine. On any failure we DO NOT throw — captions
+// are non-critical and recording must continue. Caller-provided
+// `on_engine_error` (if any) gets a one-shot notification.
+std::unique_ptr<CaptionEngine> try_start_caption_engine(
+        const Config& cfg, const CaptionHooks* hooks) {
+    if (!hooks) return nullptr;
+    auto engine = std::make_unique<CaptionEngine>();
+    CaptionEngine::Options opts;
+    opts.model_dir = resolve_caption_model_dir(cfg.caption_model).string();
+    opts.num_threads = 1;  // Phase 4 will surface a config knob.
+    bool ok = engine->start(opts,
+                            hooks->on_result,   hooks->result_ud,
+                            hooks->on_degraded, hooks->degraded_ud);
+    if (!ok) {
+        std::string err = engine->last_error();
+        log_warn("captions: engine failed to start (%s) — continuing without captions",
+                 err.c_str());
+        if (hooks->on_engine_error) {
+            hooks->on_engine_error(err, hooks->engine_error_ud);
+        }
+        return nullptr;
+    }
+    log_info("captions: streaming engine started (model=%s)",
+             opts.model_dir.c_str());
+    return engine;
+}
+
+} // anonymous namespace
+
+PostprocessInput run_recording(const Config& cfg, StopToken& stop, PhaseCallback on_phase,
+                               const CaptionHooks* caption_hooks) {
     log_debug("pipeline: run_recording ENTER (mic=%s, monitor=%s)",
               cfg.mic_source.c_str(), cfg.monitor_source.c_str());
 
@@ -173,6 +262,16 @@ PostprocessInput run_recording(const Config& cfg, StopToken& stop, PhaseCallback
         // --- Record ---
         phase("recording");
 
+        // Phase 3: caption engine is opt-in per recording. Wired to the mic
+        // capture only — monitor audio is recorded but not captioned in V1.
+        // We instantiate AFTER the capture is constructed and started but
+        // BEFORE the recording loop, so the producer-side callback is in
+        // place for the full recording duration. Teardown is the inverse:
+        //   cap.stop()  -> ActiveCaptionEngine dtor (unsub + engine.stop())
+        //                -> cap.drain()
+        // The dtor order is enforced by stack-frame nesting below.
+        const bool want_captions = cfg.captions_enabled && caption_hooks != nullptr;
+
         if (dual_mode) {
             notify("Recording started", "Mic: " + mic_source + "\nMonitor: " + monitor_source);
 
@@ -181,6 +280,17 @@ PostprocessInput run_recording(const Config& cfg, StopToken& stop, PhaseCallback
             log_debug("pipeline: PipeWireCapture created");
             mic_cap.start();
             log_debug("pipeline: capture start (mic)");
+
+            // Caption engine — wired to mic only (monitor audio is recorded
+            // but not captioned in V1). Lifetime: from here through the
+            // explicit `caption.reset()` after `mic_cap.stop()`.
+            std::unique_ptr<ActiveCaptionEngine<PipeWireCapture>> caption;
+            if (want_captions) {
+                if (auto eng = try_start_caption_engine(cfg, caption_hooks)) {
+                    caption = std::make_unique<ActiveCaptionEngine<PipeWireCapture>>(
+                        std::move(eng), &mic_cap);
+                }
+            }
 
             // Start monitor capture — try PipeWire CAPTURE_SINK first, fall back to pa_simple
             std::unique_ptr<PipeWireCapture> mon_pw;
@@ -222,10 +332,19 @@ PostprocessInput run_recording(const Config& cfg, StopToken& stop, PhaseCallback
             timer_thread.join();
             fprintf(stderr, "Recording stopped.\n");
 
-            // Stop captures
+            // Stop captures. After cap.stop() returns, the capture-thread
+            // callback no longer fires, so it is safe to tear down the
+            // caption engine before draining the buffer.
             mic_cap.stop();
             if (mon_pw) mon_pw->stop();
             if (mon_pa) mon_pa->stop();
+
+            // Phase 3 teardown ordering: cap.stop() -> engine teardown ->
+            // cap.drain(). The engine's worker drains its own ring buffer
+            // and joins inside the destructor; explicitly resetting here
+            // makes the ordering visible (and asserts vs. unsubscribe by
+            // the time drain() runs).
+            caption.reset();
 
             // Drain and write
             auto mic_samples = mic_cap.drain();
@@ -270,6 +389,17 @@ PostprocessInput run_recording(const Config& cfg, StopToken& stop, PhaseCallback
             cap.start();
             log_debug("pipeline: capture start (mic)");
 
+            // Caption engine — wired to the single mic capture. Same
+            // teardown ordering applies: cap.stop() -> caption.reset() ->
+            // cap.drain().
+            std::unique_ptr<ActiveCaptionEngine<PipeWireCapture>> caption;
+            if (want_captions) {
+                if (auto eng = try_start_caption_engine(cfg, caption_hooks)) {
+                    caption = std::make_unique<ActiveCaptionEngine<PipeWireCapture>>(
+                        std::move(eng), &cap);
+                }
+            }
+
             StopToken timer_stop;
             std::thread timer_thread(display_elapsed, std::ref(timer_stop));
 
@@ -282,6 +412,9 @@ PostprocessInput run_recording(const Config& cfg, StopToken& stop, PhaseCallback
             fprintf(stderr, "Recording stopped.\n");
 
             cap.stop();
+            // Phase 3 teardown ordering: cap.stop() -> engine teardown ->
+            // cap.drain(). See dual_mode branch above for the rationale.
+            caption.reset();
             auto samples = cap.drain();
             log_debug("pipeline: drained audio (%.1fs)",
                       samples.size() / (float)SAMPLE_RATE);

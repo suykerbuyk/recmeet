@@ -53,6 +53,10 @@ JsonMap config_to_map(const Config& cfg) {
     m["vad_min_speech"]   = static_cast<double>(cfg.vad_min_speech);
     m["vad_max_speech"]   = static_cast<double>(cfg.vad_max_speech);
 
+    // Live captions (Phase 3 — opt-in per recording via record.start params).
+    m["captions_enabled"] = cfg.captions_enabled;
+    m["caption_model"]    = cfg.caption_model;
+
     // Performance
     m["threads"]          = static_cast<int64_t>(cfg.threads);
 
@@ -166,6 +170,9 @@ Config config_from_map(const JsonMap& m) {
     f("vad_min_silence", cfg.vad_min_silence);
     f("vad_min_speech", cfg.vad_min_speech);
     f("vad_max_speech", cfg.vad_max_speech);
+
+    b("captions_enabled", cfg.captions_enabled);
+    str("caption_model", cfg.caption_model);
 
     i("threads", cfg.threads);
 

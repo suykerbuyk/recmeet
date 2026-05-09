@@ -86,6 +86,15 @@ struct Config {
     float vad_min_speech = 0.25f;
     float vad_max_speech = 30.0f;
 
+    // Live captions (Phase 3 — daemon-side only; CLI flags / YAML config
+    // come in Phase 4). When `captions_enabled` is true on a `record.start`,
+    // pipeline.cpp wires a CaptionEngine to the live capture and broadcasts
+    // `caption` / `caption.degraded` IPC events. `caption_model` overrides
+    // the default streaming model directory name; empty means
+    // "en-2023-06-26".
+    bool captions_enabled = false;
+    std::string caption_model;
+
     // Performance
     int threads = 0;  // 0 = auto-detect (hardware_concurrency - 1)
 
