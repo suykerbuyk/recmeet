@@ -165,6 +165,7 @@ set(IPC_SOURCES
     src/config_json.cpp
     src/ipc_client.cpp
     src/ipc_server.cpp
+    src/caption_format.cpp
 )
 
 add_library(recmeet_ipc STATIC ${IPC_SOURCES})
@@ -306,6 +307,8 @@ if(RECMEET_BUILD_TESTS)
         tests/streaming_engine_tests.cpp
         tests/test_caption_ipc_integration.cpp
         tests/test_caption_model_manager.cpp
+        tests/test_caption_format.cpp
+        tests/test_caption_render.cpp
     )
     target_link_libraries(recmeet_tests PRIVATE recmeet_core Catch2::Catch2WithMain)
     if(RECMEET_BUILD_WEB)

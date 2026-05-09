@@ -102,6 +102,13 @@ struct Config {
     bool captions_enabled = false;
     std::string caption_model;
 
+    // Phase 5.5 — render-time caption normalization. The IPC `caption`
+    // event payload always carries the raw engine output (ALL-CAPS, no
+    // punctuation for the en-2023-06-26 streaming Zipformer); CLI / tray
+    // pass it through `normalize_caption()` before display when this is
+    // true. Disable for transcript-fidelity debugging.
+    bool caption_normalize_display = true;
+
     // Performance
     int threads = 0;  // 0 = auto-detect (hardware_concurrency - 1)
 

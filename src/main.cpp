@@ -178,7 +178,8 @@ static int client_stop(const std::string& addr = "") {
 // The thin `client_record` wrapper below uses it for the single-meeting CLI
 // path with its own SIGINT/SIGTERM handlers installed.
 
-static int client_record(const Config& cfg, const std::string& addr = "") {
+static int client_record(const Config& cfg, const std::string& addr = "",
+                         bool show_captions_on_stderr = false) {
     using namespace recmeet;
 
     // Save previous SIGINT/SIGTERM so we don't clobber the batch-level
@@ -207,7 +208,7 @@ static int client_record(const Config& cfg, const std::string& addr = "") {
     sigaction(SIGINT, &sa, nullptr);
     sigaction(SIGTERM, &sa, nullptr);
 
-    int rc = client_record_no_sigaction(cfg, addr);
+    int rc = client_record_no_sigaction(cfg, addr, show_captions_on_stderr);
 
     sigaction(SIGINT, &prev_int, nullptr);
     sigaction(SIGTERM, &prev_term, nullptr);
@@ -697,7 +698,10 @@ int main(int argc, char* argv[]) {
 
     if (use_daemon && !list_sources) {
         log_info("Using daemon mode");
-        int rc = client_record(cfg, cli.daemon_addr);
+        // Phase 5.2 — pass --show-captions through so the daemon-mode CLI
+        // path renders caption events to stderr alongside phase / progress.
+        // Standalone mode uses the same flag below at the run_recording site.
+        int rc = client_record(cfg, cli.daemon_addr, cli.caption_show_on_stderr);
         log_shutdown();
         return rc;
     }

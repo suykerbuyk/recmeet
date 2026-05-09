@@ -53,9 +53,13 @@ JsonMap config_to_map(const Config& cfg) {
     m["vad_min_speech"]   = static_cast<double>(cfg.vad_min_speech);
     m["vad_max_speech"]   = static_cast<double>(cfg.vad_max_speech);
 
-    // Live captions (Phase 3 — opt-in per recording via record.start params).
-    m["captions_enabled"] = cfg.captions_enabled;
-    m["caption_model"]    = cfg.caption_model;
+    // Live captions (Phase 3 — opt-in per recording via record.start params;
+    // Phase 5.5 added `caption_normalize_display`, a client-only knob — the
+    // daemon never reads it, but it round-trips through this map so the tray
+    // and CLI carry it correctly across config saves).
+    m["captions_enabled"]          = cfg.captions_enabled;
+    m["caption_model"]             = cfg.caption_model;
+    m["caption_normalize_display"] = cfg.caption_normalize_display;
 
     // Performance
     m["threads"]          = static_cast<int64_t>(cfg.threads);
@@ -173,6 +177,7 @@ Config config_from_map(const JsonMap& m) {
 
     b("captions_enabled", cfg.captions_enabled);
     str("caption_model", cfg.caption_model);
+    b("caption_normalize_display", cfg.caption_normalize_display);
 
     i("threads", cfg.threads);
 

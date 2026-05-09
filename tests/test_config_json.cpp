@@ -163,6 +163,34 @@ TEST_CASE("config_to_json: handles special characters in paths", "[config_json]"
     CHECK(loaded.device_pattern == cfg.device_pattern);
 }
 
+TEST_CASE("caption_normalize_display round-trips through JSON",
+          "[config_json][captions]") {
+    // Phase 5.5 — render-side knob; default true. Verifies round-trip and
+    // negation persistence through both the map and string round-trips.
+    SECTION("default true preserved") {
+        Config original;
+        REQUIRE(original.caption_normalize_display == true);
+        Config loaded = config_from_json(config_to_json(original));
+        CHECK(loaded.caption_normalize_display == true);
+    }
+    SECTION("explicit false preserved") {
+        Config original;
+        original.caption_normalize_display = false;
+        Config loaded = config_from_json(config_to_json(original));
+        CHECK(loaded.caption_normalize_display == false);
+    }
+    SECTION("paired with captions_enabled") {
+        Config original;
+        original.captions_enabled = true;
+        original.caption_model = "en-2023-06-26";
+        original.caption_normalize_display = false;
+        Config loaded = config_from_map(config_to_map(original));
+        CHECK(loaded.captions_enabled == true);
+        CHECK(loaded.caption_model == "en-2023-06-26");
+        CHECK(loaded.caption_normalize_display == false);
+    }
+}
+
 TEST_CASE("config_to_map includes api_key for client-to-daemon IPC", "[config_json]") {
     Config cfg;
     cfg.api_key = "sk-secret-key-12345";

@@ -230,6 +230,8 @@ Config load_config(const fs::path& config_path) {
     // Phase-0.2 lock stays in one place.
     cfg.captions_enabled = get_bool(entries, "captions", "enabled", false);
     cfg.caption_model = get_val(entries, "captions", "model", "");
+    cfg.caption_normalize_display =
+        get_bool(entries, "captions", "normalize_display", true);
 
     // General section
     std::string threads_str = get_val(entries, "general", "threads", "0");
@@ -371,14 +373,20 @@ void save_config(const Config& cfg, const fs::path& config_path) {
             out << "  max_speech: " << cfg.vad_max_speech << "\n";
     }
 
-    // Live captions (Phase 4) — only emitted when non-default to keep the
-    // generated YAML compact for the common case where captions are off.
-    if (cfg.captions_enabled || !cfg.caption_model.empty()) {
+    // Live captions (Phase 4 + 5.5) — only emitted when non-default to keep
+    // the generated YAML compact for the common case where captions are off.
+    // `normalize_display` (Phase 5.5) is a render-side knob (default true);
+    // emit only when the user has explicitly turned it off so the YAML
+    // round-trip preserves the negation.
+    if (cfg.captions_enabled || !cfg.caption_model.empty()
+        || !cfg.caption_normalize_display) {
         out << "\ncaptions:\n";
         if (cfg.captions_enabled)
             out << "  enabled: true\n";
         if (!cfg.caption_model.empty())
             out << "  model: " << cfg.caption_model << "\n";
+        if (!cfg.caption_normalize_display)
+            out << "  normalize_display: false\n";
     }
 
     out << "\noutput:\n"
