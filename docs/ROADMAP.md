@@ -70,7 +70,37 @@ Run `recmeet-daemon` on a headless machine (home server, NUC) and control it fro
 - The Unix socket should remain the default for local use — zero-config, no auth overhead, systemd socket activation works.
 - Firewall/port exposure: binding to `0.0.0.0` without auth would be a security issue. Default to localhost; require explicit opt-in for network listen.
 
-## Phase 2b: Live Captioning
+## Phase 2b: Live Captioning — DELIVERED
+
+**Status: shipped iter-??? (V1 capstone — operator will replace `???`
+with the actual iter at wrap time).** Phases 1–6 of the
+`live-captioning-v1-capstone` task landed on `feat/live-captioning-v1`:
+audio-capture callback (Phase 1), `CaptionEngine` streaming-ASR worker
+(Phase 2), IPC `caption` + `caption.degraded` events with `record.start`
+opt-in (Phase 3), model manager + CLI flags + pre-flight prompt
+(Phase 4), tray overlay + CLI stderr rendering with display
+normalization (Phase 5), and `.vtt` sidecar persistence (Phase 6).
+Phase 7 added stress + memory-bound + full-stack [captions]-tagged
+tests, doc sync, and the `v1.0.0` tag preconditions.
+
+**Model choice:** `sherpa-onnx-streaming-zipformer-en-2023-06-26`
+(int8, ~74 MB, Apache-2.0, English-only). `en-small` (~28 MB) ships as
+a low-end-host alternative.
+
+**Follow-ups (post-V1):**
+
+- `webui-live-captions` task — surface live captions in the WebUI
+  client. Filed as a follow-up to the original Phase 5 descope; tracked
+  in the project's task vault.
+- Thin-client recording server (Phase 2 → V2 Phase A onward) resumes
+  immediately after the `v1.0.0` cut and the `v1-maintenance` branch
+  point. The V1 → V2 port of live captioning is the explicit
+  validation test for the maintenance-branch policy: the audio
+  callback API, `caption` event payload, and `.vtt` sidecar contract
+  must survive the V2 `recmeet_capture` extraction and client/server
+  split unchanged.
+
+The original sketch is preserved below as the historical record.
 
 ### What it enables
 

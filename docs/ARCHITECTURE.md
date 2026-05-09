@@ -273,6 +273,105 @@ Single-meeting (`--reprocess <dir>`) and batch (`--reprocess-batch <parent>`) sh
 - **Per-iteration `StopToken` plumbing** — each iteration owns a fresh `StopToken iter_stop`. Before dispatch the driver publishes `&iter_stop` into `g_active_iter_stop` (atomic, release-store); the standalone-mode `batch_sigint_handler` and the daemon-mode `batch_daemon_sigint_handler` (installed per-iteration around the IPC call by `dispatch_one_reprocess_daemon`) read it via acquire-load and trip the token without ever touching a mutex (POSIX async-signal-safety). The handlers also set `g_batch_stop_requested` so the loop's between-iteration check breaks out cleanly. A `SigGuard` RAII helper saves and restores the previous `sigaction` on every exit path.
 - **IPC `batch_job` propagation** — the `record.start` request carries `cfg.batch_mode`; the daemon stores it on the per-job state and stamps it onto the `job.complete` event as `batch_job: <bool>`. The tray (`tray.cpp`) gates its "Meeting note ready" desktop notification on `!batch_job` so a 30-meeting batch produces a single end-of-batch summary notification (emitted by the batch driver itself in the operator's terminal), not one per meeting. Pipeline-error notifications stay unconditional — failures want operator attention regardless of mode.
 
+## Live Captioning Architecture
+
+Live captioning runs *during* `run_recording()` — not in postprocessing —
+because its value proposition is real-time text. The architecture mirrors
+the rest of the pipeline (heavy compute behind an opt-in flag, fan-out via
+`broadcast()`, callback-driven state machines) but adds a producer/consumer
+seam between the audio capture thread and a dedicated ASR worker thread.
+
+**Source:** `src/caption_engine.{h,cpp}`, `src/caption_vtt.{h,cpp}`,
+`src/caption_format.{h,cpp}`, `src/pipeline.cpp` (fan-out adapter +
+RAII teardown), `src/daemon.cpp` (IPC broadcast wiring),
+`src/main.cpp` (CLI flags, model pre-flight), `src/tray.cpp` (overlay).
+
+### Component placement
+
+| Component | Lives in | Notes |
+|---|---|---|
+| `CaptionEngine` (sherpa-onnx streaming Zipformer wrapper, SPSC ring, ASR worker thread) | `recmeet_core` | Producer (`on_audio_chunk`) is lock-free, non-allocating, non-logging |
+| `VttWriter` (append-only WebVTT sidecar persistence) | `recmeet_core` | Pure I/O — no sherpa dependency |
+| `normalize_caption()` (ALL-CAPS → human-readable display normalization) | `recmeet_core` | Pure function; both clients call it at render time |
+| Tray caption overlay (`GtkLabel` popup window) | `recmeet-tray` | Subscribes to `caption` events, calls `normalize_caption()` before display |
+| CLI stderr renderer (`[caption] <text>` lines during recording) | `recmeet` | Same render path as tray, `isatty(STDERR_FILENO)`-gated |
+| Caption model manager (`ensure_caption_model()`, pre-flight prompt) | `recmeet_core` | Curated table of streaming models; same download pattern as whisper/sherpa |
+
+### Data flow
+
+```mermaid
+flowchart LR
+    PW["PipeWire/Pulse RT thread<br/>(on_process)"] -->|"int16 mono 16 kHz<br/>chunks (lock-free)"| CB["set_audio_callback<br/>= CaptionEngine::on_audio_chunk"]
+    CB -->|"push samples<br/>(SPSC ring)"| RING["ring buffer<br/>~2s @ 16 kHz<br/>32 768 samples"]
+    RING -->|"drain"| WORKER["ASR worker thread<br/>(SCHED_BATCH or nice +10)"]
+    WORKER -->|"sherpa-onnx<br/>OnlineRecognizer<br/>greedy_search"| RESULT["CaptionResult<br/>{text, is_partial,<br/>timestamp_ms}"]
+    RESULT --> FANOUT["CaptionFanoutAdapter<br/>(pipeline.cpp)"]
+    FANOUT -->|"every result"| BROADCAST["IpcServer::broadcast<br/>caption / caption.degraded"]
+    FANOUT -->|"is_partial=false only"| VTT["VttWriter::append<br/>(O_APPEND, no fsync)"]
+    BROADCAST -.->|"NDJSON over Unix socket"| TRAY["Tray overlay"]
+    BROADCAST -.->|"NDJSON over Unix socket"| CLI["CLI stderr"]
+    VTT --> SIDECAR["~/meetings/&lt;dir&gt;/<br/>captions.vtt"]
+```
+
+### Teardown ordering (load-bearing)
+
+The order in which the recording loop tears down is critical because the
+producer (capture thread) and the consumer (engine worker) share an
+in-memory ring through a static function pointer:
+
+1. **`cap.stop()`** — capture's RT thread exits; `set_audio_callback`'s
+   atomic pointer can no longer fire.
+2. **Engine teardown (RAII)** — `ActiveCaptionEngine` destructor first
+   unsubscribes the callback as a belt-and-braces step, then calls
+   `engine.stop()` which joins the worker thread after it drains the
+   remaining ring contents and emits any pending finals.
+3. **`cap.drain()`** — moves the buffered audio out of the capture for
+   WAV writing.
+
+Reversing 1 and 2 leaves a window where the destroyed engine's address is
+still in the capture's atomic callback pointer; reversing 2 and 3 means
+the engine could feed the recognizer with samples from a partially-drained
+capture buffer. This sequence is enforced by stack-frame nesting in both
+`run_recording` branches (mic-only and mic+monitor).
+
+### V2 compatibility surface (immutable across V1 → V2)
+
+The following V1 contracts are explicit V2-Phase-A inputs and must not
+change without a V2 migration:
+
+- **Audio callback API:** `void set_audio_callback(AudioChunkCallback cb,
+  void* userdata)` on `PipeWireCapture` / `PulseMonitorCapture`. Survives
+  the V2 Phase B `recmeet_capture` library extraction unchanged — same
+  signature, same int16-mono-16-kHz samples.
+- **`caption` event payload:** `{job_id, text, is_partial, timestamp_ms}`.
+  `job_id` survives V2 Phase A.4's `client_id`-routing change because per-
+  job filtering is the natural axis. Adding `client_id` later is additive.
+- **`record.start` params:** `captions_enabled` (bool) and `caption_model`
+  (string) become wire-compatible client request fields in V2 Phase B.
+- **`.vtt` sidecar layout:** `~/meetings/<dir>/captions.vtt`, WebVTT,
+  finalized cues only, no cue ids. The `~/meetings/` wire-format-at-rest
+  contract is V1-frozen and additive-only.
+
+### Default model
+
+`sherpa-onnx-streaming-zipformer-en-2023-06-26` (int8 quantized, ~74 MB,
+Apache-2.0, English-only). Resolved by `caption_model_dir(name)` in the
+model manager; empty `name` resolves to this default at use time so a
+future pin change touches one place.
+
+### Limitations (V1)
+
+- ALL-CAPS, no-punctuation engine output. Display normalization happens
+  at the client (tray + CLI), not at the engine — the IPC payload is
+  always raw engine text so a downstream consumer can opt out.
+- Partial captions stream over IPC but never land in the `.vtt` sidecar.
+- English-only. `cfg.language` other than empty/`en` disables captions
+  with a warning at recording start.
+- Sherpa-OFF builds: `CaptionEngine::start()` returns false with the
+  canonical error message; `record.start {captions_enabled: true}`
+  broadcasts a one-shot `caption.degraded` event and continues recording
+  without captions.
+
 ## Diarization
 
 Speaker diarization labels each transcript segment with `Speaker_01`, `Speaker_02`, etc. before speaker identification (or `merge_speakers()`) renames them. recmeet has two diarization paths that share the same `DiarizeResult` data shape; the pipeline picks one based on audio length.

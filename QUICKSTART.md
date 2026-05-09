@@ -162,6 +162,78 @@ Click the tray icon, select **Record** to start, **Stop Recording** to finish. T
 recmeet --no-daemon --model base
 ```
 
+### Enable live captions (optional)
+
+Live captions are an opt-in feature — they consume CPU that some users
+want reserved. Captions display in real time during recording and are
+saved as a `.vtt` sidecar; the post-recording batch transcript remains
+the authoritative record.
+
+**1. First-time setup — download the streaming model**
+
+The default model is `sherpa-onnx-streaming-zipformer-en-2023-06-26`
+(~74 MB int8, English-only, Apache-2.0). The CLI prompts before
+downloading on first use:
+
+```bash
+recmeet --mic-only --show-captions
+# Streaming caption model 'en-2023-06-26' (~74 MB) is not cached.
+# Download now? [y/N]
+```
+
+The tray applet shows the same prompt the first time you tick "Show
+Live Captions". The model is cached at
+`~/.local/share/recmeet/models/sherpa/online/en-2023-06-26/`.
+
+**2. Verify by recording a short test clip**
+
+```bash
+recmeet --mic-only --show-captions --no-summary --model tiny
+# Speak something. You should see captions appear on stderr in real
+# time, e.g.:
+#   [caption] hello and welcome to the meeting
+#   [caption] let's start with the status update
+# Press Ctrl+C to stop.
+```
+
+After the recording stops, check the meeting directory for the
+sidecar:
+
+```
+meetings/2026-05-09_10-30/
+  audio_2026-05-09_10-30.wav
+  captions.vtt                    # WebVTT, finalized cues only
+  Meeting_2026-05-09_10-30_*.md   # Standard meeting note
+```
+
+The `.vtt` file plays cleanly in VLC / browser `<track>` elements and
+parses round-trip with ffmpeg.
+
+**3. List available caption models**
+
+```bash
+recmeet --list-caption-models
+# en-2023-06-26  (~74 MB)  cached
+# en-small       (~28 MB)  not cached
+```
+
+**4. Persist via config**
+
+```yaml
+# ~/.config/recmeet/config.yaml
+captions:
+  enabled: true
+  model: en-2023-06-26
+```
+
+The tray's "Show Live Captions" checkbox writes this for you.
+
+**Limitations:** English-only in V1; partial captions are streamed but
+not persisted; ALL-CAPS engine output is normalized at display time.
+Sherpa-OFF builds compile but `--show-captions` is a no-op (the engine
+emits a one-shot degraded event and recording continues without
+captions).
+
 ## 7. View output
 
 Each recording creates a directory under `meetings/`:

@@ -20,6 +20,7 @@ source code implementation, not aspirational design.
 11. [Subprocess Postprocessing](#11-subprocess-postprocessing)
 12. [Audio Capture Subsystem](#12-audio-capture-subsystem)
 13. [Go Tools Module](#13-go-tools-module)
+14. [Live Captioning Pipeline](#14-live-captioning-pipeline)
 
 ---
 
@@ -1479,3 +1480,108 @@ flowchart TD
         V_RESULT["stderr: result preview"]
     end
 ```
+
+---
+
+## 14. Live Captioning Pipeline
+
+End-to-end flow for the V1 capstone live-captioning feature. Audio
+capture, ASR worker, IPC fan-out, and `.vtt` sidecar persistence all live
+in `recmeet_core`; the tray applet and CLI are display-only consumers
+that render the same IPC events.
+
+```mermaid
+flowchart TD
+    subgraph "Capture (PipeWire RT thread / Pulse capture thread)"
+        ON_PROC["on_process / pa_simple_read<br/>(int16 mono 16 kHz chunks)"]
+        SET_CB{"set_audio_callback<br/>installed?"}
+        BUF["Append to capture<br/>ring buffer (drained at stop)"]
+        PUSH["Invoke callback<br/>(lock-free, non-allocating)"]
+
+        ON_PROC --> SET_CB
+        SET_CB -->|"yes (captions on)"| PUSH
+        SET_CB -->|"no"| BUF
+        PUSH --> BUF
+    end
+
+    subgraph "CaptionEngine (recmeet_core)"
+        CB_FN["CaptionEngine::on_audio_chunk<br/>(static, atomic ptr-stable)"]
+        RING["SPSC ring buffer<br/>~32 768 int16 samples<br/>(~2 s @ 16 kHz)"]
+        DROP{"ring full?"}
+        DROP_PATH["drop oldest samples;<br/>set atomic overflow flag"]
+        WORKER["ASR worker thread<br/>(SCHED_BATCH; nice +10 fallback)"]
+        DRAIN["drain ring → recognizer.AcceptWaveform"]
+        DECODE["recognizer.Decode<br/>(streaming Zipformer, int8)"]
+        ENDPOINT{"endpoint detected?"}
+        EMIT_PARTIAL["emit CaptionResult<br/>(is_partial=true)"]
+        EMIT_FINAL["emit CaptionResult<br/>(is_partial=false);<br/>recognizer.Reset"]
+        DEGRADED["emit CaptionDegraded<br/>(BufferOverrun;<br/>rate-limited 1/s)"]
+
+        PUSH --> CB_FN --> RING
+        RING --> DROP
+        DROP -->|"yes"| DROP_PATH --> RING
+        WORKER --> DRAIN --> DECODE --> ENDPOINT
+        ENDPOINT -->|"no"| EMIT_PARTIAL --> WORKER
+        ENDPOINT -->|"yes"| EMIT_FINAL --> WORKER
+        DROP_PATH -.-> DEGRADED
+    end
+
+    subgraph "Pipeline fan-out (pipeline.cpp)"
+        ADAPTER["CaptionFanoutAdapter<br/>(downstream cb + VttWriter)"]
+        DOWNSTREAM["downstream callback<br/>= daemon's IPC hook"]
+        VTT_TIMER["VttCueTimer<br/>(prev_final_ms watermark)"]
+        VTT_APPEND["VttWriter::append<br/>(O_APPEND, single write)"]
+    end
+
+    EMIT_PARTIAL --> ADAPTER
+    EMIT_FINAL --> ADAPTER
+    ADAPTER --> DOWNSTREAM
+    ADAPTER -->|"is_partial=false only"| VTT_TIMER --> VTT_APPEND
+
+    subgraph "Daemon broadcast (daemon.cpp + ipc_server.cpp)"
+        IPC_POST["IpcServer::post<br/>(self-pipe wakeup)"]
+        BROADCAST["broadcast caption / caption.degraded<br/>NDJSON over Unix socket"]
+    end
+
+    DOWNSTREAM --> IPC_POST --> BROADCAST
+    DEGRADED --> IPC_POST
+
+    subgraph "Tray (recmeet-tray)"
+        TRAY_RX["IPC client receives<br/>caption event"]
+        NORM_T["normalize_caption()<br/>(ALL-CAPS → human)"]
+        OVERLAY["GtkLabel popup<br/>(replace partial in place;<br/>append finalized)"]
+    end
+
+    subgraph "CLI (recmeet)"
+        CLI_RX["IPC client receives<br/>caption event"]
+        NORM_C["normalize_caption()"]
+        STDERR["fprintf(stderr, '[caption] …')<br/>isatty-gated"]
+    end
+
+    BROADCAST -.->|"NDJSON"| TRAY_RX --> NORM_T --> OVERLAY
+    BROADCAST -.->|"NDJSON"| CLI_RX --> NORM_C --> STDERR
+
+    VTT_APPEND --> SIDECAR["~/meetings/&lt;dir&gt;/captions.vtt<br/>WEBVTT, finalized cues only"]
+
+    subgraph "Teardown order (load-bearing)"
+        T1["1. capture.stop()<br/>(RT thread exits)"]
+        T2["2. ActiveCaptionEngine dtor<br/>= unsubscribe + engine.stop()<br/>= worker join + ring drain"]
+        T3["3. capture.drain()<br/>(WAV write)"]
+        T1 --> T2 --> T3
+    end
+```
+
+**Key invariants:**
+
+- The audio callback pointer is atomic; the engine destructor unsubscribes
+  before joining its worker, so the destroyed engine's address can never
+  observe a live capture callback.
+- The VTT writer uses `O_APPEND` with a single `write(2)` per cue (~100 B,
+  well under the FS atomic-write block size). No `fsync`. Crash recovery
+  is "valid up to last fully-flushed cue."
+- Display normalization (`normalize_caption()`) lives at the client
+  render boundary, not in the engine — the IPC payload always carries
+  raw engine output so a downstream consumer can opt out.
+- Sherpa-OFF builds compile every component cleanly; `CaptionEngine::start`
+  returns false with the canonical error message and recording continues
+  without captions.
