@@ -293,6 +293,7 @@ if(RECMEET_BUILD_TESTS)
         tests/test_ndjson_parse.cpp
         tests/test_full_stack.cpp
         tests/test_integration_pipeline.cpp
+        tests/streaming_capture_tests.cpp
     )
     target_link_libraries(recmeet_tests PRIVATE recmeet_core Catch2::Catch2WithMain)
     if(RECMEET_BUILD_WEB)

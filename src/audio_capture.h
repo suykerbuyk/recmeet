@@ -5,6 +5,7 @@
 
 #include "util.h"
 
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <mutex>
@@ -12,6 +13,17 @@
 #include <vector>
 
 namespace recmeet {
+
+/// C-style audio chunk callback. Invoked from the capture thread for every
+/// chunk appended to the internal buffer. Use a function pointer + void*
+/// userdata pair (NOT std::function) so the call site allocates nothing —
+/// this matters on the PipeWire RT-promoted thread.
+///
+/// Contract: callback body MUST be lock-free (or try_lock-only) and MUST NOT
+/// log or allocate when invoked from PipeWireCapture (which runs on
+/// PW_STREAM_FLAG_RT_PROCESS thread). PulseMonitorCapture has no RT
+/// constraints but the same signature is used for symmetry.
+using AudioChunkCallback = void(*)(const int16_t* samples, std::size_t n, void* userdata);
 
 /// PipeWire pw_stream capture. Captures S16LE mono 16kHz audio from a named source.
 class PipeWireCapture {
@@ -35,6 +47,18 @@ public:
 
     /// Check if the stream is actively capturing.
     bool is_running() const;
+
+    /// Install a streaming callback. Pass cb=nullptr to clear.
+    /// Callback fires for every chunk inserted into the internal buffer.
+    /// The samples pointer is valid only for the duration of the call.
+    /// See AudioChunkCallback for the RT-safety contract.
+    void set_audio_callback(AudioChunkCallback cb, void* userdata);
+
+    // Test-only: directly drive the buffer-append + callback dispatch path
+    // without opening a PipeWire stream. Mirrors the body of on_process()
+    // so callback wiring can be unit-tested hermetically. Production code
+    // never calls this; the unit-test files are the only callers.
+    void _inject_for_test(const int16_t* samples, std::size_t n);
 
 private:
     struct Impl;

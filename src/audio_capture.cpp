@@ -29,6 +29,13 @@ struct PwCaptureImpl {
 
     std::atomic<bool> first_callback_received{false};
     std::atomic<pid_t> callback_tid{0};
+
+    // Streaming callback. Loaded lock-free on the RT thread; stored from
+    // arbitrary threads via set_audio_callback(). Userdata is published
+    // before cb (release) and read after cb (acquire) so the userdata write
+    // is visible to any reader that observes the cb store.
+    std::atomic<AudioChunkCallback> stream_cb{nullptr};
+    std::atomic<void*> stream_cb_userdata{nullptr};
 };
 
 static void on_process(void* userdata) {
@@ -55,6 +62,21 @@ static void on_process(void* userdata) {
     {
         std::lock_guard lk(impl->buf_mtx);
         impl->buffer.insert(impl->buffer.end(), samples, samples + n_samples);
+        // Streaming callback: fire after the insert, before any size-warn /
+        // logging branch. Two atomic loads + an indirect call; no allocation,
+        // no logging, no extra locks. Acquire-load the cb first, then
+        // userdata — see PwCaptureImpl for the publication ordering.
+        AudioChunkCallback cb = impl->stream_cb.load(std::memory_order_acquire);
+        if (cb) {
+            void* ud = impl->stream_cb_userdata.load(std::memory_order_acquire);
+            // Pass a pointer to the just-inserted samples (still in scope as
+            // the source `samples` from the pw_buffer below — buffer.insert
+            // copies into impl->buffer, but the live PipeWire chunk is what
+            // the callback wants for streaming consumers that don't drain
+            // the batch buffer). Use the source pointer to avoid handing out
+            // a vector iterator that other threads could resize-invalidate.
+            cb(samples, n_samples, ud);
+        }
         // Warn once when buffer exceeds ~120 minutes of audio (230 MB)
         constexpr size_t WARN_SAMPLES = SAMPLE_RATE * 60 * 120;
         if (impl->buffer.size() >= WARN_SAMPLES &&
@@ -206,6 +228,27 @@ std::vector<int16_t> PipeWireCapture::drain() {
 
 bool PipeWireCapture::is_running() const {
     return impl_->running;
+}
+
+void PipeWireCapture::set_audio_callback(AudioChunkCallback cb, void* userdata) {
+    // Publish userdata first (release), then cb (release). The reader on the
+    // RT thread loads cb (acquire) first; if it observes the new cb, the
+    // happens-before relationship orders the userdata write before the cb
+    // write, so the userdata acquire-load sees the matching value.
+    impl_->stream_cb_userdata.store(userdata, std::memory_order_release);
+    impl_->stream_cb.store(cb, std::memory_order_release);
+}
+
+void PipeWireCapture::_inject_for_test(const int16_t* samples, std::size_t n) {
+    // Test-only path that mirrors the buffer-append + callback dispatch
+    // shape from on_process() without opening a PipeWire stream.
+    std::lock_guard lk(impl_->buf_mtx);
+    impl_->buffer.insert(impl_->buffer.end(), samples, samples + n);
+    AudioChunkCallback cb = impl_->stream_cb.load(std::memory_order_acquire);
+    if (cb) {
+        void* ud = impl_->stream_cb_userdata.load(std::memory_order_acquire);
+        cb(samples, n, ud);
+    }
 }
 
 } // namespace recmeet

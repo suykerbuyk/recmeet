@@ -61,6 +61,15 @@ void PulseMonitorCapture::start() {
             }
             std::lock_guard lk(buf_mtx_);
             buffer_.insert(buffer_.end(), chunk, chunk + chunk_samples);
+            // Streaming callback (matches the shape used in
+            // PipeWireCapture::on_process). No RT constraint here — plain
+            // worker thread — but kept allocation-free and lock-free anyway
+            // for symmetry and to keep the callback contract uniform.
+            AudioChunkCallback cb = cb_.load(std::memory_order_acquire);
+            if (cb) {
+                void* ud = cb_userdata_.load(std::memory_order_acquire);
+                cb(chunk, chunk_samples, ud);
+            }
             // Warn once when buffer exceeds ~120 minutes of audio (230 MB)
             constexpr size_t WARN_SAMPLES = SAMPLE_RATE * 60 * 120;
             if (buffer_.size() >= WARN_SAMPLES &&
@@ -98,6 +107,27 @@ std::vector<int16_t> PulseMonitorCapture::drain() {
 
 bool PulseMonitorCapture::is_running() const {
     return running_;
+}
+
+void PulseMonitorCapture::set_audio_callback(AudioChunkCallback cb, void* userdata) {
+    // Publish userdata first (release), then cb (release) — same pattern as
+    // PipeWireCapture::set_audio_callback. See audio_capture.cpp for the
+    // ordering rationale.
+    cb_userdata_.store(userdata, std::memory_order_release);
+    cb_.store(cb, std::memory_order_release);
+}
+
+void PulseMonitorCapture::_inject_for_test(const int16_t* samples, std::size_t n) {
+    // Test-only path that exercises the buffer-append + callback dispatch
+    // shape without opening a PulseAudio stream. Mirrors the inside of the
+    // worker loop above so test coverage is meaningful.
+    std::lock_guard lk(buf_mtx_);
+    buffer_.insert(buffer_.end(), samples, samples + n);
+    AudioChunkCallback cb = cb_.load(std::memory_order_acquire);
+    if (cb) {
+        void* ud = cb_userdata_.load(std::memory_order_acquire);
+        cb(samples, n, ud);
+    }
 }
 
 } // namespace recmeet
