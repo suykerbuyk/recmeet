@@ -81,7 +81,7 @@ opt-in (Phase 3), model manager + CLI flags + pre-flight prompt
 (Phase 4), tray overlay + CLI stderr rendering with display
 normalization (Phase 5), and `.vtt` sidecar persistence (Phase 6).
 Phase 7 added stress + memory-bound + full-stack [captions]-tagged
-tests, doc sync, and the `v1.0.0` tag preconditions.
+tests, doc sync, and the `v1.5.0` tag preconditions.
 
 **Model choice:** `sherpa-onnx-streaming-zipformer-en-2023-06-26`
 (int8, ~74 MB, Apache-2.0, English-only). `en-small` (~28 MB) ships as
@@ -93,7 +93,7 @@ a low-end-host alternative.
   client. Filed as a follow-up to the original Phase 5 descope; tracked
   in the project's task vault.
 - Thin-client recording server (Phase 2 → V2 Phase A onward) resumes
-  immediately after the `v1.0.0` cut and the `v1-maintenance` branch
+  immediately after the `v1.5.0` cut and the `v1-maintenance` branch
   point. The V1 → V2 port of live captioning is the explicit
   validation test for the maintenance-branch policy: the audio
   callback API, `caption` event payload, and `.vtt` sidecar contract
