@@ -172,12 +172,13 @@ the authoritative record.
 **1. First-time setup — download the streaming model**
 
 The default model is `sherpa-onnx-streaming-zipformer-en-2023-06-26`
-(~74 MB int8, English-only, Apache-2.0). The CLI prompts before
-downloading on first use:
+(English-only, Apache-2.0). The tarball is ~310 MB on disk (ships both
+int8 and fp32 weights); recmeet loads only the ~74 MB int8 set at
+runtime. The CLI prompts before downloading on first use:
 
 ```bash
 recmeet --mic-only --show-captions
-# Streaming caption model 'en-2023-06-26' (~74 MB) is not cached.
+# Streaming caption model 'en-2023-06-26' (~310 MB) is not cached.
 # Download now? [y/N]
 ```
 
@@ -213,8 +214,8 @@ parses round-trip with ffmpeg.
 
 ```bash
 recmeet --list-caption-models
-# en-2023-06-26  (~74 MB)  cached
-# en-small       (~28 MB)  not cached
+# en-2023-06-26  (~310 MB)  cached
+# en-small       (~128 MB)  not cached
 ```
 
 **4. Persist via config**

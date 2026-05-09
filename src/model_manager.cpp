@@ -233,13 +233,26 @@ fs::path download_vad_model() {
 // Phase 4 — streaming caption (online ASR) models.
 //
 // Layout mirrors the sherpa-onnx model zoo: each curated model has a
-// repo-id under huggingface and ships a `.tar.bz2` whose top-level dir
-// matches the repo name. Extraction strips one directory component so the
-// files land directly in `<models>/sherpa/online/<short-name>/`.
+// `.tar.bz2` whose top-level dir matches the repo name. Extraction strips
+// one directory component so the files land directly in
+// `<models>/sherpa/online/<short-name>/`.
+//
+// **Download URL provenance.** Tarballs live on the sherpa-onnx project's
+// GitHub Releases (`asr-models` release) — the canonical mirror that the
+// upstream sherpa-onnx project itself documents. The corresponding
+// HuggingFace repos host the individual ONNX files but no longer ship a
+// tarball, so we fetch from GitHub Releases. URL was relocated 2026-05-09;
+// see CHANGELOG entry under v1.0.0 for details. Switch to per-file
+// HuggingFace fetches is a possible future optimization (would shrink the
+// download from ~310 MB to ~74 MB by skipping the fp32 weights we don't
+// load), tracked as a follow-up.
 //
 // The two models we surface for V1:
-//   * en-2023-06-26 — Phase 0.2-locked Zipformer (~74 MB), the default.
-//   * en-small      — 20 M-param fast Zipformer (~28 MB), low-end-host fallback.
+//   * en-2023-06-26 — Phase 0.2-locked Zipformer, the default.
+//                     Tarball ships both int8 (~74 MB runtime) and fp32
+//                     (~262 MB) weights; ~310 MB download.
+//   * en-small      — 20 M-param fast Zipformer, low-end-host fallback.
+//                     Same dual-precision packaging; ~128 MB download.
 //
 // `is_caption_model_cached()` is deliberately resilient: model-zoo entries
 // don't all use the same `encoder-epoch-99-avg-1.onnx` filename, so we
@@ -250,22 +263,20 @@ fs::path download_vad_model() {
 namespace {
 
 struct CaptionModelInfo {
-    std::string url;        // tarball URL (sherpa-onnx model zoo on HF)
-    std::string size_hint;  // human-readable size for the prompt
+    std::string url;        // tarball URL (sherpa-onnx asr-models GH release)
+    std::string size_hint;  // human-readable download size for the prompt
 };
 
 const std::map<std::string, CaptionModelInfo>& caption_models_table() {
     static const std::map<std::string, CaptionModelInfo> models = {
         {"en-2023-06-26",
-            {"https://huggingface.co/csukuangfj/"
-             "sherpa-onnx-streaming-zipformer-en-2023-06-26/"
-             "resolve/main/sherpa-onnx-streaming-zipformer-en-2023-06-26.tar.bz2",
-             "~74 MB"}},
+            {"https://github.com/k2-fsa/sherpa-onnx/releases/download/"
+             "asr-models/sherpa-onnx-streaming-zipformer-en-2023-06-26.tar.bz2",
+             "~310 MB"}},
         {"en-small",
-            {"https://huggingface.co/csukuangfj/"
-             "sherpa-onnx-streaming-zipformer-en-20M-2023-02-17/"
-             "resolve/main/sherpa-onnx-streaming-zipformer-en-20M-2023-02-17.tar.bz2",
-             "~28 MB"}},
+            {"https://github.com/k2-fsa/sherpa-onnx/releases/download/"
+             "asr-models/sherpa-onnx-streaming-zipformer-en-20M-2023-02-17.tar.bz2",
+             "~128 MB"}},
     };
     return models;
 }
