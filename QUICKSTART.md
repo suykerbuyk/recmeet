@@ -198,8 +198,11 @@ transcription:
 
 diarization:
   enabled: true
-  num_speakers: 0        # 0 = auto-detect
+  num_speakers: 0           # 0 = auto-detect
   cluster_threshold: 1.18
+  chunk_minutes: 15.0       # window width; auto-chunks audio above ~17.5 min
+  chunk_overlap_sec: 30.0   # overlap between chunks
+  stitch_threshold: 0.6     # cosine similarity floor for cross-chunk centroid stitching
 
 speaker_id:
   enabled: true            # auto-enabled when speakers are enrolled
@@ -232,7 +235,8 @@ notes:
   domain: general        # used in meeting note frontmatter
 
 logging:
-  level: none            # none, error, warn, info
+  level: error           # none, error, warn, info, debug
+  # retention_hours: 4   # hours of log history to keep before rotation
 
 general:
   threads: 0             # 0 = auto (cores - 1)

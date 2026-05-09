@@ -34,6 +34,10 @@ Drop an audio file (WAV, FLAC, MP3) into a designated folder and have it automat
 
 ## Phase 2: Network Daemon
 
+> **Status (2026-05): superseded by active task `agentctx/tasks/thin-client-recording-server.md`.** That task replaces the original "daemon-captures, clients-watch" framing with a thin-client / heavy-server architecture: audio capture moves to the client (tray), the daemon becomes stateless w.r.t. capture and owns compute (transcribe, diarize, identify, summarize). Wire protocol extends with length-prefixed binary frames for bulk audio upload + result download on the same connection. Phasing: A (security foundation: PSK + caps + identity + session handshake) → B (audio capture migration to client) → C (submit/process/fetch IPC + server-side job queue) → D (client-side queueing + reconnect with `(endpoint, job_id)` persistence) → E (cleanup + config schema split + binary slimming).
+>
+> The Phase 2 sketch below predates the task and is preserved as historical context for the original network-daemon framing. New work should reference the task plan, not this section.
+
 ### What it enables
 
 Run `recmeet-daemon` on a headless machine (home server, NUC) and control it from tray clients on other machines over the LAN or a Tailscale network. Audio capture still happens on the daemon host; clients get real-time status and retrieve results remotely.
@@ -133,7 +137,7 @@ requirement.
 
 - **Transcription scales fine.** Whisper steady-states at ~2.2 GB regardless
   of audio length, validated empirically on 60-min audio (T1A field
-  measurements 2026-04-30; see `docs/DEADLOCK-INVESTIGATION.md`). Whisper
+  measurements 2026-04-30; see `docs/history/DEADLOCK-INVESTIGATION.md`). Whisper
   destroys its context cleanly between phases, returning memory to the OS
   under `MALLOC_ARENA_MAX=2`.
 - **Containment is correct end-to-end.** T1A (commit b5c2264, iter 113):

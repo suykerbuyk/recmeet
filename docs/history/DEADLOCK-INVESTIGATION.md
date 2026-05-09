@@ -1,8 +1,36 @@
 # Deadlock Investigation: Subprocess Postprocessing Hang
 
+**Status**: Resolved — fixes shipped iter 94/95/98 + T1A/T1B/T1C iter 111–114. Document preserved as forensic record (T1A field measurements at §"T1A Field Measurements (2026-04-30)" explain the empirical basis for T2 chunked diarization shipped iter 121).
+
 **Date**: 2026-03-30
-**Iteration**: 93 (investigation only; fix planned for next iteration)
+**Iteration**: 93 (investigation) — see Resolution section below for shipped fixes
 **System**: Arch Linux, 16 cores (AMD), onnxruntime 1.24.4, sherpa-onnx v1.12.27
+
+## Resolution Summary
+
+All three "Planned Fixes" listed at §"Planned Fixes" below shipped, plus a second containment round (T1A/B/C) prompted by the 2026-04-30 incident documented in the Addendum.
+
+| Iter   | Commit         | Ships                                                                                                                                                                                       |
+|--------|----------------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| 94     | `5dbf80f`      | Heartbeat watchdog (10 s child emit, 120 s daemon staleness kill); sherpa-onnx 4-thread cap (Planned Fixes #1 & #2).                                                                        |
+| 94     | `73b4842`      | Phase-change `last_percent = -1` reset (Planned Fix #3).                                                                                                                                    |
+| 95     | `332661e`      | Dual-timestamp watchdog split (progress-staleness vs heartbeat-only); diarization progress callback via sherpa-onnx `ProcessWithCallback`; close leaked daemon FDs before child `exec(2)`. |
+| 98     | (logging)      | Deterministic logging framework — millis+tid format, ~70 `log_debug()` calls across all async boundaries; future deadlocks now trivially diagnosable from the log file alone.              |
+| 111    | `b5c2264`      | T1A — systemd cgroup caps (`MemoryHigh=10G`, `MemoryMax=14G`, `MemorySwapMax=0`), `MALLOC_ARENA_MAX=2`, RSS-aware no-malloc / no-stdio-lock heartbeat path, daemon-side RSS visibility per heartbeat. |
+| 113–14 | `828d6ea`      | T1B+T1C — vendored sherpa-onnx CMake patch disables onnxruntime CPU memory arena (cuts VmPeak ~40%); identify-phase heartbeat-as-liveness rule; cgroup-aware kill-grace SM (SIGTERM→5s→SIGKILL→30s→`MemoryHigh=infinity`→30s→restore). |
+
+The 4-hour / 16 GB long-audio target is met end-to-end on a `MemoryMax=16G` cgroup with no swap. T2 chunked diarization shipped iter 121 closes the remaining VmRSS-side risk by capping per-chunk peak working set; T2.2 H1's `identify_speakers_with_centroids` bypass eliminates the multi-GB identify-phase spike documented in §"T1A Field Measurements" by reusing chunk-local centroids rather than re-streaming audio through the embedding extractor.
+
+## Why This Document Stays
+
+The investigation captures forensic content not duplicated elsewhere:
+
+- §"Root Cause: onnxruntime Thread Pool Deadlock" — first-principles derivation of the work-stealing deadlock mechanism. Valuable for any future onnxruntime version regression.
+- §"Lessons Learned" — `ps` CPU% unreliability, onnxruntime thread-pool fragility, subprocess isolation as a load-bearing architectural choice, heartbeats > blind timeouts.
+- §"T1A Field Measurements (2026-04-30)" — the only place in the codebase that records the empirical RSS curve showing identify-speakers' 17× spike on 60-min audio. This is the empirical justification for choosing chunked diarization (T2) over alternatives.
+- §"Manual reproduction of the kill grace machine" — repro recipe for the T1C.2 fallback path; useful for future systemd / cgroup work.
+
+---
 
 ## Symptom
 

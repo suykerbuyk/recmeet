@@ -1,7 +1,8 @@
 {
-  "iter_n": 129,
-  "anchor_sha": "cc992a6688beaef5df425e71315d75b002851799",
+  "iter_n": 130,
+  "anchor_sha": "79444e0ed0f7475d1b9520714f75d5fe7ee24731",
   "active": [
+    "persistent-documentation-validation-update-pass",
     "thin-client-recording-server"
   ],
   "done": [

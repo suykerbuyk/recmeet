@@ -283,6 +283,15 @@ stateDiagram-v2
         Worker threads use lock_guard on g_state_mu
         for all multi-flag transitions.
         Bare atomic reads are fine without the mutex.
+
+        Reprocess (`--reprocess` or `--reprocess-batch`)
+        traverses the same path: record.start handler
+        receives `reprocess_dir` param, sets g_recording
+        briefly, run_recording() validates paths (no
+        capture), then hands off as above.
+        composite_state_name() projects the live flags
+        as "reprocessing" or "reprocessing+postprocessing"
+        for the on-wire `state.changed` event.
     end note
 ```
 
@@ -1053,6 +1062,52 @@ flowchart TD
     end
 ```
 
+### 10b. Batch Reprocess Orchestration
+
+`--reprocess-batch DIR` (iter 128) wraps the single-meeting reprocess path in a classify-and-dispatch loop. The driver is `run_reprocess_batch()` in `src/reprocess_batch.cpp`; it locks the daemon-vs-standalone dispatch decision once at start and tags every dispatched job with `cfg.batch_mode = true` so the tray can suppress per-meeting notifications and emit only the end-of-batch summary.
+
+```mermaid
+flowchart TD
+    BATCH_ENTRY["main: --reprocess-batch DIR<br/>(set cfg.reprocess_batch_dir)"]
+    BATCH_GUARD["batch_sigint_handler installed once<br/>(daemon-mode also installs per-iter<br/>handler in dispatch_one_reprocess)"]
+    CLASSIFY["classify_batch_entries(DIR)<br/>→ {needs_processing, has_note,<br/>   no_wav, malformed_dirname}"]
+    PRINT_SUMMARY["Print classification tally"]
+
+    DRY{"--dry-run?"}
+    DRY -->|"yes"| DRY_EXIT["exit 0 (no work done)"]
+    DRY -->|"no"| MODE_LOCK
+
+    MODE_LOCK["Lock daemon-vs-standalone:<br/>probe daemon ONCE<br/>(failures mid-batch error out cleanly)"]
+    ENSURE_MODELS["ensure_models_cached_or_fail()<br/>(once, not per meeting)"]
+
+    LOOP_HEAD{"For each entry<br/>in needs_processing"}
+    DISPATCH["dispatch_one_reprocess(entry, locked_mode)<br/>↳ daemon: client_record_no_sigaction()<br/>  standalone: subprocess pp via run_pipeline<br/>  cfg.batch_mode = true on the dispatched job"]
+    OUTCOME{"Outcome?"}
+    SIGNAL_CHECK{"g_batch_stop_requested<br/>set?"}
+
+    BATCH_ENTRY --> BATCH_GUARD --> CLASSIFY --> PRINT_SUMMARY --> DRY
+    MODE_LOCK --> ENSURE_MODELS --> LOOP_HEAD
+    LOOP_HEAD -->|"next"| DISPATCH
+    DISPATCH --> OUTCOME
+    OUTCOME -->|"Success / Failed"| RECORD_RESULT["Append per-meeting status<br/>to batch summary"]
+    OUTCOME -->|"Cancelled<br/>(SIGINT or batch_stop)"| RECLASSIFY["Reclassify Failed→Cancelled<br/>if iter_stop or<br/>g_batch_stop_requested set"]
+    RECORD_RESULT --> SIGNAL_CHECK
+    RECLASSIFY --> SIGNAL_CHECK
+    SIGNAL_CHECK -->|"yes"| BREAK["Break loop<br/>print partial summary<br/>exit 130"]
+    SIGNAL_CHECK -->|"no"| LOOP_HEAD
+    LOOP_HEAD -->|"done"| END_SUMMARY["Print end-of-batch summary<br/>(tray emits ONE notification<br/>via batch_job gating, see §11e)"]
+    END_SUMMARY --> EXIT_BATCH["exit 0 (or 1 if any meeting failed)"]
+```
+
+**Hybrid SIGINT model.** Two handlers cooperate:
+
+- `batch_sigint_handler` (installed once at batch entry, standalone-only): sets `g_batch_stop_requested` so the loop breaks after the current iteration's clean shutdown.
+- `batch_daemon_sigint_handler` (re-installed per iteration via `dispatch_one_reprocess` in daemon mode): forwards SIGINT to the daemon as `record.stop` for the current job, then sets `g_batch_stop_requested` so the loop breaks once the daemon reports the job ended.
+
+A single Ctrl-C aborts the current meeting's pipeline, lets it shut down cleanly, then exits the loop with code 130. Per-meeting failures (transcription error, OOM, malformed audio) record into the summary but do not abort the batch.
+
+**Daemon-disappearance handling.** If the daemon dies between iterations (rare), `client_record_no_sigaction()` returns the canonical exit code `kClientConnectFailedExitCode == 2` from `dispatch_one_reprocess` and the batch loop exits with a clear "daemon died mid-batch" error rather than silently switching to standalone mode mid-run.
+
 ---
 
 ## 11. Subprocess Postprocessing
@@ -1187,6 +1242,27 @@ flowchart TD
     ENTRY --> LOG_OFF --> READ_CFG --> PARSE --> SUPPRESS
     SUPPRESS --> SIGNALS --> HEARTBEAT --> REC --> PP --> COMPLETE --> CLEANUP --> RET
 ```
+
+### 11e. batch_mode and batch_job propagation
+
+When `--reprocess-batch` is the entry point (see §10b), each dispatched job carries `cfg.batch_mode = true`. This propagates through the IPC and subprocess boundary so the tray can render exactly one end-of-batch desktop notification instead of one per meeting.
+
+```mermaid
+flowchart LR
+    BATCH_DRIVER["run_reprocess_batch:<br/>cfg.batch_mode = true<br/>per dispatched job"]
+    DAEMON["daemon.cpp record.start<br/>handler stores cfg<br/>(includes batch_mode)"]
+    JSON["write_job_config():<br/>job config JSON<br/>includes 'batch_mode' field"]
+    SUBPROC["subprocess_main reads<br/>config_from_json,<br/>cfg.batch_mode set"]
+    JOB_COMPLETE["subprocess emits<br/>NDJSON job.complete<br/>{note_path, output_dir,<br/> batch_job: cfg.batch_mode}"]
+    DAEMON_BC["daemon poll loop:<br/>broadcasts job.complete<br/>WITH batch_job field"]
+    TRAY["tray.cpp on_job_complete:<br/>if (batch_job) skip notify();<br/>else notify('Note written: …')"]
+
+    BATCH_DRIVER --> DAEMON --> JSON --> SUBPROC --> JOB_COMPLETE --> DAEMON_BC --> TRAY
+```
+
+The standalone `--reprocess-batch` path (no daemon) bypasses the tray entirely — the CLI prints the per-meeting status lines directly and emits a single libnotify desktop notification at end of batch, gated by the same `cfg.batch_mode` flag inside `run_reprocess_batch()`.
+
+A live single-meeting reprocess or live recording leaves `cfg.batch_mode = false`; the tray then renders a per-meeting "Note written: …" notification on `job.complete` as before.
 
 ---
 

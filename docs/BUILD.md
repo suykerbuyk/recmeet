@@ -258,7 +258,7 @@ cmake -B build -G Ninja -DRECMEET_BUILD_TESTS=OFF
 
 # Disable the vendored sherpa-onnx CPU memory arena patch (T1B; for A/B
 # benchmarking only — the patch is a memory containment fix on long
-# meetings, see docs/DEADLOCK-INVESTIGATION.md). Toggling requires
+# meetings, see docs/history/DEADLOCK-INVESTIGATION.md). Toggling requires
 # `make clean-deps` between runs because FetchContent caches populate
 # state across reconfigures.
 cmake -B build -G Ninja -DRECMEET_PATCH_SHERPA_ARENA=OFF
@@ -284,29 +284,35 @@ make clean-deps && cmake -B build -G Ninja -DRECMEET_PATCH_SHERPA_ARENA=OFF && n
 ```
 
 `make clean-deps` wipes only the FetchContent populate dirs (sherpa-onnx,
-catch2) — compile artifacts for recmeet itself are preserved. As a faster
-alternative for in-place toggle without a re-fetch, you can run
-`git -C build/_deps/sherpa-onnx-src checkout sherpa-onnx/csrc/session.cc`
-to revert the patched source manually.
+catch2) — compile artifacts for recmeet itself are preserved. The CMake
+`PATCH_COMMAND` machinery wraps the arena patch with `git apply --reverse
+--check` so it remains idempotent across reconfigures; no manual revert
+is needed.
+
+**Fallback only** — if the patched source ever needs in-place inspection
+without a full re-fetch, `git -C build/_deps/sherpa-onnx-src checkout
+sherpa-onnx/csrc/session.cc` reverts the patched file manually. This is
+rarely necessary; `PATCH_COMMAND` handles toggling automatically.
 
 ---
 
 ## What the build targets are
 
-`CMakeLists.txt` defines five targets and how they relate:
+`CMakeLists.txt` defines six targets across two static libraries (the iter-104 split that lets `recmeet-tray` ship without ML dependencies):
 
 ```
-recmeet_core  (static library — all pipeline + IPC logic)
+recmeet_ipc   (static library — config, IPC client/server, util, NDJSON, no ML deps)
+    │
+    └── recmeet-tray  (tray binary = tray.cpp + recmeet_ipc + GTK3 + AppIndicator)
+
+recmeet_core  (static library — recmeet_ipc + ML pipeline: whisper, sherpa-onnx, llama)
     │
     ├── recmeet-daemon (daemon binary = daemon.cpp + recmeet_core)
     ├── recmeet        (CLI binary = main.cpp + recmeet_core)
-    ├── recmeet-tray   (tray binary = tray.cpp + recmeet_core + GTK3)
     └── recmeet_tests  (test binary = tests/*.cpp + recmeet_core + Catch2)
 ```
 
-`recmeet_core` is compiled once as a static library (`.a` file), then linked
-into all four binaries. This means changing a test file only recompiles that
-test file and re-links `recmeet_tests` — it doesn't recompile or re-link the
+`recmeet_ipc` and `recmeet_core` are each compiled once as static libraries (`.a` files), then linked into the binaries that need them. The split is load-bearing for the tray applet: linking `recmeet_ipc` only means `recmeet-tray` does not pull in onnxruntime, whisper.cpp, or llama.cpp, keeping the applet's binary size and runtime memory low and unblocking the future thin-client architecture (operator-host applet, compute on a separate daemon host). Changing a test file only recompiles that test file and re-links `recmeet_tests` — it doesn't recompile or re-link the
 other binaries.
 
 ---
@@ -560,6 +566,12 @@ The auto-dependency detection (`SHLIBDEPS` for DEB, `AUTOREQ` for RPM) maps
 ELF NEEDED entries to the correct package names for the distro where the build
 runs.
 
+### Toolchain version requirements
+
+- **CMake ≥ 3.28** — `CMakeLists.txt` declares this floor with `cmake_minimum_required(VERSION 3.28)`. Older CMake will fail at the `cmake -B build` step.
+- **GCC ≥ 12** — `cmake/prerequisites.cmake` gates on this with `FATAL_ERROR` when `RECMEET_USE_SHERPA=ON` (the default). GCC < 12 produces miscompiled onnxruntime due to `<filesystem>` ABI handling and the `std::regex` ABI break that sherpa-onnx's bundled `libonnxruntime.a` (compiled with GCC 11) trips over. The check is informational, not optional — the build refuses to configure if the floor isn't met.
+- **Clang** — currently untested as a primary compiler; the prerequisite check is GCC-specific. Patches welcome.
+
 ### Build dependencies by distro
 
 | Dependency | Arch | Debian/Ubuntu | Fedora/RHEL |
@@ -618,6 +630,7 @@ Key properties:
 - **Shared library** — sherpa-onnx's cmake checks for `.so` first on Linux.
 - **Bundles protobuf internally** — immune to system protobuf version changes.
 - **Host GCC** — no ABI mismatch with the rest of the build.
+- **GCC 15 auto-patch** — onnxruntime 1.23.2 predates GCC 15's stricter transitive-include behavior; `core/common/semver.h` no longer compiles cleanly because it relied on `<cstdint>` being pulled in by another header. The build script detects the missing include via `grep` and `sed`-injects `#include <cstdint>` after `#include "core/common/status.h"` before invoking the upstream `build.sh`. No operator action needed; the patch is documented here so rolling-distro users on GCC 15+ know what the script's doing.
 
 ### Customization
 

@@ -25,7 +25,7 @@ Environment=RECMEET_RSS_LIMIT_MB=12288
 # --- Memory containment (cgroup-enforced) ---
 # MemoryHigh: soft cap; kernel begins aggressive reclaim above this and
 # throttles processes without killing them. NOTE: the daemon's watchdog
-# kill-grace machine (T1C.2, see docs/DEADLOCK-INVESTIGATION.md) may
+# kill-grace machine (T1C.2, see docs/history/DEADLOCK-INVESTIGATION.md) may
 # transiently raise this to "infinity" via `systemctl set-property` to
 # unblock D-state worker threads when SIGKILL stalls under reclaim
 # contention; it restores this value (or whatever the operator-current

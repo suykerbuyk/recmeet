@@ -263,6 +263,14 @@ The batch driver:
 
 A single Ctrl-C aborts the current meeting, stops the loop, prints what completed, and exits 130. Per-meeting failures are reported in the summary but do not abort the batch; the exit code is 1 if any meeting failed, 0 otherwise.
 
+**Memory headroom on 16 GB hosts.** For batch runs over a parent directory containing long meetings, pass `--diarize-chunk-minutes 12` to narrow the chunked-diarize window from the default 15 min:
+
+```bash
+./build/recmeet --reprocess-batch ~/meetings/ --diarize-chunk-minutes 12
+```
+
+This widens per-chunk RSS headroom at a small cost to per-chunk centroid quality — useful when reprocessing many long meetings back-to-back where library caches accumulate residual host overhead between iterations. The default of 15 min is the iter-121 quality/memory pick; 12 min is the documented stress-test value, not a regression. The chunked-diarize path is automatic — it engages whenever audio length exceeds `chunk_minutes·60 + chunk_overlap_sec + 120` seconds (≈17.5 min at default, ≈14.5 min at 12).
+
 `--reprocess-batch` is mutually exclusive with `--reprocess`. To re-process a single meeting that already has a note, delete the note manually and re-run; v1 has no `--force` overwrite (frontmatter and manual body edits warrant a deliberate design — tracked as follow-up).
 
 ## CLI reference
@@ -301,6 +309,9 @@ Options:
   --no-diarize         Disable speaker diarization
   --num-speakers N     Number of speakers (0 = auto-detect, default: 0)
   --cluster-threshold F  Clustering distance threshold (default: 1.18, higher = fewer speakers)
+  --diarize-chunk-minutes N  Chunked-diarize window (default: 15.0; auto-engages above ~17.5 min audio)
+  --diarize-chunk-overlap-sec N  Overlap between chunks (default: 30.0)
+  --diarize-stitch-threshold F   Cosine similarity floor for cross-chunk centroid stitching (default: 0.6)
   --no-speaker-id      Disable speaker identification (voiceprint matching)
   --speaker-threshold F  Speaker identification similarity threshold (default: 0.6)
   --speaker-db DIR     Speaker database directory (default: ~/.local/share/recmeet/speakers/)
@@ -309,6 +320,7 @@ Options:
   --speaker N          Speaker number to enroll (1-based; omit for interactive prompt)
   --speakers           List enrolled speakers and exit
   --remove-speaker NAME  Remove an enrolled speaker and exit
+  --reset-speakers     Wipe the entire speaker database and exit
   --identify DIR       Identify speakers in a recording (dry-run) and exit
   --no-vad             Disable VAD segmentation (transcribe full audio)
   --vad-threshold F    VAD speech detection threshold (default: 0.5)
@@ -316,15 +328,19 @@ Options:
   --reprocess DIR      Reprocess existing recording directory
   --reprocess-batch DIR  Reprocess every meeting subdir under DIR (skips meetings with existing notes)
   --dry-run            With --reprocess-batch: classify and tally only, don't run any pipeline work
-  --log-level LEVEL    Log level: none, error, warn, info (default: none)
+  --log-level LEVEL    Log level: none, error, warn, info, debug (default: error)
   --log-dir DIR        Log file directory (default: ~/.local/share/recmeet/logs/)
+  --log-retention HOURS  Hours of log history to keep (default: 4)
   --list-sources       List available audio sources and exit
   --download-models    Download required models and exit
   --update-models      Re-download all cached models and exit
   --daemon             Force client mode (require running daemon)
   --no-daemon          Force standalone mode (skip daemon detection)
+  --daemon-addr ADDR   Daemon address override (Unix socket path or host:port for TCP)
   --status             Query daemon status and exit
   --stop               Stop daemon recording and exit
+  --progress-json      Emit machine-readable NDJSON progress on stdout (subprocess mode)
+  --config-json FILE   Subprocess-mode config file (internal: parent-to-child handoff)
   -h, --help           Show this help
   -v, --version        Show version
 ```
@@ -337,11 +353,13 @@ Usage: recmeet-daemon [OPTIONS]
 Run the recmeet daemon (IPC server for CLI and tray clients).
 
 Options:
-  --socket PATH     Unix socket path (default: $XDG_RUNTIME_DIR/recmeet/daemon.sock)
-  --log-level LEVEL Log level: none, error, warn, info (default: info)
-  --log-dir DIR     Log file directory
-  -h, --help        Show this help
-  -v, --version     Show version
+  --socket PATH        Unix socket path (default: $XDG_RUNTIME_DIR/recmeet/daemon.sock)
+  --listen ADDRESS     Listen address: Unix socket path or host:port for TCP
+  --log-level LEVEL    Log level: none, error, warn, info, debug (default: info)
+  --log-dir DIR        Log file directory
+  --log-retention HOURS  Hours of log history to keep (default: 4)
+  -h, --help           Show this help
+  -v, --version        Show version
 ```
 
 ## Configuration
@@ -360,8 +378,11 @@ transcription:
 
 diarization:
   enabled: true
-  num_speakers: 0 # 0 = auto-detect
+  num_speakers: 0           # 0 = auto-detect
   cluster_threshold: 1.18
+  chunk_minutes: 15.0       # window width; auto-chunks audio above ~17.5 min
+  chunk_overlap_sec: 30.0   # overlap between chunks (must satisfy chunk_minutes*60 > overlap+60)
+  stitch_threshold: 0.6     # cosine similarity floor for cross-chunk centroid stitching
 
 speaker_id:
   enabled: true            # auto-enabled when speakers are enrolled
@@ -394,7 +415,8 @@ notes:
   domain: general
 
 logging:
-  level: none # none, error, warn, info
+  level: error # none, error, warn, info, debug
+  # retention_hours: 4   # hours of log history to keep before rotation
   # directory: ~/.local/share/recmeet/logs/
 
 general:
@@ -429,16 +451,21 @@ make coverage            # Go test coverage report
 
 ## Testing
 
-440 C++ test cases (1435+ assertions) across 25 modules, plus integration, benchmark, full-stack, and Go test suites.
+451 C++ unit-test cases (1734 assertions) across 28 modules, plus 54 IPC integration cases (368 assertions), 16 reprocess-batch cases, 15 [t2-1] long-audio integration cases, 17 benchmark cases, 5 full-stack end-to-end cases, and 93 Go test functions across the MCP server and AI agent.
 
 ```bash
 make test                # C++ unit + Go tests (no hardware needed)
+make integration         # all [integration]-tagged tests (IPC + reprocess-batch + device + t2-1)
+make integration-t2-1    # long-audio chunked-diarize gate under cgroup MemoryMax=8G (systemd-run)
 make benchmark           # benchmark tests (needs whisper models + assets/)
 make full-stack          # end-to-end pipeline tests (models + assets/)
+make build-onnxruntime   # build vendored onnxruntime from source (~20 min, see docs/BUILD.md)
 
 # Or run directly for more control:
 ./build/recmeet_tests "~[integration]~[benchmark]~[full-stack]"  # unit tests only
-./build/recmeet_tests "[integration]"                 # needs running PipeWire session
+./build/recmeet_tests "[ipc][integration]"            # IPC integration
+./build/recmeet_tests "[reprocess-batch]"             # reprocess-batch CLI
+./build/recmeet_tests "[t2-1]"                        # long-audio chunked-diarize integration
 ./build/recmeet_tests "[benchmark]"                   # needs whisper models + assets/
 ./build/recmeet_tests "[full-stack]"                  # end-to-end pipeline (models + assets/)
 ./build/recmeet_tests "[cli]"                         # single module
@@ -498,35 +525,21 @@ The tray service is tied to `graphical-session.target` and restarts automaticall
 
 ### Postprocessing memory limits
 
-**Target:** process up to **4 hours of audio plus context notes on a host
-with a hard 16 GB memory ceiling**. This is a stated requirement; the
-roadmap (`docs/ROADMAP.md` "Long-Audio Containment") tracks the
-engineering path to meeting it. Current effective limit is ~45 minutes of
-audio, dominated by sherpa-onnx's speaker-identification phase whose
-working set scales with per-speaker audio length.
+**Target met (iter 121):** recmeet processes up to **4 hours of audio plus context notes on a host with a hard 16 GB memory ceiling**, end-to-end through transcription, diarization, speaker identification, and summarization. Validated against a 60-min real meeting and a 4-hour synthetic fixture under a `MemoryMax=16G` cgroup with no swap.
 
-The daemon's systemd unit caps memory at `MemoryHigh=10G` / `MemoryMax=14G`
-and sets `MALLOC_ARENA_MAX=2` to reduce malloc-arena fragmentation under
-onnxruntime's threaded ML workload. The postprocessing subprocess
-additionally self-limits at 12 GB (`RECMEET_RSS_LIMIT_MB=12288`); on
-overflow it exits with `child RSS limit exceeded — split audio (ffmpeg)
-or raise RECMEET_RSS_LIMIT_MB`, and the daemon stays alive thanks to
-subprocess isolation.
+The architecture has three layers of containment, each load-bearing:
 
-If you process audio longer than ~45 minutes and hit this limit today,
-either split the file:
+1. **systemd cgroup caps** (`dist/recmeet-daemon.service.in`): `MemoryHigh=10G` / `MemoryMax=14G` / `MemorySwapMax=0`. Cgroup-enforced so even an unrecoverable workload reaps only this unit, not the whole host.
+2. **Subprocess isolation**: postprocessing runs as a forked child. Crashes or the cgroup hard-cap kill only the child; the daemon stays alive, the audio is preserved, the operator gets a precise error.
+3. **Chunked diarization** (T2.1, iter 121): when audio exceeds `chunk_minutes·60 + chunk_overlap_sec + 120` seconds (≈17.5 min at default chunk_minutes=15), the pipeline auto-engages `diarize_chunked()` — slices audio into overlapping windows, reuses one `DiarizeSession` and one `SpeakerEmbeddingSession` across all chunks, stitches per-chunk centroids into a global registry by cosine similarity, then bypasses the second extractor pass via `identify_speakers_with_centroids()` (T2.2 H1). Per-chunk peak working set stays ≤ 6 GB on the 60-min fixture.
 
-```bash
-ffmpeg -i input.wav -t 1800 -c copy chunk1.wav
-ffmpeg -i input.wav -ss 1800 -c copy chunk2.wav
-```
+Below the chunk threshold the single-call `diarize()` path runs unchanged — short meetings pay no chunking overhead.
 
-…or raise the limits in `dist/recmeet-daemon.service.in` and reinstall. See
-[BUILD.md](docs/BUILD.md) "Daemon memory tuning" for the full table. The
-underlying fix — chunked diarization that bounds peak memory by chunk size
-rather than file length — is tracked in
-[ROADMAP.md](docs/ROADMAP.md) and
-[agentctx/tasks/postprocess-memory-containment.md](agentctx/tasks/postprocess-memory-containment.md).
+The postprocessing subprocess also self-limits at 12 GB (`RECMEET_RSS_LIMIT_MB=12288`); on overflow it writes `child RSS limit exceeded — split audio (ffmpeg) or raise RECMEET_RSS_LIMIT_MB` to stderr and exits cleanly. This is a defense-in-depth layer behind the cgroup; the cgroup remains the real backstop because RSS-self-limiting can stall under uninterruptible kernel sleep.
+
+**Tunable for batch runs:** `--diarize-chunk-minutes 12` narrows the chunk window from the default 15 min, widening per-chunk RSS headroom for batch reprocessing of many long meetings back-to-back. See "Batch reprocess" above for the full recipe.
+
+Forensic context for the original investigation that drove this design lives at [docs/history/DEADLOCK-INVESTIGATION.md](docs/history/DEADLOCK-INVESTIGATION.md).
 
 ## Project history
 
@@ -573,8 +586,9 @@ The CLI auto-detects a running daemon and operates as a client. Use `--no-daemon
 
 - **Transport**: Unix domain socket
 - **Wire format**: Newline-delimited JSON (NDJSON)
+- **Transports**: Unix domain socket (default) or TCP — selected via `--listen`/`--daemon-addr`
 - **Methods**: `record.start`, `record.stop`, `status.get`, `config.update`, `config.reload`, `sources.list`, `models.list`, `models.ensure`, `models.update`
-- **Events** (server push): `phase`, `state.changed`, `job.complete`, `model.downloading`
+- **Events** (server push): `phase`, `progress`, `state.changed`, `job.complete`, `model.downloading`
 
 See [BUILD.md](BUILD.md) for a detailed build system tutorial.
 

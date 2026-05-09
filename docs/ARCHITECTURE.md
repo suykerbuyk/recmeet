@@ -101,20 +101,21 @@ A long-running IPC server that owns the recording pipeline. Designed for headles
 
 ### State machine
 
-The daemon tracks a single atomic state with four values:
+The daemon tracks state via three independent atomic flags rather than a single enum, so one workload class can begin while another finishes:
 
-| State | Meaning |
-|---|---|
-| `Idle` | Ready to accept work |
-| `Recording` | Audio capture in progress (worker thread) |
-| `Postprocessing` | Transcription + summarization in progress (worker thread) |
-| `Downloading` | Model download in progress (worker thread) |
+| Flag | Set when | Cleared when |
+|---|---|---|
+| `g_recording` | Live audio capture is running | Capture worker exits |
+| `g_postprocessing` | Postprocess subprocess is alive | Subprocess exits and `waitpid` returns |
+| `g_downloading` | A model download is in progress | Download worker finishes or fails |
 
-State transitions use `compare_exchange_strong` — only one job runs at a time.
+`composite_state_name()` (`src/daemon.cpp:101`) projects the live flags into the wire-protocol state string broadcast on `state.changed` events. Possible values include `idle`, `recording`, `postprocessing`, `reprocessing`, `downloading`, `recording+postprocessing`, and `reprocessing+postprocessing`. The `reprocessing` distinction is set when `g_postprocessing` is active for a `--reprocess` or `--reprocess-batch` job (no live capture); a CLI/tray-initiated live recording produces plain `recording` or the composite `recording+postprocessing` if a previous reprocess is still wrapping up.
+
+State transitions guard the multi-flag mutations under `g_state_mu`. The end-of-recording handoff to postprocessing flips both `g_recording=false` and `g_postprocessing=true` atomically inside the lock, with no `state.changed` broadcast emitted between the two writes — clients see exactly one transition. The `record.start` admission guard checks `g_recording || g_downloading` (NOT `g_postprocessing`), so a new live recording can begin while a previous reprocess is still postprocessing — that's the concurrent-jobs case.
 
 ### Worker threads
 
-Heavy work (recording, postprocessing, model downloads) runs on a detached `std::thread` (`g_worker`). The worker communicates results back to the poll thread via `server.post()`, which writes to a self-pipe to wake `poll()` and execute the callback on the main thread. This keeps all IPC I/O and broadcast calls single-threaded.
+Heavy work runs on independent worker threads — capture (`g_capture_worker`), postprocess subprocess supervisor (`g_pp_worker`), model downloads (`g_dl_worker`). Each writes results back to the poll thread via `server.post()`, which writes to a self-pipe to wake `poll()` and execute the callback on the main thread. This keeps all IPC I/O and broadcast calls single-threaded; the worker threads never touch the wire directly.
 
 ### PID locking
 
