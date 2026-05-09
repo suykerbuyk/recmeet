@@ -1,8 +1,7 @@
 {
-  "iter_n": 130,
-  "anchor_sha": "79444e0ed0f7475d1b9520714f75d5fe7ee24731",
+  "iter_n": 131,
+  "anchor_sha": "4e7f2179b3bab05f0dd1ffd9f93328205a029cde",
   "active": [
-    "persistent-documentation-validation-update-pass",
     "thin-client-recording-server"
   ],
   "done": [
@@ -46,6 +45,7 @@
     "open-latest-session",
     "optimized-dancing-pearl",
     "persist-meeting-context-per-instance-file-naming",
+    "persistent-documentation-validation-update-pass",
     "pipeline-write-error-checks",
     "portable-onnxruntime-build-detail",
     "postprocess-memory-containment",
