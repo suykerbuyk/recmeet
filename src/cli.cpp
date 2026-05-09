@@ -9,6 +9,18 @@
 
 namespace recmeet {
 
+bool caption_language_supported(const std::string& language) {
+    // The streaming Zipformer we ship in V1 is English-only. Treat empty
+    // (auto-detect) as English-compatible — the language flag is the user's
+    // explicit choice; auto-detect is the default that lets the daemon
+    // proceed. ISO 639-1 codes are 2 letters; we lower-case for tolerance.
+    if (language.empty()) return true;
+    std::string lc;
+    lc.reserve(language.size());
+    for (char c : language) lc.push_back((c >= 'A' && c <= 'Z') ? c + 32 : c);
+    return lc == "en";
+}
+
 CliResult parse_cli(int argc, char* argv[]) {
     static const struct option long_opts[] = {
         {"source",         required_argument, nullptr, 's'},
@@ -70,6 +82,10 @@ CliResult parse_cli(int argc, char* argv[]) {
         {"diarize-stitch-threshold",  required_argument, nullptr, 1031},
         {"reprocess-batch", required_argument, nullptr, 1032},
         {"dry-run",         no_argument,       nullptr, 1033},
+        {"caption-model",      required_argument, nullptr, 1034},
+        {"list-caption-models", no_argument,      nullptr, 1035},
+        {"no-captions",        no_argument,       nullptr, 1036},
+        {"show-captions",      no_argument,       nullptr, 1037},
         {"help",           no_argument,       nullptr, 'h'},
         {"version",        no_argument,       nullptr, 'v'},
         {nullptr, 0, nullptr, 0},
@@ -141,6 +157,11 @@ CliResult parse_cli(int argc, char* argv[]) {
             case 1031: result.cfg.stitch_threshold = static_cast<float>(std::atof(optarg)); break;
             case 1032: result.cfg.reprocess_batch_dir = optarg; break;
             case 1033: result.cfg.reprocess_batch_dry_run = true; break;
+            case 1034: result.cfg.caption_model = optarg; break;
+            case 1035: result.list_caption_models = true; break;
+            case 1036: result.caption_force_off = true; break;
+            case 1037: result.caption_force_on = true;
+                       result.caption_show_on_stderr = true; break;
             case 'v': result.show_version = true; return result;
             case 'h': result.show_help = true; return result;
             default:  result.show_help = true; return result;
@@ -178,6 +199,58 @@ CliResult parse_cli(int argc, char* argv[]) {
             "--reprocess and --reprocess-batch are mutually exclusive "
             "(single-meeting reprocess vs. parent-dir batch reprocess); "
             "pass exactly one";
+    }
+
+    // ----------------------------------------------------------------
+    // Phase 4 — caption flag precedence + language guard.
+    //
+    // Precedence (highest → lowest, applied here so the resolved value
+    // lands in result.cfg.captions_enabled BEFORE the request is built):
+    //   1. --no-captions   (force off)              wins everything.
+    //   2. --show-captions (force on)               wins config, loses
+    //                                               to language guard.
+    //   3. config (captions_enabled in YAML)        baseline.
+    //
+    // Mutual exclusion: --no-captions + --show-captions is a usage error.
+    // The language guard is CLI-side (not daemon-side) so the daemon
+    // stays stateless w.r.t. UI-level decisions.
+    // ----------------------------------------------------------------
+    if (result.caption_force_on && result.caption_force_off
+        && result.parse_error.empty()) {
+        result.parse_error =
+            "--no-captions and --show-captions are mutually exclusive "
+            "(force-disable vs. force-enable); pass exactly one";
+    }
+
+    if (result.caption_force_off) {
+        result.cfg.captions_enabled = false;
+    } else if (result.caption_force_on) {
+        result.cfg.captions_enabled = true;
+    }
+    // (no flag → keep config-loaded value)
+
+    // Language guard. V1 ships an English-only streaming Zipformer; if the
+    // operator forced a non-English language we override captions to off
+    // and emit a warning on the result. main.cpp prints parse_warning to
+    // stderr without exiting (non-fatal — recording proceeds).
+    if (result.cfg.captions_enabled
+        && !caption_language_supported(result.cfg.language)) {
+        result.cfg.captions_enabled = false;
+        result.caption_show_on_stderr = false;
+        char buf[256];
+        if (result.caption_force_on) {
+            std::snprintf(buf, sizeof(buf),
+                "live captions: --show-captions ignored — only English "
+                "supported in V1 (got --language=%s)",
+                result.cfg.language.c_str());
+        } else {
+            std::snprintf(buf, sizeof(buf),
+                "live captions: only English supported in V1; final "
+                "transcript will use whisper as configured "
+                "(got --language=%s)",
+                result.cfg.language.c_str());
+        }
+        result.parse_warning = buf;
     }
 
     return result;

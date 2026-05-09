@@ -86,12 +86,19 @@ struct Config {
     float vad_min_speech = 0.25f;
     float vad_max_speech = 30.0f;
 
-    // Live captions (Phase 3 — daemon-side only; CLI flags / YAML config
-    // come in Phase 4). When `captions_enabled` is true on a `record.start`,
-    // pipeline.cpp wires a CaptionEngine to the live capture and broadcasts
-    // `caption` / `caption.degraded` IPC events. `caption_model` overrides
-    // the default streaming model directory name; empty means
-    // "en-2023-06-26".
+    // Live captions (Phase 3 daemon wiring + Phase 4 surface). When
+    // `captions_enabled` is true on a `record.start`, pipeline.cpp wires a
+    // CaptionEngine to the live capture and broadcasts `caption` /
+    // `caption.degraded` IPC events. `caption_model` names the streaming
+    // model directory (under `~/.local/share/recmeet/models/sherpa/online/`);
+    // empty resolves to the Phase-0.2-locked default at use time so a future
+    // pin change picks up automatically.
+    //
+    // The default for `captions_enabled` is `false` — captions are an
+    // explicit opt-in (CLI: `--show-captions`; tray: checkbox). The default
+    // for `caption_model` is left as the empty string here; the resolver
+    // (resolve_caption_model_dir / model_manager) treats empty as
+    // "en-2023-06-26", keeping the lock in one place.
     bool captions_enabled = false;
     std::string caption_model;
 

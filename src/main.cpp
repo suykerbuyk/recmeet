@@ -117,6 +117,11 @@ static void print_usage() {
         "  --no-daemon          Force standalone mode (skip daemon detection)\n"
         "  --status             Query daemon status and exit\n"
         "  --stop               Stop daemon recording and exit\n"
+        "  --caption-model NAME Streaming caption model name (default: en-2023-06-26)\n"
+        "  --list-caption-models  List available streaming caption models and exit\n"
+        "  --show-captions      Force-enable live captions for this recording\n"
+        "                       (V1: English only; ignored with --language != en)\n"
+        "  --no-captions        Force-disable live captions for this recording\n"
         "  -h, --help           Show this help\n"
         "  -v, --version        Show version\n"
     );
@@ -226,6 +231,31 @@ int main(int argc, char* argv[]) {
         fprintf(stderr, "Error: %s\n", cli.parse_error.c_str());
         return 2;  // CLI usage error
     }
+    // Phase 4 — non-fatal caption warnings (e.g. language guard). Printed
+    // before any command dispatch so operators see it even on early exits
+    // (e.g. --list-caption-models). Recording proceeds.
+    if (!cli.parse_warning.empty()) {
+        fprintf(stderr, "Warning: %s\n", cli.parse_warning.c_str());
+    }
+
+    // Phase 4 — `--list-caption-models` prints the curated list and exits.
+    // Cache status (cached / not cached) is shown so operators know which
+    // are already on disk. Standalone, no daemon needed.
+    if (cli.list_caption_models) {
+        auto names = recmeet::known_caption_models();
+        printf("Streaming caption models:\n");
+        for (const auto& n : names) {
+            bool cached = recmeet::is_caption_model_cached(n);
+            std::string hint = recmeet::caption_model_size_hint(n);
+            printf("  %-20s  %s%s%s%s\n", n.c_str(),
+                   cached ? "cached" : "not cached",
+                   hint.empty() ? "" : "  (",
+                   hint.c_str(),
+                   hint.empty() ? "" : ")");
+        }
+        printf("\nDefault: en-2023-06-26\n");
+        return 0;
+    }
 
     // RECMEET_DAEMON_ADDR env var as fallback for --daemon-addr
     if (cli.daemon_addr.empty()) {
@@ -266,6 +296,21 @@ int main(int argc, char* argv[]) {
             try {
                 fprintf(stderr, "  VAD model... ");
                 ensure_vad_model();
+                fprintf(stderr, "ready\n");
+            } catch (const std::exception& e) {
+                fprintf(stderr, "FAILED: %s\n", e.what());
+            }
+        }
+        // Phase 4 — opportunistically download the caption model alongside
+        // the rest when captions are enabled in config (or when CLI
+        // forced-on via --show-captions). Operators with captions disabled
+        // shouldn't pay the multi-MB cost.
+        if (cfg.captions_enabled) {
+            std::string canonical = cfg.caption_model.empty()
+                ? std::string("en-2023-06-26") : cfg.caption_model;
+            try {
+                fprintf(stderr, "  Caption model '%s'... ", canonical.c_str());
+                ensure_caption_model(cfg.caption_model);
                 fprintf(stderr, "ready\n");
             } catch (const std::exception& e) {
                 fprintf(stderr, "FAILED: %s\n", e.what());
@@ -939,6 +984,56 @@ static int standalone_main(CliResult& cli) {
         fprintf(stderr, "Warning: VAD requires sherpa-onnx support (not compiled in).\n");
         fprintf(stderr, "Rebuild with: cmake -DRECMEET_USE_SHERPA=ON, or use --no-vad to suppress.\n");
         cfg.vad = false;
+#endif
+    }
+
+    // Phase 4 — caption model pre-flight. Only runs when captions are
+    // currently enabled (after CLI precedence + language guard). Branches:
+    //   * sherpa-OFF build      → warn-and-disable (engine cannot run).
+    //   * model already cached  → no-op, recording proceeds with captions.
+    //   * stdin is a TTY        → interactive [Y/n] prompt.
+    //   * stdin is NOT a TTY    → warn-and-disable (no way to confirm a
+    //                             multi-MB download in non-interactive mode).
+    if (cfg.captions_enabled) {
+#if RECMEET_USE_SHERPA
+        if (!is_caption_model_cached(cfg.caption_model)) {
+            std::string canonical = cfg.caption_model.empty()
+                ? std::string("en-2023-06-26") : cfg.caption_model;
+            std::string hint = caption_model_size_hint(cfg.caption_model);
+            if (isatty(STDIN_FILENO)) {
+                fprintf(stderr, "Caption model '%s' not present. Download%s%s%s [Y/n]? ",
+                        canonical.c_str(),
+                        hint.empty() ? "" : " (",
+                        hint.c_str(),
+                        hint.empty() ? "" : ")");
+                int ch = getchar();
+                if (ch == 'n' || ch == 'N') {
+                    fprintf(stderr, "Captions disabled for this recording.\n");
+                    cfg.captions_enabled = false;
+                } else {
+                    try {
+                        ensure_caption_model(cfg.caption_model);
+                        fprintf(stderr, "Caption model ready.\n\n");
+                    } catch (const RecmeetError& e) {
+                        fprintf(stderr, "Error downloading caption model: %s\n", e.what());
+                        fprintf(stderr, "Captions disabled for this recording.\n");
+                        cfg.captions_enabled = false;
+                    }
+                }
+            } else {
+                fprintf(stderr,
+                        "caption model '%s' not present; "
+                        "captions disabled for this recording\n",
+                        canonical.c_str());
+                cfg.captions_enabled = false;
+            }
+        }
+#else
+        fprintf(stderr,
+                "Warning: live captions require sherpa-onnx support "
+                "(not compiled in). Captions disabled for this recording.\n"
+                "Rebuild with: cmake -DRECMEET_USE_SHERPA=ON\n");
+        cfg.captions_enabled = false;
 #endif
     }
 

@@ -223,6 +223,14 @@ Config load_config(const fs::path& config_path) {
     std::string vmxs = get_val(entries, "vad", "max_speech", "");
     if (!vmxs.empty()) cfg.vad_max_speech = std::atof(vmxs.c_str());
 
+    // Live captions section (Phase 4 — global preference; tray reads this
+    // for its checkbox initial state). Both keys are optional; a missing
+    // file or section keeps the struct defaults (enabled=false,
+    // model=""). The model-name default is resolved at use time so the
+    // Phase-0.2 lock stays in one place.
+    cfg.captions_enabled = get_bool(entries, "captions", "enabled", false);
+    cfg.caption_model = get_val(entries, "captions", "model", "");
+
     // General section
     std::string threads_str = get_val(entries, "general", "threads", "0");
     cfg.threads = std::atoi(threads_str.c_str());
@@ -361,6 +369,16 @@ void save_config(const Config& cfg, const fs::path& config_path) {
             out << "  min_speech: " << cfg.vad_min_speech << "\n";
         if (cfg.vad_max_speech != 30.0f)
             out << "  max_speech: " << cfg.vad_max_speech << "\n";
+    }
+
+    // Live captions (Phase 4) — only emitted when non-default to keep the
+    // generated YAML compact for the common case where captions are off.
+    if (cfg.captions_enabled || !cfg.caption_model.empty()) {
+        out << "\ncaptions:\n";
+        if (cfg.captions_enabled)
+            out << "  enabled: true\n";
+        if (!cfg.caption_model.empty())
+            out << "  model: " << cfg.caption_model << "\n";
     }
 
     out << "\noutput:\n"
