@@ -11,6 +11,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstdlib>
 #include <memory>
 #include <condition_variable>
 #include <mutex>
@@ -20,6 +21,12 @@
 #include <thread>
 #include <vector>
 #include <unistd.h>
+
+// Needed by [psk] tests (raw_tcp_connect / raw_recv_line)
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <poll.h>
+#include <sys/socket.h>
 
 // Ignore SIGPIPE so writing to disconnected clients doesn't kill the process
 static struct SigpipeIgnorer {
@@ -1970,8 +1977,17 @@ TEST_CASE("job.context with only context_inline (no vocabulary)", "[ipc][integra
 TEST_CASE("TCP reconnect: server restart detected by client", "[ipc][integration]") {
     const char* TCP_ADDR = "127.0.0.1:19878";
 
+    // Phase A.1: TCP listeners require a PSK. Both ends read RECMEET_AUTH_TOKEN
+    // (server via set_psk() — mirrors daemon::main; client via env var inside
+    // connect_tcp()). Use a fixed token for deterministic test runs and
+    // restore the prior env value at scope exit.
+    const char* prev = std::getenv("RECMEET_AUTH_TOKEN");
+    std::string prev_str = prev ? prev : "";
+    setenv("RECMEET_AUTH_TOKEN", "test-token-reconnect", 1);
+
     // Start server
     auto server = std::make_unique<IpcServer>(TCP_ADDR);
+    server->set_psk("test-token-reconnect");
     server->on("status.get", [](const IpcRequest&, IpcResponse& resp, IpcError&) {
         resp.result["state"] = std::string("idle");
         return true;
@@ -2001,6 +2017,7 @@ TEST_CASE("TCP reconnect: server restart detected by client", "[ipc][integration
 
     // Restart server on same port
     server = std::make_unique<IpcServer>(TCP_ADDR);
+    server->set_psk("test-token-reconnect");
     server->on("status.get", [](const IpcRequest&, IpcResponse& resp, IpcError&) {
         resp.result["state"] = std::string("recording");
         return true;
@@ -2016,6 +2033,9 @@ TEST_CASE("TCP reconnect: server restart detected by client", "[ipc][integration
 
     server->stop();
     srv2.join();
+
+    if (prev) setenv("RECMEET_AUTH_TOKEN", prev_str.c_str(), 1);
+    else      unsetenv("RECMEET_AUTH_TOKEN");
 }
 
 // ===========================================================================
@@ -2153,4 +2173,270 @@ TEST_CASE("record.start -> job.context (empty string) -> record.stop writes no c
     CHECK_FALSE(fs::exists(stamped));
     CHECK_FALSE(fs::exists(tmp.path / LEGACY_CONTEXT_NAME));
     CHECK(find_context_file(tmp.path).empty());
+}
+
+// ===========================================================================
+// Phase A.1 — PSK auth gate on TCP listener
+//
+// On TCP, the daemon refuses to accept any request until the client sends
+// `{"type":"auth.token","token":"..."}` matching RECMEET_AUTH_TOKEN. Unix
+// sockets bypass auth (kernel peer credentials are sufficient for local
+// trust). The daemon also refuses to even bring up a TCP listener if no
+// PSK is configured — better fail-stop than expose an open compute
+// surface to the network.
+//
+// These integration tests cover server start refusal, the happy/sad paths,
+// the wrong-first-frame and mid-handshake-drop cases, and the Unix bypass.
+// The tests drive bare sockets where they need to send malformed first
+// frames; otherwise they exercise the IpcClient path operators see.
+// ===========================================================================
+
+namespace {
+
+// RAII helper for setting RECMEET_AUTH_TOKEN inside a test, restoring the
+// prior value at scope exit. The PSK tests run on the server poll thread
+// + a fresh client per test, so process-wide env var changes are safe.
+struct ScopedAuthToken {
+    std::string previous;
+    bool had_previous;
+    explicit ScopedAuthToken(const std::string& value) {
+        const char* prev = std::getenv("RECMEET_AUTH_TOKEN");
+        had_previous = prev != nullptr;
+        previous = had_previous ? prev : "";
+        setenv("RECMEET_AUTH_TOKEN", value.c_str(), 1);
+    }
+    ~ScopedAuthToken() {
+        if (had_previous) setenv("RECMEET_AUTH_TOKEN", previous.c_str(), 1);
+        else              unsetenv("RECMEET_AUTH_TOKEN");
+    }
+};
+
+// Connect to a TCP port without performing any auth handshake. Returns fd
+// or -1. Used by the sad-path tests that need to send a non-auth first
+// frame or close mid-handshake.
+int raw_tcp_connect(const char* host, uint16_t port) {
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) return -1;
+    struct sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(port);
+    if (inet_pton(AF_INET, host, &addr.sin_addr) != 1) { close(fd); return -1; }
+    if (::connect(fd, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) < 0) {
+        close(fd);
+        return -1;
+    }
+    return fd;
+}
+
+// Send a literal NDJSON line (caller supplies content; '\n' is appended).
+bool raw_send_line(int fd, const std::string& msg) {
+    std::string wire = msg + "\n";
+    ssize_t total = 0;
+    while (total < static_cast<ssize_t>(wire.size())) {
+        ssize_t n = write(fd, wire.data() + total, wire.size() - total);
+        if (n <= 0) return false;
+        total += n;
+    }
+    return true;
+}
+
+// Read until newline OR timeout OR EOF. Returns the line content (no \n)
+// on success; empty string on EOF/timeout.
+std::string raw_recv_line(int fd, int timeout_ms = 1000) {
+    std::string buf;
+    auto deadline = std::chrono::steady_clock::now()
+                  + std::chrono::milliseconds(timeout_ms);
+    while (std::chrono::steady_clock::now() < deadline) {
+        struct pollfd pfd = {fd, POLLIN, 0};
+        auto remain = std::chrono::duration_cast<std::chrono::milliseconds>(
+            deadline - std::chrono::steady_clock::now()).count();
+        if (remain <= 0) break;
+        int r = poll(&pfd, 1, static_cast<int>(remain));
+        if (r <= 0) break;
+        char c;
+        ssize_t n = read(fd, &c, 1);
+        if (n <= 0) break;
+        if (c == '\n') return buf;
+        buf += c;
+    }
+    return buf;
+}
+
+// Standalone TCP-server harness — minimal `status.get` handler, no daemon
+// state machine. PSK + port are configurable. The harness owns the poll
+// thread and joins on destruction.
+struct PskServerFixture {
+    std::unique_ptr<IpcServer> server;
+    std::thread srv_thread;
+    std::string addr;
+
+    PskServerFixture(const std::string& tcp_addr, const std::string& psk)
+        : addr(tcp_addr)
+    {
+        server = std::make_unique<IpcServer>(addr);
+        server->set_psk(psk);
+        server->on("status.get", [](const IpcRequest&, IpcResponse& resp, IpcError&) {
+            resp.result["state"] = std::string("idle");
+            return true;
+        });
+        REQUIRE(server->start());
+        srv_thread = std::thread([this]() { server->run(); });
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+
+    ~PskServerFixture() {
+        if (server) server->stop();
+        if (srv_thread.joinable()) srv_thread.join();
+    }
+};
+
+} // anonymous namespace
+
+TEST_CASE("PSK happy path: TCP client with correct token clears the gate",
+          "[ipc][integration][psk]") {
+    const std::string TCP_ADDR = "127.0.0.1:19881";
+    const std::string TOKEN = "happy-path-token";
+
+    ScopedAuthToken env(TOKEN);
+    PskServerFixture srv(TCP_ADDR, TOKEN);
+
+    IpcClient client(TCP_ADDR);
+    REQUIRE(client.connect());
+    CHECK(client.is_remote());
+
+    IpcResponse resp;
+    IpcError err;
+    REQUIRE(client.call("status.get", resp, err, 2000));
+    CHECK(json_val_as_string(resp.result["state"]) == "idle");
+}
+
+TEST_CASE("PSK wrong token: TCP client is rejected with auth.error and disconnect",
+          "[ipc][integration][psk]") {
+    const std::string TCP_ADDR = "127.0.0.1:19882";
+
+    // Server expects the real token. Client sends a wrong one — IpcClient's
+    // connect() reads RECMEET_AUTH_TOKEN, so we set the env to the wrong
+    // value, expect connect() to fail, and confirm via raw probe that
+    // subsequent requests are not dispatched (server already closed the fd).
+    PskServerFixture srv(TCP_ADDR, "expected-token");
+
+    {
+        ScopedAuthToken bad("wrong-token");
+        IpcClient client(TCP_ADDR);
+        REQUIRE_FALSE(client.connect());
+    }
+
+    // Belt-and-suspenders: send a wrong token via raw socket and observe the
+    // exact wire response, then confirm the server has closed the fd.
+    int fd = raw_tcp_connect("127.0.0.1", 19882);
+    REQUIRE(fd >= 0);
+    REQUIRE(raw_send_line(fd, "{\"type\":\"auth.token\",\"token\":\"wrong-token\"}"));
+    std::string reply = raw_recv_line(fd, 1000);
+    CHECK(reply.find("\"auth.error\"") != std::string::npos);
+    CHECK(reply.find("\"invalid_token\"") != std::string::npos);
+
+    // Subsequent reads return EOF (server closed). Try reading once more —
+    // empty buffer confirms close. (raw_recv_line returns empty on EOF.)
+    char throwaway;
+    ssize_t n = read(fd, &throwaway, 1);
+    CHECK(n <= 0);
+    close(fd);
+}
+
+TEST_CASE("PSK missing first frame: non-auth request is rejected with auth_required",
+          "[ipc][integration][psk]") {
+    const std::string TCP_ADDR = "127.0.0.1:19883";
+    PskServerFixture srv(TCP_ADDR, "expected-token");
+
+    int fd = raw_tcp_connect("127.0.0.1", 19883);
+    REQUIRE(fd >= 0);
+
+    // Send a normal status.get request as the first frame — this is the
+    // mistake an unauthed client would make. The server must refuse with
+    // `auth_required`, NOT dispatch the handler.
+    REQUIRE(raw_send_line(fd, "{\"id\":1,\"method\":\"status.get\",\"params\":{}}"));
+
+    std::string reply = raw_recv_line(fd, 1000);
+    CHECK(reply.find("\"auth.error\"") != std::string::npos);
+    CHECK(reply.find("\"auth_required\"") != std::string::npos);
+
+    // Reading the success response from a hypothetical handler dispatch
+    // should NOT happen — server has closed by now.
+    char throwaway;
+    ssize_t n = read(fd, &throwaway, 1);
+    CHECK(n <= 0);
+    close(fd);
+}
+
+TEST_CASE("PSK mid-handshake drop: client connects and closes without sending any frame",
+          "[ipc][integration][psk]") {
+    const std::string TCP_ADDR = "127.0.0.1:19884";
+    PskServerFixture srv(TCP_ADDR, "expected-token");
+
+    // Open and close N connections without ever sending the auth frame.
+    // The server should clean up each PendingPsk client cleanly — no crash,
+    // no fd leak, no stuck client entries.
+    for (int i = 0; i < 5; ++i) {
+        int fd = raw_tcp_connect("127.0.0.1", 19884);
+        REQUIRE(fd >= 0);
+        close(fd);
+    }
+
+    // After the dust settles, an authenticated client must still connect
+    // and dispatch successfully — proves the server poll loop is healthy
+    // and the previous PendingPsk fds have been reaped.
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+    ScopedAuthToken env("expected-token");
+    IpcClient client(TCP_ADDR);
+    REQUIRE(client.connect());
+    IpcResponse resp;
+    IpcError err;
+    REQUIRE(client.call("status.get", resp, err, 2000));
+    CHECK(json_val_as_string(resp.result["state"]) == "idle");
+}
+
+TEST_CASE("PSK Unix bypass: Unix-socket clients dispatch immediately with no auth frame",
+          "[ipc][integration][psk]") {
+    const char* SOCK = "/tmp/recmeet_test_psk_unix.sock";
+    unlink(SOCK);
+
+    // Set a PSK on the env var to confirm Unix sockets do NOT consult it.
+    ScopedAuthToken env("would-be-required-on-tcp");
+
+    IpcServer server(SOCK);
+    // Note: we deliberately do NOT call set_psk() — Unix listeners do not
+    // require one, so this should still start successfully.
+    server.on("status.get", [](const IpcRequest&, IpcResponse& resp, IpcError&) {
+        resp.result["state"] = std::string("idle");
+        return true;
+    });
+    REQUIRE(server.start());
+    std::thread srv_thread([&server]() { server.run(); });
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+    IpcClient client(SOCK);
+    REQUIRE(client.connect());
+    CHECK_FALSE(client.is_remote());
+
+    // First request — no auth frame ever sent by the client — must succeed.
+    IpcResponse resp;
+    IpcError err;
+    REQUIRE(client.call("status.get", resp, err, 2000));
+    CHECK(json_val_as_string(resp.result["state"]) == "idle");
+
+    server.stop();
+    srv_thread.join();
+}
+
+TEST_CASE("PSK startup refusal: TCP listener with empty PSK fails to start",
+          "[ipc][integration][psk]") {
+    // Note: this exercises the IpcServer::start() guard directly. The full
+    // daemon-side check (RECMEET_AUTH_TOKEN unset → exit 1) is exercised in
+    // the daemon binary's main() — covered indirectly by the contract that
+    // daemon::main calls set_psk() and that start() refuses without it.
+    const std::string TCP_ADDR = "127.0.0.1:19885";
+    IpcServer server(TCP_ADDR);
+    // Intentionally NOT calling set_psk() — start() must refuse.
+    CHECK_FALSE(server.start());
 }

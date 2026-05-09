@@ -5,6 +5,7 @@
 
 #include <cassert>
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <sys/socket.h>
 #include <sys/un.h>
@@ -16,6 +17,71 @@
 #include <poll.h>
 
 namespace recmeet {
+
+namespace {
+
+// JSON-escape a token value. Tokens are unlikely to contain special chars
+// in practice, but we never want to emit invalid JSON if an operator
+// chose a token with quotes or backslashes.
+std::string json_escape_token(const std::string& s) {
+    std::string out;
+    out.reserve(s.size() + 2);
+    for (char c : s) {
+        switch (c) {
+            case '"':  out += "\\\""; break;
+            case '\\': out += "\\\\"; break;
+            case '\n': out += "\\n";  break;
+            case '\r': out += "\\r";  break;
+            case '\t': out += "\\t";  break;
+            default:
+                if (static_cast<unsigned char>(c) < 0x20) {
+                    char buf[8];
+                    std::snprintf(buf, sizeof(buf), "\\u%04x", c);
+                    out += buf;
+                } else {
+                    out += c;
+                }
+        }
+    }
+    return out;
+}
+
+// Read one NDJSON line from a blocking-mode fd with a deadline. Returns
+// true when a complete line is in `out` (without the trailing \n); false
+// on timeout/disconnect/error.
+bool read_one_line_blocking(int fd, std::string& out, int timeout_ms) {
+    auto deadline = std::chrono::steady_clock::now()
+        + std::chrono::milliseconds(timeout_ms);
+    out.clear();
+    char buf[256];
+    while (true) {
+        // Check if line already complete from a previous read attempt.
+        // (We never accumulate beyond the first \n in this helper.)
+        struct pollfd pfd = {fd, POLLIN, 0};
+        auto now = std::chrono::steady_clock::now();
+        auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now).count();
+        if (remaining <= 0) return false;
+        int r = poll(&pfd, 1, static_cast<int>(remaining));
+        if (r <= 0) return false;
+        if (pfd.revents & (POLLHUP | POLLERR)) {
+            // POLLHUP can come with a final readable buffer; try one read.
+        }
+        ssize_t n = read(fd, buf, sizeof(buf));
+        if (n <= 0) return false;
+        for (ssize_t i = 0; i < n; ++i) {
+            if (buf[i] == '\n') {
+                // We don't currently support the server sending more than
+                // one frame in this window — auth.ok is the only valid
+                // response. Anything trailing is a protocol violation, but
+                // we ignore it because connection state matters more.
+                return true;
+            }
+            out += buf[i];
+        }
+    }
+}
+
+} // anonymous namespace
 
 IpcClient::IpcClient(const std::string& socket_path) {
     if (!parse_ipc_address(socket_path, addr_))
@@ -99,6 +165,33 @@ bool IpcClient::connect_tcp() {
     setsockopt(fd_, IPPROTO_TCP, TCP_KEEPINTVL, &intvl, sizeof(intvl));
     int cnt = 3;
     setsockopt(fd_, IPPROTO_TCP, TCP_KEEPCNT, &cnt, sizeof(cnt));
+
+    // Phase A.1 PSK gate: TCP clients must send `auth.token` as the first
+    // frame and wait for `auth.ok` before any other traffic. The token is
+    // read from RECMEET_AUTH_TOKEN at connect time so operators can rotate
+    // by relaunching. Per-client config arrives in A.6 (session.init);
+    // until then, the env var is the v1 source of truth.
+    const char* token_env = std::getenv("RECMEET_AUTH_TOKEN");
+    std::string token = token_env ? token_env : "";
+
+    std::string auth_frame = "{\"type\":\"auth.token\",\"token\":\""
+                           + json_escape_token(token) + "\"}\n";
+    ssize_t aw = write(fd_, auth_frame.data(), auth_frame.size());
+    if (aw < 0) { close(fd_); fd_ = -1; return false; }
+
+    std::string reply;
+    if (!read_one_line_blocking(fd_, reply, 5000)) {
+        close(fd_); fd_ = -1; return false;
+    }
+
+    // We accept any reply containing the literal `"auth.ok"` type marker.
+    // Anything else (auth.error or unexpected) → close. We don't surface a
+    // structured error here because v1 callers handle connection failure
+    // identically; operators see the daemon-side log line which already
+    // names the rejection reason.
+    if (reply.find("\"auth.ok\"") == std::string::npos) {
+        close(fd_); fd_ = -1; return false;
+    }
 
     return true;
 }

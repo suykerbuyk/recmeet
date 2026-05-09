@@ -20,6 +20,84 @@
 
 namespace recmeet {
 
+namespace {
+
+// Constant-time string comparison. Avoids early-exit timing leaks on the
+// PSK match path. Strings of differing length still take O(max(len)) time
+// (length difference is itself non-secret — the attacker controls their
+// own input length).
+bool ct_equals(const std::string& a, const std::string& b) {
+    const size_t na = a.size();
+    const size_t nb = b.size();
+    const size_t n  = na > nb ? na : nb;
+    unsigned char diff = static_cast<unsigned char>(na ^ nb);
+    for (size_t i = 0; i < n; ++i) {
+        unsigned char ca = i < na ? static_cast<unsigned char>(a[i]) : 0;
+        unsigned char cb = i < nb ? static_cast<unsigned char>(b[i]) : 0;
+        diff |= static_cast<unsigned char>(ca ^ cb);
+    }
+    return diff == 0;
+}
+
+// Format peer address for log lines from getpeername(). Falls back to
+// "unknown" if the syscall fails. Never logs anything sensitive.
+std::string format_peer_tcp(int fd) {
+    struct sockaddr_in addr{};
+    socklen_t len = sizeof(addr);
+    if (getpeername(fd, reinterpret_cast<struct sockaddr*>(&addr), &len) != 0)
+        return "unknown";
+    char host[INET_ADDRSTRLEN] = {0};
+    inet_ntop(AF_INET, &addr.sin_addr, host, sizeof(host));
+    return std::string(host) + ":" + std::to_string(ntohs(addr.sin_port));
+}
+
+// Send a small auth-error JSON frame. Hand-rolled rather than going through
+// the `IpcError` enum because the auth surface is its own protocol shape:
+// it is `{"type":"auth.error","reason":"..."}`, not a request/response pair.
+std::string make_auth_error_frame(const std::string& reason) {
+    return std::string("{\"type\":\"auth.error\",\"reason\":\"") + reason + "\"}\n";
+}
+
+const std::string AUTH_OK_FRAME = "{\"type\":\"auth.ok\"}\n";
+
+// Lightweight extractor for `{"type":"auth.token","token":"..."}`. Avoids
+// pulling the full IpcMessage parser into the auth path — auth frames are
+// not requests/responses/events and do not carry an id. Returns true when
+// `line` looks like a well-formed auth.token frame and `out` is populated.
+bool try_parse_auth_token(const std::string& line, std::string& out) {
+    // Find "type":"auth.token"
+    if (line.find("\"type\":\"auth.token\"") == std::string::npos
+        && line.find("\"type\": \"auth.token\"") == std::string::npos)
+        return false;
+
+    // Find "token": followed by a quoted string. Tolerate optional whitespace
+    // and conservative escape handling (\\, \"). Daemon-side validation only
+    // accepts the value if extraction succeeds; on any malformed shape the
+    // caller treats this as a reject and closes.
+    size_t key = line.find("\"token\"");
+    if (key == std::string::npos) return false;
+    size_t colon = line.find(':', key);
+    if (colon == std::string::npos) return false;
+    size_t open = line.find('"', colon);
+    if (open == std::string::npos) return false;
+    out.clear();
+    for (size_t i = open + 1; i < line.size(); ++i) {
+        char c = line[i];
+        if (c == '\\' && i + 1 < line.size()) {
+            char nc = line[i + 1];
+            if (nc == '"' || nc == '\\') { out += nc; ++i; continue; }
+            // Other escape sequences are not expected for token values; pass through.
+            out += c;
+            continue;
+        }
+        if (c == '"') return true;
+        out += c;
+    }
+    return false;
+}
+
+} // anonymous namespace
+
 IpcServer::IpcServer(const std::string& socket_path) {
     if (!parse_ipc_address(socket_path, addr_)) {
         addr_ = default_ipc_address();
@@ -42,6 +120,15 @@ void IpcServer::on(const std::string& method, MethodHandler handler) {
 }
 
 bool IpcServer::start() {
+    // Phase A.1 PSK gate: refuse to bring up an unauthenticated TCP listener.
+    // Unix-socket listeners do not require a PSK because kernel peer
+    // credentials provide local trust.
+    if (addr_.transport == IpcTransport::Tcp && psk_.empty()) {
+        log_error("ipc_server: TCP listener requires a pre-shared key. "
+                  "Set RECMEET_AUTH_TOKEN or use a Unix socket.");
+        return false;
+    }
+
     // Create self-pipe for cross-thread wakeup
     int pipefd[2];
     if (pipe(pipefd) < 0) {
@@ -221,6 +308,7 @@ void IpcServer::accept_client() {
     if (fd < 0) return;
     fcntl(fd, F_SETFL, O_NONBLOCK);
 
+    ClientState cs;
     if (addr_.transport == IpcTransport::Tcp) {
         int yes = 1;
         setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &yes, sizeof(yes));
@@ -231,10 +319,53 @@ void IpcServer::accept_client() {
         setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &intvl, sizeof(intvl));
         int cnt = 3;
         setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &cnt, sizeof(cnt));
+
+        // Phase A.1: TCP clients must complete the PSK handshake before any
+        // request handler is dispatched. Capture the peer address up front
+        // so refusal log lines have it even if the client closes early.
+        cs.auth_state = AuthState::PendingPsk;
+        cs.peer_addr  = format_peer_tcp(fd);
+    } else {
+        // Unix-socket peer credentials make local trust authoritative.
+        cs.auth_state = AuthState::Authed;
+        cs.peer_addr  = "unix";
     }
 
-    clients_[fd] = {};
-    log_info("ipc_server: client connected (fd=%d, total=%zu)", fd, clients_.size());
+    clients_[fd] = std::move(cs);
+    log_info("ipc_server: client connected (fd=%d, peer=%s, total=%zu)",
+             fd, clients_[fd].peer_addr.c_str(), clients_.size());
+}
+
+bool IpcServer::handle_pending_psk(int fd, ClientState& cs, const std::string& line) {
+    std::string token;
+    if (!try_parse_auth_token(line, token)) {
+        // First TCP frame was not auth.token — protocol violation.
+        log_warn("ipc_server: TCP auth refused (peer=%s, reason=auth_required)",
+                 cs.peer_addr.c_str());
+        cs.auth_state = AuthState::Rejected;
+        send_to(fd, make_auth_error_frame("auth_required"));
+        // send_to may have already closed on EAGAIN-loop write failure.
+        // If the fd is still alive, drop it now.
+        if (clients_.find(fd) != clients_.end())
+            remove_client(fd);
+        return false;
+    }
+
+    if (!ct_equals(token, psk_)) {
+        // Mismatched PSK. Log the peer + reason but never the token itself.
+        log_warn("ipc_server: TCP auth refused (peer=%s, reason=invalid_token)",
+                 cs.peer_addr.c_str());
+        cs.auth_state = AuthState::Rejected;
+        send_to(fd, make_auth_error_frame("invalid_token"));
+        if (clients_.find(fd) != clients_.end())
+            remove_client(fd);
+        return false;
+    }
+
+    cs.auth_state = AuthState::Authed;
+    log_info("ipc_server: TCP auth ok (peer=%s)", cs.peer_addr.c_str());
+    send_to(fd, AUTH_OK_FRAME);
+    return true;
 }
 
 void IpcServer::handle_client_data(int fd) {
@@ -257,6 +388,34 @@ void IpcServer::handle_client_data(int fd) {
         rbuf.erase(0, pos + 1);
 
         if (line.empty()) continue;
+
+        // Phase A.1 PSK gate: TCP clients must clear PendingPsk before any
+        // other dispatch. handle_pending_psk() consumes the line — on
+        // success it flips auth_state to Authed and continues; on failure
+        // it sends auth.error, schedules removal, and we break out of the
+        // per-line loop because the iterator may now be stale. Unix
+        // clients are pre-marked Authed in accept_client() and skip this
+        // branch entirely.
+        if (it->second.auth_state == AuthState::PendingPsk) {
+            if (!handle_pending_psk(fd, it->second, line)) {
+                // Connection dropped; the iterator/clients_ entry is gone.
+                return;
+            }
+            // Either we're now Authed and continue dispatching subsequent
+            // lines, or we have already returned. Re-look-up the iterator
+            // because clients_ map may have rehashed.
+            it = clients_.find(fd);
+            if (it == clients_.end()) return;
+            continue;
+        }
+
+        // Defensive: a Rejected client should already be gone, but guard
+        // anyway so a residual buffered frame after rejection cannot
+        // surface to a request handler.
+        if (it->second.auth_state != AuthState::Authed) {
+            remove_client(fd);
+            return;
+        }
 
         IpcMessage msg;
         if (!parse_ipc_message(line, msg) || msg.type != IpcMessageType::Request) {

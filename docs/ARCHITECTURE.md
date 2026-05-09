@@ -204,6 +204,14 @@ Values are `string | int64 | double | bool | null`. Nested objects/arrays are st
 
 The IPC server runs a single-threaded `poll()` loop. All socket reads, writes, and broadcasts happen on this thread. Worker threads marshal results back via `server.post()` + self-pipe wakeup, ensuring no concurrent access to client fd state.
 
+### TCP authentication (Phase A.1, V2)
+
+When the daemon listens on TCP (`--listen host:port`), every connection must complete a pre-shared-key handshake before any other request is dispatched. The PSK is read from the `RECMEET_AUTH_TOKEN` environment variable at daemon startup (and again at client connect). The daemon refuses to even bind a TCP listener with an empty PSK — this is fail-stop, not warn-and-continue, because exposing the compute surface to the network without auth is unacceptable. Unix-socket clients bypass the gate entirely; kernel-enforced peer credentials are sufficient for local trust.
+
+The client opens the connection and sends `{"type":"auth.token","token":"..."}\n` as its first frame. On match the server replies `{"type":"auth.ok"}\n` and flips the connection's `auth_state` from `PendingPsk` to `Authed`. On mismatch (or wrong first frame), the server logs the refusal at WARN with the peer address, sends `{"type":"auth.error","reason":"invalid_token"|"auth_required"}\n`, and closes. The token itself is never logged. PSK comparison is constant-time so the daemon does not leak the prefix length of the configured key.
+
+In V2 multi-server work the global PSK is expected to grow into per-server PSKs and a session.init credential channel; the gate's chokepoint (refusing dispatch unless `auth_state == Authed`) is the same in either model.
+
 ## Recording Pipeline
 
 The pipeline has two phases, split at the point where audio capture completes:

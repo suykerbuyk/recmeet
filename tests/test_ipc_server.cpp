@@ -7,6 +7,7 @@
 #include "ipc_protocol.h"
 
 #include <atomic>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <thread>
@@ -241,7 +242,14 @@ TEST_CASE("IpcServer: post() wakes poll loop", "[ipc_server]") {
 // ---------------------------------------------------------------------------
 
 TEST_CASE("IpcServer TCP: listen + echo round-trip", "[ipc_server]") {
+    // Phase A.1: TCP listeners require a PSK. Both ends read the same value
+    // (server via set_psk(), client via RECMEET_AUTH_TOKEN inside connect_tcp()).
+    const char* prev = std::getenv("RECMEET_AUTH_TOKEN");
+    std::string prev_str = prev ? prev : "";
+    setenv("RECMEET_AUTH_TOKEN", "ipc_server_test_token", 1);
+
     IpcServer server("127.0.0.1:19876");
+    server.set_psk("ipc_server_test_token");
     server.on("echo", [](const IpcRequest& req, IpcResponse& resp, IpcError&) {
         resp.result["msg"] = req.params.at("msg");
         return true;
@@ -263,10 +271,19 @@ TEST_CASE("IpcServer TCP: listen + echo round-trip", "[ipc_server]") {
 
     server.stop();
     srv.join();
+
+    if (prev) setenv("RECMEET_AUTH_TOKEN", prev_str.c_str(), 1);
+    else      unsetenv("RECMEET_AUTH_TOKEN");
 }
 
 TEST_CASE("IpcServer TCP: broadcast to 2 clients", "[ipc_server]") {
+    // Phase A.1: same PSK pattern as the round-trip test above.
+    const char* prev = std::getenv("RECMEET_AUTH_TOKEN");
+    std::string prev_str = prev ? prev : "";
+    setenv("RECMEET_AUTH_TOKEN", "ipc_server_test_token", 1);
+
     IpcServer server("127.0.0.1:19877");
+    server.set_psk("ipc_server_test_token");
     server.on("ping", [](const IpcRequest&, IpcResponse& resp, IpcError&) {
         resp.result["ok"] = true;
         return true;
@@ -304,4 +321,7 @@ TEST_CASE("IpcServer TCP: broadcast to 2 clients", "[ipc_server]") {
 
     server.stop();
     srv.join();
+
+    if (prev) setenv("RECMEET_AUTH_TOKEN", prev_str.c_str(), 1);
+    else      unsetenv("RECMEET_AUTH_TOKEN");
 }

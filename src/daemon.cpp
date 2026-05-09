@@ -878,6 +878,24 @@ int main(int argc, char* argv[]) {
     IpcServer server(socket_path);
     g_server = &server;
 
+    // Phase A.1 PSK gate: TCP listeners require RECMEET_AUTH_TOKEN. Unix
+    // listeners trust the kernel's peer credentials and skip the PSK check.
+    if (listen_addr.transport == IpcTransport::Tcp) {
+        const char* token_env = std::getenv("RECMEET_AUTH_TOKEN");
+        std::string token = token_env ? token_env : "";
+        if (token.empty()) {
+            fprintf(stderr,
+                    "recmeet-daemon: refusing to start TCP listener without "
+                    "RECMEET_AUTH_TOKEN set.\n"
+                    "Set RECMEET_AUTH_TOKEN to a strong shared secret, or use "
+                    "--listen with a Unix socket path for local-only mode.\n");
+            log_error("daemon: refusing TCP startup — RECMEET_AUTH_TOKEN unset");
+            return 1;
+        }
+        server.set_psk(token);
+        log_info("daemon: PSK auth enabled for TCP listener");
+    }
+
     // --- Method handlers ---
 
     server.on("status.get", [](const IpcRequest& req, IpcResponse& resp, IpcError&) {
