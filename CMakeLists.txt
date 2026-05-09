@@ -222,6 +222,15 @@ if(RECMEET_USE_SHERPA)
     target_compile_definitions(recmeet_core PUBLIC RECMEET_USE_SHERPA=1)
 endif()
 
+# Phase 2 — streaming caption engine. Compiled in both build flavors:
+#  - With RECMEET_USE_SHERPA=ON the .cpp pulls in <sherpa-onnx/c-api/c-api.h>
+#    and builds the real recognizer-backed engine.
+#  - With RECMEET_USE_SHERPA=OFF the same .cpp compiles to stub bodies; the
+#    only side effect of start() is to set last_error() to
+#    "captions require RECMEET_USE_SHERPA=ON build" and return false. The
+#    header is single-source-of-truth so callers compile uniformly.
+target_sources(recmeet_core PRIVATE src/caption_engine.cpp)
+
 # CLI binary
 add_executable(recmeet src/main.cpp)
 target_link_libraries(recmeet PRIVATE recmeet_core)
@@ -294,6 +303,7 @@ if(RECMEET_BUILD_TESTS)
         tests/test_full_stack.cpp
         tests/test_integration_pipeline.cpp
         tests/streaming_capture_tests.cpp
+        tests/streaming_engine_tests.cpp
     )
     target_link_libraries(recmeet_tests PRIVATE recmeet_core Catch2::Catch2WithMain)
     if(RECMEET_BUILD_WEB)
