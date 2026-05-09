@@ -18,6 +18,12 @@
 #include <string>
 #include <vector>
 
+// All [full-stack] tests below exercise sherpa-onnx diarization + speaker
+// identification end-to-end. They cannot compile when RECMEET_USE_SHERPA is
+// OFF because is_sherpa_model_cached() / is_vad_model_cached() and the
+// sherpa-only members of speaker_id.h are not declared in that build.
+#if RECMEET_USE_SHERPA
+
 using namespace recmeet;
 using namespace recmeet::test_helpers;
 
@@ -625,3 +631,5 @@ TEST_CASE("Reprocess-batch: skip-existing + reprocess-missing end-to-end",
 
     fs::remove_all(workspace);
 }
+
+#endif // RECMEET_USE_SHERPA
