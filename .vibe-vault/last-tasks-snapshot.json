@@ -1,8 +1,10 @@
 {
-  "iter_n": 132,
-  "anchor_sha": "fc3c6192a2d4384b5729aae5fd417d1b297dea07",
+  "iter_n": 134,
+  "anchor_sha": "b436642b3734dcce87a0b524169b85fe44977759",
   "active": [
-    "thin-client-recording-server"
+    "live-captioning-v1-capstone",
+    "thin-client-recording-server",
+    "webui-live-captions"
   ],
   "done": [
     "audio-buffer-bounds",
