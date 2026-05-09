@@ -72,8 +72,7 @@ Run `recmeet-daemon` on a headless machine (home server, NUC) and control it fro
 
 ## Phase 2b: Live Captioning — DELIVERED
 
-**Status: shipped iter-??? (V1 capstone — operator will replace `???`
-with the actual iter at wrap time).** Phases 1–6 of the
+**Status: shipped iter 135 (V1 capstone, tagged 1.5.0).** Phases 1–6 of the
 `live-captioning-v1-capstone` task landed on `feat/live-captioning-v1`:
 audio-capture callback (Phase 1), `CaptionEngine` streaming-ASR worker
 (Phase 2), IPC `caption` + `caption.degraded` events with `record.start`

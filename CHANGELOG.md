@@ -8,7 +8,7 @@ The V1 capstone release. Live captioning lands as the final V1 feature, completi
 
 ### Added
 
-- **Live captioning** (Phases 1–6 of the V1 capstone, iter-???):
+- **Live captioning** (Phases 1–6 of the V1 capstone, iter 135):
   - `CaptionEngine` wraps sherpa-onnx streaming Zipformer (`sherpa-onnx-streaming-zipformer-en-2023-06-26`, ~74 MB int8) behind a SPSC ring buffer + dedicated worker thread.
   - Per-recording opt-in via `record.start {captions_enabled: true, caption_model: ...}` params; CLI flags `--show-captions`, `--caption-model`, `--list-caption-models`, `--no-captions`; tray "Show Live Captions" checkbox.
   - IPC `caption` + `caption.degraded` events with `job_id` payload (V2 forward-compat for per-client routing).

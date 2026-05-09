@@ -1,8 +1,7 @@
 {
-  "iter_n": 134,
-  "anchor_sha": "b436642b3734dcce87a0b524169b85fe44977759",
+  "iter_n": 135,
+  "anchor_sha": "334ba03e12cd360b1065f26c7b1172926614552f",
   "active": [
-    "live-captioning-v1-capstone",
     "thin-client-recording-server",
     "webui-live-captions"
   ],
@@ -34,6 +33,7 @@
     "ipc-client-sends-api-key",
     "is-running-atomicity",
     "library-split-recmeet-ipc",
+    "live-captioning-v1-capstone",
     "lively-conjuring-hare",
     "logging-facility",
     "logical-discovering-gosling",
