@@ -15,7 +15,7 @@ The result: full transcriptions with speaker labels, professionally structured s
 ## What it does
 
 - **Records** mic input and speaker output simultaneously via PipeWire/PulseAudio — captures both sides of any conversation regardless of platform
-- **Transcribes** with whisper.cpp (tiny through large-v3 models, auto-downloaded on first use), with vocabulary hints to improve accuracy for names and domain-specific terms
+- **Transcribes** with whisper.cpp (tiny through large-v3 models, auto-downloaded on first use), with vocabulary hints to improve accuracy for names and domain-specific terms; auto-detects Vulkan GPU acceleration at build time (~26× faster on whisper-medium / Radeon Pro W5500) with transparent CPU fallback
 - **Identifies speakers** via sherpa-onnx diarization (Pyannote segmentation + 3D-Speaker embeddings), with cross-session speaker identification — enroll voices once, get real names in every transcript
 - **Summarizes** via cloud API (xAI/OpenAI/Anthropic — all OpenAI-compatible) or a local GGUF model via llama.cpp — your choice
 - **Outputs** timestamped transcripts, structured summaries, and meeting notes with YAML frontmatter (Obsidian-compatible)
@@ -270,6 +270,30 @@ let's start with the status update
   cleanly but `--show-captions` is a no-op (the engine reports a
   one-shot degraded event and recording continues without captions).
 
+## GPU acceleration
+
+`recmeet` builds with **Vulkan GPU acceleration** by default whenever the host has the toolchain installed (`libvulkan` + headers + `glslc`). On a Radeon Pro W5500 with Mesa RADV, whisper-medium on a 63-minute meeting runs in ~16 minutes on GPU vs ~7 hours on CPU — roughly 26× faster. Speaker diarization stays on CPU regardless (onnxruntime would need a separate ROCm/MIGraphX build).
+
+The build is a **single binary that uses GPU when available and silently falls back to CPU when not.** GPU backends ship as separate `libggml-vulkan.so` plugins loaded at startup; `ldd build/recmeet | grep vulkan` is empty even on a Vulkan-enabled build. Move the binary to a host with no GPU and it still runs.
+
+```bash
+# Default — autodetect Vulkan if the toolchain is present, warn if missing pieces, fall back to CPU
+make build
+
+# Required — fail configure if Vulkan can't be enabled
+cmake -B build -G Ninja -DRECMEET_GGML_VULKAN=ON
+
+# Force CPU-only (e.g. distro packagers shipping a universal artifact)
+cmake -B build -G Ninja -DRECMEET_GGML_VULKAN=OFF
+```
+
+At daemon startup, look for the **active-backend banner** on stderr or in `journalctl --user -u recmeet-daemon.service`:
+
+    ggml: backend registry: CPU, Vulkan
+    ggml: active backend: Vulkan (AMD Radeon Pro W5500 (RADV NAVI10), 8192 MB)
+
+If you built with Vulkan but the GPU isn't being used (missing ICD driver, headless host, …), the banner emits a `WARN` line naming the gap before falling back to CPU. See [BUILD.md](docs/BUILD.md#gpu-acceleration-vulkan) for the full toolchain matrix, per-distro install hints, and VRAM measurements.
+
 ## Output
 
 ### Directory structure
@@ -503,13 +527,14 @@ general:
 
 ## Build options
 
-| Option                | Default | Effect                                                      |
-| --------------------- | ------- | ----------------------------------------------------------- |
-| `RECMEET_USE_SHERPA`  | ON      | Enable speaker diarization (fetches sherpa-onnx via CMake)  |
-| `RECMEET_USE_LLAMA`   | ON      | Enable local LLM summarization via llama.cpp                |
-| `RECMEET_USE_NOTIFY`  | ON      | Enable desktop notifications via libnotify                  |
-| `RECMEET_BUILD_TRAY`  | ON      | Build the system tray applet (requires GTK3 + AppIndicator) |
-| `RECMEET_BUILD_TESTS` | ON      | Build the Catch2 test suite                                 |
+| Option                | Default | Effect                                                                                        |
+| --------------------- | ------- | --------------------------------------------------------------------------------------------- |
+| `RECMEET_GGML_VULKAN` | AUTO    | GPU acceleration via ggml Vulkan backend. AUTO probes; ON requires; OFF disables. See below.  |
+| `RECMEET_USE_SHERPA`  | ON      | Enable speaker diarization (fetches sherpa-onnx via CMake)                                    |
+| `RECMEET_USE_LLAMA`   | ON      | Enable local LLM summarization via llama.cpp                                                  |
+| `RECMEET_USE_NOTIFY`  | ON      | Enable desktop notifications via libnotify                                                    |
+| `RECMEET_BUILD_TRAY`  | ON      | Build the system tray applet (requires GTK3 + AppIndicator)                                   |
+| `RECMEET_BUILD_TESTS` | ON      | Build the Catch2 test suite                                                                   |
 
 ```bash
 # Example: headless build without tray or diarization

@@ -329,6 +329,10 @@ cmake -B build -G Ninja -DRECMEET_USE_SHERPA=OFF
 # Disable building tests (skips Catch2 download)
 cmake -B build -G Ninja -DRECMEET_BUILD_TESTS=OFF
 
+# GPU acceleration (Vulkan): AUTO (default), ON (require), OFF (force-disable).
+# See "GPU acceleration (Vulkan)" below for the full story.
+cmake -B build -G Ninja -DRECMEET_GGML_VULKAN=ON
+
 # Disable the vendored sherpa-onnx CPU memory arena patch (T1B; for A/B
 # benchmarking only — the patch is a memory containment fix on long
 # meetings, see docs/history/DEADLOCK-INVESTIGATION.md). Toggling requires
@@ -387,6 +391,54 @@ recmeet_core  (static library — recmeet_ipc + ML pipeline: whisper, sherpa-onn
 
 `recmeet_ipc` and `recmeet_core` are each compiled once as static libraries (`.a` files), then linked into the binaries that need them. The split is load-bearing for the tray applet: linking `recmeet_ipc` only means `recmeet-tray` does not pull in onnxruntime, whisper.cpp, or llama.cpp, keeping the applet's binary size and runtime memory low and unblocking the future thin-client architecture (operator-host applet, compute on a separate daemon host). Changing a test file only recompiles that test file and re-links `recmeet_tests` — it doesn't recompile or re-link the
 other binaries.
+
+---
+
+## Plugin architecture (ggml backends)
+
+Starting in v1.6.0, the vendored `whisper.cpp` and `llama.cpp` subbuilds ship as **shared libraries** with ggml's `GGML_BACKEND_DL=ON` plugin model. Compute backends (CPU variants, Vulkan, CUDA, etc.) are no longer statically linked into the `recmeet` binary — they are separate `libggml-*.so` files loaded at startup by `dlopen()`.
+
+### What this gets you
+
+- **No hard GPU dependencies in the binary.** `ldd build/recmeet | grep vulkan` returns empty even when the build had Vulkan enabled. The binary loads on any host the distro supports; if `libggml-vulkan.so` is missing or its Vulkan ICD isn't available, the daemon silently falls back to CPU.
+- **Per-ISA CPU plugins.** `GGML_CPU_ALL_VARIANTS=ON` (forced) emits multiple `libggml-cpu-*.so` plugins (`sse4_2`, `avx`, `avx2`, `avx512`, `amx` on x86). At startup ggml scores each one against the host CPU and picks the highest-supported variant. Same binary on a 2015 server and a 2024 laptop.
+- **Split packaging-friendly layout.** Distro packagers can ship `recmeet` (always installed, CPU-capable, no GPU deps) plus optional companion packages that drop their backend `.so` into `<prefix>/lib/`. The companion split is on the roadmap — see `agentctx/tasks/runtime-loadable-gpu-backends.md` Step 7.
+
+### Plugin discovery at startup
+
+`recmeet-daemon` and the standalone `recmeet` CLI call `recmeet::load_backends()` immediately after `log_init()` returns (`src/daemon.cpp:851`, `src/main.cpp:863`). It resolves the plugin directory deterministically from `/proc/self/exe`, in this order:
+
+1. `$RECMEET_GGML_BACKEND_PATH` — test/dev override.
+2. `<exe-dir>/../lib` — production install layout (e.g. `~/.local/bin/recmeet` → `~/.local/lib/`).
+3. `<exe-dir>/bin` — in-tree build layout (`build/recmeet` → `build/bin/`).
+4. `<exe-dir>` — alternate co-located layout.
+
+We resolve the path ourselves rather than relying on ggml's built-in `$ORIGIN/../lib` macro because `dlopen()` does not expand `$ORIGIN` the way `ld.so` does for `RPATH`/`RUNPATH` — leaving ggml to its default search produces a noisy `search path $ORIGIN/../lib does not exist` debug trail and ultimately falls through to a CWD search (an attacker-plantable location). The compile-time `GGML_BACKEND_DIR=$ORIGIN/../lib` pin remains as defense-in-depth for unusual layouts where `/proc/self/exe` is unavailable.
+
+### Active-backend banner
+
+After `load_backends()`, the same call sites invoke `recmeet::log_backend_summary()`, which emits a 2-line banner on stderr (and into the log at `info`):
+
+    ggml: backend registry: CPU, Vulkan
+    ggml: active backend: Vulkan (AMD Radeon Pro W5500 (RADV NAVI10), 8192 MB)
+
+The banner is mirrored to stderr unconditionally (not just at `RECMEET_LOG_LEVEL=info`) so it remains visible under `journalctl --user -u recmeet-daemon.service` even at the default `error` level — same precedent as the daemon's existing "listening on" line. If a non-CPU backend registered but exposes zero devices (e.g. `libggml-vulkan.so` loaded on a host without a working Vulkan ICD), an extra `WARN` line surfaces the gap before the CPU-fallback active-backend line.
+
+If you want the banner in the log itself, set `RECMEET_LOG_LEVEL=info` in `dist/recmeet-daemon.service.in` or the environment.
+
+### Where the plugins live
+
+| Layout | Plugin path |
+|---|---|
+| In-tree build (`build/`) | `build/bin/libggml-*.so` |
+| Installed (`make install`, default `~/.local`) | `~/.local/lib/libggml-*.so` |
+| System install (`sudo make install PREFIX=/usr/local`) | `/usr/local/lib/libggml-*.so` |
+
+The vendor `add_subdirectory(vendor/whisper.cpp)` call self-installs the plugins via ggml's `ggml_add_backend_library()` rule, so they appear in the install manifest automatically.
+
+### Implications for testing
+
+The test runner (`recmeet_tests`) calls `load_backends()` from a static constructor in `tests/test_backend_dl.cpp` so plugins are registered before any test body runs. Without this, whisper-context creation in unrelated tests (`tests/test_pipeline_helpers.cpp:184`) aborts against an empty registry.
 
 ---
 
@@ -475,6 +527,11 @@ cmake --install build --prefix /tmp/test-install
 | `recmeet` | `<prefix>/bin/` |
 | `recmeet-daemon` | `<prefix>/bin/` |
 | `recmeet-tray` | `<prefix>/bin/` (only when `RECMEET_BUILD_TRAY=ON`) |
+| `libggml-base.so`, `libggml.so`, `libwhisper.so` | `<prefix>/lib/` (vendor shared libs) |
+| `libggml-cpu-*.so` (one per ISA variant) | `<prefix>/lib/` (loaded at startup, scored by host CPU) |
+| `libggml-vulkan.so` | `<prefix>/lib/` (only when `RECMEET_GGML_VULKAN` resolved to `ON`) |
+| `libllama.so` | `<prefix>/lib/` (only when `RECMEET_USE_LLAMA=ON`) |
+| `libonnxruntime.so.1` | `<prefix>/lib/` (only when locally built — see "Building onnxruntime from source") |
 | `recmeet-tray.desktop` | `<prefix>/share/applications/` (only when `RECMEET_BUILD_TRAY=ON`) |
 | `recmeet-daemon.service` | `<prefix>/share/systemd/user/` |
 | `recmeet-daemon.socket` | `<prefix>/share/systemd/user/` |
@@ -731,6 +788,98 @@ make build 2>&1 | grep onnxruntime
 # The shared lib should resolve to the local build
 ldd build/libsherpa-onnx-c-api.so | grep onnxruntime
 ```
+
+---
+
+## GPU acceleration (Vulkan)
+
+recmeet supports GPU-accelerated transcription via ggml's Vulkan backend. On the reference host (Radeon Pro W5500 + Mesa RADV), whisper-medium on a 63-minute meeting runs in ~16 minutes on GPU vs ~7 hours on CPU — roughly 26× speedup. Sherpa-onnx diarization stays on CPU regardless (onnxruntime needs a separate ROCm/MIGraphX build, which is out of scope here).
+
+### How it's selected
+
+`RECMEET_GGML_VULKAN` is a tri-state cache variable (`cmake/recmeet-vulkan.cmake`):
+
+| Value | Behavior |
+|---|---|
+| `AUTO` (default) | Probe for `libvulkan.so.1`, headers, and `glslc`. Enable if all three present; otherwise WARN with a per-distro install hint and fall back to CPU. |
+| `ON` | Require the toolchain. FATAL_ERROR with the same per-distro hint if anything is missing. |
+| `OFF` | Silently disable. Use this in PKGBUILDs / Debian rules / RPM specs that ship a CPU-only artifact. |
+
+For back-compat with the v1.5.x `RECMEET_GGML_VULKAN=ON`-as-boolean usage, `1`/`0`/`YES`/`NO`/`TRUE`/`FALSE` are all accepted and remapped to `ON`/`OFF` before the tri-state is evaluated.
+
+```bash
+cmake -B build -G Ninja                              # AUTO — detect at configure time
+cmake -B build -G Ninja -DRECMEET_GGML_VULKAN=ON     # require Vulkan (fails configure otherwise)
+cmake -B build -G Ninja -DRECMEET_GGML_VULKAN=OFF    # force CPU-only, no warning
+```
+
+### What gets detected
+
+`find_package(Vulkan COMPONENTS glslc)`. Three pieces must all be present:
+
+| Piece | What it is | Used at |
+|---|---|---|
+| Loader (`libvulkan.so.1`) | `Vulkan_LIBRARIES` | Build time + runtime |
+| Headers (`vulkan/vulkan.h`) | `Vulkan_INCLUDE_DIRS` | Build time only |
+| `glslc` (shaderc) | `Vulkan_GLSLC_EXECUTABLE` | Build time only — ggml compiles shaders into the plugin |
+
+`glslc` is from `shaderc`. Debian/Ubuntu's `glslang-tools` package provides `glslangValidator`, which ggml does **not** use — install `glslc` instead.
+
+### Install hints
+
+The configure-time warning names the missing pieces and emits the install command for your distro (auto-detected from `/etc/os-release`):
+
+```
+Arch:        sudo pacman -S vulkan-headers shaderc vulkan-icd-loader \
+                            vulkan-radeon   # or vulkan-intel / vulkan-nouveau
+Debian:      sudo apt install libvulkan-dev glslc mesa-vulkan-drivers
+Fedora:      sudo dnf install vulkan-headers glslc vulkan-loader mesa-vulkan-drivers
+NixOS:       nix-shell -p vulkan-headers vulkan-loader shaderc mesa
+Alpine:      apk add vulkan-headers vulkan-loader-dev shaderc mesa-vulkan-ati
+Gentoo:      sudo emerge media-libs/vulkan-loader dev-util/vulkan-headers media-libs/shaderc
+openSUSE:    sudo zypper install vulkan-devel shaderc Mesa-libvulkan-devel
+```
+
+The ICD driver (`vulkan-radeon`, `vulkan-intel`, `mesa-vulkan-drivers`, …) is required at *runtime* but is not detected at configure time — a build with `vulkan-headers + shaderc + libvulkan-dev` and no ICD will configure fine, link fine, and silently fall back to CPU at daemon startup. The banner's `WARN: Vulkan compiled in but 0 devices enumerable` line surfaces this gap.
+
+### Verifying GPU is in use
+
+After a build that enabled Vulkan, run the standalone CLI or start the daemon and look at stderr / `journalctl`:
+
+```bash
+$ ./build/recmeet --no-daemon --mic-only --no-summary --no-diarize --model tiny 2>&1 | head -5
+ggml: backend registry: CPU, Vulkan
+ggml: active backend: Vulkan (AMD Radeon Pro W5500 (RADV NAVI10), 8192 MB)
+...
+```
+
+vs. on a CPU-only build:
+
+```
+ggml: backend registry: CPU
+ggml: active backend: CPU (16 threads, AMD Ryzen 7 5800X)
+```
+
+Confirm the binary has no hard Vulkan dependency:
+
+```bash
+$ ldd build/recmeet | grep -i vulkan
+# (empty — Vulkan is loaded via the plugin, not linked into recmeet)
+
+$ ls build/bin/libggml-vulkan.so
+build/bin/libggml-vulkan.so   # present when configured with Vulkan
+```
+
+### VRAM and host RSS
+
+On the reference host (Radeon Pro W5500, 8 GB VRAM), whisper-medium on a 63-min recording:
+
+- ~5.0 GB VRAM peak (whisper-medium fits comfortably in 8 GB).
+- ~600 MB host RSS during transcription (model lives on-device).
+- ~5.7 GB host RSS during chunked diarization (sherpa-onnx still CPU; no VRAM contribution).
+- No VRAM leak across chunks.
+
+Whisper-large-v3 (~3.1 GB GGML file) fits in 8 GB VRAM but leaves less headroom — measure before relying on it for batch runs.
 
 ---
 
