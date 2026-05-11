@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 #include "audio_file.h"
+#include "backend_info.h"
 #include "cli.h"
 #include "config.h"
 #include "config_json.h"
@@ -852,6 +853,16 @@ static int subprocess_main(CliResult& cli) {
 }
 
 static int standalone_main(CliResult& cli) {
+    // Discover runtime-loadable ggml backends and surface the active device.
+    // Fires for both standalone recording and the subprocess postprocessing
+    // child (launched via execv by the daemon) — the child's banner is what
+    // tells the operator the subprocess inherited the same GPU plugin
+    // discovery as the parent daemon. See agentctx/tasks/runtime-loadable-
+    // gpu-backends.md (Step 4 + Step 9 T6) and auto-detect-vulkan-backend.md
+    // (Step 5).
+    load_backends();
+    log_backend_summary();
+
     // Subprocess mode: daemon launched us with --progress-json --config-json
     if (cli.progress_json && !cli.config_json_path.empty()) {
         return subprocess_main(cli);

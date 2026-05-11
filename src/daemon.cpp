@@ -1,6 +1,7 @@
 // Copyright (c) 2026 John Suykerbuyk and SykeTech LTD
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+#include "backend_info.h"
 #include "config.h"
 #include "config_json.h"
 #include "device_enum.h"
@@ -841,6 +842,14 @@ int main(int argc, char* argv[]) {
     auto log_level = parse_log_level(log_level_str);
     log_init(log_level, log_dir, log_retention_hours, true);
     log_info("daemon: starting (socket=%s)", socket_path.c_str());
+
+    // Discover runtime-loadable ggml backends (libggml-vulkan.so / libggml-cpu-*.so
+    // installed alongside the binary) and surface which device the daemon will
+    // use, so `journalctl --user -u recmeet-daemon.service` answers the GPU-or-CPU
+    // question without an `ldd` round-trip. See agentctx/tasks/runtime-loadable-
+    // gpu-backends.md (Step 4) and auto-detect-vulkan-backend.md (Step 5).
+    load_backends();
+    log_backend_summary();
 
     // Suppress whisper output
     whisper_log_set(whisper_null_log, nullptr);
