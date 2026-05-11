@@ -1,41 +1,17 @@
-# cmake/prerequisites.cmake — Distro detection and helpful error messages
+# cmake/prerequisites.cmake — Helpful error messages keyed on detected distro
 #
-# Detects the Linux distribution from /etc/os-release and provides wrapper
-# functions that print distro-specific install commands when packages are
-# missing.  Included early in CMakeLists.txt, before any find_package calls.
+# Distro detection itself lives in cmake/recmeet-distro.cmake (shared with
+# cmake/recmeet-vulkan.cmake). After that include, RECMEET_DISTRO is one of:
+#   arch, debian, fedora, nixos, alpine, gentoo, opensuse, unknown
+#
+# This file provides wrapper functions that print distro-specific install
+# commands when packages are missing. Included early in CMakeLists.txt,
+# before any find_package calls.
 
 # ---------------------------------------------------------------------------
 # 1. Detect the distribution family
 # ---------------------------------------------------------------------------
-set(RECMEET_DISTRO "unknown")
-
-if(EXISTS "/etc/os-release")
-    file(STRINGS "/etc/os-release" _os_release)
-    foreach(_line IN LISTS _os_release)
-        if(_line MATCHES "^ID=(.+)")
-            string(STRIP "${CMAKE_MATCH_1}" _distro_id)
-            string(REPLACE "\"" "" _distro_id "${_distro_id}")
-            break()
-        endif()
-    endforeach()
-    foreach(_line IN LISTS _os_release)
-        if(_line MATCHES "^ID_LIKE=(.+)")
-            string(STRIP "${CMAKE_MATCH_1}" _distro_like)
-            string(REPLACE "\"" "" _distro_like "${_distro_like}")
-            break()
-        endif()
-    endforeach()
-
-    if(_distro_id STREQUAL "arch" OR _distro_like MATCHES "arch")
-        set(RECMEET_DISTRO "arch")
-    elseif(_distro_id MATCHES "debian|ubuntu|linuxmint|pop" OR _distro_like MATCHES "debian|ubuntu")
-        set(RECMEET_DISTRO "debian")
-    elseif(_distro_id MATCHES "fedora|rhel|centos|rocky|alma" OR _distro_like MATCHES "fedora|rhel")
-        set(RECMEET_DISTRO "fedora")
-    endif()
-endif()
-
-message(STATUS "Detected distro family: ${RECMEET_DISTRO}")
+include(${CMAKE_CURRENT_LIST_DIR}/recmeet-distro.cmake)
 
 # ---------------------------------------------------------------------------
 # 2. Per-distro install command templates

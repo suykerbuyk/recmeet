@@ -67,18 +67,46 @@ endif()
 set(CMAKE_WARN_DEPRECATED OFF CACHE BOOL "" FORCE)
 set(CMAKE_POLICY_VERSION_MINIMUM 3.10 CACHE STRING "" FORCE)
 
-# GGML compute backends shared by whisper.cpp and llama.cpp. Vulkan covers
-# AMD/Intel/NVIDIA on Linux via the ICD loader (no vendor SDK required) and
-# falls back to CPU at runtime if no Vulkan device is enumerated. Default
-# OFF so packaged builds stay portable to systems without libvulkan.so.1;
-# enable at configure time with `cmake -DRECMEET_GGML_VULKAN=ON`.
-option(RECMEET_GGML_VULKAN "Enable Vulkan compute backend in ggml" OFF)
-if(RECMEET_GGML_VULKAN)
-    set(GGML_VULKAN ON CACHE BOOL "" FORCE)
-endif()
+# CMP0177 (CMake 3.31+) normalizes install() DESTINATION paths. The ggml
+# subbuild passes our GGML_BACKEND_DIR ($ORIGIN/../lib) as a DESTINATION;
+# with the policy unset, CMake literally creates a $ORIGIN/ subdirectory
+# under the install prefix and then traverses back out via .., leaving
+# install detritus. NEW behavior normalizes the value to plain "lib",
+# placing files where they belong with no side effects. The string baked
+# into libggml-base.so via target_compile_definitions stays untouched —
+# only install DESTINATIONs are normalized — so the runtime dynamic-loader
+# expansion of $ORIGIN continues to work as designed.
+# CMAKE_POLICY_DEFAULT_CMPxxxx (rather than cmake_policy(SET ...)) is
+# required so the policy survives vendor cmake_minimum_required(VERSION 3.10)
+# resets at the add_subdirectory() boundary.
+set(CMAKE_POLICY_DEFAULT_CMP0177 NEW)
+
+# GGML compute backends shared by whisper.cpp and llama.cpp. The
+# recmeet-vulkan module handles AUTO/ON/OFF tri-state + per-distro install
+# hints + decision-matrix messaging; see cmake/recmeet-vulkan.cmake. Must
+# run AFTER prerequisites.cmake so RECMEET_DISTRO is populated.
+include(cmake/recmeet-vulkan.cmake)
+
+# Vendor subbuilds (whisper.cpp + llama.cpp) ship as shared libs so the
+# ggml plugin model (GGML_BACKEND_DL) can drop libggml-*.so files alongside
+# the binary at runtime. GGML_BACKEND_DIR is pinned to $ORIGIN/../lib —
+# symmetric with the CMAKE_INSTALL_RPATH established for libonnxruntime.so
+# — so ggml's plugin search never falls through to the CWD fallback (which
+# would be an attacker-plantable location). Pinning is MANDATORY for
+# security; see agentctx/tasks/runtime-loadable-gpu-backends.md.
+set(GGML_BACKEND_DL ON CACHE BOOL "" FORCE)
+set(GGML_BACKEND_DIR "$ORIGIN/../lib" CACHE STRING "" FORCE)
+# GGML_BACKEND_DL=ON is incompatible with GGML_NATIVE (the default), which
+# would emit -march=native into the single libggml-cpu.so plugin and break
+# the "build once per platform, run everywhere" goal. Use CPU_ALL_VARIANTS
+# so ggml emits per-ISA plugins (sse4.2 / avx / avx2 / avx512 / amx on x86)
+# and the runtime ggml_backend_score() picks the highest-scoring variant
+# the host CPU supports.
+set(GGML_NATIVE OFF CACHE BOOL "" FORCE)
+set(GGML_CPU_ALL_VARIANTS ON CACHE BOOL "" FORCE)
 
 # Vendor: whisper.cpp
-set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
+set(BUILD_SHARED_LIBS ON CACHE BOOL "" FORCE)
 set(WHISPER_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 set(WHISPER_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
 set(WHISPER_BUILD_SERVER OFF CACHE BOOL "" FORCE)
@@ -86,6 +114,9 @@ add_subdirectory(vendor/whisper.cpp EXCLUDE_FROM_ALL)
 
 # Vendor: llama.cpp
 if(RECMEET_USE_LLAMA)
+    # llama.cpp bundles its own ggml; same BUILD_SHARED_LIBS=ON requirement
+    # under GGML_BACKEND_DL=ON applies (vendor/whisper.cpp/ggml/src/CMakeLists.txt:188).
+    set(BUILD_SHARED_LIBS ON CACHE BOOL "" FORCE)
     set(LLAMA_BUILD_TESTS OFF CACHE BOOL "" FORCE)
     set(LLAMA_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
     set(LLAMA_BUILD_SERVER OFF CACHE BOOL "" FORCE)
@@ -328,6 +359,43 @@ include(GNUInstallDirs)
 
 install(TARGETS recmeet RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 install(TARGETS recmeet-daemon RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+
+# Install vendored whisper.cpp + llama.cpp shared libraries. The ggml
+# backend MODULE plugins (libggml-base.so, libggml-cpu.so, libggml-vulkan.so,
+# ...) self-install via ggml_add_backend_library() into GGML_BACKEND_DIR
+# ($ORIGIN/../lib → ${CMAKE_INSTALL_LIBDIR}), so they are NOT listed here —
+# adding them would duplicate or conflict with the subbuild's own install
+# rules. Only the top-level linked targets (whisper, ggml, llama) need
+# explicit rules.
+# Vendor whisper.cpp/ggml/llama.cpp set PUBLIC_HEADER on these targets for
+# their own SDK-style install rules. recmeet ships as a binary distro, not
+# a developer SDK — we don't want whisper.h / ggml*.h / llama.h leaking
+# into the system include path. Clear the property before our LIBRARY
+# install so CMake doesn't warn about orphaned PUBLIC_HEADER file sets.
+set_target_properties(whisper ggml PROPERTIES PUBLIC_HEADER "")
+if(RECMEET_USE_LLAMA)
+    set_target_properties(llama PROPERTIES PUBLIC_HEADER "")
+endif()
+
+# Top-level shared libs that recmeet links against directly.
+install(TARGETS whisper ggml ggml-base LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR})
+if(RECMEET_USE_LLAMA)
+    install(TARGETS llama LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR})
+endif()
+
+# GGML backend MODULE plugins. With add_subdirectory(... EXCLUDE_FROM_ALL),
+# vendor's own install(TARGETS ${backend} LIBRARY DESTINATION ${GGML_BACKEND_DIR})
+# rules inside ggml_add_backend_library() are suppressed — install rules in
+# EXCLUDE_FROM_ALL subdirectories don't fire. We re-issue explicit install
+# rules at the top level so CMake performs proper RPATH fix-up on each
+# plugin's $ORIGIN/../lib runpath. ggml exports the full backend-target
+# list in the INTERNAL cache variable GGML_AVAILABLE_BACKENDS (populated
+# inside ggml_add_backend_library() at src/CMakeLists.txt:282-291); we
+# iterate it to stay portable across host architectures (x86 variants
+# differ from arm64 variants, ROCm/CUDA add their own, etc.).
+if(GGML_AVAILABLE_BACKENDS)
+    install(TARGETS ${GGML_AVAILABLE_BACKENDS} LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR})
+endif()
 
 # Install vendored onnxruntime shared libraries (built by scripts/build-onnxruntime.sh).
 # The binaries link against these at build time; RPATH ($ORIGIN/../lib) finds them at runtime.
