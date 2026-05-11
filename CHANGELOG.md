@@ -2,6 +2,50 @@
 
 All notable changes to recmeet are documented in this file. The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.6.0] — Unreleased
+
+First release on the `v1-maintenance` branch. Delivers the "build once per platform, run everywhere" GPU acceleration story as a bundled pair: configure-time auto-detect of Vulkan + a runtime-loadable plugin model so the same binary uses GPU when available and silently falls back to CPU when not.
+
+### Added
+
+- **Vulkan GPU acceleration, auto-detected at configure time** (Phase 1, iter 142, `cmake/recmeet-vulkan.cmake`):
+  - New tri-state cache variable `RECMEET_GGML_VULKAN` with values `AUTO` (default), `ON` (require), `OFF` (force-disable). Boolean values `1`/`0`/`YES`/`NO`/`TRUE`/`FALSE` accepted for back-compat with v1.5.x usage.
+  - `find_package(Vulkan COMPONENTS glslc)` probes for the loader, headers, and `glslc` shader compiler. All three required to enable.
+  - Per-distro install hints rendered into the configure-time warning: Arch, Debian/Ubuntu, Fedora/RHEL, NixOS, Alpine, Gentoo, openSUSE, plus a generic fallback.
+  - `AUTO` + missing toolchain → `WARN` with install hint, CPU-only build. `ON` + missing → `FATAL_ERROR` with the same hint.
+- **Runtime-loadable GPU backends via `GGML_BACKEND_DL`** (Phase 1, iter 142):
+  - Vendored `whisper.cpp` and `llama.cpp` subbuilds now configure with `BUILD_SHARED_LIBS=ON` (required for `GGML_BACKEND_DL=ON`).
+  - `GGML_BACKEND_DIR` pinned to `$ORIGIN/../lib` (mandatory; closes the ggml CWD-fallback attacker-plantable-plugin path).
+  - `GGML_NATIVE=OFF` + `GGML_CPU_ALL_VARIANTS=ON` so ggml emits per-ISA CPU plugins (`libggml-cpu-sse42.so`, `libggml-cpu-avx.so`, …) scored at startup by host capabilities. Same binary runs on a 2015 server and a 2024 laptop.
+  - Compute backends (`libggml-vulkan.so`, `libggml-cpu-*.so`) ship as separate `.so` files installed into `<prefix>/lib/`. The `recmeet` binary has no `libvulkan.so.1` (or any other GPU lib) in `DT_NEEDED`.
+- **Daemon-startup active-backend banner** (Phase 2, iter 142, `src/backend_info.{h,cpp}`):
+  - `recmeet::load_backends()` resolves the plugin directory deterministically from `/proc/self/exe` (env-override → `<exe>/../lib` install layout → `<exe>/bin` in-tree → `<exe>`) so `dlopen` sees a real path. Bypasses ggml's `$ORIGIN`-macro search, which `dlopen` does not expand the way `ld.so` does for RPATH.
+  - `recmeet::log_backend_summary()` emits two banner lines on stderr (and in the log at `info`): the full backend registry and the highest-priority enumerable device (GPU > IGPU > ACCEL > CPU). Stderr-mirrored unconditionally so it shows up under `journalctl` even at the default `RECMEET_LOG_LEVEL=error`.
+  - WARN line surfaces non-CPU backends that registered but exposed zero devices (e.g. `libggml-vulkan.so` loaded on a host without a working Vulkan ICD) before showing the CPU-fallback active-backend line.
+  - Wired into both call sites: `src/daemon.cpp:851` (daemon startup, after `log_init()`) and `src/main.cpp:863` (standalone CLI top of `standalone_main()`, before subprocess-mode dispatch).
+- **Plugin-bootstrap static initializer for tests** (`tests/test_backend_dl.cpp`):
+  - C++ static-constructor `BackendBootstrap` calls `load_backends()` before Catch2's `main` runs, so plugins are registered before any test body needs them.
+  - Fixes a previously-latent failure: `tests/test_pipeline_helpers.cpp:184` (run_postprocessing transcribe test) was silently broken by the `GGML_BACKEND_DL=ON` flip since `whisper_init_from_file_with_params` aborts against an empty registry.
+  - 3 new `[backend-dl]` tests cover plugin discovery, registry enumeration, and the GPU > IGPU > ACCEL > CPU active-device picker.
+- **Documentation**: BUILD.md gains a "Plugin architecture (ggml backends)" section and a "GPU acceleration (Vulkan)" section. README.md gains a top-level "GPU acceleration" section and a `RECMEET_GGML_VULKAN` entry in the Build options table.
+
+### Changed
+
+- `whisper.cpp` and (when `RECMEET_USE_LLAMA=ON`) `llama.cpp` are now configured with `BUILD_SHARED_LIBS=ON`. The vendor `.so` files (`libwhisper.so`, `libggml.so`, `libggml-base.so`, `libllama.so`) install into `<prefix>/lib/` alongside the compute-backend plugins. `recmeet_ipc` and `recmeet_core` remain static libraries — the change is scoped to the vendor ML subtree.
+- `CMAKE_POLICY_DEFAULT_CMP0177=NEW` set at the top of `CMakeLists.txt` so install `DESTINATION` paths normalize correctly under CMake 3.31+. The compile-time `GGML_BACKEND_DIR=$ORIGIN/../lib` string baked into `libggml-base.so` survives the policy unchanged — only install destinations are normalized.
+
+### Migration notes (distro packagers)
+
+- The installed file set now includes `libggml-*.so` plugins in `<prefix>/lib/`. Update package contents lists / `.install` files accordingly. `make install` and the CMake install step handle this automatically; only manual packaging recipes need attention.
+- To ship a CPU-only artifact (matching v1.5.x behavior), pin `-DRECMEET_GGML_VULKAN=OFF` in your PKGBUILD / Debian rules / RPM spec. The new default (`AUTO`) probes the build host's toolchain, which may not match the target audience's hardware.
+- The split-packaging model (a base `recmeet` package + companion `recmeet-vulkan` / `recmeet-cuda` packages each shipping their own `libggml-*.so`) is a roadmap item — see `agentctx/tasks/runtime-loadable-gpu-backends.md` Step 7.
+
+### Verification
+
+- Full-stack reprocess of a 63-min real meeting on Radeon Pro W5500 (RDNA1 / 8 GB VRAM / Mesa RADV): ~16 min transcription via Vulkan (~26× CPU baseline), 5.0 GB VRAM peak, 600 MB host RSS, chunked-diarize peak 5.7 GB host RSS, no VRAM leak across chunks, cloud summary + Obsidian note written.
+- 540/540 unit tests, 78/78 integration tests, zero compiler warnings (`sherpa-ON` build).
+- `ldd build/recmeet | grep -i vulkan` returns empty on the Vulkan-enabled build.
+
 ## [1.5.0] — 2026-05-09
 
 The V1 capstone release. Live captioning lands as the final V1 feature, completing the V1 line at version 1.5.0 (following 1.3.x and 1.4.x). The `v1-maintenance` branch is cut from this tag and V2 work begins on `main` thereafter; future V1 patch releases ship as `v1.5.x` from `v1-maintenance`.
