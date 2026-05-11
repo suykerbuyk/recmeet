@@ -480,25 +480,70 @@ layout is identical regardless of how you install.
 
 ### Arch Linux
 
-A `PKGBUILD` is provided in `dist/arch/`. It builds from the local git repo
-and derives the package version from `git describe`.
+A split-package `PKGBUILD` is provided in `dist/arch/`. It builds from the
+local git repo and derives the package version from `git describe`. Two
+packages are produced:
+
+| Package | Contents | Depends on |
+|---|---|---|
+| `recmeet-git` (always installed) | binaries, vendor shared libs (`libwhisper.so`, `libggml.so`, `libggml-base.so`, `libllama.so`), the mandatory per-ISA CPU plugins (`libggml-cpu-*.so`), `libonnxruntime.so.1`, systemd user units, tray `.desktop` + icons | pipewire, libpulse, libsndfile, curl, libnotify, libayatana-appindicator, gtk3 |
+| `recmeet-vulkan-git` (optional companion) | `libggml-vulkan.so` only | `recmeet-git=<exact-version>`, `vulkan-icd-loader` |
 
 ```bash
 cd dist/arch
-makepkg -sf          # build the package
-sudo pacman -U recmeet-git-*.pkg.tar.*   # install it
+makepkg -sf          # build both packages
+sudo pacman -U recmeet-git-*.pkg.tar.*           # install base (CPU)
+sudo pacman -U recmeet-vulkan-git-*.pkg.tar.*    # add Vulkan GPU plugin
 ```
 
 The `-s` flag auto-installs missing build dependencies. The `-f` flag forces
-a rebuild if a package file already exists.
+a rebuild if a package file already exists. Both `.pkg.tar.*` files appear
+in `dist/arch/` after a single `makepkg` run.
+
+The base package alone is fully functional in CPU mode and the most common
+deployment. Adding the companion package enables GPU transcription provided
+the host also has a working Vulkan ICD driver — install one matching your
+hardware:
+
+```bash
+sudo pacman -S vulkan-radeon       # AMD via Mesa RADV
+sudo pacman -S vulkan-intel        # Intel via Mesa ANV
+sudo pacman -S vulkan-nouveau      # NVIDIA via Mesa NVK (experimental)
+sudo pacman -S nvidia-utils        # NVIDIA via the proprietary driver
+```
+
+These ICDs are listed as `optdepends` of the companion package so pacman
+suggests them but doesn't force a choice — the right driver depends on the
+host GPU vendor.
+
+Missing ICD at runtime is a graceful failure: `libggml-vulkan.so` loads but
+its device count is zero, the daemon's startup banner emits a WARN line
+naming the gap, and ggml falls back to the always-present CPU plugin. The
+`recmeet-vulkan-git` package is therefore safe to install speculatively;
+the only cost is ~30 MB of disk for an unused plugin.
 
 The PKGBUILD uses `git+file://` to clone from the local repo, so your working
 tree doesn't need to be clean — but only committed changes are included.
 To publish to the AUR, change the `source` URL to point at a remote git repo.
 
-Build options: the PKGBUILD only overrides `-DRECMEET_BUILD_TESTS=OFF` — all
-other options inherit the CMake defaults (Release, all features ON). Edit the
-`build()` function to change these.
+Build options: the PKGBUILD forces `-DRECMEET_GGML_VULKAN=ON` (so the
+companion package is never silently empty) and `-DRECMEET_BUILD_TESTS=OFF`.
+All other options inherit the CMake defaults (Release, all features ON).
+Edit the `build()` function to change these.
+
+#### Build-once-package-twice mechanics
+
+The PKGBUILD's `build()` function runs `cmake --install` once into a
+staging directory (`${srcdir}/stage/`). Each `package_*()` function then
+copies its subset of files into its own `${pkgdir}/`:
+
+- `package_recmeet-git()` copies the full staging tree, then `rm`s
+  `usr/lib/libggml-vulkan.so` (it ships in the companion package).
+- `package_recmeet-vulkan-git()` `install`s only `usr/lib/libggml-vulkan.so`
+  out of the staging tree, leaving everything else.
+
+This is the standard Arch split-package idiom — one build, multiple member
+packages, each member's content is a pure file-selection step.
 
 ### Debian / Ubuntu
 

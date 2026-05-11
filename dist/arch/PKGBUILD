@@ -1,54 +1,127 @@
 # Maintainer: recmeet contributors
-pkgname=recmeet-git
-pkgver=0.0.0.r0.0000000
+#
+# Split package definition for v1.6.0+:
+#   recmeet-git          — always installed. CPU-capable, no GPU runtime deps.
+#                          Ships the binaries, vendor shared libs, and the
+#                          mandatory libggml-cpu-*.so plugins.
+#   recmeet-vulkan-git   — optional companion. Ships libggml-vulkan.so only.
+#                          Depends on recmeet-git + a Vulkan ICD loader.
+#
+# Both packages are produced by a single build step (build() runs once);
+# the split happens in package_*(), each pulling files out of the shared
+# staging directory at ${srcdir}/stage/.
+#
+# Installing recmeet-git alone → CPU. Adding recmeet-vulkan-git → GPU when
+# a working ICD driver is also installed (vulkan-radeon / vulkan-intel /
+# vulkan-nouveau / nvidia-utils). Missing ICD at runtime → silent CPU
+# fallback via ggml's plugin-load failure path; the daemon's startup
+# banner names the active backend so the operator can verify.
+
+pkgbase=recmeet-git
+pkgname=('recmeet-git' 'recmeet-vulkan-git')
+pkgver=1.5.0.r6.gc45f334
 pkgrel=1
-pkgdesc="Record, transcribe, and summarize meetings locally"
 arch=('x86_64')
 url="https://github.com/anthropics/recmeet"
 license=('MIT' 'Apache-2.0')
-depends=(
-    'pipewire'
-    'libpulse'
-    'libsndfile'
-    'curl'
-    'libnotify'
-    'libayatana-appindicator'
-    'gtk3'
-)
 makedepends=(
     'git'
     'cmake'
     'ninja'
     'gcc'
     'pkgconf'
+    # Required to build libggml-vulkan.so. Forced ON in build() below so
+    # both member packages always have the plugin available to pull in.
+    'vulkan-headers'
+    'shaderc'
+    'vulkan-icd-loader'
 )
-provides=('recmeet')
-conflicts=('recmeet')
-source=("${pkgname}::git+file://${startdir}/../..")
+source=("${pkgbase}::git+file://${startdir}/../..")
 sha256sums=('SKIP')
 
 pkgver() {
-    cd "${pkgname}"
-    git describe --tags --match 'v[0-9]*' --long 2>/dev/null |
+    cd "${pkgbase}"
+    # Tags in this repo are unprefixed (e.g. 1.5.0, not v1.5.0); the
+    # leading `s/^v//` in the sed is kept as a no-op for future tags
+    # that may use a `v` prefix.
+    git describe --tags --match '[0-9]*' --long 2>/dev/null |
         sed 's/^v//; s/-/.r/; s/-/./' ||
         printf "0.1.0.r%s.g%s" "$(git rev-list --count HEAD)" "$(git rev-parse --short HEAD)"
 }
 
 prepare() {
-    cd "${pkgname}"
+    cd "${pkgbase}"
     git submodule update --init --recursive
 }
 
 build() {
-    cmake -S "${pkgname}" -B build -G Ninja \
+    # RECMEET_GGML_VULKAN=ON (not AUTO) so the packaging build fails loudly
+    # if the Vulkan toolchain pieces in makedepends are not actually present
+    # — the companion package would otherwise be silently empty.
+    cmake -S "${pkgbase}" -B build -G Ninja \
         -DCMAKE_INSTALL_PREFIX=/usr \
+        -DRECMEET_GGML_VULKAN=ON \
         -DRECMEET_BUILD_TESTS=OFF
     cmake --build build
+
+    # Stage the full install tree once. Each package_*() function copies
+    # the subset it owns out of here. Running cmake --install twice (once
+    # per member package) would also work, but staging makes the split
+    # explicit and lets each package_*() be a pure file-selection step.
+    rm -rf "${srcdir}/stage"
+    DESTDIR="${srcdir}/stage" cmake --install build
 }
 
-package() {
-    DESTDIR="${pkgdir}" cmake --install build
+package_recmeet-git() {
+    pkgdesc="Record, transcribe, and summarize meetings locally (CPU build)"
+    depends=(
+        'pipewire'
+        'libpulse'
+        'libsndfile'
+        'curl'
+        'libnotify'
+        'libayatana-appindicator'
+        'gtk3'
+    )
+    optdepends=(
+        'recmeet-vulkan-git: Vulkan GPU acceleration plugin (~26x faster transcription on whisper-medium)'
+        'onnxruntime: required at runtime for speaker diarization (sherpa-onnx)'
+    )
+    provides=('recmeet')
+    conflicts=('recmeet')
 
-    cd "${pkgname}"
-    install -Dm644 LICENSE "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"
+    # Copy the full staged tree, then remove the Vulkan plugin — it ships
+    # in the companion package. Everything else (binaries, libwhisper.so,
+    # libggml.so, libggml-base.so, libggml-cpu-*.so per-ISA plugins,
+    # libllama.so, libonnxruntime.so when locally built, systemd units,
+    # tray .desktop + icons) stays here.
+    cp -a "${srcdir}/stage/." "${pkgdir}/"
+    rm -f "${pkgdir}/usr/lib/libggml-vulkan.so"
+
+    install -Dm644 "${srcdir}/${pkgbase}/LICENSE" \
+        "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"
+}
+
+package_recmeet-vulkan-git() {
+    pkgdesc="Vulkan GPU acceleration plugin for recmeet (ggml backend)"
+    # Tight version pin — the libggml-vulkan.so ABI tracks the libggml.so
+    # shipped in the base package. Mixing across versions would fail at
+    # dlopen with an undefined-symbol error.
+    depends=(
+        "recmeet-git=${pkgver}"
+        'vulkan-icd-loader'
+    )
+    optdepends=(
+        'vulkan-radeon: Mesa RADV driver for AMD GPUs'
+        'vulkan-intel: Mesa ANV driver for Intel GPUs'
+        'vulkan-nouveau: Mesa NVK driver for NVIDIA GPUs (experimental)'
+        'nvidia-utils: NVIDIA proprietary driver (alternative to vulkan-nouveau)'
+    )
+    provides=('recmeet-vulkan')
+    conflicts=('recmeet-vulkan')
+
+    install -Dm644 "${srcdir}/stage/usr/lib/libggml-vulkan.so" \
+        "${pkgdir}/usr/lib/libggml-vulkan.so"
+    install -Dm644 "${srcdir}/${pkgbase}/LICENSE" \
+        "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"
 }
