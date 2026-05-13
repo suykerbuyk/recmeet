@@ -117,6 +117,17 @@ func followUpCmd() *cobra.Command {
 		RunE: func(cmd *cobra.Command, args []string) error {
 			notePath := args[0]
 
+			// Validate note path early with an actionable error so the
+			// operator-visible message names the failing path AND hints
+			// that absolute paths are expected (matches the
+			// usability.ExpectBadNotePath contract).
+			if _, statErr := os.Stat(notePath); statErr != nil {
+				if os.IsNotExist(statErr) {
+					return fmt.Errorf("note path does not exist: %s (use an absolute path to the meeting note .md file)", notePath)
+				}
+				return fmt.Errorf("note path %s: %w (use an absolute path to the meeting note .md file)", notePath, statErr)
+			}
+
 			cfg, err := agent.LoadAgentConfig(configPath)
 			if err != nil {
 				return fmt.Errorf("load config: %w", err)

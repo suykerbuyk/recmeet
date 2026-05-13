@@ -23,9 +23,10 @@ import (
 //
 // Each subdir contains:
 //
-//   - <date>_<time>.md            (the note)
+//   - Meeting_<date>_<time>.md     (the note — `Meeting_` prefix is required
+//     by meetingdata.findMDFiles for discovery via SearchNotes / etc.)
 //   - audio_<date>_<time>.wav.json (minimal sidecar metadata)
-//   - speakers.json               (copy of testdata/speakers.json)
+//   - speakers.json                (copy of testdata/speakers.json)
 //
 // Tests requiring multiple isolated fixture sets simply call this
 // once per test against their own t.TempDir().
@@ -70,7 +71,7 @@ func BuildMeetingsFixture(t *testing.T) string {
 		if err != nil {
 			t.Fatalf("BuildMeetingsFixture: read %s: %v", src, err)
 		}
-		notePath := filepath.Join(dir, m.dirName+".md")
+		notePath := filepath.Join(dir, "Meeting_"+m.dirName+".md")
 		if err := os.WriteFile(notePath, content, 0o644); err != nil {
 			t.Fatalf("BuildMeetingsFixture: write %s: %v", notePath, err)
 		}
