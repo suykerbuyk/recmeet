@@ -143,6 +143,19 @@ struct Config {
     // Web server
     int web_port = 8384;
     std::string web_bind = "127.0.0.1";
+
+    // IPC framing limits (Phase A.2). `max_message_bytes` caps NDJSON line
+    // length per connection — accumulating reads past this without a `\n`
+    // are treated as protocol abuse (slowloris, oversized frame) and the
+    // fd is dropped. Cap is line-length only; binary frame payloads
+    // (Phase C `0x01`/`0x02`/`0x03`) are bounded separately by
+    // `max_upload_bytes`. Default 8 MB matches the plan body.
+    size_t max_message_bytes = 8 * 1024 * 1024;
+
+    // Maximum binary upload size (Phase C `process.submit`). Declared here
+    // now so the schema is in place for C.2; A.2 itself does not enforce it.
+    // Default 4 GB per the plan body.
+    size_t max_upload_bytes = 4ull * 1024 * 1024 * 1024;
 };
 
 /// Load config. Uses path if provided, otherwise ~/.config/recmeet/config.yaml.

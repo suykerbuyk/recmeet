@@ -240,11 +240,19 @@ void IpcServer::run() {
     log_debug("ipc: event loop ENTER (tid=%d)", (int)syscall(SYS_gettid));
     while (running_) {
         // Build pollfd array: [wakeup_read, listen_fd, ...clients]
+        // Each client fd watches POLLIN always; POLLOUT is added only when
+        // the per-fd outbound queue is back-pressured (Phase A.2). This
+        // replaces the iter-139 C-1 busy-spin on EAGAIN — the poll loop
+        // now sleeps until either there is data to read OR the kernel
+        // socket buffer drains enough to accept more bytes.
         std::vector<struct pollfd> fds;
         fds.push_back({wakeup_read_, POLLIN, 0});
         fds.push_back({listen_fd_, POLLIN, 0});
-        for (auto& [fd, _] : clients_)
-            fds.push_back({fd, POLLIN, 0});
+        for (auto& [fd, cs] : clients_) {
+            short events = POLLIN;
+            if (cs.want_pollout) events |= POLLOUT;
+            fds.push_back({fd, events, 0});
+        }
 
         int ret = poll(fds.data(), fds.size(), -1);
         if (ret < 0) {
@@ -264,10 +272,24 @@ void IpcServer::run() {
         if (fds[1].revents & POLLIN)
             accept_client();
 
-        // Check client sockets
+        // Check client sockets. POLLOUT path runs BEFORE the read path so
+        // that an outstanding response goes out even if the client is
+        // simultaneously sending more data — and so that fds flagged
+        // pending_close on a prior enqueue overflow are reaped before
+        // they are read again. Hangup/error wins outright.
         for (size_t i = 2; i < fds.size(); ++i) {
-            if (fds[i].revents & (POLLIN | POLLHUP | POLLERR))
-                handle_client_data(fds[i].fd);
+            int fd = fds[i].fd;
+            short rev = fds[i].revents;
+            if (rev & (POLLHUP | POLLERR | POLLNVAL)) {
+                remove_client(fd);
+                continue;
+            }
+            if (rev & POLLOUT) {
+                drain_outbound(fd);
+                if (clients_.find(fd) == clients_.end()) continue;
+            }
+            if (rev & POLLIN)
+                handle_client_data(fd);
         }
     }
     log_debug("ipc: event loop EXIT");
@@ -284,11 +306,15 @@ void IpcServer::stop() {
 
 void IpcServer::broadcast(const IpcEvent& ev) {
     std::string wire = serialize(ev) + "\n";
-    // Copy client fds in case send_to removes one
+    // Copy client fds in case send_to removes one (Response-class overflow
+    // closes the client mid-loop). Events themselves use drop-oldest, but
+    // an unrelated queued response on the same fd could trigger close;
+    // the copy makes the iteration safe either way.
     std::vector<int> fds;
+    fds.reserve(clients_.size());
     for (auto& [fd, _] : clients_) fds.push_back(fd);
     for (int fd : fds)
-        send_to(fd, wire);
+        send_to(fd, wire, MessageClass::Event);
 }
 
 void IpcServer::post(std::function<void()> fn) {
@@ -343,9 +369,10 @@ bool IpcServer::handle_pending_psk(int fd, ClientState& cs, const std::string& l
         log_warn("ipc_server: TCP auth refused (peer=%s, reason=auth_required)",
                  cs.peer_addr.c_str());
         cs.auth_state = AuthState::Rejected;
-        send_to(fd, make_auth_error_frame("auth_required"));
-        // send_to may have already closed on EAGAIN-loop write failure.
-        // If the fd is still alive, drop it now.
+        send_to(fd, make_auth_error_frame("auth_required"), MessageClass::Response);
+        // send_to() never closes synchronously on EAGAIN any more (Phase A.2);
+        // it queues + arms POLLOUT. But Response-class overflow may close.
+        // Drop the fd if it is still alive.
         if (clients_.find(fd) != clients_.end())
             remove_client(fd);
         return false;
@@ -356,7 +383,7 @@ bool IpcServer::handle_pending_psk(int fd, ClientState& cs, const std::string& l
         log_warn("ipc_server: TCP auth refused (peer=%s, reason=invalid_token)",
                  cs.peer_addr.c_str());
         cs.auth_state = AuthState::Rejected;
-        send_to(fd, make_auth_error_frame("invalid_token"));
+        send_to(fd, make_auth_error_frame("invalid_token"), MessageClass::Response);
         if (clients_.find(fd) != clients_.end())
             remove_client(fd);
         return false;
@@ -364,7 +391,7 @@ bool IpcServer::handle_pending_psk(int fd, ClientState& cs, const std::string& l
 
     cs.auth_state = AuthState::Authed;
     log_info("ipc_server: TCP auth ok (peer=%s)", cs.peer_addr.c_str());
-    send_to(fd, AUTH_OK_FRAME);
+    send_to(fd, AUTH_OK_FRAME, MessageClass::Response);
     return true;
 }
 
@@ -380,10 +407,43 @@ void IpcServer::handle_client_data(int fd) {
     if (it == clients_.end()) return;
     it->second.read_buf.append(buf, n);
 
+    // Phase A.2 NDJSON line cap. Apply BEFORE the per-line consume loop so
+    // a malicious peer that never sends `\n` (slowloris) cannot grow
+    // `read_buf` unboundedly. A buffer past the cap with no `\n` proves
+    // there is no complete line to dispatch; treat as protocol abuse and
+    // drop. The check is post-append intentionally — if the cap is e.g.
+    // 8 MB and a single read brought in 4 KB, we want to admit the bytes
+    // and only drop when the cap is genuinely exceeded.
+    {
+        const std::string& rbuf_c = it->second.read_buf;
+        if (rbuf_c.size() > max_message_bytes_
+            && rbuf_c.find('\n') == std::string::npos) {
+            log_warn("ipc_server: NDJSON line cap exceeded "
+                     "(fd=%d, peer=%s, buffered=%zu, cap=%zu); closing client",
+                     fd, it->second.peer_addr.c_str(),
+                     rbuf_c.size(), max_message_bytes_);
+            remove_client(fd);
+            return;
+        }
+    }
+
     // Process complete lines (NDJSON)
     std::string& rbuf = it->second.read_buf;
     size_t pos;
     while ((pos = rbuf.find('\n')) != std::string::npos) {
+        // Phase A.2: even a line terminated by `\n` is rejected if its
+        // length exceeds the cap. This guards against the case where a
+        // client streams `max_message_bytes + 1` bytes and only then
+        // sends a newline — the slowloris cap above caught the
+        // never-newline path; this catches the eventually-newline path.
+        if (pos > max_message_bytes_) {
+            log_warn("ipc_server: NDJSON line cap exceeded "
+                     "(fd=%d, peer=%s, line_len=%zu, cap=%zu); closing client",
+                     fd, it->second.peer_addr.c_str(),
+                     pos, max_message_bytes_);
+            remove_client(fd);
+            return;
+        }
         std::string line = rbuf.substr(0, pos);
         rbuf.erase(0, pos + 1);
 
@@ -423,7 +483,11 @@ void IpcServer::handle_client_data(int fd) {
             err.id = 0;
             err.code = static_cast<int>(IpcErrorCode::InvalidRequest);
             err.message = "Invalid request";
-            send_to(fd, serialize(err) + "\n");
+            send_to(fd, serialize(err) + "\n", MessageClass::Response);
+            // Response-class overflow may have closed the client; re-look
+            // up to keep the loop safe.
+            it = clients_.find(fd);
+            if (it == clients_.end()) return;
             continue;
         }
 
@@ -434,7 +498,9 @@ void IpcServer::handle_client_data(int fd) {
             err.id = msg.request.id;
             err.code = static_cast<int>(IpcErrorCode::MethodNotFound);
             err.message = "Method not found: " + msg.request.method;
-            send_to(fd, serialize(err) + "\n");
+            send_to(fd, serialize(err) + "\n", MessageClass::Response);
+            it = clients_.find(fd);
+            if (it == clients_.end()) return;
             continue;
         }
 
@@ -444,9 +510,14 @@ void IpcServer::handle_client_data(int fd) {
         err.id = msg.request.id;
 
         if (handler_it->second(msg.request, resp, err))
-            send_to(fd, serialize(resp) + "\n");
+            send_to(fd, serialize(resp) + "\n", MessageClass::Response);
         else
-            send_to(fd, serialize(err) + "\n");
+            send_to(fd, serialize(err) + "\n", MessageClass::Response);
+
+        // Re-look-up the iterator: send_to() with Response-class can close
+        // the fd on overflow, invalidating any cached reference.
+        it = clients_.find(fd);
+        if (it == clients_.end()) return;
     }
 }
 
@@ -456,17 +527,119 @@ void IpcServer::remove_client(int fd) {
     clients_.erase(fd);
 }
 
-void IpcServer::send_to(int fd, const std::string& msg) {
-    ssize_t total = 0;
-    while (total < static_cast<ssize_t>(msg.size())) {
-        ssize_t n = write(fd, msg.data() + total, msg.size() - total);
-        if (n < 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) continue;
+void IpcServer::send_to(int fd, std::string msg, MessageClass cls) {
+    // Phase A.2 send path. Replaces the iter-139 C-1 EAGAIN spin loop.
+    //
+    // Flow:
+    //   1. Look up the client. If gone, drop silently — the caller may
+    //      legitimately call send_to() from a posted callback after the
+    //      client has disconnected.
+    //   2. Enqueue the frame on the per-fd outbound queue, applying the
+    //      overflow policy by `cls`.
+    //   3. Try to drain the queue immediately (non-blocking). On
+    //      `EAGAIN`/`EWOULDBLOCK` set `want_pollout` and return; the poll
+    //      loop will arm POLLOUT for this fd and resume the drain when
+    //      the kernel socket buffer has room.
+    //
+    // The path under EAGAIN is bounded — write() returns immediately and
+    // the loop yields to poll() — so a slow TCP consumer cannot stall the
+    // poll thread under any event-rate pattern.
+
+    auto it = clients_.find(fd);
+    if (it == clients_.end()) return;
+    ClientState& cs = it->second;
+
+    // Apply overflow policy at enqueue time so the queue invariants hold.
+    // Two caps (entries OR bytes); either tripping triggers overflow.
+    auto would_overflow = [&]() {
+        return cs.outbound.size() >= kOutboundMaxEntries
+            || (cs.outbound_bytes + msg.size()) > kOutboundMaxBytes;
+    };
+
+    if (would_overflow()) {
+        if (cls == MessageClass::Response) {
+            // Response-class overflow is fatal — closing immediately frees
+            // the slot for a healthy client. Logging surfaces the event
+            // once per fd; per-frame logging would amplify a flood.
+            log_warn("ipc_server: outbound queue overflow on response "
+                     "(fd=%d, peer=%s, queued_bytes=%zu, queued_entries=%zu); "
+                     "closing client",
+                     fd, cs.peer_addr.c_str(),
+                     cs.outbound_bytes, cs.outbound.size());
             remove_client(fd);
             return;
         }
-        total += n;
+        // Event-class: drop-oldest until we have room. Bound the loop to
+        // the queue size — the new frame itself fits in `kOutboundMaxBytes`
+        // because broadcast events are small (caption/progress/phase
+        // ticks are well under a kilobyte).
+        while (!cs.outbound.empty() && would_overflow()) {
+            const OutboundFrame& front = cs.outbound.front();
+            // Account for partial send: only the unsent tail still counts.
+            size_t unsent = front.payload.size() - front.bytes_sent;
+            cs.outbound_bytes -= unsent;
+            cs.outbound.pop_front();
+            ++cs.dropped_events;
+        }
+        // If a single payload exceeds the byte cap, accept it anyway
+        // (defensive — better to deliver one oversized event than to
+        // silently lose it AND every queued sibling). The byte cap is
+        // sized for caption/progress traffic; a payload past it indicates
+        // a different bug worth surfacing.
     }
+
+    OutboundFrame frame;
+    frame.payload    = std::move(msg);
+    frame.bytes_sent = 0;
+    frame.cls        = cls;
+    cs.outbound_bytes += frame.payload.size();
+    cs.outbound.push_back(std::move(frame));
+
+    // Try an immediate drain so the steady-state happy path stays a
+    // single write() syscall. drain_outbound() arms `want_pollout` if
+    // it hits EAGAIN — no busy spin.
+    drain_outbound(fd);
+}
+
+void IpcServer::drain_outbound(int fd) {
+    auto it = clients_.find(fd);
+    if (it == clients_.end()) return;
+    ClientState& cs = it->second;
+
+    while (!cs.outbound.empty()) {
+        OutboundFrame& frame = cs.outbound.front();
+        const char* p = frame.payload.data() + frame.bytes_sent;
+        size_t remaining = frame.payload.size() - frame.bytes_sent;
+        ssize_t n = write(fd, p, remaining);
+        if (n > 0) {
+            frame.bytes_sent += static_cast<size_t>(n);
+            cs.outbound_bytes -= static_cast<size_t>(n);
+            if (frame.bytes_sent == frame.payload.size()) {
+                cs.outbound.pop_front();
+                continue;
+            }
+            // Short write — kernel buffer is full, fall through to the
+            // EAGAIN handling below by trying once more.
+            continue;
+        }
+        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            // Phase A.2 acceptance: this is the path that used to spin.
+            // Now we set the POLLOUT-arm flag and return; the poll loop
+            // sleeps until the socket is writable again. No CPU burn.
+            cs.want_pollout = true;
+            return;
+        }
+        if (n < 0 && errno == EINTR) {
+            continue;
+        }
+        // Hard error (ECONNRESET / EPIPE / etc.) — drop the client.
+        remove_client(fd);
+        return;
+    }
+
+    // Queue fully drained. Clear the POLLOUT-arm flag so the next poll()
+    // does not wake on writable for no reason.
+    cs.want_pollout = false;
 }
 
 void IpcServer::drain_wakeup() {

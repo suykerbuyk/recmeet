@@ -266,6 +266,33 @@ Config load_config(const fs::path& config_path) {
     cfg.web_port = std::atoi(port_str.c_str());
     cfg.web_bind = get_val(entries, "web", "bind", "127.0.0.1");
 
+    // IPC framing limits (Phase A.2). Both knobs default to the struct
+    // defaults; a zero / negative override falls back rather than
+    // disabling the cap entirely (defense-in-depth — operator typo
+    // shouldn't open the door to a slowloris).
+    {
+        std::string mmb = get_val(entries, "ipc", "max_message_bytes", "");
+        if (!mmb.empty()) {
+            long long v = std::atoll(mmb.c_str());
+            if (v > 0) cfg.max_message_bytes = static_cast<size_t>(v);
+            else
+                log_warn("config: invalid [ipc] max_message_bytes=%s; "
+                         "keeping default %zu", mmb.c_str(),
+                         cfg.max_message_bytes);
+        }
+    }
+    {
+        std::string mub = get_val(entries, "server", "max_upload_bytes", "");
+        if (!mub.empty()) {
+            long long v = std::atoll(mub.c_str());
+            if (v > 0) cfg.max_upload_bytes = static_cast<size_t>(v);
+            else
+                log_warn("config: invalid [server] max_upload_bytes=%s; "
+                         "keeping default %zu", mub.c_str(),
+                         cfg.max_upload_bytes);
+        }
+    }
+
     return cfg;
 }
 
@@ -417,6 +444,17 @@ void save_config(const Config& cfg, const fs::path& config_path) {
             out << "  port: " << cfg.web_port << "\n";
         if (cfg.web_bind != "127.0.0.1")
             out << "  bind: \"" << cfg.web_bind << "\"\n";
+    }
+
+    // IPC framing limits (Phase A.2). Only emit when non-default to keep
+    // the generated YAML compact.
+    if (cfg.max_message_bytes != 8ull * 1024 * 1024) {
+        out << "\nipc:\n"
+            << "  max_message_bytes: " << cfg.max_message_bytes << "\n";
+    }
+    if (cfg.max_upload_bytes != 4ull * 1024 * 1024 * 1024) {
+        out << "\nserver:\n"
+            << "  max_upload_bytes: " << cfg.max_upload_bytes << "\n";
     }
 
     out.close();

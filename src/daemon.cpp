@@ -887,6 +887,11 @@ int main(int argc, char* argv[]) {
     IpcServer server(socket_path);
     g_server = &server;
 
+    // Phase A.2: apply the NDJSON line cap from config before start().
+    // Default is 8 MB; a daemon.yaml override via `[ipc] max_message_bytes`
+    // is already resolved in g_config by load_config().
+    server.set_max_message_bytes(g_config.max_message_bytes);
+
     // Phase A.1 PSK gate: TCP listeners require RECMEET_AUTH_TOKEN. Unix
     // listeners trust the kernel's peer credentials and skip the PSK check.
     if (listen_addr.transport == IpcTransport::Tcp) {
