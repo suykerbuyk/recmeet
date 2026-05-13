@@ -1,8 +1,9 @@
 {
-  "iter_n": 145,
-  "anchor_sha": "820334b66b4651baf8fd67341b7370033dd16d5c",
+  "iter_n": 146,
+  "anchor_sha": "6673a98a002c32d3f9ce80a1693e717a431ab9ac",
   "active": [
     "auto-detect-vulkan-backend",
+    "go-tools-integration-tests",
     "runtime-loadable-gpu-backends",
     "thin-client-recording-server",
     "webui-live-captions"
