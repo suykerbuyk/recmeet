@@ -831,3 +831,295 @@ TEST_CASE("A.2: slow-TCP-consumer does not stall the poll thread",
     server.stop();
     srv.join();
 }
+
+// ---------------------------------------------------------------------------
+// Phase A.3 — Connection cap (max_clients) + listen backlog
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// Read whatever bytes are available on `fd` within `timeout_ms`, stopping on
+// EOF, the first complete `\n`-terminated line, or timeout. Returns the bytes
+// read (which may include partial / multiple lines or be empty on timeout).
+// Used by A.3 tests that need to observe BOTH the refusal frame AND the
+// subsequent EOF on a single fd without committing to a line-only reader.
+std::string a3_read_until_eof_or_line(int fd, int timeout_ms = 2000) {
+    std::string out;
+    auto deadline = std::chrono::steady_clock::now()
+                  + std::chrono::milliseconds(timeout_ms);
+    while (std::chrono::steady_clock::now() < deadline) {
+        struct pollfd pfd{fd, POLLIN, 0};
+        int r = poll(&pfd, 1, 50);
+        if (r < 0) {
+            if (errno == EINTR) continue;
+            break;
+        }
+        if (r == 0) continue;
+        if (pfd.revents & (POLLIN | POLLHUP | POLLERR)) {
+            char buf[256];
+            ssize_t n = read(fd, buf, sizeof(buf));
+            if (n <= 0) return out;  // EOF or error — done
+            out.append(buf, static_cast<size_t>(n));
+            // Stop once we have a complete line — caller can keep reading
+            // for the trailing EOF separately if it wants.
+            if (out.find('\n') != std::string::npos) return out;
+        }
+    }
+    return out;
+}
+
+} // anonymous namespace
+
+TEST_CASE("A.3: connection cap rejects past the limit with JSON refusal frame",
+          "[ipc][a3]") {
+    // Set the cap deliberately small (2). Open 2 Unix-socket clients; both
+    // succeed. Open a 3rd; `connect()` lands at the TCP/socket layer
+    // (Unix-domain SOCK_STREAM is symmetric), but the server's
+    // `accept_client()` sees `clients_.size() >= max_clients_`, writes a
+    // single-line JSON `server_full` frame, and closes the fd before
+    // registration. The two existing clients must remain functional.
+    unlink(TEST_SOCK);
+    IpcServer server(TEST_SOCK);
+    server.set_max_clients(2);
+    server.on("ping", [](const IpcRequest& req, IpcResponse& resp, IpcError&) {
+        resp.id = req.id;
+        resp.result["pong"] = true;
+        return true;
+    });
+    REQUIRE(server.start());
+    std::thread srv([&server]() { server.run(); });
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+    int c1 = connect_client(TEST_SOCK);
+    REQUIRE(c1 >= 0);
+    int c2 = connect_client(TEST_SOCK);
+    REQUIRE(c2 >= 0);
+
+    // Give the poll loop time to accept both before we attempt #3 — the
+    // cap is checked at accept() time, so a race where #3's accept fires
+    // before #2 is registered would defeat the test.
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+    int c3 = connect_client(TEST_SOCK);
+    REQUIRE(c3 >= 0);  // socket-layer connect succeeds; refusal is in-band
+
+    // The server must write the refusal frame and close the fd. We read
+    // until either a complete line or EOF, then verify both.
+    std::string refusal = a3_read_until_eof_or_line(c3, 2000);
+    REQUIRE_FALSE(refusal.empty());
+    CHECK(refusal.find("\"event\":\"error\"") != std::string::npos);
+    CHECK(refusal.find("\"kind\":\"server_full\"") != std::string::npos);
+    CHECK(refusal.back() == '\n');
+
+    // Confirm EOF after the refusal frame — server closed the fd.
+    char throwaway[16];
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    bool got_eof = false;
+    while (std::chrono::steady_clock::now() < deadline) {
+        struct pollfd pfd{c3, POLLIN, 0};
+        int r = poll(&pfd, 1, 100);
+        if (r > 0 && (pfd.revents & (POLLIN | POLLHUP))) {
+            ssize_t n = read(c3, throwaway, sizeof(throwaway));
+            if (n == 0) { got_eof = true; break; }
+            if (n < 0) { got_eof = true; break; }
+            // Drain leftover bytes from the refusal frame and keep going.
+        }
+    }
+    CHECK(got_eof);
+
+    // The two existing clients must still be functional.
+    IpcRequest req;
+    req.id = 11;
+    req.method = "ping";
+    send_line(c1, serialize(req));
+    std::string reply1 = read_line(c1);
+    REQUIRE_FALSE(reply1.empty());
+    IpcMessage msg1;
+    REQUIRE(parse_ipc_message(reply1, msg1));
+    CHECK(msg1.type == IpcMessageType::Response);
+    CHECK(msg1.response.id == 11);
+
+    req.id = 12;
+    send_line(c2, serialize(req));
+    std::string reply2 = read_line(c2);
+    REQUIRE_FALSE(reply2.empty());
+    IpcMessage msg2;
+    REQUIRE(parse_ipc_message(reply2, msg2));
+    CHECK(msg2.type == IpcMessageType::Response);
+    CHECK(msg2.response.id == 12);
+
+    close(c3);
+    close(c2);
+    close(c1);
+    server.stop();
+    srv.join();
+}
+
+TEST_CASE("A.3: JSON refusal frame is well-formed and parses as error event",
+          "[ipc][a3]") {
+    // Same scenario as the cap test above, but focused on the wire shape:
+    //   - The refusal frame is a single `\n`-terminated NDJSON line.
+    //   - The standard IpcMessage parser recognizes it as an Event with
+    //     `event = "error"` (the A.1 dispatch chokepoint that an unrouted
+    //     `error`-typed event will never accidentally land in a handler).
+    //   - `kind` and `reason` are present in the wire payload.
+    //
+    // The plan body specifies a flat frame shape
+    // (`{"event":"error","kind":"server_full","reason":...}`) rather than
+    // nesting under `data`, which mirrors A.1's `make_auth_error_frame`
+    // style — both are out-of-band protocol frames, not in-band events.
+    // We assert the parsed `event.event` field via the standard parser,
+    // then probe the raw string for `kind` / `reason` because the parser
+    // routes those into `top` rather than `event.data` for flat shapes.
+    unlink(TEST_SOCK);
+    IpcServer server(TEST_SOCK);
+    server.set_max_clients(1);
+    REQUIRE(server.start());
+    std::thread srv([&server]() { server.run(); });
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+    int c1 = connect_client(TEST_SOCK);
+    REQUIRE(c1 >= 0);
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+    int c2 = connect_client(TEST_SOCK);
+    REQUIRE(c2 >= 0);
+
+    // Pull a single line off the rejected fd.
+    std::string line = read_line(c2, 2000);
+    REQUIRE_FALSE(line.empty());
+
+    IpcMessage msg;
+    REQUIRE(parse_ipc_message(line, msg));
+    REQUIRE(msg.type == IpcMessageType::Event);
+    CHECK(msg.event.event == "error");
+
+    // Raw-string verification for `kind` and `reason` — the flat-frame
+    // shape is the contract specified by the plan body, not the
+    // `data`-nested IpcEvent shape produced by `serialize(IpcEvent)`.
+    CHECK(line.find("\"kind\":\"server_full\"") != std::string::npos);
+    CHECK(line.find("\"reason\":\"") != std::string::npos);
+
+    close(c2);
+    close(c1);
+    server.stop();
+    srv.join();
+}
+
+TEST_CASE("A.3: cap is configurable — 1 then 5",
+          "[ipc][a3]") {
+    // Two sub-scenarios in one TEST_CASE to keep test infra cost low.
+    //
+    // Phase 1: cap = 1. First client succeeds; second is refused.
+    // Phase 2: tear down, restart with cap = 5. All 5 succeed.
+    //
+    // We use two distinct sockets so the second IpcServer instance is not
+    // racing the first on the unlink path.
+    SECTION("cap=1 admits one, rejects the second") {
+        const char* SOCK = "/tmp/recmeet_test_ipc_a3_cap1.sock";
+        unlink(SOCK);
+        IpcServer server(SOCK);
+        server.set_max_clients(1);
+        REQUIRE(server.start());
+        std::thread srv([&server]() { server.run(); });
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+        int ok = connect_client(SOCK);
+        REQUIRE(ok >= 0);
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+        int over = connect_client(SOCK);
+        REQUIRE(over >= 0);
+        std::string refusal = read_line(over, 2000);
+        CHECK(refusal.find("server_full") != std::string::npos);
+
+        close(over);
+        close(ok);
+        server.stop();
+        srv.join();
+        unlink(SOCK);
+    }
+
+    SECTION("cap=5 admits five, rejects the sixth") {
+        const char* SOCK = "/tmp/recmeet_test_ipc_a3_cap5.sock";
+        unlink(SOCK);
+        IpcServer server(SOCK);
+        server.set_max_clients(5);
+        server.on("ping", [](const IpcRequest& req, IpcResponse& resp,
+                             IpcError&) {
+            resp.id = req.id;
+            resp.result["pong"] = true;
+            return true;
+        });
+        REQUIRE(server.start());
+        std::thread srv([&server]() { server.run(); });
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+        std::vector<int> fds;
+        for (int i = 0; i < 5; ++i) {
+            int fd = connect_client(SOCK);
+            REQUIRE(fd >= 0);
+            fds.push_back(fd);
+        }
+        // Let the server accept all five before the over-cap attempt.
+        std::this_thread::sleep_for(std::chrono::milliseconds(150));
+
+        // Hit one of them with a round-trip to confirm it really is
+        // registered (not silently rejected with no refusal frame).
+        IpcRequest req;
+        req.id = 7;
+        req.method = "ping";
+        send_line(fds[2], serialize(req));
+        std::string reply = read_line(fds[2], 2000);
+        REQUIRE_FALSE(reply.empty());
+        IpcMessage msg;
+        REQUIRE(parse_ipc_message(reply, msg));
+        CHECK(msg.type == IpcMessageType::Response);
+
+        // Now exceed.
+        int over = connect_client(SOCK);
+        REQUIRE(over >= 0);
+        std::string refusal = read_line(over, 2000);
+        CHECK(refusal.find("server_full") != std::string::npos);
+
+        close(over);
+        for (int fd : fds) close(fd);
+        server.stop();
+        srv.join();
+        unlink(SOCK);
+    }
+}
+
+TEST_CASE("A.3: listen backlog tracks max_clients * 2",
+          "[ipc][a3]") {
+    // Direct code-path assertion via the test accessor. Verifies
+    //   backlog = max_clients * 2 for the common range, AND
+    //   backlog floors at 8 for very small caps (operator typo cushion).
+    //
+    // The values used here mirror the documented defaults and the
+    // boundary case (cap=2 produces backlog=8 from the floor, NOT 4).
+    IpcServer s_default(TEST_SOCK);
+    CHECK(s_default.max_clients() == 16);   // struct default
+    CHECK(s_default.backlog_for_test() == 32);
+
+    IpcServer s_small(TEST_SOCK);
+    s_small.set_max_clients(2);
+    CHECK(s_small.max_clients() == 2);
+    CHECK(s_small.backlog_for_test() == 8);  // floor
+
+    IpcServer s_mid(TEST_SOCK);
+    s_mid.set_max_clients(8);
+    CHECK(s_mid.backlog_for_test() == 16);
+
+    IpcServer s_big(TEST_SOCK);
+    s_big.set_max_clients(64);
+    CHECK(s_big.backlog_for_test() == 128);
+
+    // A zero cap is meaningless — set_max_clients(0) is clamped to 1
+    // (matches the setter's documented behavior). Backlog still uses the
+    // 8-floor so the kernel queue is never gratuitously starved.
+    IpcServer s_zero(TEST_SOCK);
+    s_zero.set_max_clients(0);
+    CHECK(s_zero.max_clients() == 1);
+    CHECK(s_zero.backlog_for_test() == 8);
+}
