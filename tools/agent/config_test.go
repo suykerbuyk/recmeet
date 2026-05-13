@@ -29,7 +29,7 @@ func TestLoadAgentConfig_Defaults(t *testing.T) {
 
 func TestLoadAgentConfig_FromConfigFile(t *testing.T) {
 	t.Setenv("ANTHROPIC_API_KEY", "")
-	os.Unsetenv("ANTHROPIC_API_KEY")
+	_ = os.Unsetenv("ANTHROPIC_API_KEY")
 
 	configPath := filepath.Join("..", "meetingdata", "testdata", "config.yaml")
 	cfg, err := LoadAgentConfig(configPath)
@@ -75,7 +75,7 @@ func TestLoadAgentConfig_BraveAPIKey(t *testing.T) {
 
 func TestLoadAgentConfig_NoBraveKeyWithoutEnv(t *testing.T) {
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
-	os.Unsetenv("BRAVE_API_KEY")
+	_ = os.Unsetenv("BRAVE_API_KEY")
 
 	cfg, err := LoadAgentConfig("")
 	if err != nil {

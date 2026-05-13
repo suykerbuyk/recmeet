@@ -78,7 +78,10 @@ function(recmeet_check_submodules)
         string(REPLACE ";" ", " _list "${_missing}")
         message(FATAL_ERROR
             "Git submodules not initialized: ${_list}\n"
-            "  Run this from the source directory:\n"
+            "  Recommended (auto-initializes via Make):\n"
+            "    make build\n"
+            "\n"
+            "  Or initialize directly:\n"
             "    git submodule update --init --recursive\n"
             "\n"
             "  Or clone with submodules next time:\n"

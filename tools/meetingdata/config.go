@@ -125,7 +125,7 @@ type yamlEntry struct {
 
 func parseYAML(text string) []yamlEntry {
 	var entries []yamlEntry
-	for _, line := range strings.Split(text, "\n") {
+	for line := range strings.SplitSeq(text, "\n") {
 		trimmed := strings.TrimSpace(line)
 		if trimmed == "" || trimmed[0] == '#' {
 			continue

@@ -21,7 +21,7 @@ func TestMockAnthropic_QueueAndPop(t *testing.T) {
 	if err != nil {
 		t.Fatalf("POST: %v", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != 200 {
 		t.Errorf("expected 200, got %d", resp.StatusCode)
 	}
@@ -47,7 +47,7 @@ func TestMockAnthropic_QueueStatus_401(t *testing.T) {
 	if err != nil {
 		t.Fatalf("POST: %v", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != 401 {
 		t.Errorf("expected 401, got %d", resp.StatusCode)
 	}
@@ -64,7 +64,7 @@ func TestMockAnthropic_EmptyQueueReturns500(t *testing.T) {
 	if err != nil {
 		t.Fatalf("POST: %v", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != 500 {
 		t.Errorf("expected 500 when queue empty, got %d", resp.StatusCode)
 	}
@@ -88,7 +88,7 @@ func TestMockAnthropic_RequestsRecorded(t *testing.T) {
 	if err != nil {
 		t.Fatalf("POST: %v", err)
 	}
-	resp.Body.Close()
+	_ = resp.Body.Close()
 
 	reqs := mock.Requests()
 	if len(reqs) != 1 {

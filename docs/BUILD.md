@@ -151,6 +151,79 @@ ninja -C build && ./build/recmeet_tests "~[integration]"
 
 The `&&` ensures tests only run if the build succeeded.
 
+### Go-tools integration tests
+
+The two Go binaries (`recmeet-mcp`, `recmeet-agent`) ship with an opt-in
+integration test suite that drives the *as-built* binaries end-to-end —
+spawning real subprocesses, exercising the MCP stdio protocol against a
+real client, and round-tripping the agent CLI against a mock Anthropic
+HTTP server. The suite lives next to each binary's source under a
+`//go:build integration` tag, so the default `go test ./...` stays fast
+(~0.5 seconds across 118 library + testutil tests) and the integration
+work only runs when explicitly requested.
+
+```bash
+cd tools && go test ./... -count=1                       # default suite (fast)
+cd tools && go test -tags=integration -count=1 ./...     # add integration suite
+make integration-go                                      # same, via Makefile
+make integration                                         # umbrella: C++ + Go
+```
+
+The Makefile umbrella `make integration` runs both `integration-cxx` (the
+C++ Catch2 `[integration]~[t2-1]` suite — needs the CMake build and a
+working test runtime) and `integration-go` sequentially. The two are
+independent: skip one with `make integration-cxx` or `make integration-go`
+alone if you only need to verify one side.
+
+**Test matrix.** Library tests prove component correctness; integration
+tests prove deployable-artifact correctness. Both are required for a
+green merge to `v1-maintenance`.
+
+| Suite | Count | Where | Tag |
+|---|---|---|---|
+| Library + testutil | 118 | `tools/{agent,mcpserver,meetingdata,testutil}` | (default) |
+| `recmeet-mcp` integration | 18 | `tools/cmd/recmeet-mcp/*_integration_test.go` | `integration` |
+| `recmeet-agent` integration | 21 | `tools/cmd/recmeet-agent/*_integration_test.go` | `integration` |
+
+The integration tests build the binaries themselves into a package-scope
+temp directory via `testutil.BuildBinaryOnce` (called from each test
+package's `TestMain`). No external network is required; the mock
+Anthropic server is an `httptest.Server` constructed in-process per test.
+
+### Subprocess coverage
+
+The C++ tests run *inside* the test binary so Catch2 reports coverage
+directly. The Go integration tests run the *real* `recmeet-mcp` /
+`recmeet-agent` binaries as subprocesses, so coverage has to be collected
+out-of-band via Go 1.20+'s `GOCOVERDIR` mechanism. `testutil.BuildBinaryOnce`
+automatically appends `-cover -coverpkg=./...` when it observes
+`GOCOVERDIR` in the environment.
+
+```bash
+GOCOVERDIR=$(mktemp -d) go test -tags=integration -count=1 ./cmd/...
+go tool covdata percent -i=$GOCOVERDIR
+```
+
+Or via the convenience wrapper:
+
+```bash
+make integration-go-coverage
+```
+
+Current numbers on a clean checkout: `cmd/recmeet-mcp/main.go` 100.0%,
+`cmd/recmeet-agent/main.go` 92.8%.
+
+### Operator-facing environment variables and flags
+
+The integration suite required three small surface additions; documenting
+them here so operators know they exist.
+
+| Surface | Where | Purpose |
+|---|---|---|
+| `ANTHROPIC_BASE_URL` env var | `recmeet-agent` | Overrides the Anthropic SDK base URL via `option.WithBaseURL`. Used by integration tests to point the agent at an `httptest` mock server. Operators won't normally set this — it exists so the test suite can drive the real agent binary without making a paid API call. |
+| `RECMEET_CONFIG` env var | `recmeet-mcp` | Explicit config path. When set, `recmeet-mcp` passes the path through to `LoadConfig` and a missing file is a *fast-fail* error (nonzero exit + stderr names the path AND the default location). Unset (the previous default) preserves the silent-defaults behavior — `~/.config/recmeet/config.yaml` being absent on a fresh install is still not an error. |
+| `--max-iterations` flag | `recmeet-agent prep` and `recmeet-agent follow-up` | Overrides the hardcoded 20-iteration cap on the agentic loop. Default `0` means "use the config default (20)"; any positive value bounds the loop tighter. Useful for cost control on long-running flows or for short test runs. |
+
 ---
 
 ## Downloading models
