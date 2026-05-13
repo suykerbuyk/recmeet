@@ -5,11 +5,11 @@ package agent
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"testing"
 
 	anthropic "github.com/anthropics/anthropic-sdk-go"
+	"github.com/syketech/recmeet-tools/testutil"
 )
 
 // MockAnthropicClient returns scripted responses.
@@ -30,12 +30,7 @@ func (m *MockAnthropicClient) CreateMessage(_ context.Context, _ anthropic.Messa
 func TestLoop_SimpleResponse(t *testing.T) {
 	mock := &MockAnthropicClient{
 		responses: []*anthropic.Message{
-			{
-				StopReason: anthropic.StopReasonEndTurn,
-				Content: []anthropic.ContentBlockUnion{
-					{Type: "text", Text: "Hello, world!"},
-				},
-			},
+			testutil.BuildAnthropicTextMessage("Hello, world!"),
 		},
 	}
 
@@ -55,28 +50,14 @@ func TestLoop_SimpleResponse(t *testing.T) {
 }
 
 func TestLoop_ToolUse(t *testing.T) {
-	toolInput, _ := json.Marshal(map[string]string{"path": "/tmp/test.txt", "content": "hello"})
-
 	mock := &MockAnthropicClient{
 		responses: []*anthropic.Message{
-			{
-				StopReason: anthropic.StopReasonToolUse,
-				Content: []anthropic.ContentBlockUnion{
-					{Type: "text", Text: "Let me write a file."},
-					{
-						Type:  "tool_use",
-						ID:    "tool_1",
-						Name:  "echo_tool",
-						Input: json.RawMessage(toolInput),
-					},
-				},
-			},
-			{
-				StopReason: anthropic.StopReasonEndTurn,
-				Content: []anthropic.ContentBlockUnion{
-					{Type: "text", Text: "Done!"},
-				},
-			},
+			testutil.BuildAnthropicToolUseMessage(
+				"echo_tool",
+				map[string]any{"path": "/tmp/test.txt", "content": "hello"},
+				"Let me write a file.",
+			),
+			testutil.BuildAnthropicTextMessage("Done!"),
 		},
 	}
 
@@ -97,27 +78,14 @@ func TestLoop_ToolUse(t *testing.T) {
 }
 
 func TestLoop_UnknownTool(t *testing.T) {
-	toolInput, _ := json.Marshal(map[string]string{"query": "test"})
-
 	mock := &MockAnthropicClient{
 		responses: []*anthropic.Message{
-			{
-				StopReason: anthropic.StopReasonToolUse,
-				Content: []anthropic.ContentBlockUnion{
-					{
-						Type:  "tool_use",
-						ID:    "tool_1",
-						Name:  "nonexistent_tool",
-						Input: json.RawMessage(toolInput),
-					},
-				},
-			},
-			{
-				StopReason: anthropic.StopReasonEndTurn,
-				Content: []anthropic.ContentBlockUnion{
-					{Type: "text", Text: "I see the tool was not found."},
-				},
-			},
+			testutil.BuildAnthropicToolUseMessage(
+				"nonexistent_tool",
+				map[string]any{"query": "test"},
+				"",
+			),
+			testutil.BuildAnthropicTextMessage("I see the tool was not found."),
 		},
 	}
 
@@ -134,23 +102,13 @@ func TestLoop_UnknownTool(t *testing.T) {
 }
 
 func TestLoop_MaxIterations(t *testing.T) {
-	toolInput, _ := json.Marshal(map[string]string{})
-
 	// Always returns tool_use to exhaust iterations
-	infiniteToolUse := &anthropic.Message{
-		StopReason: anthropic.StopReasonToolUse,
-		Content: []anthropic.ContentBlockUnion{
-			{
-				Type:  "tool_use",
-				ID:    "tool_1",
-				Name:  "echo_tool",
-				Input: json.RawMessage(toolInput),
-			},
-		},
+	infiniteToolUse := func() *anthropic.Message {
+		return testutil.BuildAnthropicToolUseMessage("echo_tool", map[string]any{}, "")
 	}
 
 	mock := &MockAnthropicClient{
-		responses: []*anthropic.Message{infiniteToolUse, infiniteToolUse, infiniteToolUse},
+		responses: []*anthropic.Message{infiniteToolUse(), infiniteToolUse(), infiniteToolUse()},
 	}
 
 	reg := NewToolRegistry()
