@@ -28,7 +28,7 @@ func TestBuildMeetingsFixture(t *testing.T) {
 			continue
 		}
 		dir := filepath.Join(root, e.Name())
-		mdPath := filepath.Join(dir, e.Name()+".md")
+		mdPath := filepath.Join(dir, "Meeting_"+e.Name()+".md")
 		if _, err := os.Stat(mdPath); err != nil {
 			t.Errorf("missing note %s: %v", mdPath, err)
 		}

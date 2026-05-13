@@ -25,7 +25,7 @@ func PrepWorkflow(ctx context.Context, cfg AgentConfig, description string, part
 	}
 
 	if cfg.AnthropicKey == "" {
-		return "", fmt.Errorf("ANTHROPIC_API_KEY not set and not found in config")
+		return "", fmt.Errorf("Anthropic API key missing: set ANTHROPIC_API_KEY env var, or add api_keys.anthropic to your config file")
 	}
 
 	registry := buildPrepRegistry(cfg)
@@ -69,7 +69,7 @@ func FollowUpWorkflow(ctx context.Context, cfg AgentConfig, notePath string, out
 	}
 
 	if cfg.AnthropicKey == "" {
-		return "", fmt.Errorf("ANTHROPIC_API_KEY not set and not found in config")
+		return "", fmt.Errorf("Anthropic API key missing: set ANTHROPIC_API_KEY env var, or add api_keys.anthropic to your config file")
 	}
 
 	registry := buildFollowUpRegistry(cfg, outputDir)
