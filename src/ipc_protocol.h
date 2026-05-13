@@ -40,9 +40,20 @@ struct IpcError {
 };
 
 // Server→client event push: {"event": "...", "data": {...}}
+//
+// Phase A.4: `client_id` is an optional routing tag carried as a top-level
+// JSON field, NOT nested under `data`. When non-empty the serializer emits
+// `"client_id":"..."`; when empty the field is omitted entirely (no
+// `"client_id":null`) so high-frequency event payloads (caption ticks at
+// ~10 Hz, progress) stay compact on the wire. The field is purely
+// informational at this stage — actual per-`client_id` routing on the
+// server runs through `IpcServer::send_to_client()`, not through the
+// `IpcEvent` payload. Phase C.7's JobQueue is what populates this from a
+// `job_id → client_id` binding; A.4 only lands the plumbing.
 struct IpcEvent {
     std::string event;
     JsonMap data;
+    std::string client_id;  // empty → omitted from wire
 };
 
 // Standard error codes

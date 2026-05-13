@@ -71,6 +71,11 @@ std::string serialize(const IpcError& err) {
 
 std::string serialize(const IpcEvent& ev) {
     std::string out = "{\"event\":\"" + json_escape(ev.event) + "\"";
+    // Phase A.4: emit `client_id` as a top-level field only when populated.
+    // Omitting it on empty keeps the wire compact for the broadcast events
+    // (caption / progress / phase) that dominate the byte budget.
+    if (!ev.client_id.empty())
+        out += ",\"client_id\":\"" + json_escape(ev.client_id) + "\"";
     out += ",\"data\":" + serialize_json_map(ev.data);
     out += "}";
     return out;
@@ -288,6 +293,11 @@ bool parse_ipc_message(const std::string& line, IpcMessage& out) {
     if (has_event) {
         out.type = IpcMessageType::Event;
         out.event.event = json_val_as_string(top["event"]);
+        // Phase A.4: top-level `client_id` is optional; when absent the
+        // event is unrouted (broadcast / global). Absence vs empty string
+        // are equivalent on the wire — both produce an empty client_id.
+        if (top.count("client_id"))
+            out.event.client_id = json_val_as_string(top["client_id"]);
         std::string data_raw = json_val_as_string(top["data"]);
         if (!data_raw.empty() && data_raw[0] == '{')
             parse_json_object(data_raw, 0, out.event.data);
