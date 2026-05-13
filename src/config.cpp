@@ -292,6 +292,21 @@ Config load_config(const fs::path& config_path) {
                          cfg.max_upload_bytes);
         }
     }
+    {
+        // Phase A.3 — `[ipc] max_clients`. Same warn-and-fallback shape as
+        // max_message_bytes above: a zero/negative override is a typo, not
+        // an opt-out, so we keep the struct default rather than disabling
+        // the cap.
+        std::string mc = get_val(entries, "ipc", "max_clients", "");
+        if (!mc.empty()) {
+            long long v = std::atoll(mc.c_str());
+            if (v > 0) cfg.max_clients = static_cast<size_t>(v);
+            else
+                log_warn("config: invalid [ipc] max_clients=%s; "
+                         "keeping default %zu", mc.c_str(),
+                         cfg.max_clients);
+        }
+    }
 
     return cfg;
 }
@@ -446,11 +461,18 @@ void save_config(const Config& cfg, const fs::path& config_path) {
             out << "  bind: \"" << cfg.web_bind << "\"\n";
     }
 
-    // IPC framing limits (Phase A.2). Only emit when non-default to keep
-    // the generated YAML compact.
-    if (cfg.max_message_bytes != 8ull * 1024 * 1024) {
-        out << "\nipc:\n"
-            << "  max_message_bytes: " << cfg.max_message_bytes << "\n";
+    // IPC framing limits (Phase A.2 / A.3). Only emit when non-default to
+    // keep the generated YAML compact. `max_message_bytes` and
+    // `max_clients` share the `[ipc]` section; emit the section header
+    // once when either knob is overridden.
+    bool emit_ipc_section = (cfg.max_message_bytes != 8ull * 1024 * 1024)
+                         || (cfg.max_clients       != 16);
+    if (emit_ipc_section) {
+        out << "\nipc:\n";
+        if (cfg.max_message_bytes != 8ull * 1024 * 1024)
+            out << "  max_message_bytes: " << cfg.max_message_bytes << "\n";
+        if (cfg.max_clients != 16)
+            out << "  max_clients: " << cfg.max_clients << "\n";
     }
     if (cfg.max_upload_bytes != 4ull * 1024 * 1024 * 1024) {
         out << "\nserver:\n"

@@ -5,7 +5,9 @@
 
 #include "ipc_protocol.h"
 
+#include <climits>
 #include <cstddef>
+#include <cstdint>
 #include <deque>
 #include <functional>
 #include <mutex>
@@ -78,6 +80,25 @@ public:
     void set_max_message_bytes(size_t n) { max_message_bytes_ = n; }
     size_t max_message_bytes() const { return max_message_bytes_; }
 
+    // Phase A.3: cap concurrent connected clients. When `clients_.size()`
+    // is already at or past this cap, `accept_client()` still drains the
+    // kernel queue (so the listening socket stops waking poll), writes a
+    // single-line `{"event":"error","kind":"server_full",...}` JSON
+    // refusal frame on the new fd, logs a warning with the peer address,
+    // and closes the fd before it is registered. The listen backlog is
+    // sized as `max_clients * 2` so kernel-queue back-pressure does not
+    // bottleneck before the daemon-side cap engages. Must be called
+    // before start() to influence the backlog; the runtime cap is read
+    // live so post-start changes are honored on the next accept.
+    void set_max_clients(size_t n) { max_clients_ = n > 0 ? n : 1; }
+    size_t max_clients() const { return max_clients_; }
+
+    // Phase A.3 test accessor: the listen backlog argument that start_unix()
+    // / start_tcp() will pass (or did pass) to listen(2). Exposed so tests
+    // can assert backlog tracks `max_clients * 2` without poking at
+    // /proc/sys/net or relying on platform-specific getsockopt behavior.
+    int backlog_for_test() const { return listen_backlog(); }
+
     // Start listening. Returns false on bind/listen failure.
     // For TCP listeners the daemon-side caller MUST set_psk() with a
     // non-empty value first; start() refuses to bring up an unauthenticated
@@ -126,6 +147,25 @@ private:
     void run_posted();
     bool start_unix();
     bool start_tcp();
+
+    // Phase A.3: compute the listen backlog from `max_clients_`. Centralized
+    // so `start_unix()` and `start_tcp()` cannot drift. Floor of 8 preserves
+    // the historical behavior for the (untyped) case where `max_clients_`
+    // is set very small — the kernel queue should never be the bottleneck
+    // before the daemon-side cap engages.
+    int listen_backlog() const {
+        const size_t b = max_clients_ * 2;
+        if (b < 8) return 8;
+        if (b > static_cast<size_t>(INT_MAX)) return INT_MAX;
+        return static_cast<int>(b);
+    }
+
+    // Phase A.3: reject a new fd because the daemon is at `max_clients_`.
+    // Writes a single-line JSON `server_full` error frame to the fd
+    // synchronously (this is a doomed fd — do NOT enqueue or arm POLLOUT),
+    // logs a warning with the peer address, and closes it. The fd is
+    // never registered in `clients_`.
+    void reject_full(int fd);
 
     IpcAddress addr_;
     int listen_fd_ = -1;
@@ -181,6 +221,12 @@ private:
     // `[ipc] max_message_bytes`. Reads that accumulate past this without
     // finding `\n` drop the connection.
     size_t max_message_bytes_ = 8 * 1024 * 1024;
+
+    // Phase A.3 connection cap. Default 16; configurable via
+    // `[ipc] max_clients`. Connections past this are refused at accept
+    // with a JSON `server_full` error frame and immediate close. The
+    // listen backlog tracks `max_clients_ * 2` (see listen_backlog()).
+    size_t max_clients_ = 16;
 
     // Handle the first-frame PSK exchange for a TCP client. Returns true
     // when the connection should remain open after this line; false when

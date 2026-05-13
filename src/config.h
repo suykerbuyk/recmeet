@@ -156,6 +156,14 @@ struct Config {
     // now so the schema is in place for C.2; A.2 itself does not enforce it.
     // Default 4 GB per the plan body.
     size_t max_upload_bytes = 4ull * 1024 * 1024 * 1024;
+
+    // Maximum concurrent IPC clients (Phase A.3). Connections past this
+    // cap that pass `accept()` are refused with a single-line JSON error
+    // frame (`{"event":"error","kind":"server_full",...}`) and the fd is
+    // closed before being registered in the client map. Default 16; the
+    // listen backlog is automatically raised to `max_clients * 2` so the
+    // kernel queue does not bottleneck before the daemon-side cap engages.
+    size_t max_clients = 16;
 };
 
 /// Load config. Uses path if provided, otherwise ~/.config/recmeet/config.yaml.

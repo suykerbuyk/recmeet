@@ -176,7 +176,11 @@ bool IpcServer::start_unix() {
         return false;
     }
 
-    if (listen(listen_fd_, 8) < 0) {
+    // Phase A.3: backlog tracks `max_clients * 2` (default 32) so the
+    // kernel listen queue does not bottleneck before the daemon-side cap
+    // engages. listen_backlog() floors at 8 to preserve historical
+    // behavior when the cap is very small.
+    if (listen(listen_fd_, listen_backlog()) < 0) {
         log_error("ipc_server: listen() failed: %s", strerror(errno));
         close(listen_fd_); listen_fd_ = -1;
         return false;
@@ -225,7 +229,9 @@ bool IpcServer::start_tcp() {
         return false;
     }
 
-    if (listen(listen_fd_, 8) < 0) {
+    // Phase A.3: backlog tracks `max_clients * 2` (default 32). See
+    // start_unix() / listen_backlog() for rationale.
+    if (listen(listen_fd_, listen_backlog()) < 0) {
         log_error("ipc_server: listen(TCP) failed: %s", strerror(errno));
         close(listen_fd_); listen_fd_ = -1;
         return false;
@@ -334,6 +340,20 @@ void IpcServer::accept_client() {
     if (fd < 0) return;
     fcntl(fd, F_SETFL, O_NONBLOCK);
 
+    // Phase A.3 connection cap. We MUST drain the kernel accept queue
+    // (the `accept()` above) even when over cap, otherwise the listening
+    // socket keeps waking poll(). Refusal happens AFTER the syscall: we
+    // write a single-line JSON `server_full` error frame and close the fd
+    // without ever registering it in `clients_`.
+    //
+    // The cap is checked here rather than inside the per-transport setup
+    // below so a client over the cap pays no PSK / sockopt cost on the
+    // daemon's side — the refusal is symmetric for Unix and TCP.
+    if (clients_.size() >= max_clients_) {
+        reject_full(fd);
+        return;
+    }
+
     ClientState cs;
     if (addr_.transport == IpcTransport::Tcp) {
         int yes = 1;
@@ -360,6 +380,42 @@ void IpcServer::accept_client() {
     clients_[fd] = std::move(cs);
     log_info("ipc_server: client connected (fd=%d, peer=%s, total=%zu)",
              fd, clients_[fd].peer_addr.c_str(), clients_.size());
+}
+
+void IpcServer::reject_full(int fd) {
+    // Phase A.3: doomed fd. Take the peer address for the log line, then
+    // write the refusal frame synchronously and close. We deliberately do
+    // NOT enqueue or arm POLLOUT — the fd is about to be closed and a
+    // partial write is acceptable (TCP RST will reach the client either
+    // way). Best-effort delivery; the client cap is the contract, the
+    // JSON frame is the courtesy.
+    //
+    // Frame shape parallels Phase A.1's `make_auth_error_frame` style:
+    // small, hand-rolled NDJSON, no dependency on the IpcEvent serializer
+    // to keep the rejection path free of allocation surprises.
+    std::string peer = (addr_.transport == IpcTransport::Tcp)
+                           ? format_peer_tcp(fd)
+                           : std::string("unix");
+    log_warn("ipc_server: connection refused — server_full "
+             "(peer=%s, current_clients=%zu, cap=%zu)",
+             peer.c_str(), clients_.size(), max_clients_);
+
+    static const char kServerFullFrame[] =
+        "{\"event\":\"error\",\"kind\":\"server_full\","
+        "\"reason\":\"connection cap reached\"}\n";
+    const size_t len = sizeof(kServerFullFrame) - 1;  // exclude NUL
+
+    // Single best-effort write. The fd was switched to O_NONBLOCK in
+    // accept_client() before we got here, so write() returns immediately
+    // — either with the full ~80 bytes (loopback / healthy peer), with a
+    // short count (rare for a payload this small), or with EAGAIN if the
+    // peer's kernel send buffer is wedged. Either way we close
+    // immediately after; we don't burn cycles looping on a doomed fd.
+    // The plan body explicitly specifies plain `write()` synchronously
+    // for the refusal frame, not the queue path.
+    ssize_t n = write(fd, kServerFullFrame, len);
+    (void)n;  // intentionally ignored — fd is doomed regardless
+    close(fd);
 }
 
 bool IpcServer::handle_pending_psk(int fd, ClientState& cs, const std::string& line) {

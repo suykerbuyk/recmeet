@@ -892,6 +892,12 @@ int main(int argc, char* argv[]) {
     // is already resolved in g_config by load_config().
     server.set_max_message_bytes(g_config.max_message_bytes);
 
+    // Phase A.3: apply the connection cap from config before start() so
+    // the listen backlog (max_clients * 2) is sized off the configured
+    // value rather than the struct default. Default is 16 / backlog 32;
+    // override via `[ipc] max_clients` in daemon.yaml.
+    server.set_max_clients(g_config.max_clients);
+
     // Phase A.1 PSK gate: TCP listeners require RECMEET_AUTH_TOKEN. Unix
     // listeners trust the kernel's peer credentials and skip the PSK check.
     if (listen_addr.transport == IpcTransport::Tcp) {
