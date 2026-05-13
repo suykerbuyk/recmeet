@@ -1,15 +1,14 @@
 {
-  "iter_n": 149,
-  "anchor_sha": "6b7e77e7e5c3dd90a56b5bd981a804d220bb5a86",
+  "iter_n": 150,
+  "anchor_sha": "f56142de7d5dcae651cecc6891d9944e42dbd905",
   "active": [
-    "auto-detect-vulkan-backend",
-    "runtime-loadable-gpu-backends",
     "thin-client-recording-server",
     "webui-live-captions"
   ],
   "done": [
     "audio-buffer-bounds",
     "audio-timestamp-naming",
+    "auto-detect-vulkan-backend",
     "binary-size",
     "breezy-zooming-ritchie",
     "bright-dreaming-scott",
@@ -61,6 +60,7 @@
     "remote-tray-tcp-ipc",
     "reprocess-batch-cli",
     "reprocess-robustness",
+    "runtime-loadable-gpu-backends",
     "serene-plotting-engelbart",
     "sherpa-onnx-cmake-warnings",
     "sherpa-onnx-fork-and-fix",
@@ -81,6 +81,7 @@
     "thread-count-redundant-validation",
     "tray-background-postprocessing",
     "tray-stop-stuck-recording-state",
+    "v2-absorb-v1.6.0-gpu-bundle",
     "vad-segmentation",
     "validated-launching-firefly",
     "velvety-finding-quokka",
