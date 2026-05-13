@@ -27,6 +27,17 @@ namespace {
 const char* TEST_SOCK = "/tmp/recmeet_test_ipc.sock";
 
 // Connect to a Unix socket. Returns fd or -1.
+//
+// Phase A.4: the daemon now enqueues a synthetic `auth.ok` frame on every
+// Unix accept (the new uniform handshake-completion event shape). Tests
+// using the raw helper want to start with a "clean" fd that has already
+// passed the handshake, so we consume that frame here. If the read times
+// out (e.g. an over-cap connection that got `server_full` instead), we
+// leave the bytes for the test to inspect — the over-cap tests rely on
+// reading the refusal frame directly. To handle both cases we peek with
+// a 100 ms poll, then only consume the line if it starts with
+// `{"type":"auth.ok"`. This is the same peek-or-tolerate idiom used by
+// IpcClient::connect_unix() in the production path.
 int connect_client(const char* path) {
     int fd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (fd < 0) return -1;
@@ -36,6 +47,37 @@ int connect_client(const char* path) {
     if (connect(fd, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) < 0) {
         close(fd);
         return -1;
+    }
+
+    // Peek for the first frame. If it begins with `{"type":` it is the
+    // auth.ok handshake — drain it. Otherwise (e.g. `{"event":"error"`
+    // server_full refusal) leave the bytes for the caller to read.
+    //
+    // The peek is required because polling could lie about readability
+    // under racing accept(), but a successful MSG_PEEK with at least the
+    // `{"type"` prefix proves the daemon has written the synthetic frame.
+    struct pollfd pfd = {fd, POLLIN, 0};
+    int pr = poll(&pfd, 1, 200);
+    if (pr > 0 && (pfd.revents & POLLIN)) {
+        char peek[16];
+        ssize_t n = recv(fd, peek, sizeof(peek), MSG_PEEK);
+        if (n > 0) {
+            std::string preview(peek, static_cast<size_t>(n));
+            if (preview.rfind("{\"type\":", 0) == 0) {
+                // Drain a single line (the auth.ok frame).
+                char c;
+                auto deadline = std::chrono::steady_clock::now()
+                              + std::chrono::milliseconds(500);
+                while (std::chrono::steady_clock::now() < deadline) {
+                    struct pollfd p2 = {fd, POLLIN, 0};
+                    int r = poll(&p2, 1, 50);
+                    if (r <= 0) continue;
+                    ssize_t rd = read(fd, &c, 1);
+                    if (rd <= 0) break;
+                    if (c == '\n') break;
+                }
+            }
+        }
     }
     return fd;
 }

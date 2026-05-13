@@ -112,7 +112,25 @@ public:
     void stop();
 
     // Broadcast an event to all connected clients.
+    //
+    // Phase A.4 retains this for genuinely-global events. The per-`client_id`
+    // routing primitive is `send_to_client()` — switching event call sites
+    // from `broadcast()` to `send_to_client()` is C.7's job, not A.4's.
     void broadcast(const IpcEvent& ev);
+
+    // Phase A.4: route an event to the specific client identified by
+    // `client_id`. Looks up the client via the `client_id → fd` reverse
+    // map. Best-effort: if the client has disconnected between event
+    // generation and this call the event is dropped silently (debug-log
+    // only). The caller does NOT need to hold any lock; lookup + send
+    // happen on the poll thread when invoked from a posted callback.
+    //
+    // Wire shape: the event is serialized with `IpcEvent::client_id`
+    // already populated to `client_id` so a downstream observer can
+    // confirm the routing target from the payload alone. Callers may
+    // pass an `IpcEvent` with `client_id` empty; this function stamps it
+    // before serialization.
+    void send_to_client(const std::string& client_id, IpcEvent ev);
 
     // Wake the poll loop from a worker thread (e.g., after job completion).
     // The callback will be invoked on the poll thread.
@@ -160,6 +178,14 @@ private:
         return static_cast<int>(b);
     }
 
+    // Phase A.4 mint a fresh client_id. Format: `c-<counter>-<6 hex chars>`.
+    // The counter guarantees process-lifetime uniqueness; the hex suffix
+    // makes the value non-guessable so a misbehaving Phase C.7 caller
+    // cannot easily forge a routing target from a sequential id alone.
+    // Hex chars come from `rand()` seeded once at first use — this is a
+    // log-friendly tag, not a security primitive.
+    std::string mint_client_id();
+
     // Phase A.3: reject a new fd because the daemon is at `max_clients_`.
     // Writes a single-line JSON `server_full` error frame to the fd
     // synchronously (this is a doomed fd — do NOT enqueue or arm POLLOUT),
@@ -188,6 +214,14 @@ private:
         AuthState   auth_state = AuthState::Authed;  // Unix default; TCP overrides
         std::string peer_addr;  // "host:port" for TCP, "unix" for Unix; for log lines
 
+        // Phase A.4 server-issued identifier. Assigned at the moment auth
+        // completes — for Unix clients at `accept_client()` (since they
+        // bypass PSK), for TCP clients when `handle_pending_psk()` flips
+        // `auth_state` to `Authed`. Format: `c-<counter>-<6 hex chars>`,
+        // short and log-friendly. Indexes the reverse-map
+        // `client_id_to_fd_` for O(1) routing in `send_to_client()`.
+        std::string client_id;
+
         // Per-fd outbound queue (Phase A.2). Capacity-bounded by entries
         // AND total queued bytes (whichever cap engages first — sized for
         // a 10 Hz caption stream surviving a 10 s consumer stall).
@@ -198,6 +232,18 @@ private:
         bool pending_close = false;      // Response-class overflow / fatal write error
     };
     std::unordered_map<int, ClientState> clients_;
+
+    // Phase A.4 reverse-map: assigned `client_id` → fd. Inserted at the
+    // same moment `ClientState::client_id` is assigned and erased in
+    // `remove_client()`. Read by `send_to_client()` for O(1) routing.
+    std::unordered_map<std::string, int> client_id_to_fd_;
+
+    // Phase A.4 monotonically increasing counter that mints unique
+    // `client_id` values when combined with a short random hex suffix.
+    // Bumped on every accept; never reset for the lifetime of the
+    // process so disconnect-then-reconnect produces a fresh id (Phase
+    // C.7 routing must not see a stale binding revive on a new fd).
+    uint64_t next_client_id_ = 1;
 
     // Per-fd outbound queue caps (Phase A.2). Whichever cap engages first
     // triggers the overflow policy. Sized per the plan body:

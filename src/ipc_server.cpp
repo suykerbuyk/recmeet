@@ -2,10 +2,14 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 #include "ipc_server.h"
+#include "json_util.h"
 #include "log.h"
 
 #include <cerrno>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <sys/stat.h>
 #include <sys/socket.h>
 #include <sys/un.h>
@@ -58,7 +62,17 @@ std::string make_auth_error_frame(const std::string& reason) {
     return std::string("{\"type\":\"auth.error\",\"reason\":\"") + reason + "\"}\n";
 }
 
-const std::string AUTH_OK_FRAME = "{\"type\":\"auth.ok\"}\n";
+// Phase A.4: the auth.ok frame is now per-client because it embeds the
+// server-issued `client_id` ("`{"type":"auth.ok","client_id":"..."}`").
+// Built on-demand at the moment auth completes — for TCP this is the
+// `handle_pending_psk()` success path; for Unix it is the synthetic
+// post-`accept_client()` event. The `client_id` is escaped through the
+// shared `json_escape()` helper so a future id format change does not
+// silently produce an invalid frame.
+std::string make_auth_ok_frame(const std::string& client_id) {
+    return std::string("{\"type\":\"auth.ok\",\"client_id\":\"")
+         + json_escape(client_id) + "\"}\n";
+}
 
 // Lightweight extractor for `{"type":"auth.token","token":"..."}`. Avoids
 // pulling the full IpcMessage parser into the auth path — auth frames are
@@ -117,6 +131,28 @@ IpcServer::~IpcServer() {
 
 void IpcServer::on(const std::string& method, MethodHandler handler) {
     handlers_[method] = std::move(handler);
+}
+
+std::string IpcServer::mint_client_id() {
+    // Phase A.4: `c-<counter>-<6 hex>`. The counter alone is enough to be
+    // unique within a process; the random suffix makes the id harder to
+    // forge from outside (a future C.7 routing bug should not let an
+    // attacker name a client_id deterministically from connection order
+    // alone). `rand()` is seeded once at first use — this is a tag, not
+    // a crypto primitive.
+    static bool seeded = false;
+    if (!seeded) {
+        // Mix in the process id so two daemons on the same host do not
+        // produce a colliding id sequence if both seed at the same epoch.
+        std::srand(static_cast<unsigned>(std::time(nullptr))
+                 ^ static_cast<unsigned>(getpid()));
+        seeded = true;
+    }
+    char hex[7];
+    std::snprintf(hex, sizeof(hex), "%06x",
+                  static_cast<unsigned>(std::rand()) & 0xFFFFFFu);
+    std::string id = "c-" + std::to_string(next_client_id_++) + "-" + hex;
+    return id;
 }
 
 bool IpcServer::start() {
@@ -323,6 +359,34 @@ void IpcServer::broadcast(const IpcEvent& ev) {
         send_to(fd, wire, MessageClass::Event);
 }
 
+void IpcServer::send_to_client(const std::string& client_id, IpcEvent ev) {
+    // Phase A.4 routing primitive. The `client_id → fd` reverse map is
+    // the authoritative lookup; we never iterate clients_ to find a
+    // matching id (would defeat the whole point of the reverse map).
+    //
+    // Best-effort delivery: a missing client_id is a normal case under
+    // the v1 contract — a Phase C.7 routed event can race a client
+    // disconnect, and the caller MUST be tolerant of that. We log at
+    // debug-level only so a misbehaving job pumping events at a gone
+    // client cannot flood the warning channel.
+    auto rit = client_id_to_fd_.find(client_id);
+    if (rit == client_id_to_fd_.end()) {
+        log_debug("ipc_server: send_to_client dropping event for unknown "
+                  "client_id=%s (event=%s)",
+                  client_id.c_str(), ev.event.c_str());
+        return;
+    }
+    int fd = rit->second;
+    // Stamp the routing target on the wire payload itself so a downstream
+    // observer (Phase C.7 test harness, future replay log) can confirm
+    // the intended recipient from the bytes alone. The caller may pass
+    // an `IpcEvent` with `client_id` already populated; we overwrite to
+    // guarantee the wire matches the lookup key.
+    ev.client_id = client_id;
+    std::string wire = serialize(ev) + "\n";
+    send_to(fd, std::move(wire), MessageClass::Event);
+}
+
 void IpcServer::post(std::function<void()> fn) {
     log_debug("ipc: post() from tid=%d", (int)syscall(SYS_gettid));
     {
@@ -369,17 +433,46 @@ void IpcServer::accept_client() {
         // Phase A.1: TCP clients must complete the PSK handshake before any
         // request handler is dispatched. Capture the peer address up front
         // so refusal log lines have it even if the client closes early.
+        //
+        // Phase A.4: client_id is NOT minted here for TCP — assignment
+        // happens at the moment `handle_pending_psk()` flips auth_state
+        // to Authed. Until then the client is pre-auth and has no id;
+        // anyone reading `cs.client_id` before then sees the default "".
         cs.auth_state = AuthState::PendingPsk;
         cs.peer_addr  = format_peer_tcp(fd);
     } else {
         // Unix-socket peer credentials make local trust authoritative.
+        //
+        // Phase A.4: Unix clients bypass PSK entirely, so client_id is
+        // minted right here at accept time. A synthetic `auth.ok` event
+        // (built per-client to include the id) is queued for the same
+        // tick so the client sees the same handshake-completion event
+        // shape as a TCP client. This is the only IPC frame the daemon
+        // ever sends unprompted on the Unix surface — everything else
+        // is request-response or broadcast.
         cs.auth_state = AuthState::Authed;
         cs.peer_addr  = "unix";
+        cs.client_id  = mint_client_id();
     }
 
+    std::string assigned_id = cs.client_id;  // empty for TCP, populated for Unix
+    bool        is_unix     = (addr_.transport != IpcTransport::Tcp);
+
     clients_[fd] = std::move(cs);
-    log_info("ipc_server: client connected (fd=%d, peer=%s, total=%zu)",
-             fd, clients_[fd].peer_addr.c_str(), clients_.size());
+    if (!assigned_id.empty())
+        client_id_to_fd_[assigned_id] = fd;
+    log_info("ipc_server: client connected (fd=%d, peer=%s, total=%zu, client_id=%s)",
+             fd, clients_[fd].peer_addr.c_str(), clients_.size(),
+             assigned_id.empty() ? "<pending>" : assigned_id.c_str());
+
+    // Phase A.4: synthetic auth.ok for the Unix bypass path. Queued via
+    // the standard send_to() so it observes the same outbound-queue
+    // back-pressure semantics as any other Response-class frame. Doing
+    // this AFTER `clients_[fd] = ...` is mandatory; send_to() looks up
+    // the fd in `clients_` and silently drops if missing.
+    if (is_unix) {
+        send_to(fd, make_auth_ok_frame(assigned_id), MessageClass::Response);
+    }
 }
 
 void IpcServer::reject_full(int fd) {
@@ -446,8 +539,18 @@ bool IpcServer::handle_pending_psk(int fd, ClientState& cs, const std::string& l
     }
 
     cs.auth_state = AuthState::Authed;
-    log_info("ipc_server: TCP auth ok (peer=%s)", cs.peer_addr.c_str());
-    send_to(fd, AUTH_OK_FRAME, MessageClass::Response);
+    // Phase A.4: assign server-issued client_id at the moment auth
+    // completes. The reverse-map insert MUST happen before send_to() so
+    // that a Phase C.7 routed event posted in the same tick can resolve
+    // the id immediately. Today's call sites all run on the poll thread
+    // so the ordering is enforced by the thread, but lock-free design
+    // means the assignment+insert pair must read atomically from the
+    // caller's perspective.
+    cs.client_id = mint_client_id();
+    client_id_to_fd_[cs.client_id] = fd;
+    log_info("ipc_server: TCP auth ok (peer=%s, client_id=%s)",
+             cs.peer_addr.c_str(), cs.client_id.c_str());
+    send_to(fd, make_auth_ok_frame(cs.client_id), MessageClass::Response);
     return true;
 }
 
@@ -578,6 +681,15 @@ void IpcServer::handle_client_data(int fd) {
 }
 
 void IpcServer::remove_client(int fd) {
+    // Phase A.4: erase the `client_id → fd` reverse-map entry alongside
+    // the primary map. Done BEFORE the close() / erase() so a callback
+    // posted concurrently (e.g. a C.7 event for this exact client) sees
+    // a consistent "gone" view — `send_to_client()` looks up the reverse
+    // map first.
+    auto it = clients_.find(fd);
+    if (it != clients_.end() && !it->second.client_id.empty()) {
+        client_id_to_fd_.erase(it->second.client_id);
+    }
     log_info("ipc_server: client disconnected (fd=%d)", fd);
     close(fd);
     clients_.erase(fd);

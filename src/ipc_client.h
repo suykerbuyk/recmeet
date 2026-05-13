@@ -54,6 +54,15 @@ public:
     // Whether this client targets a remote (TCP) daemon.
     bool is_remote() const { return addr_.transport == IpcTransport::Tcp; }
 
+    // Phase A.4: the server-issued `client_id` for this connection.
+    // Populated when `connect()` succeeds, from the `auth.ok` frame
+    // (TCP: read inline after the PSK exchange; Unix: read on the
+    // first `read_and_dispatch()` after connect — `auth.ok` arrives
+    // unsolicited from the daemon for Unix clients). Empty before
+    // connect or after `close_connection()`. Stable for the lifetime
+    // of a connection: reconnect mints a fresh id on the server.
+    const std::string& client_id() const { return client_id_; }
+
     // Get the underlying fd (for integration with external event loops).
     int fd() const { return fd_; }
 
@@ -71,6 +80,11 @@ private:
     int64_t next_id_ = 1;
     std::string read_buf_;
     EventCallback event_cb_;
+
+    // Phase A.4: server-issued client identifier, extracted from the
+    // `auth.ok` frame. Cleared on `close_connection()` so a reconnect
+    // never surfaces a stale id. Read by `client_id()`.
+    std::string client_id_;
 
     // For blocking call(): stores the response/error for the pending request ID.
     int64_t pending_id_ = 0;

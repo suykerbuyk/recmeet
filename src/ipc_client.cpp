@@ -20,6 +20,37 @@ namespace recmeet {
 
 namespace {
 
+// Phase A.4: extract a `client_id` value from an auth.ok NDJSON frame.
+// The frame shape is `{"type":"auth.ok","client_id":"..."}`. We do not
+// route through `parse_ipc_message()` because auth frames are not the
+// request/response/event/error shape that parser recognizes — auth is
+// its own micro-protocol layered atop the same NDJSON transport.
+// Returns the extracted id (without quotes) or empty string if the
+// frame does not carry the field. The function is intentionally
+// tolerant: an auth.ok frame from a pre-A.4 daemon (which omits
+// `client_id`) round-trips cleanly with an empty result.
+std::string extract_client_id_from_auth_ok(const std::string& line) {
+    size_t key = line.find("\"client_id\"");
+    if (key == std::string::npos) return "";
+    size_t colon = line.find(':', key);
+    if (colon == std::string::npos) return "";
+    size_t open = line.find('"', colon);
+    if (open == std::string::npos) return "";
+    std::string out;
+    for (size_t i = open + 1; i < line.size(); ++i) {
+        char c = line[i];
+        if (c == '\\' && i + 1 < line.size()) {
+            char nc = line[i + 1];
+            if (nc == '"' || nc == '\\') { out += nc; ++i; continue; }
+            out += c;
+            continue;
+        }
+        if (c == '"') return out;
+        out += c;
+    }
+    return "";
+}
+
 // JSON-escape a token value. Tokens are unlikely to contain special chars
 // in practice, but we never want to emit invalid JSON if an operator
 // chose a token with quotes or backslashes.
@@ -116,6 +147,37 @@ bool IpcClient::connect_unix() {
         return false;
     }
 
+    // Phase A.4: the daemon enqueues a synthetic `auth.ok` frame for Unix
+    // clients at accept time so the handshake-completion event shape
+    // matches TCP. Read it now, mirror of the TCP path. The blocking
+    // read uses the same 5 s budget as TCP's auth wait; in practice the
+    // frame is in the socket buffer well before connect() returns, so
+    // this is a fast-path read.
+    //
+    // Tolerance: a pre-A.4 daemon does NOT emit this frame. To stay
+    // backward-compatible we poll the fd briefly and only consume the
+    // frame if it is actually there; on timeout we proceed with an
+    // empty client_id_ rather than failing the connect outright. The
+    // poll is cheap (100 ms upper bound) because the local daemon
+    // either has the frame queued already or never will.
+    struct pollfd pfd = {fd_, POLLIN, 0};
+    int pr = poll(&pfd, 1, 100);
+    if (pr > 0 && (pfd.revents & POLLIN)) {
+        std::string reply;
+        if (read_one_line_blocking(fd_, reply, 500)) {
+            if (reply.find("\"auth.ok\"") != std::string::npos) {
+                client_id_ = extract_client_id_from_auth_ok(reply);
+            } else {
+                // Unexpected first frame on Unix — close. The protocol
+                // contract says the only daemon-initiated unsolicited
+                // frame on a fresh Unix connection is auth.ok.
+                close(fd_); fd_ = -1;
+                return false;
+            }
+        }
+        // poll() lied or timed out under the inner deadline → tolerate.
+    }
+
     return true;
 }
 
@@ -193,6 +255,13 @@ bool IpcClient::connect_tcp() {
         close(fd_); fd_ = -1; return false;
     }
 
+    // Phase A.4: capture the server-issued client_id. A pre-A.4 daemon
+    // emits `{"type":"auth.ok"}` with no client_id field — leave the
+    // value empty in that case for backward compatibility (no callers
+    // require a non-empty id in v1; the field is observability today
+    // and will become load-bearing in Phase C.7 routing).
+    client_id_ = extract_client_id_from_auth_ok(reply);
+
     return true;
 }
 
@@ -208,6 +277,11 @@ void IpcClient::close_connection() {
         fd_ = -1;
     }
     read_buf_.clear();
+    // Phase A.4: drop the cached server-issued client_id so a subsequent
+    // reconnect cannot surface a stale value. The daemon mints a fresh
+    // id on every accept; carrying the old one across a reconnect would
+    // confuse Phase C.7 routing.
+    client_id_.clear();
 }
 
 bool IpcClient::call(const std::string& method, const JsonMap& params,
