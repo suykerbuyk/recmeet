@@ -33,7 +33,14 @@ func main() {
 	configPath := os.Getenv("RECMEET_CONFIG")
 	cfg, err := meetingdata.LoadConfig(configPath)
 	if err != nil {
-		errLog.Fatalf("load config: %v", err)
+		// On a missing explicit-config error, surface both the path
+		// the operator pointed us at AND the default location so the
+		// fix is obvious: either drop a file at the default path or
+		// fix the RECMEET_CONFIG env var.
+		errLog.Printf("load config: %v", err)
+		errLog.Printf("hint: set RECMEET_CONFIG to a valid config path, or place a config at %s",
+			meetingdata.DefaultConfigPath())
+		os.Exit(1)
 	}
 
 	mcpSrv := mcpserver.NewServer(cfg)

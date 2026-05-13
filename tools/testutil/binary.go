@@ -60,7 +60,19 @@ func BuildBinaryOnce(name string) (path string, cleanup func(), err error) {
 		binPath += ".exe"
 	}
 
-	cmd := exec.Command("go", "build", "-o", binPath, "./cmd/"+name)
+	// When GOCOVERDIR is set in the test environment, build the
+	// binary with `-cover` so subprocess invocations write coverage
+	// counters that `go tool covdata` can fold back into the final
+	// coverage report. Without this, integration tests that exercise
+	// the binary as a subprocess report 0% coverage on its main.go
+	// even when the code paths are fully exercised.
+	args := []string{"build", "-o", binPath}
+	if os.Getenv("GOCOVERDIR") != "" {
+		args = append(args, "-cover", "-coverpkg=./...")
+	}
+	args = append(args, "./cmd/"+name)
+
+	cmd := exec.Command("go", args...)
 	cmd.Dir = moduleRoot
 	cmd.Env = os.Environ()
 
