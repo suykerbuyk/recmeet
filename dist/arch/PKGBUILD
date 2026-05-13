@@ -30,6 +30,10 @@ makedepends=(
     'ninja'
     'gcc'
     'pkgconf'
+    # Required to build the Go tools (recmeet-mcp, recmeet-agent). The CMake
+    # build invokes `go build` and the resulting binaries land in the
+    # base package alongside the C++ binaries.
+    'go'
     # Required to build libggml-vulkan.so. Forced ON in build() below so
     # both member packages always have the plugin available to pull in.
     'vulkan-headers'

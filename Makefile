@@ -49,6 +49,9 @@ endif
 ifdef RECMEET_BUILD_WEB
 CMAKE_OPTS += -DRECMEET_BUILD_WEB=$(RECMEET_BUILD_WEB)
 endif
+ifdef RECMEET_BUILD_GO_TOOLS
+CMAKE_OPTS += -DRECMEET_BUILD_GO_TOOLS=$(RECMEET_BUILD_GO_TOOLS)
+endif
 
 # ── Auto-detect locally-built onnxruntime ──────────────────────────
 ONNXRT_LOCAL := $(CURDIR)/vendor/onnxruntime-local
@@ -82,8 +85,6 @@ build-onnxruntime:
 build: ensure-submodules
 	cmake -B $(BUILD_DIR) -G Ninja $(CMAKE_OPTS)
 	ninja -C $(BUILD_DIR)
-	cd tools && go build -o ../$(BUILD_DIR)/recmeet-mcp ./cmd/recmeet-mcp
-	cd tools && go build -o ../$(BUILD_DIR)/recmeet-agent ./cmd/recmeet-agent
 
 test: ensure-submodules
 	cmake -B $(BUILD_DIR) -G Ninja $(CMAKE_OPTS) -DRECMEET_BUILD_TESTS=ON
@@ -139,6 +140,20 @@ full-stack: ensure-submodules
 	./$(BUILD_DIR)/recmeet_tests "[full-stack]"
 
 install: build
+	@# Force-relink the C++ binaries before install. CMake's install-time
+	@# RPATH_CHANGE expects the binary's current RUNPATH to match what the
+	@# CURRENT cmake_install.cmake was generated against, entry-by-entry.
+	@# A reconfigure that changes the link search path (e.g. discovering
+	@# vendor/onnxruntime-local where the prior configure didn't, toggling
+	@# RECMEET_USE_SHERPA, switching system vs vendored onnxruntime) leaves
+	@# the binary on disk with a stale RUNPATH; the install then fails
+	@# with a confusing "current RUNPATH does not contain X as was expected"
+	@# error. Relinking is cheap (no recompile of object files; ~5s for the
+	@# four binaries) and only happens on the install path, so it doesn't
+	@# slow day-to-day `make build`.
+	rm -f $(BUILD_DIR)/recmeet $(BUILD_DIR)/recmeet-daemon \
+	      $(BUILD_DIR)/recmeet-tray $(BUILD_DIR)/recmeet-web
+	ninja -C $(BUILD_DIR)
 	DESTDIR=$(DESTDIR) cmake --install $(BUILD_DIR)
 ifndef DESTDIR
 	@echo ""
@@ -166,6 +181,8 @@ uninstall:
 	rm -fv $(DESTDIR)$(PREFIX)/bin/recmeet-daemon
 	rm -fv $(DESTDIR)$(PREFIX)/bin/recmeet-tray
 	rm -fv $(DESTDIR)$(PREFIX)/bin/recmeet-web
+	rm -fv $(DESTDIR)$(PREFIX)/bin/recmeet-mcp
+	rm -fv $(DESTDIR)$(PREFIX)/bin/recmeet-agent
 	rm -fv $(DESTDIR)$(PREFIX)/share/applications/recmeet-tray.desktop
 	rm -fv $(DESTDIR)$(PREFIX)/share/systemd/user/recmeet-daemon.service
 	rm -fv $(DESTDIR)$(PREFIX)/share/systemd/user/recmeet-daemon.socket
@@ -268,3 +285,4 @@ help:
 	@echo "  RECMEET_USE_NOTIFY ON|OFF               (default: ON)"
 	@echo "  RECMEET_BUILD_TESTS ON|OFF              (default: ON)"
 	@echo "  RECMEET_BUILD_WEB  ON|OFF               (default: ON)"
+	@echo "  RECMEET_BUILD_GO_TOOLS ON|OFF           (default: ON, builds recmeet-mcp + recmeet-agent)"
