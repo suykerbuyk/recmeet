@@ -1,7 +1,9 @@
 {
-  "iter_n": 139,
-  "anchor_sha": "7644fadd71f12e10123e2890b7b93e5b812619f3",
+  "iter_n": 149,
+  "anchor_sha": "6b7e77e7e5c3dd90a56b5bd981a804d220bb5a86",
   "active": [
+    "auto-detect-vulkan-backend",
+    "runtime-loadable-gpu-backends",
     "thin-client-recording-server",
     "webui-live-captions"
   ],
@@ -25,6 +27,7 @@
     "full-stack-pipeline-integration-test",
     "giggly-dreaming-cascade",
     "gleaming-mixing-squirrel",
+    "go-tools-integration-tests",
     "golden-strolling-cerf",
     "graceful-gathering-newell",
     "http-client-boilerplate",
