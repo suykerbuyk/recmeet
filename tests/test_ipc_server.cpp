@@ -1165,3 +1165,310 @@ TEST_CASE("A.3: listen backlog tracks max_clients * 2",
     CHECK(s_zero.max_clients() == 1);
     CHECK(s_zero.backlog_for_test() == 8);
 }
+
+// ---------------------------------------------------------------------------
+// Phase A.4 — Client identity (client_id assignment + send_to_client routing)
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// Connect a raw Unix-socket client WITHOUT consuming the synthetic auth.ok
+// frame. Mirror of `connect_client()` minus the peek-and-drain step. A.4
+// tests that want to assert the wire shape of the auth.ok frame itself
+// use this helper; tests that just want a registered client downstream
+// use the standard `connect_client()` helper above.
+int a4_connect_raw(const char* path) {
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) return -1;
+    struct sockaddr_un addr{};
+    addr.sun_family = AF_UNIX;
+    std::strncpy(addr.sun_path, path, sizeof(addr.sun_path) - 1);
+    if (connect(fd, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) < 0) {
+        close(fd);
+        return -1;
+    }
+    return fd;
+}
+
+// Parse a server-issued `client_id` out of an auth.ok line, with the
+// same tolerant extraction the production IpcClient uses. Returns empty
+// if the field is absent.
+std::string a4_extract_client_id(const std::string& line) {
+    size_t key = line.find("\"client_id\"");
+    if (key == std::string::npos) return "";
+    size_t colon = line.find(':', key);
+    if (colon == std::string::npos) return "";
+    size_t open = line.find('"', colon);
+    if (open == std::string::npos) return "";
+    std::string out;
+    for (size_t i = open + 1; i < line.size(); ++i) {
+        char c = line[i];
+        if (c == '\\' && i + 1 < line.size()) {
+            char nc = line[i + 1];
+            if (nc == '"' || nc == '\\') { out += nc; ++i; continue; }
+            out += c;
+            continue;
+        }
+        if (c == '"') return out;
+        out += c;
+    }
+    return "";
+}
+
+} // anonymous namespace
+
+TEST_CASE("A.4: TCP client_id is assigned at auth and surfaced via auth.ok",
+          "[ipc][a4]") {
+    // Connect two TCP clients with valid PSK and observe each receives an
+    // `auth.ok` frame carrying a non-empty `client_id`. The two ids must
+    // be distinct — proves the counter increments and the format
+    // produces unique values per connection.
+    const char* prev = std::getenv("RECMEET_AUTH_TOKEN");
+    std::string prev_str = prev ? prev : "";
+    setenv("RECMEET_AUTH_TOKEN", "a4-tcp-token", 1);
+
+    IpcServer server("127.0.0.1:19895");
+    server.set_psk("a4-tcp-token");
+    REQUIRE(server.start());
+    std::thread srv([&server]() { server.run(); });
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+    IpcClient c1("127.0.0.1:19895");
+    IpcClient c2("127.0.0.1:19895");
+    REQUIRE(c1.connect());
+    REQUIRE(c2.connect());
+
+    // Both clients must have a non-empty, distinct client_id parsed from
+    // the per-client auth.ok frame.
+    CHECK_FALSE(c1.client_id().empty());
+    CHECK_FALSE(c2.client_id().empty());
+    CHECK(c1.client_id() != c2.client_id());
+
+    // Sanity: the id format is `c-<counter>-<6 hex>` — at minimum it
+    // starts with `c-` and is longer than that prefix.
+    CHECK(c1.client_id().rfind("c-", 0) == 0);
+    CHECK(c2.client_id().rfind("c-", 0) == 0);
+    CHECK(c1.client_id().size() > 2);
+    CHECK(c2.client_id().size() > 2);
+
+    c1.close_connection();
+    c2.close_connection();
+    // After close, client_id_ is cleared so a stale value cannot leak
+    // into a Phase C.7 routing call from a reused IpcClient instance.
+    CHECK(c1.client_id().empty());
+    CHECK(c2.client_id().empty());
+
+    server.stop();
+    srv.join();
+
+    if (prev) setenv("RECMEET_AUTH_TOKEN", prev_str.c_str(), 1);
+    else      unsetenv("RECMEET_AUTH_TOKEN");
+}
+
+TEST_CASE("A.4: Unix client also gets a populated client_id via synthetic auth.ok",
+          "[ipc][a4]") {
+    // Unix clients bypass PSK but still need a server-issued client_id
+    // for the C.7 routing primitive. The server enqueues a synthetic
+    // `auth.ok` frame at `accept_client()` so the handshake-completion
+    // event shape is uniform across transports. We assert by reading
+    // the raw frame off the fd ourselves — bypassing IpcClient — so the
+    // test pins the wire contract directly, not just the client-side
+    // convenience getter.
+    unlink(TEST_SOCK);
+    IpcServer server(TEST_SOCK);
+    REQUIRE(server.start());
+    std::thread srv([&server]() { server.run(); });
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+    int fd = a4_connect_raw(TEST_SOCK);
+    REQUIRE(fd >= 0);
+
+    std::string line = read_line(fd, 2000);
+    REQUIRE_FALSE(line.empty());
+    // Shape: `{"type":"auth.ok","client_id":"..."}`
+    CHECK(line.find("\"type\":\"auth.ok\"") != std::string::npos);
+    CHECK(line.find("\"client_id\":\"") != std::string::npos);
+
+    std::string id = a4_extract_client_id(line);
+    CHECK_FALSE(id.empty());
+    CHECK(id.rfind("c-", 0) == 0);
+
+    // IpcClient on the same socket must see the same shape via its
+    // public getter (sanity check the Unix connect_unix() drain path).
+    IpcClient c(TEST_SOCK);
+    REQUIRE(c.connect());
+    CHECK_FALSE(c.client_id().empty());
+    CHECK(c.client_id().rfind("c-", 0) == 0);
+    // The two ids are NOT equal — they came from distinct accepts.
+    CHECK(id != c.client_id());
+
+    close(fd);
+    c.close_connection();
+    server.stop();
+    srv.join();
+}
+
+TEST_CASE("A.4: send_to_client routes to the named client only",
+          "[ipc][a4]") {
+    // Open two clients, capture client1's id, then post an event via
+    // `server.send_to_client(client1.id, ev)` from the poll thread. The
+    // poll thread is the only correct caller for send_to_client (today's
+    // contract — locking is not required because all the maps are read
+    // there). client1 must observe the event; client2 must NOT.
+    unlink(TEST_SOCK);
+    IpcServer server(TEST_SOCK);
+    REQUIRE(server.start());
+    std::thread srv([&server]() { server.run(); });
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+    IpcClient c1(TEST_SOCK), c2(TEST_SOCK);
+    REQUIRE(c1.connect());
+    REQUIRE(c2.connect());
+
+    REQUIRE_FALSE(c1.client_id().empty());
+    REQUIRE_FALSE(c2.client_id().empty());
+    REQUIRE(c1.client_id() != c2.client_id());
+
+    std::atomic<int> c1_events{0};
+    std::atomic<int> c2_events{0};
+    std::atomic<std::int64_t> c1_seq{-1};
+    c1.set_event_callback([&](const IpcEvent& ev) {
+        if (ev.event == "a4.routed") {
+            c1_events++;
+            c1_seq = json_val_as_int(ev.data.count("seq")
+                                     ? ev.data.at("seq") : JsonVal{}, -1);
+        }
+    });
+    c2.set_event_callback([&](const IpcEvent& ev) {
+        if (ev.event == "a4.routed") c2_events++;
+    });
+
+    const std::string target_id = c1.client_id();
+    server.post([&server, target_id]() {
+        IpcEvent ev;
+        ev.event = "a4.routed";
+        ev.data["seq"] = static_cast<int64_t>(7);
+        server.send_to_client(target_id, ev);
+    });
+
+    // Give both clients time to dispatch the routed event (only c1 will
+    // actually receive one); 1 s is generous for a local Unix socket.
+    c1.read_events("a4.routed", 1000);
+    c2.read_events("a4.routed", 200);
+
+    CHECK(c1_events == 1);
+    CHECK(c2_events == 0);
+    CHECK(c1_seq == 7);
+
+    c1.close_connection();
+    c2.close_connection();
+    server.stop();
+    srv.join();
+}
+
+TEST_CASE("A.4: send_to_client to a disconnected id drops silently",
+          "[ipc][a4]") {
+    // Capture client1's id, disconnect it, then call send_to_client with
+    // that now-stale id. The call must not throw, must not crash, and
+    // must not leak the event to client2 (which stays connected). This
+    // pins the "best-effort delivery" contract spelled out in the A.4
+    // plan body.
+    unlink(TEST_SOCK);
+    IpcServer server(TEST_SOCK);
+    REQUIRE(server.start());
+    std::thread srv([&server]() { server.run(); });
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+    IpcClient c1(TEST_SOCK), c2(TEST_SOCK);
+    REQUIRE(c1.connect());
+    REQUIRE(c2.connect());
+    REQUIRE_FALSE(c1.client_id().empty());
+
+    std::atomic<int> c2_events{0};
+    c2.set_event_callback([&](const IpcEvent& ev) {
+        if (ev.event == "a4.dropped") c2_events++;
+    });
+
+    // Capture c1's id, then disconnect c1.
+    const std::string gone_id = c1.client_id();
+    c1.close_connection();
+    // Give the server's poll loop time to observe the EOF and erase
+    // the entry from both `clients_` and `client_id_to_fd_`.
+    std::this_thread::sleep_for(std::chrono::milliseconds(150));
+
+    // Post a routed event to the gone id. Must not throw, must not
+    // surface anywhere. We then post a broadcast control event and
+    // wait for c2 to see *that*, which proves the event loop is alive
+    // and the gone-id send did not wedge anything.
+    server.post([&server, gone_id]() {
+        IpcEvent ev;
+        ev.event = "a4.dropped";
+        ev.data["payload"] = std::string("must not arrive");
+        server.send_to_client(gone_id, ev);  // best-effort drop
+    });
+    server.post([&server]() {
+        IpcEvent ev;
+        ev.event = "a4.control";
+        server.broadcast(ev);
+    });
+
+    // Wait for the control event on c2.
+    std::atomic<int> c2_control{0};
+    c2.set_event_callback([&](const IpcEvent& ev) {
+        if (ev.event == "a4.dropped") c2_events++;
+        if (ev.event == "a4.control") c2_control++;
+    });
+    c2.read_events("a4.control", 1000);
+
+    CHECK(c2_control == 1);
+    CHECK(c2_events == 0);  // never received the routed event
+
+    c2.close_connection();
+    server.stop();
+    srv.join();
+}
+
+TEST_CASE("A.4: broadcast() still fans out to every connected client",
+          "[ipc][a4]") {
+    // Sanity check that the existing fan-out path is unchanged by A.4.
+    // The plan body explicitly requires A.4 to NOT change the routing
+    // behavior of any existing event — current call sites in daemon.cpp
+    // continue to call `broadcast()` and continue to fan out. Two
+    // clients, one broadcast, both see it.
+    unlink(TEST_SOCK);
+    IpcServer server(TEST_SOCK);
+    REQUIRE(server.start());
+    std::thread srv([&server]() { server.run(); });
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+    IpcClient c1(TEST_SOCK), c2(TEST_SOCK);
+    REQUIRE(c1.connect());
+    REQUIRE(c2.connect());
+
+    std::atomic<int> c1_events{0};
+    std::atomic<int> c2_events{0};
+    c1.set_event_callback([&](const IpcEvent& ev) {
+        if (ev.event == "a4.global") c1_events++;
+    });
+    c2.set_event_callback([&](const IpcEvent& ev) {
+        if (ev.event == "a4.global") c2_events++;
+    });
+
+    server.post([&server]() {
+        IpcEvent ev;
+        ev.event = "a4.global";
+        ev.data["payload"] = std::string("hello all");
+        server.broadcast(ev);
+    });
+
+    c1.read_events("a4.global", 1000);
+    c2.read_events("a4.global", 1000);
+
+    CHECK(c1_events == 1);
+    CHECK(c2_events == 1);
+
+    c1.close_connection();
+    c2.close_connection();
+    server.stop();
+    srv.join();
+}

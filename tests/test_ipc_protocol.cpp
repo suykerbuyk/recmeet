@@ -127,6 +127,72 @@ TEST_CASE("IpcEvent: empty data", "[ipc]") {
     CHECK(msg.event.data.empty());
 }
 
+TEST_CASE("A.4: IpcEvent client_id serialize + parse round-trip", "[ipc][a4]") {
+    // Phase A.4 wire-shape contract:
+    //   - When `client_id` is non-empty the serializer emits a top-level
+    //     `"client_id":"..."` field.
+    //   - When empty the field is omitted entirely (NO `"client_id":null`).
+    //   - The parser round-trips the field through `IpcEvent::client_id`.
+
+    SECTION("populated client_id appears on the wire and round-trips") {
+        IpcEvent ev;
+        ev.event = "caption";
+        ev.client_id = "c-42-abcdef";
+        ev.data["seq"] = int64_t(99);
+
+        std::string wire = serialize(ev);
+        // Top-level field, not nested under "data".
+        CHECK(wire.find("\"client_id\":\"c-42-abcdef\"") != std::string::npos);
+        // Ordering check: client_id appears before the "data" object so a
+        // consumer reading the prefix can dispatch without parsing the
+        // (potentially large) payload.
+        size_t cid_pos  = wire.find("\"client_id\"");
+        size_t data_pos = wire.find("\"data\":");
+        REQUIRE(cid_pos  != std::string::npos);
+        REQUIRE(data_pos != std::string::npos);
+        CHECK(cid_pos < data_pos);
+
+        IpcMessage msg;
+        REQUIRE(parse_ipc_message(wire, msg));
+        REQUIRE(msg.type == IpcMessageType::Event);
+        CHECK(msg.event.event == "caption");
+        CHECK(msg.event.client_id == "c-42-abcdef");
+        CHECK(json_val_as_int(msg.event.data["seq"]) == 99);
+    }
+
+    SECTION("empty client_id is omitted from the wire") {
+        IpcEvent ev;
+        ev.event = "phase";
+        ev.data["name"] = std::string("transcribing");
+        // client_id left default-constructed (empty).
+
+        std::string wire = serialize(ev);
+        CHECK(wire.find("\"client_id\"") == std::string::npos);
+        // No `"client_id":null` either — the field is omitted entirely
+        // so high-frequency events stay compact.
+        CHECK(wire.find("\"client_id\":null") == std::string::npos);
+
+        IpcMessage msg;
+        REQUIRE(parse_ipc_message(wire, msg));
+        REQUIRE(msg.type == IpcMessageType::Event);
+        CHECK(msg.event.client_id.empty());
+    }
+
+    SECTION("client_id with embedded special chars escapes safely") {
+        // Defensive — the id format never produces these characters but
+        // the serializer must never emit invalid JSON if a future format
+        // change introduces quotes or backslashes.
+        IpcEvent ev;
+        ev.event = "test";
+        ev.client_id = "weird\"id\\with-escapes";
+
+        std::string wire = serialize(ev);
+        IpcMessage msg;
+        REQUIRE(parse_ipc_message(wire, msg));
+        CHECK(msg.event.client_id == "weird\"id\\with-escapes");
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Special characters
 // ---------------------------------------------------------------------------
