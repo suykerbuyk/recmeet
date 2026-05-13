@@ -67,7 +67,7 @@ func prepCmd() *cobra.Command {
 
 			var parts []string
 			if participants != "" {
-				for _, p := range strings.Split(participants, ",") {
+				for p := range strings.SplitSeq(participants, ",") {
 					parts = append(parts, strings.TrimSpace(p))
 				}
 			}

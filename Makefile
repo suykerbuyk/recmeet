@@ -63,43 +63,76 @@ endif
 endif
 
 # ── Targets ─────────────────────────────────────────────────────────
-.PHONY: build build-onnxruntime test integration integration-t2-1 benchmark full-stack install uninstall package-deb package-rpm package-arch clean coverage help daemon-start daemon-stop daemon-status
+.PHONY: build build-onnxruntime test integration integration-cxx integration-go integration-go-coverage integration-t2-1 benchmark full-stack install uninstall package-deb package-rpm package-arch clean coverage help daemon-start daemon-stop daemon-status ensure-submodules
+
+# Idempotent submodule populate. Triggered as a prerequisite of every target
+# that runs CMake, so a fresh `git clone` (without --recurse-submodules) or a
+# newly-created `git worktree add` populates vendor/whisper.cpp + vendor/llama.cpp
+# automatically — no operator step, no AI-agent rule required. Skipped when
+# both top-level CMakeLists.txt files are already present.
+ensure-submodules:
+	@if [ ! -f vendor/whisper.cpp/CMakeLists.txt ] || [ ! -f vendor/llama.cpp/CMakeLists.txt ]; then \
+	    echo "--- Initializing git submodules (vendor/whisper.cpp + vendor/llama.cpp) ---"; \
+	    git submodule update --init --recursive; \
+	fi
 
 build-onnxruntime:
 	./scripts/build-onnxruntime.sh
 
-build:
+build: ensure-submodules
 	cmake -B $(BUILD_DIR) -G Ninja $(CMAKE_OPTS)
 	ninja -C $(BUILD_DIR)
 	cd tools && go build -o ../$(BUILD_DIR)/recmeet-mcp ./cmd/recmeet-mcp
 	cd tools && go build -o ../$(BUILD_DIR)/recmeet-agent ./cmd/recmeet-agent
 
-test:
+test: ensure-submodules
 	cmake -B $(BUILD_DIR) -G Ninja $(CMAKE_OPTS) -DRECMEET_BUILD_TESTS=ON
 	ninja -C $(BUILD_DIR)
 	./$(BUILD_DIR)/recmeet_tests "~[integration]~[benchmark]~[full-stack]"
 	cd tools && go test ./... -count=1
 
-integration:
+# `integration` is the umbrella that runs BOTH the C++ Catch2 [integration]
+# suite AND the Go-tools integration suite (recmeet-mcp + recmeet-agent,
+# build-tag opt-in). Each sub-target is independently invokable.
+integration: integration-cxx integration-go
+
+integration-cxx: ensure-submodules
 	cmake -B $(BUILD_DIR) -G Ninja $(CMAKE_OPTS) -DRECMEET_BUILD_TESTS=ON
 	ninja -C $(BUILD_DIR)
 	./$(BUILD_DIR)/recmeet_tests "[integration]~[t2-1]"
 
+# Go-tools integration: 39 build-tag-gated tests across recmeet-mcp + recmeet-agent.
+# Builds binaries via testutil.BuildBinaryOnce; no shared state with the C++ suite,
+# so this is safe to run in parallel with integration-cxx if desired.
+integration-go:
+	cd tools && go test -tags=integration -count=1 ./...
+
+# Subprocess-coverage variant: re-run the same suite under GOCOVERDIR collection,
+# then report aggregate per-package percentage. Useful for verifying that changes
+# to recmeet-mcp/main.go or recmeet-agent/main.go remain covered by the integration
+# suite. testutil.BuildBinaryOnce auto-injects `-cover -coverpkg=./...` when
+# GOCOVERDIR is set in the environment.
+integration-go-coverage:
+	@covdir="$$(mktemp -d)"; \
+	    echo "GOCOVERDIR=$$covdir"; \
+	    cd tools && GOCOVERDIR=$$covdir go test -tags=integration -count=1 ./cmd/... && \
+	    go tool covdata percent -i=$$covdir
+
 # T2.3 integration gate: chunked-diarize end-to-end on the iter-110 fixture
 # under a cgroup MemoryMax=8G cap. Requires systemd user instance + cgroup v2.
 # Provide the fixture path via RECMEET_T2_1_FIXTURE=/path/to/iter-110.wav.
-integration-t2-1:
+integration-t2-1: ensure-submodules
 	cmake -B $(BUILD_DIR) -G Ninja $(CMAKE_OPTS) -DRECMEET_BUILD_TESTS=ON
 	ninja -C $(BUILD_DIR)
 	systemd-run --user --scope -p MemoryMax=8G -p MemorySwapMax=0 \
 	    ./$(BUILD_DIR)/recmeet_tests "[integration][t2-1]"
 
-benchmark:
+benchmark: ensure-submodules
 	cmake -B $(BUILD_DIR) -G Ninja $(CMAKE_OPTS) -DRECMEET_BUILD_TESTS=ON
 	ninja -C $(BUILD_DIR)
 	./$(BUILD_DIR)/recmeet_tests "[benchmark]"
 
-full-stack:
+full-stack: ensure-submodules
 	cmake -B $(BUILD_DIR) -G Ninja $(CMAKE_OPTS) -DRECMEET_BUILD_TESTS=ON
 	ninja -C $(BUILD_DIR)
 	./$(BUILD_DIR)/recmeet --download-models --model base
@@ -201,7 +234,10 @@ help:
 	@echo "  make build-onnxruntime  Build onnxruntime from source (~20 min)"
 	@echo "  make build         Configure + build (Release)"
 	@echo "  make test          Build + run unit tests"
-	@echo "  make integration   Build + run integration tests"
+	@echo "  make integration   Build + run integration tests (C++ + Go umbrella)"
+	@echo "  make integration-cxx   Build + run only the C++ Catch2 [integration] suite"
+	@echo "  make integration-go    Run only the Go-tools integration suite (build-tag opt-in)"
+	@echo "  make integration-go-coverage  Re-run Go integration suite under GOCOVERDIR and report binary coverage"
 	@echo "  make integration-t2-1  T2.3 chunked-diarize gate under MemoryMax=8G cgroup"
 	@echo "  make benchmark     Build + run benchmark tests"
 	@echo "  make full-stack    Build + run end-to-end pipeline tests"

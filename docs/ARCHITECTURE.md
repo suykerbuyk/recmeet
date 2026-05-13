@@ -945,7 +945,23 @@ The agent reads the standard recmeet `config.yaml` for meeting paths, speaker DB
 | Setting | Source | Default |
 |---|---|---|
 | Anthropic API key | `ANTHROPIC_API_KEY` env var, then `api_keys.anthropic` in config | — (required) |
+| Anthropic base URL | `ANTHROPIC_BASE_URL` env var | — (SDK default; tests point this at an `httptest` mock) |
 | Brave API key | `BRAVE_API_KEY` env var | — (optional, enables web_search) |
 | Model | `--model` flag | `claude-sonnet-4-6` |
-| Max iterations | hardcoded | 20 |
+| Max iterations | `--max-iterations` flag (per subcommand) | `20` |
 | Context staging dir | `$XDG_DATA_HOME/recmeet/context/` | `~/.local/share/recmeet/context/` |
+
+### Testing
+
+The Go tools have two complementary test layers; both gate `make integration` and a merge to `v1-maintenance`.
+
+| Layer | Count | Build tag | Scope |
+|---|---|---|---|
+| Library + `testutil` | 118 | (default) | Unit-level — proves each component (`meetingdata` parsers, `mcpserver` handlers, `agent` workflows, `testutil` helpers) works correctly in isolation. `make test` runs these alongside the C++ suite. |
+| Integration | 39 (18 `recmeet-mcp` + 21 `recmeet-agent`) | `//go:build integration` | End-to-end — builds the as-built binaries via `testutil.BuildBinaryOnce`, then drives them as real subprocesses against the MCP stdio protocol and a mock Anthropic httptest server. Proves the deployable artifacts complete a real session, not just that components compose. `make integration-go` runs these. |
+
+`tools/testutil/` is the shared infrastructure: package-scope binary build cache (via `TestMain` + `os.MkdirTemp`), `MockAnthropic` httptest server, fixture builders (`BuildMeetingsFixture` writes `Meeting_<date>.md` files matching `meetingdata.findMDFiles`'s glob), a custom MCP stdio transport that supports stdout-teeing for the hygiene test, and a named usability-assertion table so each error-path test names its actionable-stderr expectation rather than duplicating string-match logic.
+
+The integration suite proves end-to-end protocol/CLI behavior — stdio hygiene, MCP handshake, Cobra flag plumbing, exit codes, error-message quality, mock-Anthropic round-trip for `prep` and `follow-up`. The library tests prove component correctness — note parsing, action-item extraction, tool dispatch, agentic-loop iteration, Claude-message shape. Together they cover both directions: components compose AND the deployable composition runs.
+
+Subprocess coverage (Go 1.20+ `GOCOVERDIR` mechanism) confirms `cmd/recmeet-mcp/main.go` at 100.0% and `cmd/recmeet-agent/main.go` at 92.8% from the integration suite alone. See `docs/BUILD.md` "Subprocess coverage" for the invocation. The build-tag mechanism means `go test ./...` stays fast for fast-feedback during development; CI and `make integration` opt in to the slower end-to-end work.

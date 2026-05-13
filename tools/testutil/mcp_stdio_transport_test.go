@@ -48,7 +48,7 @@ done
 	if err := tt.Start(context.Background()); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
-	defer tt.Close()
+	defer func() { _ = tt.Close() }()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()

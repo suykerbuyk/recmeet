@@ -94,7 +94,9 @@ func TestLoadConfig_Missing(t *testing.T) {
 func TestLoadConfig_Empty(t *testing.T) {
 	tmp := t.TempDir()
 	path := filepath.Join(tmp, "config.yaml")
-	os.WriteFile(path, []byte("# empty config\n"), 0644)
+	if err := os.WriteFile(path, []byte("# empty config\n"), 0644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
 
 	cfg, err := LoadConfig(path)
 	if err != nil {
