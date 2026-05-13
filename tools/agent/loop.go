@@ -31,8 +31,14 @@ func (c *sdkClient) CreateMessage(ctx context.Context, params anthropic.MessageN
 }
 
 // NewSDKClient creates an AnthropicClient backed by the real Anthropic SDK.
-func NewSDKClient(apiKey string) AnthropicClient {
-	client := anthropic.NewClient(option.WithAPIKey(apiKey))
+// If baseURL is non-empty, it overrides the SDK's default endpoint via
+// option.WithBaseURL — primarily for integration tests against a mock server.
+func NewSDKClient(apiKey, baseURL string) AnthropicClient {
+	opts := []option.RequestOption{option.WithAPIKey(apiKey)}
+	if baseURL != "" {
+		opts = append(opts, option.WithBaseURL(baseURL))
+	}
+	client := anthropic.NewClient(opts...)
 	return &sdkClient{client: &client}
 }
 

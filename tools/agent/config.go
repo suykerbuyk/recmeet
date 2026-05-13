@@ -12,11 +12,12 @@ import (
 // AgentConfig extends the base meetingdata config with agent-specific settings.
 type AgentConfig struct {
 	meetingdata.Config
-	Model         string // LLM model to use (default: "claude-sonnet-4-6")
-	MaxIterations int    // max agentic loop iterations (default: 20)
-	ContextDir    string // staging dir for context files
-	BraveAPIKey   string // Brave Search API key
-	AnthropicKey  string // Anthropic API key
+	Model             string // LLM model to use (default: "claude-sonnet-4-6")
+	MaxIterations     int    // max agentic loop iterations (default: 20)
+	ContextDir        string // staging dir for context files
+	BraveAPIKey       string // Brave Search API key
+	AnthropicKey      string // Anthropic API key
+	AnthropicBaseURL  string // Anthropic API base URL override (from ANTHROPIC_BASE_URL env var)
 }
 
 // LoadAgentConfig loads base config from the given path and overlays
@@ -38,6 +39,12 @@ func LoadAgentConfig(configPath string) (AgentConfig, error) {
 		ac.AnthropicKey = key
 	} else if key, ok := base.APIKeys["anthropic"]; ok {
 		ac.AnthropicKey = key
+	}
+
+	// Optional Anthropic base URL override (env var only; primarily used by
+	// integration tests that point the SDK at a mock httptest server).
+	if baseURL := os.Getenv("ANTHROPIC_BASE_URL"); baseURL != "" {
+		ac.AnthropicBaseURL = baseURL
 	}
 
 	if key := os.Getenv("BRAVE_API_KEY"); key != "" {

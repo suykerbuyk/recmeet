@@ -4,8 +4,10 @@
 package meetingdata
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -48,16 +50,45 @@ func TestLoadConfig(t *testing.T) {
 }
 
 func TestLoadConfig_Missing(t *testing.T) {
-	cfg, err := LoadConfig("/nonexistent/config.yaml")
-	if err != nil {
-		t.Fatalf("expected no error for missing config, got: %v", err)
-	}
-	if cfg.OutputDir != "./meetings" {
-		t.Errorf("expected default OutputDir, got %q", cfg.OutputDir)
-	}
-	if cfg.WebPort != 8384 {
-		t.Errorf("expected default WebPort 8384, got %d", cfg.WebPort)
-	}
+	// Empty-path (default-path lookup) silently returns defaults when the
+	// default config file is absent. Point the default-path-resolver at a
+	// guaranteed-empty XDG dir so the test is hermetic regardless of the
+	// developer's actual $HOME/.config layout.
+	t.Run("default_path_silent_defaults", func(t *testing.T) {
+		tmp := t.TempDir()
+		t.Setenv("XDG_CONFIG_HOME", tmp)
+		// Sanity: ensure no recmeet/config.yaml exists under the temp dir.
+		if _, err := os.Stat(filepath.Join(tmp, "recmeet", "config.yaml")); !os.IsNotExist(err) {
+			t.Fatalf("expected no config.yaml under XDG_CONFIG_HOME, got err=%v", err)
+		}
+
+		cfg, err := LoadConfig("")
+		if err != nil {
+			t.Fatalf("empty-path LoadConfig: expected no error for missing default config, got: %v", err)
+		}
+		if cfg.OutputDir != "./meetings" {
+			t.Errorf("expected default OutputDir, got %q", cfg.OutputDir)
+		}
+		if cfg.WebPort != 8384 {
+			t.Errorf("expected default WebPort 8384, got %d", cfg.WebPort)
+		}
+	})
+
+	// Explicit-path lookup returns an os.ErrNotExist-wrapped error that
+	// names the missing path so operators get an actionable message.
+	t.Run("explicit_path_returns_error", func(t *testing.T) {
+		missing := "/nonexistent/recmeet/config.yaml"
+		_, err := LoadConfig(missing)
+		if err == nil {
+			t.Fatalf("explicit-path LoadConfig: expected error for missing %s, got nil", missing)
+		}
+		if !errors.Is(err, os.ErrNotExist) {
+			t.Errorf("expected error to wrap os.ErrNotExist, got: %v", err)
+		}
+		if !strings.Contains(err.Error(), missing) {
+			t.Errorf("expected error message to name the missing path %q, got: %v", missing, err)
+		}
+	})
 }
 
 func TestLoadConfig_Empty(t *testing.T) {

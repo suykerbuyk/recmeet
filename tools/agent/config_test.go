@@ -10,8 +10,11 @@ import (
 )
 
 func TestLoadAgentConfig_Defaults(t *testing.T) {
-	// Load with nonexistent path to get defaults
-	cfg, err := LoadAgentConfig("/nonexistent/config.yaml")
+	// Empty-path lookup falls through to DefaultConfigPath; redirect XDG to a
+	// known-empty temp dir so the test is hermetic and observes silent
+	// defaults regardless of the developer's actual config layout.
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	cfg, err := LoadAgentConfig("")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -57,9 +60,10 @@ func TestLoadAgentConfig_EnvOverridesConfig(t *testing.T) {
 }
 
 func TestLoadAgentConfig_BraveAPIKey(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 	t.Setenv("BRAVE_API_KEY", "brave-key-456")
 
-	cfg, err := LoadAgentConfig("/nonexistent/config.yaml")
+	cfg, err := LoadAgentConfig("")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -70,9 +74,10 @@ func TestLoadAgentConfig_BraveAPIKey(t *testing.T) {
 }
 
 func TestLoadAgentConfig_NoBraveKeyWithoutEnv(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 	os.Unsetenv("BRAVE_API_KEY")
 
-	cfg, err := LoadAgentConfig("/nonexistent/config.yaml")
+	cfg, err := LoadAgentConfig("")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
