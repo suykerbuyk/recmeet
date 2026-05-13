@@ -69,9 +69,24 @@ std::string make_auth_error_frame(const std::string& reason) {
 // post-`accept_client()` event. The `client_id` is escaped through the
 // shared `json_escape()` helper so a future id format change does not
 // silently produce an invalid frame.
-std::string make_auth_ok_frame(const std::string& client_id) {
-    return std::string("{\"type\":\"auth.ok\",\"client_id\":\"")
-         + json_escape(client_id) + "\"}\n";
+//
+// Phase A.5: the frame also carries `protocol_version` so the client
+// can verify wire compatibility at the moment auth completes. A negative
+// version (only used by test seams) suppresses the field entirely so the
+// "missing field → mismatch" path can be exercised without forging raw
+// bytes; production callers always pass `IPC_PROTOCOL_VERSION`.
+std::string make_auth_ok_frame(const std::string& client_id, int protocol_version) {
+    std::string out;
+    out.reserve(64 + client_id.size());
+    out += "{\"type\":\"auth.ok\",\"client_id\":\"";
+    out += json_escape(client_id);
+    out += "\"";
+    if (protocol_version >= 0) {
+        out += ",\"protocol_version\":";
+        out += std::to_string(protocol_version);
+    }
+    out += "}\n";
+    return out;
 }
 
 // Lightweight extractor for `{"type":"auth.token","token":"..."}`. Avoids
@@ -471,7 +486,8 @@ void IpcServer::accept_client() {
     // this AFTER `clients_[fd] = ...` is mandatory; send_to() looks up
     // the fd in `clients_` and silently drops if missing.
     if (is_unix) {
-        send_to(fd, make_auth_ok_frame(assigned_id), MessageClass::Response);
+        send_to(fd, make_auth_ok_frame(assigned_id, protocol_version_),
+                MessageClass::Response);
     }
 }
 
@@ -550,7 +566,8 @@ bool IpcServer::handle_pending_psk(int fd, ClientState& cs, const std::string& l
     client_id_to_fd_[cs.client_id] = fd;
     log_info("ipc_server: TCP auth ok (peer=%s, client_id=%s)",
              cs.peer_addr.c_str(), cs.client_id.c_str());
-    send_to(fd, make_auth_ok_frame(cs.client_id), MessageClass::Response);
+    send_to(fd, make_auth_ok_frame(cs.client_id, protocol_version_),
+            MessageClass::Response);
     return true;
 }
 

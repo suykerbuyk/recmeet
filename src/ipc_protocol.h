@@ -15,6 +15,20 @@ namespace recmeet {
 // Wire format: newline-delimited JSON (NDJSON)
 // ---------------------------------------------------------------------------
 
+// Phase A.5: wire protocol version. Stamped by the daemon in every
+// `auth.ok` frame ("`{"type":"auth.ok","client_id":"...","protocol_version":N}`").
+// The client reads it on connect; a mismatch (or missing field — treated
+// as v0) closes the connection and surfaces `IpcClient::protocol_mismatch()`.
+// All in-tree clients (tray, cli, future thin-client tray) ship with the
+// daemon as a unit so backwards-compat is bounded — no third-party clients
+// on the wire today. Bump this when the wire contract changes in a way the
+// daemon and client must agree on (new auth fields, new frame shape).
+//
+// `inline constexpr` keeps the symbol header-only with external linkage so
+// tests in another TU can reference the same value without a separate .cpp
+// definition.
+inline constexpr int IPC_PROTOCOL_VERSION = 1;
+
 // JSON value: string, int64, double, bool, or null (monostate)
 using JsonVal = std::variant<std::monostate, bool, int64_t, double, std::string>;
 using JsonMap = std::map<std::string, JsonVal>;

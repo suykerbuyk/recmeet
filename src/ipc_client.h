@@ -63,6 +63,21 @@ public:
     // of a connection: reconnect mints a fresh id on the server.
     const std::string& client_id() const { return client_id_; }
 
+    // Phase A.5: the server-reported `protocol_version` parsed from the
+    // `auth.ok` frame. Zero before connect, after `close_connection()`,
+    // or if the daemon emits a frame without the field (pre-A.5 daemon —
+    // also treated as a mismatch and the connect is failed). On a
+    // matching version this returns `IPC_PROTOCOL_VERSION`.
+    int protocol_version() const { return protocol_version_; }
+
+    // Phase A.5: true when the most recent `connect()` attempt observed
+    // a `protocol_version` mismatch (including a missing field). Set
+    // alongside the failure return from `connect()`; cleared on the
+    // next successful connect. Tests use this to distinguish a clean
+    // connect failure from a version-rejection failure without parsing
+    // log output.
+    bool protocol_mismatch() const { return protocol_mismatch_; }
+
     // Get the underlying fd (for integration with external event loops).
     int fd() const { return fd_; }
 
@@ -75,6 +90,13 @@ private:
     bool connect_unix();
     bool connect_tcp();
 
+    // Phase A.5: parse an auth.ok reply, capture client_id +
+    // protocol_version, and enforce the version invariant. Returns true
+    // when the reply is acceptable (matching version), false when the
+    // version is absent or mismatched. Callers close the fd on a false
+    // return; the helper only mutates per-client state.
+    bool verify_auth_ok_and_capture(const std::string& reply);
+
     IpcAddress addr_;
     int fd_ = -1;
     int64_t next_id_ = 1;
@@ -85,6 +107,17 @@ private:
     // `auth.ok` frame. Cleared on `close_connection()` so a reconnect
     // never surfaces a stale id. Read by `client_id()`.
     std::string client_id_;
+
+    // Phase A.5: server-reported wire protocol version, parsed from the
+    // same `auth.ok` frame. Zero when absent, on a fresh client, or
+    // after `close_connection()`. Read by `protocol_version()`.
+    int protocol_version_ = 0;
+
+    // Phase A.5: latched true when a `connect()` attempt rejected the
+    // server's `auth.ok` because the `protocol_version` did not match
+    // (including the "field missing" case). Surfaced via
+    // `protocol_mismatch()`. Cleared on the next successful connect.
+    bool protocol_mismatch_ = false;
 
     // For blocking call(): stores the response/error for the pending request ID.
     int64_t pending_id_ = 0;

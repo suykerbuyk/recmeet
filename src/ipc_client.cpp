@@ -2,8 +2,10 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 #include "ipc_client.h"
+#include "log.h"
 
 #include <cassert>
+#include <cctype>
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
@@ -49,6 +51,47 @@ std::string extract_client_id_from_auth_ok(const std::string& line) {
         out += c;
     }
     return "";
+}
+
+// Phase A.5: extract the `protocol_version` integer from an auth.ok
+// NDJSON frame. Frame shape after A.5 is
+// `{"type":"auth.ok","client_id":"...","protocol_version":N}`. The
+// daemon writes the version with `std::to_string(int)` so the value is
+// always a base-10 signed integer with no whitespace, no JSON escapes,
+// and no quotes around it. We scan for `"protocol_version"`, walk past
+// the colon and any surrounding whitespace, then parse the digits.
+// Returns `present=false` when the field is absent (pre-A.5 daemon) —
+// the caller treats absence as a mismatch since A.5 is the floor.
+struct AuthOkProtocolVersion {
+    bool present = false;
+    int  value   = 0;
+};
+AuthOkProtocolVersion extract_protocol_version_from_auth_ok(const std::string& line) {
+    AuthOkProtocolVersion r;
+    size_t key = line.find("\"protocol_version\"");
+    if (key == std::string::npos) return r;
+    size_t colon = line.find(':', key);
+    if (colon == std::string::npos) return r;
+    // Skip whitespace after the colon, then accept an optional leading
+    // sign, then digits. Stop at the first non-digit (typically `,` or `}`).
+    size_t i = colon + 1;
+    while (i < line.size() && std::isspace(static_cast<unsigned char>(line[i])))
+        ++i;
+    int sign = 1;
+    if (i < line.size() && (line[i] == '+' || line[i] == '-')) {
+        if (line[i] == '-') sign = -1;
+        ++i;
+    }
+    if (i >= line.size() || !std::isdigit(static_cast<unsigned char>(line[i])))
+        return r;
+    int v = 0;
+    while (i < line.size() && std::isdigit(static_cast<unsigned char>(line[i]))) {
+        v = v * 10 + (line[i] - '0');
+        ++i;
+    }
+    r.present = true;
+    r.value   = sign * v;
+    return r;
 }
 
 // JSON-escape a token value. Tokens are unlikely to contain special chars
@@ -125,6 +168,12 @@ IpcClient::~IpcClient() {
 
 bool IpcClient::connect() {
     if (fd_ >= 0) return true;
+    // Phase A.5: clear the latched mismatch flag at the START of a new
+    // connect attempt so a successful retry surfaces a clean state. On
+    // failure paths below the flag stays valid through the function's
+    // return and remains true until the next connect() is attempted —
+    // tests inspect it on the failed-connect return value.
+    protocol_mismatch_ = false;
     if (addr_.transport == IpcTransport::Tcp)
         return connect_tcp();
     return connect_unix();
@@ -154,19 +203,23 @@ bool IpcClient::connect_unix() {
     // frame is in the socket buffer well before connect() returns, so
     // this is a fast-path read.
     //
-    // Tolerance: a pre-A.4 daemon does NOT emit this frame. To stay
-    // backward-compatible we poll the fd briefly and only consume the
-    // frame if it is actually there; on timeout we proceed with an
-    // empty client_id_ rather than failing the connect outright. The
-    // poll is cheap (100 ms upper bound) because the local daemon
-    // either has the frame queued already or never will.
+    // Phase A.5: the frame now also carries `protocol_version`. Mismatch
+    // (or absent — treated as v0) fails the connect and sets the
+    // `protocol_mismatch_` flag. The peek-before-read idiom from A.4 is
+    // retained for the "no auth.ok at all" case (e.g. a pre-A.4 daemon
+    // that never wrote anything), but as soon as the frame IS present we
+    // enforce A.5 — A.5 explicitly drops backward compatibility with
+    // pre-A.5 daemons that omit `protocol_version`.
     struct pollfd pfd = {fd_, POLLIN, 0};
     int pr = poll(&pfd, 1, 100);
     if (pr > 0 && (pfd.revents & POLLIN)) {
         std::string reply;
         if (read_one_line_blocking(fd_, reply, 500)) {
             if (reply.find("\"auth.ok\"") != std::string::npos) {
-                client_id_ = extract_client_id_from_auth_ok(reply);
+                if (!verify_auth_ok_and_capture(reply)) {
+                    close(fd_); fd_ = -1;
+                    return false;
+                }
             } else {
                 // Unexpected first frame on Unix — close. The protocol
                 // contract says the only daemon-initiated unsolicited
@@ -178,6 +231,36 @@ bool IpcClient::connect_unix() {
         // poll() lied or timed out under the inner deadline → tolerate.
     }
 
+    return true;
+}
+
+bool IpcClient::verify_auth_ok_and_capture(const std::string& reply) {
+    // Phase A.5: parse client_id + protocol_version out of the auth.ok
+    // frame and enforce the version invariant. Caller owns closing the
+    // fd on a `false` return — this function only mutates the per-client
+    // state (`client_id_`, `protocol_version_`, `protocol_mismatch_`).
+    const std::string parsed_id = extract_client_id_from_auth_ok(reply);
+    const auto pv = extract_protocol_version_from_auth_ok(reply);
+    if (!pv.present || pv.value != IPC_PROTOCOL_VERSION) {
+        // Missing field → treat as v0 for logging. The plan body is
+        // explicit: A.5 ships with the daemon as a unit so a pre-A.5
+        // daemon on the wire is an operational error worth surfacing
+        // loudly, not a "tolerate silently" condition.
+        const int seen = pv.present ? pv.value : 0;
+        log_error("ipc_client: protocol_version mismatch "
+                  "(expected=%d, seen=%d, present=%s) — closing connection",
+                  IPC_PROTOCOL_VERSION, seen, pv.present ? "true" : "false");
+        protocol_mismatch_ = true;
+        protocol_version_  = pv.present ? pv.value : 0;
+        // Do NOT populate client_id_ on a rejected handshake — leaving
+        // it empty makes "did this connection succeed" trivially testable
+        // via `client_id().empty()` alongside `protocol_mismatch()`.
+        client_id_.clear();
+        return false;
+    }
+    client_id_         = parsed_id;
+    protocol_version_  = pv.value;
+    protocol_mismatch_ = false;
     return true;
 }
 
@@ -255,12 +338,13 @@ bool IpcClient::connect_tcp() {
         close(fd_); fd_ = -1; return false;
     }
 
-    // Phase A.4: capture the server-issued client_id. A pre-A.4 daemon
-    // emits `{"type":"auth.ok"}` with no client_id field — leave the
-    // value empty in that case for backward compatibility (no callers
-    // require a non-empty id in v1; the field is observability today
-    // and will become load-bearing in Phase C.7 routing).
-    client_id_ = extract_client_id_from_auth_ok(reply);
+    // Phase A.4 + A.5: capture client_id and enforce protocol_version.
+    // Mismatch flips `protocol_mismatch_` and fails the connect — the
+    // server-side has no notion of "rejected by client" but the disconnect
+    // is observable as a clean EOF on its end.
+    if (!verify_auth_ok_and_capture(reply)) {
+        close(fd_); fd_ = -1; return false;
+    }
 
     return true;
 }
@@ -282,6 +366,11 @@ void IpcClient::close_connection() {
     // id on every accept; carrying the old one across a reconnect would
     // confuse Phase C.7 routing.
     client_id_.clear();
+    // Phase A.5: drop the cached server-reported protocol_version for
+    // symmetry. The latched `protocol_mismatch_` is intentionally NOT
+    // cleared here — it documents the reason this connection was torn
+    // down, and the next `connect()` call clears it before retrying.
+    protocol_version_ = 0;
 }
 
 bool IpcClient::call(const std::string& method, const JsonMap& params,

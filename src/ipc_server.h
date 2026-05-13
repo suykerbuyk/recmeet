@@ -99,6 +99,16 @@ public:
     // /proc/sys/net or relying on platform-specific getsockopt behavior.
     int backlog_for_test() const { return listen_backlog(); }
 
+    // Phase A.5 test seam: override the `protocol_version` value stamped
+    // into outgoing `auth.ok` frames. Production code never calls this —
+    // the default is `IPC_PROTOCOL_VERSION`. Tests use it to simulate a
+    // server speaking a different version (mismatch path) or a pre-A.5
+    // server that omits the field entirely (pass any negative value to
+    // suppress the field). Must be called before clients connect; reads
+    // of the value run on the poll thread at auth-completion time.
+    void set_protocol_version_for_test(int v) { protocol_version_ = v; }
+    int  protocol_version_for_test() const     { return protocol_version_; }
+
     // Start listening. Returns false on bind/listen failure.
     // For TCP listeners the daemon-side caller MUST set_psk() with a
     // non-empty value first; start() refuses to bring up an unauthenticated
@@ -273,6 +283,13 @@ private:
     // with a JSON `server_full` error frame and immediate close. The
     // listen backlog tracks `max_clients_ * 2` (see listen_backlog()).
     size_t max_clients_ = 16;
+
+    // Phase A.5: protocol version stamped into outgoing `auth.ok` frames.
+    // Defaults to the compile-time `IPC_PROTOCOL_VERSION`. Tests can
+    // override via `set_protocol_version_for_test()` to drive mismatch
+    // paths without crafting raw bytes; a negative value suppresses the
+    // field entirely to simulate a pre-A.5 daemon.
+    int protocol_version_ = IPC_PROTOCOL_VERSION;
 
     // Handle the first-frame PSK exchange for a TCP client. Returns true
     // when the connection should remain open after this line; false when
