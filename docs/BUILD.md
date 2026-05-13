@@ -61,13 +61,15 @@ cmake -B build -G Ninja
 ninja -C build
 ```
 
-That produces four binaries inside `build/`:
+That produces six binaries inside `build/`:
 
 | Binary | What it is |
 |---|---|
 | `build/recmeet` | CLI tool (standalone or daemon client) |
 | `build/recmeet-daemon` | Background daemon (IPC server + pipeline) |
 | `build/recmeet-tray` | System tray applet (daemon client) |
+| `build/recmeet-mcp` | Model Context Protocol server (Go) — exposes meeting data to AI tools |
+| `build/recmeet-agent` | AI agent CLI (Go) — meeting prep + follow-up workflows |
 | `build/recmeet_tests` | Test runner |
 
 ### Daily workflow
@@ -239,7 +241,7 @@ ls -lh ~/.local/share/recmeet/models/llama/   # optional
 
 ## CMake options
 
-recmeet has five build options you can toggle at configure time. All features
+recmeet has six build options you can toggle at configure time. All features
 default to ON and the build type defaults to Release, so a plain
 `cmake -B build -G Ninja` gives you a fully-featured optimized build.
 
@@ -255,6 +257,9 @@ cmake -B build -G Ninja -DRECMEET_USE_SHERPA=OFF
 
 # Disable building tests (skips Catch2 download)
 cmake -B build -G Ninja -DRECMEET_BUILD_TESTS=OFF
+
+# Disable building the Go tools (skips Go toolchain requirement)
+cmake -B build -G Ninja -DRECMEET_BUILD_GO_TOOLS=OFF
 
 # GPU acceleration (Vulkan): AUTO (default), ON (require), OFF (force-disable).
 # See "GPU acceleration (Vulkan)" below for the full story.
@@ -454,6 +459,8 @@ cmake --install build --prefix /tmp/test-install
 | `recmeet` | `<prefix>/bin/` |
 | `recmeet-daemon` | `<prefix>/bin/` |
 | `recmeet-tray` | `<prefix>/bin/` (only when `RECMEET_BUILD_TRAY=ON`) |
+| `recmeet-mcp` | `<prefix>/bin/` (only when `RECMEET_BUILD_GO_TOOLS=ON`, default) |
+| `recmeet-agent` | `<prefix>/bin/` (only when `RECMEET_BUILD_GO_TOOLS=ON`, default) |
 | `libggml-base.so`, `libggml.so`, `libwhisper.so` | `<prefix>/lib/` (vendor shared libs) |
 | `libggml-cpu-*.so` (one per ISA variant) | `<prefix>/lib/` (loaded at startup, scored by host CPU) |
 | `libggml-vulkan.so` | `<prefix>/lib/` (only when `RECMEET_GGML_VULKAN` resolved to `ON`) |
@@ -486,7 +493,7 @@ packages are produced:
 
 | Package | Contents | Depends on |
 |---|---|---|
-| `recmeet-git` (always installed) | binaries, vendor shared libs (`libwhisper.so`, `libggml.so`, `libggml-base.so`, `libllama.so`), the mandatory per-ISA CPU plugins (`libggml-cpu-*.so`), `libonnxruntime.so.1`, systemd user units, tray `.desktop` + icons | pipewire, libpulse, libsndfile, curl, libnotify, libayatana-appindicator, gtk3 |
+| `recmeet-git` (always installed) | binaries (incl. `recmeet-mcp`, `recmeet-agent`), vendor shared libs (`libwhisper.so`, `libggml.so`, `libggml-base.so`, `libllama.so`), the mandatory per-ISA CPU plugins (`libggml-cpu-*.so`), `libonnxruntime.so.1`, systemd user units, tray `.desktop` + icons | pipewire, libpulse, libsndfile, curl, libnotify, libayatana-appindicator, gtk3 |
 | `recmeet-vulkan-git` (optional companion) | `libggml-vulkan.so` only | `recmeet-git=<exact-version>`, `vulkan-icd-loader` |
 
 ```bash
@@ -682,6 +689,7 @@ runs.
 | Ninja | `ninja` | `ninja-build` | `ninja-build` |
 | C/C++ compiler | `gcc` | `build-essential` | `gcc-c++` |
 | pkg-config | `pkg-config` (in base) | `pkg-config` | `pkgconf-pkg-config` |
+| Go ² | `go` | `golang-go` | `golang` |
 | PipeWire | `pipewire` | `libpipewire-0.3-dev` | `pipewire-devel` |
 | PulseAudio | `libpulse` | `libpulse-dev` | `pulseaudio-libs-devel` |
 | libsndfile | `libsndfile` | `libsndfile1-dev` | `libsndfile-devel` |
@@ -697,6 +705,12 @@ bundles a pre-built static `libonnxruntime.a` compiled with GCC 11, whose
 `std::regex` ABI is incompatible with GCC 12+; (2) rolling distros like Arch
 can upgrade protobuf (e.g., 33→34) while the system onnxruntime package was
 built against the old version, causing SIGABRT during ONNX model parsing.
+
+² **Required** when building the Go tools (`RECMEET_BUILD_GO_TOOLS=ON`, the
+default). The CMake build invokes `go build` for `recmeet-mcp` and
+`recmeet-agent`; the resulting binaries are installed alongside the C++
+binaries. Skip with `-DRECMEET_BUILD_GO_TOOLS=OFF` if you do not need the
+MCP server or agent CLI.
 
 **Recommended fix**: build onnxruntime from source (see below). This bundles
 protobuf internally and uses your host GCC, eliminating both crash vectors.

@@ -315,6 +315,54 @@ if(RECMEET_BUILD_TRAY)
     )
 endif()
 
+# Go tools — recmeet-mcp (Model Context Protocol server) and recmeet-agent
+# (AI meeting prep + follow-up CLI). Built via `go build` driven by an
+# add_custom_command so the binaries land in ${CMAKE_BINARY_DIR} alongside
+# the C++ outputs and participate in `cmake --install` / CPack on equal
+# footing. Dep tracking uses CONFIGURE_DEPENDS over tools/**/*.go +
+# go.mod/go.sum — adding a new .go file requires a `cmake -B build` reconfigure,
+# same convention as adding a new C++ source.
+option(RECMEET_BUILD_GO_TOOLS
+    "Build and install recmeet-mcp + recmeet-agent (requires Go toolchain)" ON)
+
+if(RECMEET_BUILD_GO_TOOLS)
+    find_program(GO_EXECUTABLE go)
+    if(NOT GO_EXECUTABLE)
+        message(FATAL_ERROR
+            "recmeet: Go toolchain required for recmeet-mcp + recmeet-agent.\n"
+            "  Install: pacman -S go | apt install golang-go | dnf install golang\n"
+            "  Or skip with: -DRECMEET_BUILD_GO_TOOLS=OFF")
+    endif()
+
+    file(GLOB_RECURSE _RECMEET_GO_SOURCES CONFIGURE_DEPENDS
+        ${CMAKE_SOURCE_DIR}/tools/*.go)
+    list(APPEND _RECMEET_GO_SOURCES
+        ${CMAKE_SOURCE_DIR}/tools/go.mod
+        ${CMAKE_SOURCE_DIR}/tools/go.sum)
+
+    set(_RECMEET_MCP_BIN   ${CMAKE_BINARY_DIR}/recmeet-mcp)
+    set(_RECMEET_AGENT_BIN ${CMAKE_BINARY_DIR}/recmeet-agent)
+
+    add_custom_command(
+        OUTPUT ${_RECMEET_MCP_BIN}
+        COMMAND ${GO_EXECUTABLE} build -o ${_RECMEET_MCP_BIN} ./cmd/recmeet-mcp
+        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}/tools
+        DEPENDS ${_RECMEET_GO_SOURCES}
+        COMMENT "Building recmeet-mcp (Go)"
+        VERBATIM)
+
+    add_custom_command(
+        OUTPUT ${_RECMEET_AGENT_BIN}
+        COMMAND ${GO_EXECUTABLE} build -o ${_RECMEET_AGENT_BIN} ./cmd/recmeet-agent
+        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}/tools
+        DEPENDS ${_RECMEET_GO_SOURCES}
+        COMMENT "Building recmeet-agent (Go)"
+        VERBATIM)
+
+    add_custom_target(recmeet_go_tools ALL
+        DEPENDS ${_RECMEET_MCP_BIN} ${_RECMEET_AGENT_BIN})
+endif()
+
 # Tests
 if(RECMEET_BUILD_TESTS)
     include(FetchContent)
@@ -460,6 +508,11 @@ if(RECMEET_BUILD_TRAY)
         ${CMAKE_BINARY_DIR}/recmeet-tray.service @ONLY)
     install(FILES ${CMAKE_BINARY_DIR}/recmeet-tray.service
         DESTINATION ${CMAKE_INSTALL_DATADIR}/systemd/user)
+endif()
+
+if(RECMEET_BUILD_GO_TOOLS)
+    install(PROGRAMS ${_RECMEET_MCP_BIN} ${_RECMEET_AGENT_BIN}
+        DESTINATION ${CMAKE_INSTALL_BINDIR})
 endif()
 
 install(FILES LICENSE AUTHORS
