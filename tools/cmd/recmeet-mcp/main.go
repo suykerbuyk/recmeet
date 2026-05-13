@@ -26,7 +26,12 @@ func main() {
 
 	errLog := log.New(os.Stderr, "recmeet-mcp: ", log.LstdFlags)
 
-	cfg, err := meetingdata.LoadConfig("")
+	// Honor RECMEET_CONFIG if set: pass the explicit path through so
+	// LoadConfig surfaces a "not found" error instead of silently falling
+	// back to defaults. Empty env var preserves the default-path lookup,
+	// which silently returns defaults when the file is absent.
+	configPath := os.Getenv("RECMEET_CONFIG")
+	cfg, err := meetingdata.LoadConfig(configPath)
 	if err != nil {
 		errLog.Fatalf("load config: %v", err)
 	}

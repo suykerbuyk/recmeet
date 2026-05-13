@@ -29,7 +29,7 @@ func PrepWorkflow(ctx context.Context, cfg AgentConfig, description string, part
 	}
 
 	registry := buildPrepRegistry(cfg)
-	client := NewSDKClient(cfg.AnthropicKey)
+	client := NewSDKClient(cfg.AnthropicKey, cfg.AnthropicBaseURL)
 	loop := NewLoop(client, cfg.Model, registry, cfg.MaxIterations, verbose)
 
 	userMsg := buildPrepUserMessage(description, participants, agendaURL)
@@ -73,7 +73,7 @@ func FollowUpWorkflow(ctx context.Context, cfg AgentConfig, notePath string, out
 	}
 
 	registry := buildFollowUpRegistry(cfg, outputDir)
-	client := NewSDKClient(cfg.AnthropicKey)
+	client := NewSDKClient(cfg.AnthropicKey, cfg.AnthropicBaseURL)
 	loop := NewLoop(client, cfg.Model, registry, cfg.MaxIterations, verbose)
 
 	result, err := loop.Run(ctx, systemPrompt, userMsg)

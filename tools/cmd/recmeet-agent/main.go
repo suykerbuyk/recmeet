@@ -33,13 +33,14 @@ func rootCmd() *cobra.Command {
 
 func prepCmd() *cobra.Command {
 	var (
-		participants string
-		agendaURL    string
-		output       string
-		model        string
-		verbose      bool
-		dryRun       bool
-		configPath   string
+		participants  string
+		agendaURL     string
+		output        string
+		model         string
+		verbose       bool
+		dryRun        bool
+		configPath    string
+		maxIterations int
 	)
 
 	cmd := &cobra.Command{
@@ -56,6 +57,9 @@ func prepCmd() *cobra.Command {
 
 			if model != "" {
 				cfg.Model = model
+			}
+			if maxIterations > 0 {
+				cfg.MaxIterations = maxIterations
 			}
 			if cfg.ContextDir == "" {
 				cfg.ContextDir = "."
@@ -90,18 +94,20 @@ func prepCmd() *cobra.Command {
 	cmd.Flags().BoolVar(&verbose, "verbose", false, "Verbose output")
 	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "Print prompts without calling API")
 	cmd.Flags().StringVar(&configPath, "config", "", "Config file path")
+	cmd.Flags().IntVar(&maxIterations, "max-iterations", 0, "override max agent loop iterations (0 = use config default of 20)")
 
 	return cmd
 }
 
 func followUpCmd() *cobra.Command {
 	var (
-		outputDir  string
-		myName     string
-		model      string
-		verbose    bool
-		dryRun     bool
-		configPath string
+		outputDir     string
+		myName        string
+		model         string
+		verbose       bool
+		dryRun        bool
+		configPath    string
+		maxIterations int
 	)
 
 	cmd := &cobra.Command{
@@ -118,6 +124,9 @@ func followUpCmd() *cobra.Command {
 
 			if model != "" {
 				cfg.Model = model
+			}
+			if maxIterations > 0 {
+				cfg.MaxIterations = maxIterations
 			}
 			if outputDir == "" {
 				outputDir = "."
@@ -140,6 +149,7 @@ func followUpCmd() *cobra.Command {
 	cmd.Flags().BoolVar(&verbose, "verbose", false, "Verbose output")
 	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "Print prompts without calling API")
 	cmd.Flags().StringVar(&configPath, "config", "", "Config file path")
+	cmd.Flags().IntVar(&maxIterations, "max-iterations", 0, "override max agent loop iterations (0 = use config default of 20)")
 
 	return cmd
 }

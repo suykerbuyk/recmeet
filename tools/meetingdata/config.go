@@ -4,6 +4,7 @@
 package meetingdata
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -51,6 +52,12 @@ func DefaultSpeakerDB() string {
 }
 
 func LoadConfig(path string) (Config, error) {
+	// Track whether the caller supplied an explicit path. When the default
+	// path is used (empty input), a missing config file is not an error —
+	// $HOME/.config/recmeet/config.yaml may legitimately be absent on a
+	// fresh install. When the caller supplies an explicit path, however,
+	// "not found" is a user-actionable error and we surface it.
+	explicit := path != ""
 	if path == "" {
 		path = DefaultConfigPath()
 	}
@@ -60,6 +67,9 @@ func LoadConfig(path string) (Config, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {
+			if explicit {
+				return cfg, fmt.Errorf("config not found: %s: %w", path, os.ErrNotExist)
+			}
 			return cfg, nil
 		}
 		return cfg, err
