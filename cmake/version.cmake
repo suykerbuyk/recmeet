@@ -16,7 +16,7 @@ set(RECMEET_VERSION_PATCH 0)
 
 if(GIT_EXECUTABLE)
     execute_process(
-        COMMAND "${GIT_EXECUTABLE}" describe --tags --match "v[0-9]*" --dirty --always
+        COMMAND "${GIT_EXECUTABLE}" describe --tags --match "[0-9]*" --dirty --always
         WORKING_DIRECTORY "${SOURCE_DIR}"
         OUTPUT_VARIABLE GIT_DESCRIBE
         OUTPUT_STRIP_TRAILING_WHITESPACE
@@ -30,9 +30,12 @@ if(GIT_EXECUTABLE)
         OUTPUT_STRIP_TRAILING_WHITESPACE
         ERROR_QUIET
     )
-    if(GIT_RESULT EQUAL 0 AND GIT_DESCRIBE MATCHES "^v")
-        # Strip leading 'v'
-        string(SUBSTRING "${GIT_DESCRIBE}" 1 -1 RECMEET_VERSION)
+    if(GIT_RESULT EQUAL 0 AND GIT_DESCRIBE)
+        if(GIT_DESCRIBE MATCHES "^v")
+            string(SUBSTRING "${GIT_DESCRIBE}" 1 -1 RECMEET_VERSION)
+        else()
+            set(RECMEET_VERSION "${GIT_DESCRIBE}")
+        endif()
     endif()
 endif()
 

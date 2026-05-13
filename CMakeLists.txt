@@ -1,5 +1,25 @@
 cmake_minimum_required(VERSION 3.28)
-project(recmeet VERSION 1.5.0 LANGUAGES C CXX)
+
+# Single source of truth for version is `git describe --tags`. The literal
+# below is a sentinel used only when .git/ is absent (source tarball builds).
+# Cutting a release is `git tag X.Y.Z && git push --tags` — no file edits.
+find_package(Git QUIET)
+set(_RECMEET_VERSION_FALLBACK "0.0.0")
+if(Git_FOUND AND EXISTS "${CMAKE_SOURCE_DIR}/.git")
+    execute_process(
+        COMMAND ${GIT_EXECUTABLE} describe --tags --match "[0-9]*" --abbrev=0
+        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+        OUTPUT_VARIABLE _RECMEET_TAG
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        ERROR_QUIET
+        RESULT_VARIABLE _GIT_RESULT
+    )
+    if(_GIT_RESULT EQUAL 0 AND _RECMEET_TAG MATCHES "^([0-9]+\\.[0-9]+\\.[0-9]+)$")
+        set(_RECMEET_VERSION_FALLBACK "${_RECMEET_TAG}")
+    endif()
+endif()
+
+project(recmeet VERSION ${_RECMEET_VERSION_FALLBACK} LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -27,7 +47,7 @@ option(RECMEET_BUILD_TESTS "Build unit tests" ON)
 option(RECMEET_BUILD_WEB   "Build web UI server" ON)
 
 # Version header — regenerated at build time from git describe
-find_package(Git QUIET)
+# (find_package(Git QUIET) was already called pre-project; GIT_EXECUTABLE is set.)
 file(MAKE_DIRECTORY ${CMAKE_BINARY_DIR}/generated)
 add_custom_target(recmeet_version ALL
     COMMAND ${CMAKE_COMMAND}
