@@ -113,6 +113,13 @@ private:
     bool connect_unix();
     bool connect_tcp();
 
+    // Phase C.1: drain every complete frame the FrameReader can assemble,
+    // dispatching NDJSON frames through `process_line()` and discarding
+    // binary frames (no client-side consumer in C.1). Returns false on a
+    // terminal framing error (unknown discriminator / oversized frame);
+    // the caller then closes the connection.
+    bool drain_frames();
+
     // Phase A.6: send a request whose params are a pre-serialized JSON
     // object (e.g. `{"credentials":{...},"preferences":{...}}`). The
     // wire-level `IpcRequest::params` shape is a flat JsonMap on this
@@ -136,7 +143,13 @@ private:
     IpcAddress addr_;
     int fd_ = -1;
     int64_t next_id_ = 1;
-    std::string read_buf_;
+    // Phase C.1: inbound framing state machine. Replaces the raw
+    // `read_buf_` + `find('\n')` scan — see docs/IPC-WIRE-PROTOCOL.md.
+    // The daemon prefixes every NDJSON message with a `0x00` discriminator;
+    // FrameReader strips it and yields the JSON line. Reset on
+    // `close_connection()` by reconstruction so a reconnect starts at a
+    // clean frame boundary.
+    FrameReader reader_;
     EventCallback event_cb_;
 
     // Phase A.4: server-issued client identifier, extracted from the

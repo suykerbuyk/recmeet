@@ -56,15 +56,18 @@ int connect_client(const char* path) {
     // The peek is required because polling could lie about readability
     // under racing accept(), but a successful MSG_PEEK with at least the
     // `{"type"` prefix proves the daemon has written the synthetic frame.
+    // Phase C.1: the synthetic auth.ok is now a `0x00` NDJSON wire frame —
+    // discriminator byte, then `{"type":"auth.ok",...}`, then '\n'. Peek
+    // for `\x00{"type":` and, if matched, drain the discriminator + line.
     struct pollfd pfd = {fd, POLLIN, 0};
     int pr = poll(&pfd, 1, 200);
     if (pr > 0 && (pfd.revents & POLLIN)) {
         char peek[16];
         ssize_t n = recv(fd, peek, sizeof(peek), MSG_PEEK);
-        if (n > 0) {
+        if (n > 1) {
             std::string preview(peek, static_cast<size_t>(n));
-            if (preview.rfind("{\"type\":", 0) == 0) {
-                // Drain a single line (the auth.ok frame).
+            if (preview.rfind(std::string("\x00{\"type\":", 9), 0) == 0) {
+                // Drain the discriminator byte + a single line (auth.ok).
                 char c;
                 auto deadline = std::chrono::steady_clock::now()
                               + std::chrono::milliseconds(500);
@@ -82,15 +85,17 @@ int connect_client(const char* path) {
     return fd;
 }
 
-// Send a string over fd.
+// Send a string over fd. Phase C.1: wrapped in a `0x00` NDJSON wire frame.
 void send_line(int fd, const std::string& msg) {
-    std::string wire = msg + "\n";
+    std::string wire = frame_ndjson(msg);
     write(fd, wire.data(), wire.size());
 }
 
-// Read until newline or timeout. Returns the line (without \n).
+// Read one framed NDJSON message; returns the line without the leading
+// `0x00` discriminator and trailing '\n'. Empty on EOF/timeout.
 std::string read_line(int fd, int timeout_ms = 2000) {
     std::string buf;
+    bool saw_discriminator = false;
     auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
     while (std::chrono::steady_clock::now() < deadline) {
         char c;
@@ -104,6 +109,10 @@ std::string read_line(int fd, int timeout_ms = 2000) {
         if (ret > 0 && FD_ISSET(fd, &rfds)) {
             ssize_t n = read(fd, &c, 1);
             if (n <= 0) break;
+            if (!saw_discriminator) {
+                saw_discriminator = true;  // 0x00 NDJSON frame-type byte
+                continue;
+            }
             if (c == '\n') return buf;
             buf += c;
         }
@@ -397,8 +406,10 @@ int a2_tcp_connect(uint16_t port) {
 }
 
 // Send a single PSK frame to clear the auth gate. Returns true on success.
+// Phase C.1: wrapped in a `0x00` NDJSON wire frame.
 bool a2_send_psk(int fd, const std::string& token) {
-    std::string line = "{\"type\":\"auth.token\",\"token\":\"" + token + "\"}\n";
+    std::string line = frame_ndjson(
+        "{\"type\":\"auth.token\",\"token\":\"" + token + "\"}");
     ssize_t total = 0;
     while (total < static_cast<ssize_t>(line.size())) {
         ssize_t n = write(fd, line.data() + total, line.size() - total);
@@ -408,10 +419,12 @@ bool a2_send_psk(int fd, const std::string& token) {
     return true;
 }
 
-// Block until a single NDJSON line arrives (or timeout). Returns the line
-// content without the trailing `\n`. Empty on EOF or timeout.
+// Block until a single framed NDJSON message arrives (or timeout). Returns
+// the line content without the leading `0x00` discriminator and trailing
+// `\n`. Empty on EOF or timeout.
 std::string a2_recv_line(int fd, int timeout_ms = 2000) {
     std::string buf;
+    bool saw_discriminator = false;
     auto deadline = std::chrono::steady_clock::now()
                   + std::chrono::milliseconds(timeout_ms);
     while (std::chrono::steady_clock::now() < deadline) {
@@ -426,6 +439,10 @@ std::string a2_recv_line(int fd, int timeout_ms = 2000) {
         if (r > 0 && FD_ISSET(fd, &rfds)) {
             ssize_t n = read(fd, &c, 1);
             if (n <= 0) break;
+            if (!saw_discriminator) {
+                saw_discriminator = true;  // 0x00 NDJSON frame-type byte
+                continue;
+            }
             if (c == '\n') return buf;
             buf += c;
         }
@@ -765,7 +782,7 @@ TEST_CASE("A.2: per-fd outbound queue closes fd on response-class overflow",
         IpcRequest req;
         req.id = i + 1;
         req.method = "blob.get";
-        std::string wire = serialize(req) + "\n";
+        std::string wire = frame_ndjson(serialize(req));  // C.1: 0x00 frame
         ssize_t total = 0;
         bool short_send = false;
         while (total < static_cast<ssize_t>(wire.size())) {
@@ -853,7 +870,7 @@ TEST_CASE("A.2: slow-TCP-consumer does not stall the poll thread",
     IpcRequest req;
     req.id = 42;
     req.method = "ping";
-    std::string wire = serialize(req) + "\n";
+    std::string wire = frame_ndjson(serialize(req));  // C.1: 0x00 frame
     ssize_t total = 0;
     while (total < static_cast<ssize_t>(wire.size())) {
         ssize_t n = write(healthy, wire.data() + total, wire.size() - total);

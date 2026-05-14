@@ -2228,9 +2228,12 @@ int raw_tcp_connect(const char* host, uint16_t port) {
     return fd;
 }
 
-// Send a literal NDJSON line (caller supplies content; '\n' is appended).
+// Send a literal NDJSON line (caller supplies content). Phase C.1: the
+// content is wrapped in a complete `0x00` NDJSON wire frame via
+// `frame_ndjson()` (discriminator + content + '\n') so the daemon's
+// FrameReader accepts it.
 bool raw_send_line(int fd, const std::string& msg) {
-    std::string wire = msg + "\n";
+    std::string wire = frame_ndjson(msg);
     ssize_t total = 0;
     while (total < static_cast<ssize_t>(wire.size())) {
         ssize_t n = write(fd, wire.data() + total, wire.size() - total);
@@ -2240,10 +2243,13 @@ bool raw_send_line(int fd, const std::string& msg) {
     return true;
 }
 
-// Read until newline OR timeout OR EOF. Returns the line content (no \n)
-// on success; empty string on EOF/timeout.
+// Read one framed NDJSON message until timeout OR EOF. Returns the line
+// content (no leading `0x00` discriminator, no trailing '\n') on success;
+// empty string on EOF/timeout. Phase C.1: the daemon prefixes every
+// NDJSON message with the `0x00` discriminator — strip it here.
 std::string raw_recv_line(int fd, int timeout_ms = 1000) {
     std::string buf;
+    bool saw_discriminator = false;
     auto deadline = std::chrono::steady_clock::now()
                   + std::chrono::milliseconds(timeout_ms);
     while (std::chrono::steady_clock::now() < deadline) {
@@ -2256,6 +2262,12 @@ std::string raw_recv_line(int fd, int timeout_ms = 1000) {
         char c;
         ssize_t n = read(fd, &c, 1);
         if (n <= 0) break;
+        if (!saw_discriminator) {
+            // First byte is the frame-type discriminator; the auth/request
+            // surface only ever carries `0x00` NDJSON frames.
+            saw_discriminator = true;
+            continue;
+        }
         if (c == '\n') return buf;
         buf += c;
     }

@@ -58,8 +58,13 @@ std::string format_peer_tcp(int fd) {
 // Send a small auth-error JSON frame. Hand-rolled rather than going through
 // the `IpcError` enum because the auth surface is its own protocol shape:
 // it is `{"type":"auth.error","reason":"..."}`, not a request/response pair.
+//
+// Phase C.1: the returned bytes are a complete `0x00` NDJSON wire frame
+// (discriminator + JSON + '\n') via `frame_ndjson()` — auth frames ride
+// the same framed transport as every other NDJSON message.
 std::string make_auth_error_frame(const std::string& reason) {
-    return std::string("{\"type\":\"auth.error\",\"reason\":\"") + reason + "\"}\n";
+    return frame_ndjson(std::string("{\"type\":\"auth.error\",\"reason\":\"")
+                        + reason + "\"}");
 }
 
 // Phase A.4: the auth.ok frame is now per-client because it embeds the
@@ -75,18 +80,22 @@ std::string make_auth_error_frame(const std::string& reason) {
 // version (only used by test seams) suppresses the field entirely so the
 // "missing field → mismatch" path can be exercised without forging raw
 // bytes; production callers always pass `IPC_PROTOCOL_VERSION`.
+//
+// Phase C.1: emitted as a complete `0x00` NDJSON wire frame via
+// `frame_ndjson()`. The client's auth-handshake reader (which runs before
+// the steady-state FrameReader path) strips the same `0x00` prefix.
 std::string make_auth_ok_frame(const std::string& client_id, int protocol_version) {
-    std::string out;
-    out.reserve(64 + client_id.size());
-    out += "{\"type\":\"auth.ok\",\"client_id\":\"";
-    out += json_escape(client_id);
-    out += "\"";
+    std::string json;
+    json.reserve(64 + client_id.size());
+    json += "{\"type\":\"auth.ok\",\"client_id\":\"";
+    json += json_escape(client_id);
+    json += "\"";
     if (protocol_version >= 0) {
-        out += ",\"protocol_version\":";
-        out += std::to_string(protocol_version);
+        json += ",\"protocol_version\":";
+        json += std::to_string(protocol_version);
     }
-    out += "}\n";
-    return out;
+    json += "}";
+    return frame_ndjson(json);
 }
 
 // Lightweight extractor for `{"type":"auth.token","token":"..."}`. Avoids
@@ -362,7 +371,8 @@ void IpcServer::stop() {
 }
 
 void IpcServer::broadcast(const IpcEvent& ev) {
-    std::string wire = serialize(ev) + "\n";
+    // Phase C.1: every outbound event is a `0x00` NDJSON wire frame.
+    std::string wire = frame_ndjson(serialize(ev));
     // Copy client fds in case send_to removes one (Response-class overflow
     // closes the client mid-loop). Events themselves use drop-oldest, but
     // an unrelated queued response on the same fd could trigger close;
@@ -398,7 +408,7 @@ void IpcServer::send_to_client(const std::string& client_id, IpcEvent ev) {
     // an `IpcEvent` with `client_id` already populated; we overwrite to
     // guarantee the wire matches the lookup key.
     ev.client_id = client_id;
-    std::string wire = serialize(ev) + "\n";
+    std::string wire = frame_ndjson(serialize(ev));  // Phase C.1: 0x00 frame
     send_to(fd, std::move(wire), MessageClass::Event);
 }
 
@@ -434,6 +444,12 @@ void IpcServer::accept_client() {
     }
 
     ClientState cs;
+    // Phase C.1: stamp the server's binary-frame cap onto this
+    // connection's FrameReader. The reader is default-constructed with
+    // `kDefaultMaxBinaryFrameBytes`; this honors a post-construction
+    // `set_max_binary_frame_bytes()` override (e.g. from daemon.yaml once
+    // C.2 / C.10a wire the config key).
+    cs.reader.set_max_binary_frame_bytes(max_binary_frame_bytes_);
     if (addr_.transport == IpcTransport::Tcp) {
         int yes = 1;
         setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &yes, sizeof(yes));
@@ -509,10 +525,14 @@ void IpcServer::reject_full(int fd) {
              "(peer=%s, current_clients=%zu, cap=%zu)",
              peer.c_str(), clients_.size(), max_clients_);
 
-    static const char kServerFullFrame[] =
+    // Phase C.1: the refusal frame is a complete `0x00` NDJSON wire frame
+    // (discriminator + JSON + '\n') so a peer that already speaks v2 reads
+    // it through the normal FrameReader path. Built once per call rather
+    // than as a static literal because `frame_ndjson()` is not constexpr.
+    const std::string server_full_frame = frame_ndjson(
         "{\"event\":\"error\",\"kind\":\"server_full\","
-        "\"reason\":\"connection cap reached\"}\n";
-    const size_t len = sizeof(kServerFullFrame) - 1;  // exclude NUL
+        "\"reason\":\"connection cap reached\"}");
+    const size_t len = server_full_frame.size();
 
     // Single best-effort write. The fd was switched to O_NONBLOCK in
     // accept_client() before we got here, so write() returns immediately
@@ -522,7 +542,7 @@ void IpcServer::reject_full(int fd) {
     // immediately after; we don't burn cycles looping on a doomed fd.
     // The plan body explicitly specifies plain `write()` synchronously
     // for the refusal frame, not the queue path.
-    ssize_t n = write(fd, kServerFullFrame, len);
+    ssize_t n = write(fd, server_full_frame.data(), len);
     (void)n;  // intentionally ignored — fd is doomed regardless
     close(fd);
 }
@@ -581,48 +601,72 @@ void IpcServer::handle_client_data(int fd) {
 
     auto it = clients_.find(fd);
     if (it == clients_.end()) return;
-    it->second.read_buf.append(buf, n);
 
-    // Phase A.2 NDJSON line cap. Apply BEFORE the per-line consume loop so
-    // a malicious peer that never sends `\n` (slowloris) cannot grow
-    // `read_buf` unboundedly. A buffer past the cap with no `\n` proves
-    // there is no complete line to dispatch; treat as protocol abuse and
-    // drop. The check is post-append intentionally — if the cap is e.g.
-    // 8 MB and a single read brought in 4 KB, we want to admit the bytes
-    // and only drop when the cap is genuinely exceeded.
-    {
-        const std::string& rbuf_c = it->second.read_buf;
-        if (rbuf_c.size() > max_message_bytes_
-            && rbuf_c.find('\n') == std::string::npos) {
-            log_warn("ipc_server: NDJSON line cap exceeded "
-                     "(fd=%d, peer=%s, buffered=%zu, cap=%zu); closing client",
-                     fd, it->second.peer_addr.c_str(),
-                     rbuf_c.size(), max_message_bytes_);
-            remove_client(fd);
-            return;
-        }
+    // Phase C.1: feed the raw bytes into the per-connection FrameReader
+    // state machine. It owns the unconsumed-byte accumulator internally
+    // and yields fully-assembled frames — replacing the A.2-era
+    // `read_buf` + `rbuf.find('\n')` scan.
+    it->second.reader.feed(buf, static_cast<size_t>(n));
+
+    // Phase A.2 NDJSON line cap, re-expressed against the FrameReader.
+    // Apply BEFORE draining frames so a malicious peer that opens a `0x00`
+    // NDJSON frame and never sends `\n` (slowloris) cannot grow the
+    // reader's internal buffer unboundedly. The cap is meaningful only
+    // while the reader is mid-NDJSON-frame — a binary frame is bounded
+    // separately by `max_binary_frame_bytes_` inside the FrameReader, and
+    // a reader sitting at a frame boundary has nothing buffered to abuse.
+    if (it->second.reader.in_ndjson_frame()
+        && it->second.reader.buffered() > max_message_bytes_) {
+        log_warn("ipc_server: NDJSON line cap exceeded "
+                 "(fd=%d, peer=%s, buffered=%zu, cap=%zu); closing client",
+                 fd, it->second.peer_addr.c_str(),
+                 it->second.reader.buffered(), max_message_bytes_);
+        remove_client(fd);
+        return;
     }
 
-    // Process complete lines (NDJSON)
-    std::string& rbuf = it->second.read_buf;
-    size_t pos;
-    while ((pos = rbuf.find('\n')) != std::string::npos) {
-        // Phase A.2: even a line terminated by `\n` is rejected if its
-        // length exceeds the cap. This guards against the case where a
-        // client streams `max_message_bytes + 1` bytes and only then
-        // sends a newline — the slowloris cap above caught the
-        // never-newline path; this catches the eventually-newline path.
-        if (pos > max_message_bytes_) {
-            log_warn("ipc_server: NDJSON line cap exceeded "
-                     "(fd=%d, peer=%s, line_len=%zu, cap=%zu); closing client",
-                     fd, it->second.peer_addr.c_str(),
-                     pos, max_message_bytes_);
+    // Drain every complete frame the reader can assemble from the bytes
+    // received so far. Each iteration produces exactly one frame; partial
+    // frames leave the reader in NeedMore and we return until more bytes
+    // arrive. A bad discriminator or oversized binary frame is terminal.
+    for (;;) {
+        Frame frame;
+        FrameStatus st = it->second.reader.next(frame);
+        if (st == FrameStatus::NeedMore)
+            break;
+        if (st == FrameStatus::BadDiscriminator) {
+            log_warn("ipc_server: unknown frame discriminator "
+                     "(fd=%d, peer=%s); closing client",
+                     fd, it->second.peer_addr.c_str());
             remove_client(fd);
             return;
         }
-        std::string line = rbuf.substr(0, pos);
-        rbuf.erase(0, pos + 1);
+        if (st == FrameStatus::FrameTooLarge) {
+            log_warn("ipc_server: binary frame exceeds cap "
+                     "(fd=%d, peer=%s, cap=%zu); closing client",
+                     fd, it->second.peer_addr.c_str(),
+                     max_binary_frame_bytes_);
+            remove_client(fd);
+            return;
+        }
+        // st == FrameStatus::Ok — `frame` holds one complete frame.
 
+        // Phase C.1: binary frames (`0x01`/`0x02`/`0x03`) are decode-able
+        // but have no consumer yet — C.2 / C.7 / C.10a wire the upload /
+        // download / streaming handlers. C.1 delivers the transport
+        // substrate only: a binary frame is parsed off the wire cleanly
+        // and discarded with a debug trace so the framing is exercised
+        // end-to-end without a half-built handler. It does NOT close the
+        // connection — NDJSON commands keep flowing on the same fd.
+        if (frame.type != FrameType::Ndjson) {
+            log_debug("ipc: received binary frame type=0x%02x len=%zu "
+                      "from fd=%d (no consumer in C.1 — discarded)",
+                      static_cast<unsigned>(frame.type),
+                      frame.payload.size(), fd);
+            continue;
+        }
+
+        const std::string& line = frame.payload;
         if (line.empty()) continue;
 
         // Phase A.1 PSK gate: TCP clients must clear PendingPsk before any
@@ -659,7 +703,7 @@ void IpcServer::handle_client_data(int fd) {
             err.id = 0;
             err.code = static_cast<int>(IpcErrorCode::InvalidRequest);
             err.message = "Invalid request";
-            send_to(fd, serialize(err) + "\n", MessageClass::Response);
+            send_to(fd, frame_ndjson(serialize(err)), MessageClass::Response);
             // Response-class overflow may have closed the client; re-look
             // up to keep the loop safe.
             it = clients_.find(fd);
@@ -681,7 +725,7 @@ void IpcServer::handle_client_data(int fd) {
             err.id = msg.request.id;
             err.code = static_cast<int>(IpcErrorCode::MethodNotFound);
             err.message = "Method not found: " + msg.request.method;
-            send_to(fd, serialize(err) + "\n", MessageClass::Response);
+            send_to(fd, frame_ndjson(serialize(err)), MessageClass::Response);
             it = clients_.find(fd);
             if (it == clients_.end()) return;
             continue;
@@ -693,9 +737,9 @@ void IpcServer::handle_client_data(int fd) {
         err.id = msg.request.id;
 
         if (handler_it->second(msg.request, resp, err))
-            send_to(fd, serialize(resp) + "\n", MessageClass::Response);
+            send_to(fd, frame_ndjson(serialize(resp)), MessageClass::Response);
         else
-            send_to(fd, serialize(err) + "\n", MessageClass::Response);
+            send_to(fd, frame_ndjson(serialize(err)), MessageClass::Response);
 
         // Re-look-up the iterator: send_to() with Response-class can close
         // the fd on overflow, invalidating any cached reference.

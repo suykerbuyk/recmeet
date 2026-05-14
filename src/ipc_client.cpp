@@ -120,17 +120,25 @@ std::string json_escape_token(const std::string& s) {
     return out;
 }
 
-// Read one NDJSON line from a blocking-mode fd with a deadline. Returns
-// true when a complete line is in `out` (without the trailing \n); false
+// Read one framed NDJSON message from a blocking-mode fd with a deadline.
+// Returns true when a complete line is in `out` (without the leading
+// `0x00` frame-type discriminator and without the trailing '\n'); false
 // on timeout/disconnect/error.
+//
+// Phase C.1: the daemon now prefixes every NDJSON message with a `0x00`
+// discriminator byte (see docs/IPC-WIRE-PROTOCOL.md). This helper runs
+// during the connect-time auth handshake — BEFORE the steady-state
+// FrameReader path takes over — so it strips the discriminator itself.
+// The auth surface only ever carries `0x00` NDJSON frames; a non-`0x00`
+// first byte from the daemon during the handshake is a protocol
+// violation and is rejected (return false).
 bool read_one_line_blocking(int fd, std::string& out, int timeout_ms) {
     auto deadline = std::chrono::steady_clock::now()
         + std::chrono::milliseconds(timeout_ms);
     out.clear();
+    bool saw_discriminator = false;
     char buf[256];
     while (true) {
-        // Check if line already complete from a previous read attempt.
-        // (We never accumulate beyond the first \n in this helper.)
         struct pollfd pfd = {fd, POLLIN, 0};
         auto now = std::chrono::steady_clock::now();
         auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now).count();
@@ -143,14 +151,25 @@ bool read_one_line_blocking(int fd, std::string& out, int timeout_ms) {
         ssize_t n = read(fd, buf, sizeof(buf));
         if (n <= 0) return false;
         for (ssize_t i = 0; i < n; ++i) {
-            if (buf[i] == '\n') {
+            char c = buf[i];
+            if (!saw_discriminator) {
+                // First byte of the stream MUST be the `0x00` NDJSON
+                // frame-type discriminator. Anything else (a binary
+                // discriminator, or garbage) is not valid on the auth
+                // handshake — reject the connection.
+                saw_discriminator = true;
+                if (c != static_cast<char>(FrameType::Ndjson))
+                    return false;
+                continue;  // discriminator consumed, not part of `out`
+            }
+            if (c == '\n') {
                 // We don't currently support the server sending more than
                 // one frame in this window — auth.ok is the only valid
                 // response. Anything trailing is a protocol violation, but
                 // we ignore it because connection state matters more.
                 return true;
             }
-            out += buf[i];
+            out += c;
         }
     }
 }
@@ -319,8 +338,12 @@ bool IpcClient::connect_tcp() {
     const char* token_env = std::getenv("RECMEET_AUTH_TOKEN");
     std::string token = token_env ? token_env : "";
 
-    std::string auth_frame = "{\"type\":\"auth.token\",\"token\":\""
-                           + json_escape_token(token) + "\"}\n";
+    // Phase C.1: the auth.token frame rides the framed transport like
+    // every other NDJSON message — prefix it with the `0x00` discriminator
+    // via `frame_ndjson()`.
+    std::string auth_frame = frame_ndjson(
+        "{\"type\":\"auth.token\",\"token\":\""
+        + json_escape_token(token) + "\"}");
     ssize_t aw = write(fd_, auth_frame.data(), auth_frame.size());
     if (aw < 0) { close(fd_); fd_ = -1; return false; }
 
@@ -360,7 +383,9 @@ void IpcClient::close_connection() {
         close(fd_);
         fd_ = -1;
     }
-    read_buf_.clear();
+    // Phase C.1: reconstruct the FrameReader so a reconnect starts at a
+    // clean frame boundary with no carried-over partial-frame state.
+    reader_ = FrameReader();
     // Phase A.4: drop the cached server-issued client_id so a subsequent
     // reconnect cannot surface a stale value. The daemon mints a fresh
     // id on every accept; carrying the old one across a reconnect would
@@ -389,9 +414,12 @@ bool IpcClient::call_with_raw_params_json(const std::string& method,
     // parser stores nested objects as raw substrings in the resulting
     // JsonMap, so this is the only way to send `{"credentials":{...}}`
     // shapes from this client.
-    std::string wire = "{\"id\":" + std::to_string(my_id) +
-                       ",\"method\":\"" + method + "\"" +
-                       ",\"params\":" + params_json + "}\n";
+    // Phase C.1: prefix with the `0x00` NDJSON frame-type discriminator
+    // via `frame_ndjson()` (which also appends the terminating '\n').
+    std::string wire = frame_ndjson(
+        "{\"id\":" + std::to_string(my_id) +
+        ",\"method\":\"" + method + "\"" +
+        ",\"params\":" + params_json + "}");
     ssize_t n = write(fd_, wire.data(), wire.size());
     if (n < 0) {
         err.code = static_cast<int>(IpcErrorCode::InternalError);
@@ -495,7 +523,8 @@ bool IpcClient::call(const std::string& method, const JsonMap& params,
     req.method = method;
     req.params = params;
 
-    std::string wire = serialize(req) + "\n";
+    // Phase C.1: prefix with the `0x00` NDJSON frame-type discriminator.
+    std::string wire = frame_ndjson(serialize(req));
     ssize_t n = write(fd_, wire.data(), wire.size());
     if (n < 0) {
         err.code = static_cast<int>(IpcErrorCode::InternalError);
@@ -581,13 +610,43 @@ bool IpcClient::read_events(const std::string& until_event, int timeout_ms) {
     }
 }
 
+// Phase C.1: drain every complete frame the FrameReader can assemble from
+// the bytes received so far, dispatching each NDJSON frame through
+// `process_line()`. Binary frames (`0x01`/`0x02`/`0x03`) have no consumer
+// on the client in C.1 — they are decoded off the wire and discarded.
+// Returns false when the framing state machine reports a terminal error
+// (unknown discriminator / oversized binary frame) — the caller closes
+// the connection. Returns true otherwise (including NeedMore).
+bool IpcClient::drain_frames() {
+    for (;;) {
+        Frame frame;
+        FrameStatus st = reader_.next(frame);
+        if (st == FrameStatus::NeedMore)
+            return true;
+        if (st != FrameStatus::Ok) {
+            // BadDiscriminator / FrameTooLarge — terminal protocol error.
+            log_error("ipc_client: framing error from daemon "
+                      "(status=%d) — closing connection",
+                      static_cast<int>(st));
+            return false;
+        }
+        if (frame.type != FrameType::Ndjson) {
+            // No client-side consumer for binary frames in C.1.
+            log_debug("ipc_client: discarding binary frame type=0x%02x len=%zu",
+                      static_cast<unsigned>(frame.type), frame.payload.size());
+            continue;
+        }
+        if (!frame.payload.empty())
+            process_line(frame.payload);
+        if (fd_ < 0) return false;  // a callback closed the connection
+    }
+}
+
 bool IpcClient::read_and_dispatch(int timeout_ms) {
-    // First, process ALL complete lines already in the buffer
-    size_t nl;
-    while ((nl = read_buf_.find('\n')) != std::string::npos) {
-        std::string line = read_buf_.substr(0, nl);
-        read_buf_.erase(0, nl + 1);
-        if (!line.empty()) process_line(line);
+    // First, process ALL complete frames already buffered in the reader.
+    if (!drain_frames()) {
+        close_connection();
+        return false;
     }
     if (pending_done_) return true;
     if (fd_ < 0) return false;  // callback closed connection
@@ -608,12 +667,11 @@ bool IpcClient::read_and_dispatch(int timeout_ms) {
         return false;
     }
 
-    read_buf_.append(buf, n);
+    reader_.feed(buf, static_cast<size_t>(n));
 
-    while ((nl = read_buf_.find('\n')) != std::string::npos) {
-        std::string line = read_buf_.substr(0, nl);
-        read_buf_.erase(0, nl + 1);
-        if (!line.empty()) process_line(line);
+    if (!drain_frames()) {
+        close_connection();
+        return false;
     }
     if (pending_done_) return true;
 

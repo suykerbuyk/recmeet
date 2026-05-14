@@ -120,6 +120,16 @@ public:
     void set_max_message_bytes(size_t n) { max_message_bytes_ = n; }
     size_t max_message_bytes() const { return max_message_bytes_; }
 
+    // Phase C.1: cap on a single binary frame's declared length (the
+    // `0x01`/`0x02`/`0x03` discriminators). Distinct from the NDJSON line
+    // cap above — binary frames are length-prefixed, not newline-delimited,
+    // so the FrameReader rejects an oversized declared length before it
+    // buffers any payload bytes. Default `kDefaultMaxBinaryFrameBytes`
+    // (16 MiB). Applied to every ClientState's FrameReader at accept time;
+    // C.2 / C.10a will wire this to a `[ipc] max_upload_bytes` config key.
+    void set_max_binary_frame_bytes(size_t n) { max_binary_frame_bytes_ = n; }
+    size_t max_binary_frame_bytes() const { return max_binary_frame_bytes_; }
+
     // Phase A.3: cap concurrent connected clients. When `clients_.size()`
     // is already at or past this cap, `accept_client()` still drains the
     // kernel queue (so the listening socket stops waking poll), writes a
@@ -293,7 +303,13 @@ private:
     };
 
     struct ClientState {
-        std::string read_buf;  // accumulates data until \n
+        // Phase C.1: inbound framing state machine. Replaces the raw
+        // `read_buf` + `rbuf.find('\n')` scan — it owns the unconsumed
+        // byte accumulator internally and yields fully-assembled `Frame`s
+        // (NDJSON lines or binary payloads). Constructed at accept time
+        // with the server's `max_binary_frame_bytes_` so a per-connection
+        // FrameReader carries the binary-frame cap.
+        FrameReader reader;
         AuthState   auth_state = AuthState::Authed;  // Unix default; TCP overrides
         std::string peer_addr;  // "host:port" for TCP, "unix" for Unix; for log lines
 
@@ -361,6 +377,12 @@ private:
     // `[ipc] max_message_bytes`. Reads that accumulate past this without
     // finding `\n` drop the connection.
     size_t max_message_bytes_ = 8 * 1024 * 1024;
+
+    // Phase C.1 binary frame cap. Default `kDefaultMaxBinaryFrameBytes`
+    // (16 MiB); will be configurable via `[ipc] max_upload_bytes` once
+    // C.2 / C.10a land. Stamped into each ClientState's FrameReader at
+    // accept time.
+    size_t max_binary_frame_bytes_ = kDefaultMaxBinaryFrameBytes;
 
     // Phase A.3 connection cap. Default 16; configurable via
     // `[ipc] max_clients`. Connections past this are refused at accept

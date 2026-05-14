@@ -308,6 +308,132 @@ bool parse_ipc_message(const std::string& line, IpcMessage& out) {
 }
 
 // ---------------------------------------------------------------------------
+// Phase C.1: framed wire protocol — encode helpers + state-machine reader
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// Big-endian encode a 32-bit length into the four bytes pointed at by `p`.
+// Hand-rolled rather than htonl() so the encoder has no <arpa/inet.h>
+// dependency and the byte order is unambiguous at the call site.
+void put_be32(char* p, uint32_t v) {
+    p[0] = static_cast<char>((v >> 24) & 0xFF);
+    p[1] = static_cast<char>((v >> 16) & 0xFF);
+    p[2] = static_cast<char>((v >> 8) & 0xFF);
+    p[3] = static_cast<char>(v & 0xFF);
+}
+
+// Big-endian decode a 32-bit length from four bytes.
+uint32_t get_be32(const char* p) {
+    return (static_cast<uint32_t>(static_cast<unsigned char>(p[0])) << 24)
+         | (static_cast<uint32_t>(static_cast<unsigned char>(p[1])) << 16)
+         | (static_cast<uint32_t>(static_cast<unsigned char>(p[2])) << 8)
+         | (static_cast<uint32_t>(static_cast<unsigned char>(p[3])));
+}
+
+// True for the three binary discriminators (length-prefixed frames).
+bool is_binary_frame_type(FrameType t) {
+    return t == FrameType::BinaryUpload
+        || t == FrameType::BinaryArtifact
+        || t == FrameType::StreamAudio;
+}
+
+// True for any discriminator the C.1 state machine knows how to decode.
+// 0x04+ is the reserved range and is intentionally NOT recognized here.
+bool is_known_frame_type(uint8_t b) {
+    return b == static_cast<uint8_t>(FrameType::Ndjson)
+        || b == static_cast<uint8_t>(FrameType::BinaryUpload)
+        || b == static_cast<uint8_t>(FrameType::BinaryArtifact)
+        || b == static_cast<uint8_t>(FrameType::StreamAudio);
+}
+
+} // anonymous namespace
+
+std::string frame_ndjson(const std::string& json) {
+    std::string out;
+    out.reserve(json.size() + 2);
+    out += static_cast<char>(FrameType::Ndjson);
+    out += json;
+    out += '\n';
+    return out;
+}
+
+std::string frame_binary(FrameType type, const std::string& payload) {
+    // Caller error to frame NDJSON through here — but degrade gracefully
+    // rather than crash: treat a misuse as an upload frame so the wire
+    // still carries a well-formed length-prefixed body.
+    if (!is_binary_frame_type(type))
+        type = FrameType::BinaryUpload;
+    std::string out;
+    out.reserve(payload.size() + 5);
+    out += static_cast<char>(type);
+    char lenbuf[4];
+    put_be32(lenbuf, static_cast<uint32_t>(payload.size()));
+    out.append(lenbuf, 4);
+    out += payload;
+    return out;
+}
+
+FrameStatus FrameReader::next(Frame& out) {
+    for (;;) {
+        switch (state_) {
+            case State::AtBoundary: {
+                if (buf_.empty()) return FrameStatus::NeedMore;
+                const uint8_t disc = static_cast<uint8_t>(buf_[0]);
+                if (!is_known_frame_type(disc)) {
+                    // Unknown discriminator (0x04+ reserved range, or
+                    // garbage). Terminal — caller closes the connection.
+                    // We do NOT consume the byte; leaving it lets a
+                    // diagnostic dump the offending prefix if desired.
+                    return FrameStatus::BadDiscriminator;
+                }
+                cur_type_ = static_cast<FrameType>(disc);
+                buf_.erase(0, 1);  // consume the discriminator
+                if (cur_type_ == FrameType::Ndjson) {
+                    state_ = State::Ndjson;
+                } else {
+                    state_ = State::BinaryLen;
+                }
+                continue;  // re-enter the loop in the new state
+            }
+
+            case State::Ndjson: {
+                size_t nl = buf_.find('\n');
+                if (nl == std::string::npos) return FrameStatus::NeedMore;
+                out.type    = FrameType::Ndjson;
+                out.payload = buf_.substr(0, nl);  // line without the '\n'
+                buf_.erase(0, nl + 1);
+                state_ = State::AtBoundary;
+                return FrameStatus::Ok;
+            }
+
+            case State::BinaryLen: {
+                if (buf_.size() < 4) return FrameStatus::NeedMore;
+                expected_len_ = get_be32(buf_.data());
+                buf_.erase(0, 4);
+                if (expected_len_ > max_binary_frame_bytes_) {
+                    // Reject BEFORE buffering any payload bytes — a hostile
+                    // peer cannot make the reader allocate arbitrarily by
+                    // declaring a huge length. Terminal for the connection.
+                    return FrameStatus::FrameTooLarge;
+                }
+                state_ = State::Binary;
+                continue;
+            }
+
+            case State::Binary: {
+                if (buf_.size() < expected_len_) return FrameStatus::NeedMore;
+                out.type    = cur_type_;
+                out.payload = buf_.substr(0, expected_len_);
+                buf_.erase(0, expected_len_);
+                state_ = State::AtBoundary;
+                return FrameStatus::Ok;
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // JsonVal helpers
 // ---------------------------------------------------------------------------
 
