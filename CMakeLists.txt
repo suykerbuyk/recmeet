@@ -202,7 +202,9 @@ endif()
 # Re-enable deprecation warnings for our own code
 set(CMAKE_WARN_DEPRECATED ON CACHE BOOL "" FORCE)
 
-# IPC library (config, IPC, utilities — no ML dependencies)
+# IPC library (config, IPC, utilities — no ML, no PulseAudio dependencies).
+# Phase B.1: device_enum moved out of this target into recmeet_capture so
+# the daemon's IPC surface stays unencumbered by audio-stack deps.
 set(IPC_SOURCES
     src/json_util.cpp
     src/api_models.cpp
@@ -210,7 +212,6 @@ set(IPC_SOURCES
     src/log.cpp
     src/config.cpp
     src/notify.cpp
-    src/device_enum.cpp
     src/http_client.cpp
     src/ipc_protocol.cpp
     src/config_json.cpp
@@ -228,7 +229,6 @@ target_include_directories(recmeet_ipc PUBLIC
 )
 target_link_libraries(recmeet_ipc PUBLIC
     Threads::Threads
-    PkgConfig::PULSE
     PkgConfig::CURL
 )
 
@@ -237,9 +237,30 @@ if(RECMEET_USE_NOTIFY)
     target_compile_definitions(recmeet_ipc PUBLIC RECMEET_USE_NOTIFY=1)
 endif()
 
-# Core library (ML pipeline — depends on recmeet_ipc)
-set(CORE_SOURCES
+# Phase B.1 — audio capture + device enumeration library. Holds the
+# PipeWire / PulseAudio surface so the daemon (thin client server)
+# can stay PulseAudio-free while the tray (and CLI) own the local
+# capture lifecycle. Tray links recmeet_ipc + recmeet_capture; the
+# daemon's vestigial live-recording code (pipeline.cpp) reaches this
+# target transitively through recmeet_core until C.9 retires it.
+set(CAPTURE_SOURCES
     src/audio_capture.cpp
+    src/device_enum.cpp
+)
+add_library(recmeet_capture STATIC ${CAPTURE_SOURCES})
+add_dependencies(recmeet_capture recmeet_version)
+target_link_libraries(recmeet_capture PUBLIC
+    recmeet_ipc
+    PkgConfig::PIPEWIRE
+    PkgConfig::PULSE
+    PkgConfig::PULSE_SIMPLE
+)
+
+# Core library (ML pipeline — depends on recmeet_ipc and, via
+# pipeline.cpp's daemon-side live-recording path, recmeet_capture).
+# Phase B.1 moved audio_capture.cpp / device_enum.cpp to recmeet_capture;
+# every other recmeet_core source remains here.
+set(CORE_SOURCES
     src/audio_monitor.cpp
     src/audio_file.cpp
     src/audio_mixer.cpp
@@ -261,8 +282,7 @@ add_library(recmeet_core STATIC ${CORE_SOURCES})
 add_dependencies(recmeet_core recmeet_version)
 target_link_libraries(recmeet_core PUBLIC
     recmeet_ipc
-    PkgConfig::PIPEWIRE
-    PkgConfig::PULSE_SIMPLE
+    recmeet_capture
     PkgConfig::SNDFILE
     whisper
 )
@@ -304,10 +324,17 @@ if(RECMEET_BUILD_WEB)
 endif()
 
 # Tray binary
+# Phase B.1+B.2: tray owns the local audio capture lifecycle, so it links
+# recmeet_capture for PipeWireCapture + list_sources(). recmeet_ipc still
+# carries the daemon IPC client surface; SNDFILE comes via recmeet_ipc
+# transitively is not the case (SNDFILE belongs to recmeet_core), so the
+# tray's WAV stager needs SNDFILE linked directly here.
 if(RECMEET_BUILD_TRAY)
     add_executable(recmeet-tray src/tray.cpp)
     target_link_libraries(recmeet-tray PRIVATE
         recmeet_ipc
+        recmeet_capture
+        PkgConfig::SNDFILE
         PkgConfig::GTK3
         PkgConfig::APPINDICATOR
     )
@@ -415,6 +442,7 @@ if(RECMEET_BUILD_TESTS)
         tests/test_caption_render.cpp
         tests/test_caption_vtt.cpp
         tests/test_backend_dl.cpp
+        tests/test_recmeet_capture.cpp
     )
     target_link_libraries(recmeet_tests PRIVATE recmeet_core Catch2::Catch2WithMain)
     if(RECMEET_BUILD_WEB)

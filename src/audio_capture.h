@@ -52,7 +52,40 @@ public:
     /// Callback fires for every chunk inserted into the internal buffer.
     /// The samples pointer is valid only for the duration of the call.
     /// See AudioChunkCallback for the RT-safety contract.
+    ///
+    /// Phase B.1: this is now a thin wrapper around the fan-out
+    /// subscriber API below — calling it clears any existing
+    /// subscribers and installs `cb` as the single subscriber. Legacy
+    /// call sites that need exactly one consumer continue to work
+    /// unchanged. New call sites that need multiple consumers (tray's
+    /// WAV stager AND C.10's streaming uploader) should use
+    /// `add_audio_subscriber` directly.
     void set_audio_callback(AudioChunkCallback cb, void* userdata);
+
+    /// Subscriber handle returned by `add_audio_subscriber`. Opaque
+    /// integer issued by the capture instance; values are unique only
+    /// within a single capture lifetime. Zero is the never-issued
+    /// sentinel: `remove_audio_subscriber(0)` is a no-op.
+    using SubscriberHandle = std::uint64_t;
+
+    /// Phase B.1 — register a streaming subscriber. Multiple
+    /// subscribers may be registered simultaneously; each receives the
+    /// same `(samples, n)` invocation on every chunk inserted into the
+    /// internal buffer. The same RT-safety contract from
+    /// `AudioChunkCallback` applies (no allocation, no logging, no
+    /// blocking).
+    ///
+    /// Thread-safe: callable from any thread, including while the
+    /// capture is running. Returns a handle suitable for
+    /// `remove_audio_subscriber`.
+    SubscriberHandle add_audio_subscriber(AudioChunkCallback cb, void* userdata);
+
+    /// Phase B.1 — remove a subscriber previously installed via
+    /// `add_audio_subscriber`. Passing an unknown / already-removed
+    /// handle is a no-op. After this returns, the callback associated
+    /// with `handle` is guaranteed not to be invoked again. Safe to
+    /// call from any thread.
+    void remove_audio_subscriber(SubscriberHandle handle);
 
     // Test-only: directly drive the buffer-append + callback dispatch path
     // without opening a PipeWire stream. Mirrors the body of on_process()

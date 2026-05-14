@@ -15,6 +15,19 @@
 
 namespace recmeet {
 
+// Phase B.1 — fan-out subscriber slot. Each entry is a callback +
+// userdata pair plus the handle returned to the caller. Lookup/remove
+// hits a tiny linear scan (worst case = number of live subscribers,
+// expected to be <= 4 in practice: WAV stager + streaming uploader +
+// caption engine + future telemetry). Allocation is bounded by
+// `reserve(8)` at construction so the RT thread never racing with an
+// add never sees a vector reallocate mid-read.
+struct AudioSubscriberSlot {
+    PipeWireCapture::SubscriberHandle handle = 0;
+    AudioChunkCallback cb = nullptr;
+    void* userdata = nullptr;
+};
+
 // Implementation struct — defined here in the .cpp, used via opaque pointer.
 struct PwCaptureImpl {
     std::string target;
@@ -30,12 +43,19 @@ struct PwCaptureImpl {
     std::atomic<bool> first_callback_received{false};
     std::atomic<pid_t> callback_tid{0};
 
-    // Streaming callback. Loaded lock-free on the RT thread; stored from
-    // arbitrary threads via set_audio_callback(). Userdata is published
-    // before cb (release) and read after cb (acquire) so the userdata write
-    // is visible to any reader that observes the cb store.
-    std::atomic<AudioChunkCallback> stream_cb{nullptr};
-    std::atomic<void*> stream_cb_userdata{nullptr};
+    // Phase B.1 fan-out subscribers. The RT thread invokes each
+    // registered callback under `buf_mtx`, which is the same mutex
+    // it already takes on every chunk to append to `buffer`. Adders
+    // and removers also take `buf_mtx`, so dispatch is race-free
+    // against subscriber list mutations without a separate mutex
+    // hop. The list is expected to be tiny (<= 4 subscribers in
+    // practice); the lock-hold duration was already determined by
+    // the buffer.insert() above, which dwarfs the cost of a small
+    // linear iteration. The TODO above (line 84) about RT-unsafe
+    // logging applies to that branch only — subscriber dispatch
+    // does not log.
+    std::vector<AudioSubscriberSlot> subscribers;
+    std::uint64_t next_subscriber_handle = 1;
 };
 
 static void on_process(void* userdata) {
@@ -62,20 +82,19 @@ static void on_process(void* userdata) {
     {
         std::lock_guard lk(impl->buf_mtx);
         impl->buffer.insert(impl->buffer.end(), samples, samples + n_samples);
-        // Streaming callback: fire after the insert, before any size-warn /
-        // logging branch. Two atomic loads + an indirect call; no allocation,
-        // no logging, no extra locks. Acquire-load the cb first, then
-        // userdata — see PwCaptureImpl for the publication ordering.
-        AudioChunkCallback cb = impl->stream_cb.load(std::memory_order_acquire);
-        if (cb) {
-            void* ud = impl->stream_cb_userdata.load(std::memory_order_acquire);
-            // Pass a pointer to the just-inserted samples (still in scope as
-            // the source `samples` from the pw_buffer below — buffer.insert
-            // copies into impl->buffer, but the live PipeWire chunk is what
-            // the callback wants for streaming consumers that don't drain
-            // the batch buffer). Use the source pointer to avoid handing out
-            // a vector iterator that other threads could resize-invalidate.
-            cb(samples, n_samples, ud);
+        // Phase B.1 fan-out — dispatch the same (samples, n_samples)
+        // tuple to every registered subscriber. The subscribers vector
+        // is mutated only under buf_mtx (this same lock), so a copy of
+        // the slot snapshot under the lock is race-free with adders /
+        // removers. We invoke the callback while still holding the
+        // mutex to keep the dispatch atomic with the pre-existing
+        // single-callback semantics: a stop() that removes the last
+        // subscriber while the RT thread is mid-dispatch waits on the
+        // mutex, so the callback never fires after `remove_audio_subscriber`
+        // returns. Pass the live PipeWire chunk pointer (not a vector
+        // iterator) to avoid resize-invalidation on the buffer above.
+        for (const auto& slot : impl->subscribers) {
+            slot.cb(samples, n_samples, slot.userdata);
         }
         // Warn once when buffer exceeds ~120 minutes of audio (230 MB)
         constexpr size_t WARN_SAMPLES = SAMPLE_RATE * 60 * 120;
@@ -231,23 +250,53 @@ bool PipeWireCapture::is_running() const {
 }
 
 void PipeWireCapture::set_audio_callback(AudioChunkCallback cb, void* userdata) {
-    // Publish userdata first (release), then cb (release). The reader on the
-    // RT thread loads cb (acquire) first; if it observes the new cb, the
-    // happens-before relationship orders the userdata write before the cb
-    // write, so the userdata acquire-load sees the matching value.
-    impl_->stream_cb_userdata.store(userdata, std::memory_order_release);
-    impl_->stream_cb.store(cb, std::memory_order_release);
+    // Phase B.1: legacy entry point retained for call sites that hold
+    // the "single subscriber" invariant (daemon-side live recording,
+    // pre-B.1 tests). Semantics: clear the current subscriber list
+    // and install `cb` as the sole subscriber. A nullptr `cb`
+    // simply clears the list.
+    std::lock_guard lk(impl_->buf_mtx);
+    impl_->subscribers.clear();
+    if (cb) {
+        AudioSubscriberSlot slot;
+        slot.handle = impl_->next_subscriber_handle++;
+        slot.cb = cb;
+        slot.userdata = userdata;
+        impl_->subscribers.push_back(slot);
+    }
+}
+
+PipeWireCapture::SubscriberHandle
+PipeWireCapture::add_audio_subscriber(AudioChunkCallback cb, void* userdata) {
+    if (!cb) return 0;
+    std::lock_guard lk(impl_->buf_mtx);
+    AudioSubscriberSlot slot;
+    slot.handle = impl_->next_subscriber_handle++;
+    slot.cb = cb;
+    slot.userdata = userdata;
+    impl_->subscribers.push_back(slot);
+    return slot.handle;
+}
+
+void PipeWireCapture::remove_audio_subscriber(SubscriberHandle handle) {
+    if (handle == 0) return;
+    std::lock_guard lk(impl_->buf_mtx);
+    for (auto it = impl_->subscribers.begin(); it != impl_->subscribers.end(); ++it) {
+        if (it->handle == handle) {
+            impl_->subscribers.erase(it);
+            return;
+        }
+    }
 }
 
 void PipeWireCapture::_inject_for_test(const int16_t* samples, std::size_t n) {
     // Test-only path that mirrors the buffer-append + callback dispatch
-    // shape from on_process() without opening a PipeWire stream.
+    // shape from on_process() without opening a PipeWire stream. Phase B.1
+    // walks the subscriber list, identical to the production RT path.
     std::lock_guard lk(impl_->buf_mtx);
     impl_->buffer.insert(impl_->buffer.end(), samples, samples + n);
-    AudioChunkCallback cb = impl_->stream_cb.load(std::memory_order_acquire);
-    if (cb) {
-        void* ud = impl_->stream_cb_userdata.load(std::memory_order_acquire);
-        cb(samples, n, ud);
+    for (const auto& slot : impl_->subscribers) {
+        slot.cb(samples, n, slot.userdata);
     }
 }
 
