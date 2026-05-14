@@ -34,10 +34,20 @@ using JsonVal = std::variant<std::monostate, bool, int64_t, double, std::string>
 using JsonMap = std::map<std::string, JsonVal>;
 
 // Request: {"id": N, "method": "...", "params": {...}}
+//
+// Phase A.6: `client_id` is a server-side stamped field — populated by the
+// IPC server immediately before invoking the registered handler, from the
+// `ClientState::client_id` of the connection that delivered the line. It
+// is NOT serialized onto the wire by `serialize(IpcRequest)`, and clients
+// never set it. Handlers that need to know the originating client (e.g.
+// `session.init`, `session.update_credentials`, `session.update_prefs`,
+// and any later handler whose state lives in the per-client session slot)
+// read it from this field instead of reaching into the server.
 struct IpcRequest {
     int64_t id = 0;
     std::string method;
     JsonMap params;
+    std::string client_id;  // server-stamped, never on the wire
 };
 
 // Success response: {"id": N, "result": {...}}

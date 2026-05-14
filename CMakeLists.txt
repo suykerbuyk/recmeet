@@ -216,6 +216,7 @@ set(IPC_SOURCES
     src/config_json.cpp
     src/ipc_client.cpp
     src/ipc_server.cpp
+    src/session_merge.cpp
     src/caption_format.cpp
 )
 
@@ -401,6 +402,7 @@ if(RECMEET_BUILD_TESTS)
         tests/test_ipc_server.cpp
         tests/test_ipc_client.cpp
         tests/test_ipc_integration.cpp
+        tests/test_session_handshake.cpp
         tests/test_ndjson_parse.cpp
         tests/test_full_stack.cpp
         tests/test_full_stack_captions.cpp

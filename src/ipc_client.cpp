@@ -373,6 +373,115 @@ void IpcClient::close_connection() {
     protocol_version_ = 0;
 }
 
+bool IpcClient::call_with_raw_params_json(const std::string& method,
+                                          const std::string& params_json,
+                                          IpcResponse& resp, IpcError& err,
+                                          int timeout_ms) {
+    if (fd_ < 0) {
+        err.code = static_cast<int>(IpcErrorCode::InternalError);
+        err.message = "Not connected";
+        return false;
+    }
+
+    int64_t my_id = next_id_++;
+    // Wire format mirrors `serialize(IpcRequest)` but emits `params_json`
+    // verbatim so nested objects survive the round-trip. The daemon's
+    // parser stores nested objects as raw substrings in the resulting
+    // JsonMap, so this is the only way to send `{"credentials":{...}}`
+    // shapes from this client.
+    std::string wire = "{\"id\":" + std::to_string(my_id) +
+                       ",\"method\":\"" + method + "\"" +
+                       ",\"params\":" + params_json + "}\n";
+    ssize_t n = write(fd_, wire.data(), wire.size());
+    if (n < 0) {
+        err.code = static_cast<int>(IpcErrorCode::InternalError);
+        err.message = "Write failed";
+        close_connection();
+        return false;
+    }
+
+    pending_id_ = my_id;
+    pending_done_ = false;
+
+    auto deadline = std::chrono::steady_clock::now();
+    if (timeout_ms > 0)
+        deadline += std::chrono::milliseconds(timeout_ms);
+
+    while (!pending_done_) {
+        int remaining = -1;
+        if (timeout_ms > 0) {
+            auto now = std::chrono::steady_clock::now();
+            remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+                deadline - now).count();
+            if (remaining <= 0) {
+                err.code = static_cast<int>(IpcErrorCode::InternalError);
+                err.message = "Timeout waiting for response";
+                pending_id_ = 0;
+                return false;
+            }
+        }
+        if (!read_and_dispatch(remaining)) {
+            err.code = static_cast<int>(IpcErrorCode::InternalError);
+            err.message = "Connection lost";
+            pending_id_ = 0;
+            return false;
+        }
+    }
+
+    pending_id_ = 0;
+    pending_done_ = false;
+
+    if (pending_result_.type == IpcMessageType::Response) {
+        resp = pending_result_.response;
+        return true;
+    } else if (pending_result_.type == IpcMessageType::Error) {
+        err = pending_result_.error;
+        return false;
+    }
+
+    err.code = static_cast<int>(IpcErrorCode::InternalError);
+    err.message = "Unexpected response type";
+    return false;
+}
+
+namespace {
+
+// Serialize a JsonMap as a JSON object literal — same logic as
+// `serialize_json_map` in ipc_protocol.cpp, but local here so the A.6
+// session helpers can emit the `{"credentials":{...},"preferences":{...}}`
+// nested shape by composing two such literals.
+std::string json_map_to_object_literal(const JsonMap& m) {
+    return serialize_json_map(m);
+}
+
+} // anonymous namespace
+
+bool IpcClient::session_init(const JsonMap& creds, const JsonMap& prefs,
+                             IpcResponse& resp, IpcError& err,
+                             int timeout_ms) {
+    std::string params = "{\"credentials\":";
+    params += json_map_to_object_literal(creds);
+    params += ",\"preferences\":";
+    params += json_map_to_object_literal(prefs);
+    params += "}";
+    return call_with_raw_params_json("session.init", params, resp, err, timeout_ms);
+}
+
+bool IpcClient::session_update_credentials(const JsonMap& creds,
+                                           IpcResponse& resp, IpcError& err,
+                                           int timeout_ms) {
+    // Flat shape: the fields ARE the params. No nesting needed because
+    // `session.update_credentials` takes the same shape as the nested
+    // `credentials` sub-object of `session.init`, but at the top level.
+    return call(std::string("session.update_credentials"), creds, resp, err, timeout_ms);
+}
+
+bool IpcClient::session_update_prefs(const JsonMap& prefs,
+                                     IpcResponse& resp, IpcError& err,
+                                     int timeout_ms) {
+    return call(std::string("session.update_prefs"), prefs, resp, err, timeout_ms);
+}
+
 bool IpcClient::call(const std::string& method, const JsonMap& params,
                      IpcResponse& resp, IpcError& err, int timeout_ms) {
     if (fd_ < 0) {

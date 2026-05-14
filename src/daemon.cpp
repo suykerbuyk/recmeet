@@ -8,6 +8,7 @@
 #include "ipc_protocol.h"
 #include "ipc_server.h"
 #include "ndjson_parse.h"
+#include "session_merge.h"
 #include "speaker_id.h"
 #include "summarize.h"
 #include "log.h"
@@ -970,13 +971,229 @@ int main(int argc, char* argv[]) {
         }
     });
 
-    server.on("config.update", [](const IpcRequest& req, IpcResponse& resp, IpcError&) {
-        std::lock_guard<std::mutex> lock(g_config_mu);
-        // Apply params as config overrides
-        JsonMap merged = config_to_map(g_config);
-        for (const auto& [k, v] : req.params)
-            merged[k] = v;
-        g_config = config_from_map(merged);
+    // Phase A.6: `config.update` IPC removed. Per-request config overrides
+    // are replaced by per-`client_id` session state established once at
+    // connect via `session.init` and refreshed via `session.update_*`.
+    // The handler is deliberately not re-registered; the IPC dispatcher
+    // returns "Method not found" for any stray `config.update` request,
+    // and tests pin that behavior (see test_ipc_integration.cpp).
+
+    // -----------------------------------------------------------------
+    // Phase A.6 session handshake handlers
+    //
+    // `session.init` is the post-auth handshake the thin-client tray and
+    // CLI use to establish credentials + preferences on the per-`client_id`
+    // slot the daemon will consult at `enqueue_postprocess()` time. Wire
+    // shape per the plan body:
+    //   {"credentials": {"provider", "api_key", "api_keys": {...}},
+    //    "preferences": {"output_dir", "note_dir", "language", "vocabulary",
+    //                    "mic_source", "monitor_source", "whisper_model",
+    //                    "summarization_backend", "llm_model",
+    //                    "captions_enabled", "caption_latency_ms"}}
+    //
+    // All fields optional. Validation enforced at this layer:
+    //   * `summarization_backend ∈ {"", "http", "local"}`  → reject otherwise
+    //   * `caption_latency_ms ∈ [200, 2000]`               → reject otherwise
+    //
+    // On success the response is {"ok": true, "session_active": true}.
+    auto parse_credentials_into = [](const JsonMap& src, SessionCredentials& dst) {
+        auto pit = src.find("provider");
+        if (pit != src.end()) dst.provider = json_val_as_string(pit->second);
+        auto kit = src.find("api_key");
+        if (kit != src.end()) dst.api_key = json_val_as_string(kit->second);
+        // Per-provider key map arrives as a nested object stringified by
+        // the parser (parse_json_object stores nested objects as their
+        // raw JSON for the outer map). We pick known providers out of
+        // that raw string so a future addition only updates one site.
+        auto m = src.find("api_keys");
+        if (m != src.end()) {
+            std::string raw = json_val_as_string(m->second);
+            JsonMap nested;
+            if (!raw.empty() && raw[0] == '{') {
+                // Reuse the IPC protocol's parser via a fake response wrap.
+                std::string wrapped = "{\"id\":0,\"result\":" + raw + "}";
+                IpcMessage tmp;
+                if (parse_ipc_message(wrapped, tmp) && tmp.type == IpcMessageType::Response)
+                    nested = std::move(tmp.response.result);
+            }
+            for (const auto& [k, v] : nested) {
+                std::string val = json_val_as_string(v);
+                if (!val.empty()) dst.api_keys[k] = val;
+            }
+        }
+    };
+
+    // Validation helper that returns true on success; on failure populates
+    // `err` and returns false. Used by all three session handlers so the
+    // shape rules (latency range, backend value-set) cannot drift between
+    // them.
+    auto validate_prefs_payload = [](const JsonMap& src, IpcError& err) {
+        auto bit = src.find("summarization_backend");
+        if (bit != src.end()) {
+            std::string b = json_val_as_string(bit->second);
+            if (!b.empty() && b != "http" && b != "local") {
+                err.code = static_cast<int>(IpcErrorCode::InvalidParams);
+                err.message = "summarization_backend must be 'http' or 'local'";
+                return false;
+            }
+        }
+        auto lit = src.find("caption_latency_ms");
+        if (lit != src.end()) {
+            int64_t v = json_val_as_int(lit->second);
+            if (v < 200 || v > 2000) {
+                err.code = static_cast<int>(IpcErrorCode::InvalidParams);
+                err.message = "caption_latency_ms must be in [200, 2000]";
+                return false;
+            }
+        }
+        return true;
+    };
+
+    auto parse_preferences_into = [](const JsonMap& src, SessionPreferences& dst) {
+        auto get_str = [&](const char* k, std::string& out) {
+            auto it = src.find(k);
+            if (it != src.end()) out = json_val_as_string(it->second);
+        };
+        get_str("output_dir",            dst.output_dir);
+        get_str("note_dir",              dst.note_dir);
+        get_str("language",              dst.language);
+        get_str("vocabulary",            dst.vocabulary);
+        get_str("mic_source",            dst.mic_source);
+        get_str("monitor_source",        dst.monitor_source);
+        get_str("whisper_model",         dst.whisper_model);
+        get_str("summarization_backend", dst.summarization_backend);
+        get_str("llm_model",             dst.llm_model);
+        auto cit = src.find("captions_enabled");
+        if (cit != src.end()) dst.captions_enabled = json_val_as_bool(cit->second);
+        auto lit = src.find("caption_latency_ms");
+        if (lit != src.end()) dst.caption_latency_ms =
+            static_cast<int>(json_val_as_int(lit->second));
+    };
+
+    // Helper: pull a nested sub-object out of req.params at `key` into a
+    // JsonMap. The IPC parser leaves nested objects as their raw JSON
+    // string in the outer map; we re-parse via the response-wrap trick.
+    auto pull_nested = [](const JsonMap& outer, const char* key, JsonMap& dst) {
+        auto it = outer.find(key);
+        if (it == outer.end()) return false;
+        std::string raw = json_val_as_string(it->second);
+        if (raw.empty() || raw[0] != '{') return false;
+        std::string wrapped = "{\"id\":0,\"result\":" + raw + "}";
+        IpcMessage tmp;
+        if (!parse_ipc_message(wrapped, tmp) || tmp.type != IpcMessageType::Response)
+            return false;
+        dst = std::move(tmp.response.result);
+        return true;
+    };
+
+    server.on("session.init", [&server, parse_credentials_into, parse_preferences_into,
+                               validate_prefs_payload, pull_nested]
+              (const IpcRequest& req, IpcResponse& resp, IpcError& err) {
+        if (req.client_id.empty()) {
+            err.code = static_cast<int>(IpcErrorCode::InternalError);
+            err.message = "session.init: no client_id stamped on request";
+            return false;
+        }
+
+        // Validate first; on rejection the slot is unchanged so the
+        // client can retry with a corrected payload without dropping a
+        // prior good session state (this handler is also valid on a
+        // fresh connection where there is no prior state to preserve,
+        // so the symmetry is just for code clarity).
+        JsonMap prefs_map;
+        bool have_prefs = pull_nested(req.params, "preferences", prefs_map);
+        if (have_prefs && !validate_prefs_payload(prefs_map, err)) {
+            err.id = req.id;
+            return false;
+        }
+
+        // Parse and apply.
+        SessionCredentials creds;
+        JsonMap creds_map;
+        if (pull_nested(req.params, "credentials", creds_map))
+            parse_credentials_into(creds_map, creds);
+
+        SessionPreferences prefs;
+        // Preserve the struct defaults (caption_latency_ms = 500) when
+        // the client omits the field; only overwrite from the request.
+        if (have_prefs)
+            parse_preferences_into(prefs_map, prefs);
+
+        server.set_session_credentials(req.client_id, creds);
+        server.set_session_preferences(req.client_id, prefs);
+
+        resp.result["ok"] = true;
+        resp.result["session_active"] = true;
+        return true;
+    });
+
+    server.on("session.update_credentials",
+              [&server, parse_credentials_into]
+              (const IpcRequest& req, IpcResponse& resp, IpcError& err) {
+        if (req.client_id.empty()) {
+            err.code = static_cast<int>(IpcErrorCode::InternalError);
+            err.message = "session.update_credentials: no client_id stamped on request";
+            return false;
+        }
+        SessionCredentials creds;
+        SessionPreferences prefs;
+        // Snapshot prior slot so the merge preserves untouched fields.
+        // If the slot does not exist yet, `creds` / `prefs` default-
+        // construct — the update behaves like a partial session.init.
+        server.get_session(req.client_id, creds, prefs);
+        // Overlay only the fields actually present in the request.
+        parse_credentials_into(req.params, creds);
+        if (!server.set_session_credentials(req.client_id, creds)) {
+            err.code = static_cast<int>(IpcErrorCode::InternalError);
+            err.message = "session slot unavailable";
+            return false;
+        }
+        resp.result["ok"] = true;
+        return true;
+    });
+
+    server.on("session.update_prefs",
+              [&server, parse_preferences_into, validate_prefs_payload]
+              (const IpcRequest& req, IpcResponse& resp, IpcError& err) {
+        if (req.client_id.empty()) {
+            err.code = static_cast<int>(IpcErrorCode::InternalError);
+            err.message = "session.update_prefs: no client_id stamped on request";
+            return false;
+        }
+        if (!validate_prefs_payload(req.params, err)) {
+            err.id = req.id;
+            return false;
+        }
+        SessionCredentials creds;
+        SessionPreferences prefs;
+        server.get_session(req.client_id, creds, prefs);
+        // Overlay only the fields actually present in the request — for
+        // strings this is "non-empty value overwrites"; for the boolean
+        // and integer we explicitly check key presence so a request that
+        // omits them preserves the prior value (and so a request that
+        // sets caption_latency_ms but omits captions_enabled does NOT
+        // implicitly set captions_enabled=false).
+        auto bit = req.params.find("captions_enabled");
+        auto lit = req.params.find("caption_latency_ms");
+        SessionPreferences from_req;
+        parse_preferences_into(req.params, from_req);
+        // String fields: non-empty overlays.
+        if (!from_req.output_dir.empty())            prefs.output_dir = from_req.output_dir;
+        if (!from_req.note_dir.empty())              prefs.note_dir = from_req.note_dir;
+        if (!from_req.language.empty())              prefs.language = from_req.language;
+        if (!from_req.vocabulary.empty())            prefs.vocabulary = from_req.vocabulary;
+        if (!from_req.mic_source.empty())            prefs.mic_source = from_req.mic_source;
+        if (!from_req.monitor_source.empty())        prefs.monitor_source = from_req.monitor_source;
+        if (!from_req.whisper_model.empty())         prefs.whisper_model = from_req.whisper_model;
+        if (!from_req.summarization_backend.empty()) prefs.summarization_backend = from_req.summarization_backend;
+        if (!from_req.llm_model.empty())             prefs.llm_model = from_req.llm_model;
+        if (bit != req.params.end()) prefs.captions_enabled   = from_req.captions_enabled;
+        if (lit != req.params.end()) prefs.caption_latency_ms = from_req.caption_latency_ms;
+        if (!server.set_session_preferences(req.client_id, prefs)) {
+            err.code = static_cast<int>(IpcErrorCode::InternalError);
+            err.message = "session slot unavailable";
+            return false;
+        }
         resp.result["ok"] = true;
         return true;
     });
@@ -1004,22 +1221,39 @@ int main(int argc, char* argv[]) {
             g_recording.store(true);
         }
 
-        // Snapshot config with any per-request overrides
+        // Phase A.6: per-request config overrides are GONE. record.start no
+        // longer merges `req.params` into Config — the per-`client_id`
+        // session state established via `session.init` is the only client-
+        // supplied input. The credential precedence chain (env > session >
+        // daemon.yaml) is resolved by `merge_creds_for_job()` at this
+        // point so the recording (and the downstream postprocess job)
+        // sees the final view. `record.start` still accepts the
+        // `reprocess_dir` shape param above; everything else is ignored.
         Config cfg;
         {
             std::lock_guard<std::mutex> lock(g_config_mu);
             cfg = g_config;
         }
-        JsonMap merged = config_to_map(cfg);
-        for (const auto& [k, v] : req.params)
-            merged[k] = v;
-        cfg = config_from_map(merged);
-
-        // Client-sent API key takes precedence (already merged above).
-        // Fall back to daemon's key if client didn't send one.
-        if (cfg.api_key.empty()) {
-            std::lock_guard<std::mutex> lock2(g_config_mu);
-            cfg.api_key = g_config.api_key;
+        {
+            SessionCredentials sess_creds;
+            SessionPreferences sess_prefs;
+            // Empty client_id → no session (e.g. a stray request before
+            // session.init landed). `get_session` returns false and the
+            // merge falls through to env > daemon.yaml.
+            if (!req.client_id.empty())
+                server.get_session(req.client_id, sess_creds, sess_prefs);
+            cfg = merge_creds_for_job_with_real_env(cfg, sess_creds, sess_prefs);
+        }
+        // Backwards compatibility: also honor `reprocess_dir` directly on
+        // req.params — it is the only non-session param record.start
+        // accepts. Tray + reprocess_batch send it via the existing
+        // `params["reprocess_dir"]` path.
+        {
+            auto rit = req.params.find("reprocess_dir");
+            if (rit != req.params.end()) {
+                std::string val = json_val_as_string(rit->second);
+                if (!val.empty()) cfg.reprocess_dir = val;
+            }
         }
 
         if (!ensure_models(cfg)) {

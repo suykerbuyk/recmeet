@@ -10,12 +10,52 @@
 #include <cstdint>
 #include <deque>
 #include <functional>
+#include <map>
 #include <mutex>
 #include <string>
 #include <unordered_map>
 #include <vector>
 
 namespace recmeet {
+
+// Phase A.6 session-handshake types. These live on the per-`client_id` slot
+// inside `IpcServer::ClientState` and are populated by the `session.init` /
+// `session.update_credentials` / `session.update_prefs` handlers. They are
+// cleared automatically on disconnect via `remove_client()`. The daemon
+// reads them at `enqueue_postprocess()` time via `IpcServer::get_session()`
+// and merges them into the postprocess job's `Config` (see `merge_creds_for_job`)
+// — the subprocess never re-reads env or daemon.yaml, so this merge is the
+// only credential path from operator config into the subprocess JSON.
+//
+// Empty-string sentinels mean "unset" for every string field — empty and
+// unset are equivalent at this layer. The merge in `merge_creds_for_job`
+// treats a non-empty session string as "session-supplied" and applies the
+// daemon-env > session > daemon.yaml precedence chain accordingly.
+struct SessionCredentials {
+    std::string provider;                          // "xai" / "openai" / "anthropic"
+    std::string api_key;                           // legacy single-key field
+    std::map<std::string, std::string> api_keys;   // per-provider keys
+};
+
+// Session preferences carried from `session.init`. `caption_latency_ms`
+// defaults to 500 (C.10's planned ms cadence); the value is rejected outside
+// [200, 2000] by the `session.init` and `session.update_prefs` handlers.
+// `summarization_backend` is constrained to `"http"` or `"local"` — empty
+// is allowed and treated as "use daemon.yaml fallback"; any other value is
+// rejected at the handler.
+struct SessionPreferences {
+    std::string output_dir;
+    std::string note_dir;
+    std::string language;
+    std::string vocabulary;
+    std::string mic_source;
+    std::string monitor_source;
+    std::string whisper_model;
+    std::string summarization_backend;   // "" / "http" / "local"
+    std::string llm_model;
+    bool captions_enabled = false;
+    int  caption_latency_ms = 500;
+};
 
 // Method handler: receives a request, returns a response or error.
 // On success, populate resp and return true.
@@ -148,6 +188,39 @@ public:
 
     int listen_fd() const { return listen_fd_; }
 
+    // Phase A.6 session-state accessors. Handlers that need to read or
+    // write the per-client session slot use these instead of reaching
+    // into the private client map directly. All three are O(1) via the
+    // `client_id → fd` reverse map.
+    //
+    // `get_session`: copies the current credentials + preferences into
+    // the caller-provided outputs. Returns `false` (and leaves outputs
+    // untouched) when `client_id` is unknown (disconnected, or a fresh
+    // connection that has not yet called `session.init`). The daemon
+    // calls this on the rec_worker thread at enqueue time; the lookup
+    // itself is single-threaded because `clients_` is owned by the poll
+    // thread and the daemon's rec_worker only runs after the poll thread
+    // has dispatched `record.start`, but writes to the slot happen on the
+    // poll thread, so callers that read off-thread accept "best-effort,
+    // last-write-wins" semantics.
+    //
+    // `set_session_credentials` / `set_session_preferences`: wholesale
+    // replacement of the slot's credentials / preferences. Handlers
+    // implement the partial-update contract by first calling
+    // `get_session()` to snapshot the existing slot, overlaying only the
+    // fields actually present in the incoming JSON params, then calling
+    // these setters with the merged result. Booleans and integers have
+    // no "unset" sentinel at the struct level, so the merge logic lives
+    // at the handler layer where the raw JSON keys are visible. Returns
+    // `false` when `client_id` is unknown.
+    bool get_session(const std::string& client_id,
+                     SessionCredentials& out_creds,
+                     SessionPreferences& out_prefs) const;
+    bool set_session_credentials(const std::string& client_id,
+                                 const SessionCredentials& creds);
+    bool set_session_preferences(const std::string& client_id,
+                                 const SessionPreferences& prefs);
+
 private:
     void accept_client();
     void handle_client_data(int fd);
@@ -231,6 +304,17 @@ private:
         // short and log-friendly. Indexes the reverse-map
         // `client_id_to_fd_` for O(1) routing in `send_to_client()`.
         std::string client_id;
+
+        // Phase A.6 per-client session state. Populated by `session.init`
+        // / `session.update_credentials` / `session.update_prefs`. Cleared
+        // automatically when the ClientState entry is erased in
+        // `remove_client()`. The daemon reads `creds` + `prefs` at
+        // `enqueue_postprocess()` time via `IpcServer::get_session()` and
+        // merges them into `PostprocessJob::cfg` before
+        // `write_job_config()` writes the temp JSON the subprocess reads
+        // — the subprocess never re-reads env or daemon.yaml.
+        SessionCredentials creds;
+        SessionPreferences prefs;
 
         // Per-fd outbound queue (Phase A.2). Capacity-bounded by entries
         // AND total queued bytes (whichever cap engages first — sized for

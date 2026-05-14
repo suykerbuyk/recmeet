@@ -81,6 +81,29 @@ public:
     // Get the underlying fd (for integration with external event loops).
     int fd() const { return fd_; }
 
+    // Phase A.6 session handshake helpers. Each is a thin wrapper around
+    // `call()` that builds the request params shape required by the
+    // daemon's `session.init` / `session.update_credentials` /
+    // `session.update_prefs` handlers. `creds` and `prefs` are flat
+    // `JsonMap`s — keys match the plan-body JSON example
+    // (`provider`, `api_key`, `api_keys.<provider>`, `output_dir`,
+    // `note_dir`, `language`, `vocabulary`, `mic_source`, `monitor_source`,
+    // `whisper_model`, `summarization_backend`, `llm_model`,
+    // `captions_enabled`, `caption_latency_ms`).
+    //
+    // `session_init` is intended for use after `connect()` succeeds and
+    // before any `record.start`. The daemon clears the slot on
+    // disconnect, so a reconnect requires a fresh `session_init`.
+    bool session_init(const JsonMap& creds, const JsonMap& prefs,
+                      IpcResponse& resp, IpcError& err,
+                      int timeout_ms = 30000);
+    bool session_update_credentials(const JsonMap& creds,
+                                    IpcResponse& resp, IpcError& err,
+                                    int timeout_ms = 30000);
+    bool session_update_prefs(const JsonMap& prefs,
+                              IpcResponse& resp, IpcError& err,
+                              int timeout_ms = 30000);
+
     // Read data from socket, parse messages, dispatch events.
     // Returns false on disconnect.
     bool read_and_dispatch(int timeout_ms);
@@ -89,6 +112,19 @@ private:
     void process_line(const std::string& line);
     bool connect_unix();
     bool connect_tcp();
+
+    // Phase A.6: send a request whose params are a pre-serialized JSON
+    // object (e.g. `{"credentials":{...},"preferences":{...}}`). The
+    // wire-level `IpcRequest::params` shape is a flat JsonMap on this
+    // codebase; nested objects in the daemon-side parser are stored as
+    // raw substrings. To send nested data the client bypasses
+    // `serialize(IpcRequest)` and emits the frame literally. This helper
+    // mirrors `call()`'s response wait + error handling so the public
+    // entry points (`session_init` / `session_update_*`) stay one-liners.
+    bool call_with_raw_params_json(const std::string& method,
+                                   const std::string& params_json,
+                                   IpcResponse& resp, IpcError& err,
+                                   int timeout_ms);
 
     // Phase A.5: parse an auth.ok reply, capture client_id +
     // protocol_version, and enforce the version invariant. Returns true

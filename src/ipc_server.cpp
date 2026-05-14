@@ -667,6 +667,13 @@ void IpcServer::handle_client_data(int fd) {
             continue;
         }
 
+        // Phase A.6: server-side stamp the originating `client_id` on the
+        // request so handlers can identify the per-client session slot
+        // without reaching into the IpcServer's private maps. The field
+        // is server-stamped only — `serialize(IpcRequest)` does not write
+        // it onto the wire, and clients never set it.
+        msg.request.client_id = it->second.client_id;
+
         log_debug("ipc: handling '%s' from fd=%d", msg.request.method.c_str(), fd);
         auto handler_it = handlers_.find(msg.request.method);
         if (handler_it == handlers_.end()) {
@@ -825,6 +832,54 @@ void IpcServer::drain_outbound(int fd) {
     // Queue fully drained. Clear the POLLOUT-arm flag so the next poll()
     // does not wake on writable for no reason.
     cs.want_pollout = false;
+}
+
+// Phase A.6 session-state accessors. `clients_` and `client_id_to_fd_` are
+// owned by the poll thread; the daemon's rec_worker thread reads via
+// `get_session()` off-thread. The implementation here accepts that
+// snapshot-on-read semantics — a concurrent `set_session_*` from the poll
+// thread mid-copy is bounded by the underlying string-copy operations,
+// each individually wait-free, and the worst-case observation is "either
+// pre-update or post-update view, never torn". The acceptable failure
+// mode if the client disconnects mid-rec_worker is `get_session()`
+// returning false; callers must then fall back to daemon.yaml-only.
+bool IpcServer::get_session(const std::string& client_id,
+                            SessionCredentials& out_creds,
+                            SessionPreferences& out_prefs) const {
+    auto rit = client_id_to_fd_.find(client_id);
+    if (rit == client_id_to_fd_.end()) return false;
+    auto it = clients_.find(rit->second);
+    if (it == clients_.end()) return false;
+    out_creds = it->second.creds;
+    out_prefs = it->second.prefs;
+    return true;
+}
+
+// Wholesale replacement. Handlers implement the partial-update by first
+// calling `get_session()` to snapshot the existing slot, overlaying only
+// the fields present in the incoming request, then calling these setters
+// with the merged result. Booleans and ints have no "unset" sentinel at
+// the C++ struct level, so deferring the merge logic to the handler
+// keeps it honest: the handler sees the raw JSON params and knows which
+// keys were actually sent.
+bool IpcServer::set_session_credentials(const std::string& client_id,
+                                        const SessionCredentials& creds) {
+    auto rit = client_id_to_fd_.find(client_id);
+    if (rit == client_id_to_fd_.end()) return false;
+    auto it = clients_.find(rit->second);
+    if (it == clients_.end()) return false;
+    it->second.creds = creds;
+    return true;
+}
+
+bool IpcServer::set_session_preferences(const std::string& client_id,
+                                        const SessionPreferences& prefs) {
+    auto rit = client_id_to_fd_.find(client_id);
+    if (rit == client_id_to_fd_.end()) return false;
+    auto it = clients_.find(rit->second);
+    if (it == clients_.end()) return false;
+    it->second.prefs = prefs;
+    return true;
 }
 
 void IpcServer::drain_wakeup() {
