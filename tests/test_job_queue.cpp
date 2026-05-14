@@ -20,6 +20,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <deque>
 #include <thread>
 
 using namespace recmeet;
@@ -34,6 +35,36 @@ Job make_pp_job() {
     j.input.transcript_text = "already transcribed";
     return j;
 }
+
+// RAII join guard for the threaded tests below. Worker threads in these
+// tests block in JobQueue::dequeue(); the tests then run REQUIRE assertions
+// *before* the explicit join(). If such an assertion fails, Catch2 throws —
+// and a std::thread destroyed while still joinable calls std::terminate(),
+// turning a clean test failure into a process abort (coredump). ThreadGuard
+// owns the worker threads, so they are destroyed as part of ~ThreadGuard:
+// it first calls shutdown() (idempotent — and the thing that unblocks any
+// thread still parked in dequeue()), then joins every thread. The happy
+// path still does its explicit join(); the guard then sees a non-joinable
+// thread and skips it. Declared right after the JobQueue in each test, so
+// it is destroyed before the queue it references.
+struct ThreadGuard {
+    JobQueue& q;
+    std::deque<std::thread> threads;   // deque: references stay valid on push.
+
+    explicit ThreadGuard(JobQueue& q_) : q(q_) {}
+
+    template <typename F>
+    std::thread& spawn(F&& f) {
+        threads.emplace_back(std::forward<F>(f));
+        return threads.back();
+    }
+
+    ~ThreadGuard() {
+        q.shutdown();   // idempotent; unblocks any thread parked in dequeue().
+        for (std::thread& t : threads)
+            if (t.joinable()) t.join();
+    }
+};
 
 } // namespace
 
@@ -70,6 +101,7 @@ TEST_CASE("JobQueue: typed slots run concurrently", "[job_queue]") {
 TEST_CASE("JobQueue: two postprocess jobs queue serially behind one slot",
           "[job_queue]") {
     JobQueue q;
+    ThreadGuard guard(q);   // joins worker threads even if a REQUIRE throws.
 
     int64_t j1 = q.enqueue(make_pp_job(), JobKind::Postprocess, "c1");
     int64_t j2 = q.enqueue(make_pp_job(), JobKind::Postprocess, "c1");
@@ -85,7 +117,7 @@ TEST_CASE("JobQueue: two postprocess jobs queue serially behind one slot",
     // job finishes. Run it on a thread and confirm it does not return early.
     std::atomic<bool> got_second{false};
     int64_t second_id = -1;
-    std::thread worker([&] {
+    std::thread& worker = guard.spawn([&] {
         auto second = q.dequeue(JobKind::Postprocess);
         if (second.has_value()) {
             second_id = second->job_id;
@@ -146,6 +178,7 @@ TEST_CASE("JobQueue: list_by_client scopes to the owning client",
 TEST_CASE("JobQueue: auto-triggers a ModelDownload for an uncached model",
           "[job_queue]") {
     JobQueue q;
+    ThreadGuard guard(q);   // joins worker threads even if a REQUIRE throws.
 
     // The resolver says every postprocess job needs "whisper/base.en"; the
     // cache checker says it is NOT on disk.
@@ -169,7 +202,7 @@ TEST_CASE("JobQueue: auto-triggers a ModelDownload for an uncached model",
     // dequeue parks the job and auto-enqueues a ModelDownload — the worker
     // stays blocked.
     std::atomic<bool> pp_ran{false};
-    std::thread pp_worker([&] {
+    std::thread& pp_worker = guard.spawn([&] {
         auto j = q.dequeue(JobKind::Postprocess);
         if (j.has_value()) pp_ran = true;
     });
@@ -203,6 +236,7 @@ TEST_CASE("JobQueue: auto-triggers a ModelDownload for an uncached model",
 TEST_CASE("JobQueue: a failed model download fails the dependent job",
           "[job_queue]") {
     JobQueue q;
+    ThreadGuard guard(q);   // joins worker threads even if a REQUIRE throws.
     q.set_model_resolver([](const Job&) -> std::vector<std::string> {
         return {"vad"};
     });
@@ -212,7 +246,7 @@ TEST_CASE("JobQueue: a failed model download fails the dependent job",
 
     std::atomic<bool> pp_returned{false};
     std::atomic<bool> pp_got_job{false};
-    std::thread pp_worker([&] {
+    std::thread& pp_worker = guard.spawn([&] {
         auto j = q.dequeue(JobKind::Postprocess);
         pp_returned = true;
         if (j.has_value()) pp_got_job = true;
@@ -286,18 +320,19 @@ TEST_CASE("JobQueue: cancel an in-flight job; finish preserves the verdict",
 TEST_CASE("JobQueue: shutdown wakes every blocked dequeue with nullopt",
           "[job_queue]") {
     JobQueue q;
+    ThreadGuard guard(q);   // joins worker threads even if a REQUIRE throws.
 
     std::atomic<int> nullopts{0};
-    auto blocker = [&](JobKind k) {
-        return std::thread([&, k] {
+    auto blocker = [&](JobKind k) -> std::thread& {
+        return guard.spawn([&, k] {
             auto j = q.dequeue(k);
             if (!j.has_value()) nullopts++;
         });
     };
 
-    std::thread t1 = blocker(JobKind::Postprocess);
-    std::thread t2 = blocker(JobKind::Streaming);
-    std::thread t3 = blocker(JobKind::ModelDownload);
+    std::thread& t1 = blocker(JobKind::Postprocess);
+    std::thread& t2 = blocker(JobKind::Streaming);
+    std::thread& t3 = blocker(JobKind::ModelDownload);
 
     std::this_thread::sleep_for(50ms);
     REQUIRE(nullopts.load() == 0);   // all three blocked, nothing queued.
