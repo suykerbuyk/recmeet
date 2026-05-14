@@ -246,6 +246,7 @@ endif()
 set(CAPTURE_SOURCES
     src/audio_capture.cpp
     src/device_enum.cpp
+    src/tray_capture.cpp
 )
 add_library(recmeet_capture STATIC ${CAPTURE_SOURCES})
 add_dependencies(recmeet_capture recmeet_version)
@@ -254,6 +255,7 @@ target_link_libraries(recmeet_capture PUBLIC
     PkgConfig::PIPEWIRE
     PkgConfig::PULSE
     PkgConfig::PULSE_SIMPLE
+    PkgConfig::SNDFILE
 )
 
 # Core library (ML pipeline — depends on recmeet_ipc and, via
@@ -443,6 +445,8 @@ if(RECMEET_BUILD_TESTS)
         tests/test_caption_vtt.cpp
         tests/test_backend_dl.cpp
         tests/test_recmeet_capture.cpp
+        tests/test_ipc_reprocess_b5.cpp
+        tests/test_tray_capture.cpp
     )
     target_link_libraries(recmeet_tests PRIVATE recmeet_core Catch2::Catch2WithMain)
     if(RECMEET_BUILD_WEB)

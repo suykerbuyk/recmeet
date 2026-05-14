@@ -145,7 +145,49 @@ int client_record_no_sigaction(const Config& cfg, const std::string& addr,
     }
 
     bool is_reprocess = !cfg.reprocess_dir.empty();
-    JsonMap params = config_to_map(cfg);
+
+    // Phase A.6 + B-bonus — CLI sends its credentials + preferences
+    // via session.init once per connection. After A.6 the daemon
+    // ignores everything except `reprocess_dir` on record.start, so
+    // the CLI MUST hand its config off through the session handshake
+    // or summarization / output dir / vocab / etc. all silently
+    // revert to daemon.yaml defaults.
+    {
+        JsonMap creds;
+        creds["provider"] = cfg.provider;
+        if (!cfg.api_key.empty()) creds["api_key"] = cfg.api_key;
+        for (const auto& [name, key] : cfg.api_keys) {
+            if (!key.empty()) creds["api_keys." + name] = key;
+        }
+
+        JsonMap prefs;
+        if (!cfg.output_dir.empty())     prefs["output_dir"]    = cfg.output_dir.string();
+        if (!cfg.note_dir.empty())       prefs["note_dir"]      = cfg.note_dir.string();
+        if (!cfg.language.empty())       prefs["language"]      = cfg.language;
+        if (!cfg.vocabulary.empty())     prefs["vocabulary"]    = cfg.vocabulary;
+        if (!cfg.mic_source.empty())     prefs["mic_source"]    = cfg.mic_source;
+        if (!cfg.monitor_source.empty()) prefs["monitor_source"]= cfg.monitor_source;
+        if (!cfg.whisper_model.empty())  prefs["whisper_model"] = cfg.whisper_model;
+        if (!cfg.llm_model.empty()) {
+            prefs["llm_model"] = cfg.llm_model;
+            prefs["summarization_backend"] = std::string("local");
+        } else if (!cfg.no_summary) {
+            prefs["summarization_backend"] = std::string("http");
+        }
+        prefs["captions_enabled"] = cfg.captions_enabled;
+
+        IpcResponse sresp;
+        IpcError serr;
+        if (!client.session_init(creds, prefs, sresp, serr, 10000)) {
+            log_warn("session.init failed: %s — proceeding with daemon defaults",
+                     serr.message.empty() ? "unknown" : serr.message.c_str());
+        }
+    }
+
+    // Phase A.6: record.start carries only `reprocess_dir`. All other
+    // config flows through session.init above.
+    JsonMap params;
+    if (is_reprocess) params["reprocess_dir"] = cfg.reprocess_dir.string();
 
     // Reset function-static state every entry. Three statics had retained
     // values across calls (rev 3 C2-1):

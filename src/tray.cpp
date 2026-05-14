@@ -1,6 +1,7 @@
 // Copyright (c) 2026 John Suykerbuyk and SykeTech LTD
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+#include "audio_capture.h"
 #include "caption_format.h"
 #include "config.h"
 #include "config_json.h"
@@ -10,6 +11,7 @@
 #include "log.h"
 #include "notify.h"
 #include "api_models.h"
+#include "tray_capture.h"
 #include "util.h"
 #include "version.h"
 
@@ -29,9 +31,12 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
+#include <ctime>
 #include <filesystem>
+#include <memory>
 #include <mutex>
 #include <thread>
+#include <vector>
 
 using namespace recmeet;
 
@@ -120,6 +125,39 @@ struct TrayState {
         guint tick_id = 0;        // GLib timer for auto-hide ticks
         bool captions_enabled_for_recording = false;  // honored at record.start
     } cap;
+
+    // Phase B.2 — local capture state. The tray now owns the audio
+    // capture lifecycle end-to-end:
+    //   Idle (no `pw` instance) →
+    //   Recording (`pw` running, WAV stager subscribed) →
+    //   Stopped (capture torn down; WAV path waiting on user
+    //            Submit/Discard/Save-for-later disposition).
+    //
+    // `pw` is a unique_ptr because PipeWireCapture's destructor calls
+    // pw_thread_loop_stop / destroy which can take a non-trivial moment;
+    // the unique_ptr lets us reset it on every stop without leaking
+    // the previous instance during a quick start→stop→start sequence.
+    //
+    // The WAV stager accumulates int16 samples on its own vector,
+    // protected by `wav_mtx`. start_capture clears the buffer, the
+    // subscriber appends on every chunk, stop_capture drains it to a
+    // file and resets to Idle.
+    struct {
+        std::unique_ptr<PipeWireCapture> pw;
+        recmeet::PipeWireCapture::SubscriberHandle wav_handle = 0;
+        std::mutex wav_mtx;
+        std::vector<int16_t> wav_buffer;
+        fs::path wav_path;             // currently-active staging WAV path
+        std::string wav_timestamp;     // YYYY-MM-DD_HH-MM for sidecar
+        std::string wav_source;        // mic source name used for this recording
+        bool waiting_disposition = false;  // capture stopped, awaiting Submit/Discard/Save
+    } capture_state;
+
+    // Phase A.6 + B-bonus — session.init bookkeeping. The tray sends
+    // `session.init` exactly once per IPC connection, immediately after
+    // the connect() call returns. The flag prevents duplicate sends and
+    // resets on disconnect (handled in close-side code).
+    bool session_inited = false;
 };
 
 static TrayState g_tray;
@@ -334,24 +372,36 @@ static void handle_ipc_event(const IpcEvent& ev) {
             if (!error.empty())
                 notify("Pipeline error", error);
         }
-        // Prefer boolean fields if present; fall back to state string
+        // Phase B.2: tray owns its own `recording` state. The daemon
+        // continues to broadcast `recording=true` whenever it has an
+        // active reprocess job in the live-recording slot, but from the
+        // tray operator's perspective that's a postprocess (the
+        // recording is already done; the WAV is being chewed on). Fold
+        // the daemon's `recording` / `reprocessing` flags into the
+        // local `postprocessing` indicator instead.
+        bool was_recording = g_tray.recording;
         auto rec_it = ev.data.find("recording");
         if (rec_it != ev.data.end()) {
-            bool rec = json_val_as_bool(rec_it->second);
+            bool daemon_rec = json_val_as_bool(rec_it->second);
             bool pp  = json_val_as_bool(ev.data.at("postprocessing"));
             bool dl  = json_val_as_bool(ev.data.at("downloading"));
-            std::string state_str = json_val_as_string(ev.data.at("state"));
-            bool reproc = state_str.find("reprocessing") != std::string::npos;
-            update_state(rec, pp, dl, reproc);
+            // Preserve the local recording indicator — only the daemon
+            // post-recording phases drive the tray's pp/dl bits now.
+            update_state(g_tray.recording, pp || daemon_rec, dl, false);
         } else {
-            // Legacy fallback: parse state string
+            // Legacy fallback: parse state string. Daemon-side recording
+            // / reprocessing are remapped to local postprocessing as
+            // above.
             std::string state = json_val_as_string(ev.data.at("state"));
-            if (state == "idle") update_state(false, false, false);
-            else if (state == "recording") update_state(true, false, false);
-            else if (state == "reprocessing") update_state(true, false, false, true);
-            else if (state == "postprocessing") update_state(false, true, false);
-            else if (state == "downloading") update_state(false, false, true);
+            if (state == "idle") update_state(g_tray.recording, false, false);
+            else if (state == "recording" || state == "reprocessing")
+                update_state(g_tray.recording, true, false, false);
+            else if (state == "postprocessing")
+                update_state(g_tray.recording, true, false);
+            else if (state == "downloading")
+                update_state(g_tray.recording, false, true);
         }
+        (void)was_recording;
     } else if (ev.event == "job.complete") {
         std::string note = json_val_as_string(ev.data.at("note_path"));
         std::string dir = json_val_as_string(ev.data.at("output_dir"));
@@ -405,9 +455,13 @@ static gboolean on_ipc_data(GIOChannel*, GIOCondition cond, gpointer) {
         log_debug("tray: daemon disconnected");
         log_warn("[tray] Daemon disconnected");
         g_tray.daemon_connected = false;
+        g_tray.session_inited = false;
         teardown_ipc_watch();
         g_tray.ipc.close_connection();
-        update_state(false, false, false);
+        // Phase B.2: keep tray-local recording state across disconnect —
+        // a lost daemon connection does not stop the operator's
+        // microphone, only the downstream postprocessing path.
+        update_state(g_tray.recording, false, false);
         // Schedule reconnect with backoff
         g_tray.reconnect_delay = 1;
         g_tray.reconnect_timer = g_timeout_add_seconds(1, try_reconnect, nullptr);
@@ -419,9 +473,10 @@ static gboolean on_ipc_data(GIOChannel*, GIOCondition cond, gpointer) {
         log_debug("tray: daemon disconnected");
         log_warn("[tray] Daemon connection lost");
         g_tray.daemon_connected = false;
+        g_tray.session_inited = false;
         teardown_ipc_watch();
         g_tray.ipc.close_connection();
-        update_state(false, false, false);
+        update_state(g_tray.recording, false, false);
         g_tray.reconnect_delay = 1;
         g_tray.reconnect_timer = g_timeout_add_seconds(1, try_reconnect, nullptr);
         return G_SOURCE_REMOVE;
@@ -458,26 +513,83 @@ static bool connect_to_daemon() {
     g_tray.daemon_connected = true;
     setup_ipc_watch();
 
-    // Sync state
+    // Sync state. Phase B.2 — the tray's local `recording` field is the
+    // sole driver of the recording indicator; the daemon's
+    // recording/reprocessing flags fold into the postprocessing
+    // indicator (same shape as in the state.changed event handler).
     IpcResponse resp;
     IpcError err;
     if (g_tray.ipc.call("status.get", resp, err, 2000)) {
         auto rec_it = resp.result.find("recording");
         if (rec_it != resp.result.end()) {
-            bool rec = json_val_as_bool(rec_it->second);
+            bool daemon_rec = json_val_as_bool(rec_it->second);
             bool pp  = json_val_as_bool(resp.result["postprocessing"]);
             bool dl  = json_val_as_bool(resp.result["downloading"]);
-            std::string state_str = json_val_as_string(resp.result["state"]);
-            bool reproc = state_str.find("reprocessing") != std::string::npos;
-            update_state(rec, pp, dl, reproc);
+            update_state(g_tray.recording, pp || daemon_rec, dl, false);
         } else {
             // Legacy fallback
             std::string state = json_val_as_string(resp.result["state"]);
-            if (state == "recording") update_state(true, false, false);
-            else if (state == "reprocessing") update_state(true, false, false, true);
-            else if (state == "postprocessing") update_state(false, true, false);
-            else if (state == "downloading") update_state(false, false, true);
-            else update_state(false, false, false);
+            if (state == "recording" || state == "reprocessing")
+                update_state(g_tray.recording, true, false, false);
+            else if (state == "postprocessing")
+                update_state(g_tray.recording, true, false);
+            else if (state == "downloading")
+                update_state(g_tray.recording, false, true);
+            else update_state(g_tray.recording, false, false);
+        }
+    }
+
+    // Phase A.6 + B-bonus — establish the per-client session credential /
+    // preference slot on the daemon. This replaces the per-`record.start`
+    // config_to_map() blob; after the session.init, `record.start`
+    // requests carry only `reprocess_dir`. The handshake is one-shot per
+    // IPC connection; the flag clears on disconnect.
+    if (!g_tray.session_inited) {
+        JsonMap creds;
+        creds["provider"] = g_tray.cfg.provider;
+        if (!g_tray.cfg.api_key.empty())
+            creds["api_key"] = g_tray.cfg.api_key;
+        JsonMap nested_keys;
+        for (const auto& [name, key] : g_tray.cfg.api_keys) {
+            if (!key.empty()) nested_keys["api_keys." + name] = key;
+        }
+        // Per-provider keys are flattened into the credentials map as
+        // dot-prefixed top-level fields; the daemon's session.init
+        // handler pulls them out via the existing api_keys.<provider>
+        // shape used by config_to_map().
+        for (const auto& [k, v] : nested_keys) creds[k] = v;
+
+        JsonMap prefs;
+        if (!g_tray.cfg.output_dir.empty())
+            prefs["output_dir"] = g_tray.cfg.output_dir.string();
+        if (!g_tray.cfg.note_dir.empty())
+            prefs["note_dir"] = g_tray.cfg.note_dir.string();
+        if (!g_tray.cfg.language.empty())
+            prefs["language"] = g_tray.cfg.language;
+        if (!g_tray.cfg.vocabulary.empty())
+            prefs["vocabulary"] = g_tray.cfg.vocabulary;
+        if (!g_tray.cfg.mic_source.empty())
+            prefs["mic_source"] = g_tray.cfg.mic_source;
+        if (!g_tray.cfg.monitor_source.empty())
+            prefs["monitor_source"] = g_tray.cfg.monitor_source;
+        if (!g_tray.cfg.whisper_model.empty())
+            prefs["whisper_model"] = g_tray.cfg.whisper_model;
+        if (!g_tray.cfg.llm_model.empty()) {
+            prefs["llm_model"] = g_tray.cfg.llm_model;
+            prefs["summarization_backend"] = std::string("local");
+        } else if (!g_tray.cfg.no_summary) {
+            prefs["summarization_backend"] = std::string("http");
+        }
+        prefs["captions_enabled"] = g_tray.cfg.captions_enabled;
+
+        IpcResponse sresp;
+        IpcError serr;
+        if (g_tray.ipc.session_init(creds, prefs, sresp, serr, 5000)) {
+            g_tray.session_inited = true;
+            log_debug("[tray] session.init ok");
+        } else {
+            log_warn("[tray] session.init failed: %s",
+                     serr.message.empty() ? "unknown" : serr.message.c_str());
         }
     }
 
@@ -673,20 +785,236 @@ static void close_context_window() {
     }
 }
 
+// --- Phase B.2 — local audio capture (tray-owned) ---
+
+namespace {
+
+// Subscriber callback — appends every chunk to the in-memory WAV
+// buffer. Runs on the PipeWire RT thread; the contract is "no
+// allocation beyond the vector's amortized doubling, no logging, no
+// blocking beyond the existing buf_mtx the capture itself takes".
+// We use the same mutex the WAV buffer is protected by (capture_state.wav_mtx)
+// — held briefly here, not nested with any other tray lock.
+void tray_wav_subscriber(const int16_t* samples, std::size_t n, void* /*ud*/) {
+    std::lock_guard<std::mutex> lk(g_tray.capture_state.wav_mtx);
+    g_tray.capture_state.wav_buffer.insert(
+        g_tray.capture_state.wav_buffer.end(), samples, samples + n);
+}
+
+// Resolve the mic source to record from. Priority: explicit
+// g_tray.cfg.mic_source > device_pattern auto-detect > system default.
+// Returns empty string if no source could be resolved; caller emits a
+// user-facing error in that case.
+std::string tray_resolve_mic_source() {
+    if (!g_tray.cfg.mic_source.empty()) return g_tray.cfg.mic_source;
+    try {
+        auto detected = detect_sources(g_tray.cfg.device_pattern);
+        if (!detected.mic.empty()) return detected.mic;
+    } catch (const std::exception& e) {
+        log_warn("[tray] detect_sources failed: %s", e.what());
+    }
+    return "";
+}
+
+}  // anonymous namespace
+
+namespace tray {
+
+// Phase B.2 — start local capture. Idempotent: returns false if a
+// capture is already running. On success:
+//   * Creates the staging dir if it does not yet exist.
+//   * Builds a unique wav_path (audio_<timestamp>.wav) with collision
+//     suffix `_N` when the timestamp-minute filename already exists.
+//   * Wires the WAV stager as the first subscriber via
+//     add_audio_subscriber; B.5's submit path and C.10's streaming
+//     uploader can stack additional subscribers on the same handle
+//     without coordination.
+//
+// `err_msg` is populated with an operator-facing message on failure.
+bool start_capture(const std::string& mic_source, std::string& err_msg) {
+    if (g_tray.capture_state.pw) {
+        err_msg = "capture already running";
+        return false;
+    }
+    if (mic_source.empty()) {
+        err_msg = "no microphone source selected (set Mic Source from the menu)";
+        return false;
+    }
+
+    fs::path staging = tray_capture::default_staging_dir();
+    std::error_code ec;
+    fs::create_directories(staging, ec);
+    if (ec) {
+        err_msg = "cannot create staging dir: " + staging.string() + " — " + ec.message();
+        return false;
+    }
+
+    std::string ts = tray_capture::format_timestamp(std::time(nullptr));
+    fs::path wav_path;
+    try {
+        wav_path = tray_capture::next_staging_wav_path(staging, ts);
+    } catch (const std::exception& e) {
+        err_msg = e.what();
+        return false;
+    }
+
+    {
+        std::lock_guard<std::mutex> lk(g_tray.capture_state.wav_mtx);
+        g_tray.capture_state.wav_buffer.clear();
+    }
+    g_tray.capture_state.wav_path      = wav_path;
+    g_tray.capture_state.wav_timestamp = ts;
+    g_tray.capture_state.wav_source    = mic_source;
+    g_tray.capture_state.waiting_disposition = false;
+
+    try {
+        g_tray.capture_state.pw = std::make_unique<PipeWireCapture>(mic_source);
+        g_tray.capture_state.wav_handle =
+            g_tray.capture_state.pw->add_audio_subscriber(&tray_wav_subscriber, nullptr);
+        g_tray.capture_state.pw->start();
+    } catch (const std::exception& e) {
+        err_msg = std::string("capture start failed: ") + e.what();
+        g_tray.capture_state.pw.reset();
+        g_tray.capture_state.wav_handle = 0;
+        return false;
+    }
+
+    log_info("[tray] capture started: source=%s wav=%s",
+             mic_source.c_str(), wav_path.c_str());
+    return true;
+}
+
+// Phase B.2 — stop local capture. Drains the WAV buffer to the
+// staging path. After this returns successfully, the capture is
+// torn down and `capture_state.waiting_disposition = true`; the
+// operator picks Submit/Discard/Save-for-later via the stop dialog
+// (B.3). On any write failure the function still tears down the
+// capture and clears the path so the tray can return to Idle without
+// leaking the unique_ptr.
+bool stop_capture(std::string& err_msg) {
+    if (!g_tray.capture_state.pw) {
+        err_msg = "no active capture";
+        return false;
+    }
+    // Tear down the capture first so the RT thread quiesces and no
+    // late chunks land in the buffer after we drain it.
+    g_tray.capture_state.pw->stop();
+    g_tray.capture_state.pw.reset();
+    g_tray.capture_state.wav_handle = 0;
+
+    std::vector<int16_t> drained;
+    {
+        std::lock_guard<std::mutex> lk(g_tray.capture_state.wav_mtx);
+        drained.swap(g_tray.capture_state.wav_buffer);
+    }
+
+    fs::path wav_path = g_tray.capture_state.wav_path;
+    std::string write_err;
+    if (!tray_capture::write_wav(wav_path, drained, write_err)) {
+        err_msg = "WAV write failed: " + write_err;
+        // Don't leave a half-written file around.
+        std::error_code ec;
+        fs::remove(wav_path, ec);
+        g_tray.capture_state.wav_path.clear();
+        g_tray.capture_state.wav_timestamp.clear();
+        g_tray.capture_state.wav_source.clear();
+        g_tray.capture_state.waiting_disposition = false;
+        return false;
+    }
+
+    g_tray.capture_state.waiting_disposition = true;
+    log_info("[tray] capture stopped: %zu samples written to %s",
+             drained.size(), wav_path.c_str());
+    return true;
+}
+
+}  // namespace tray
+
+// --- Phase B.3 — submit / discard / save-for-later dialog ---
+
+enum class StopDisposition {
+    Submit,
+    Discard,
+    SaveForLater,
+    Cancelled,   // dialog closed without choice — treat as Save (file kept)
+};
+
+// Run the modal three-button disposition dialog. Returns the
+// operator's choice. The dialog matches the existing GTK style used
+// elsewhere in tray (gtk_dialog_new_with_buttons + content area).
+static StopDisposition tray_run_disposition_dialog(const fs::path& wav_path,
+                                                   std::size_t sample_count) {
+    GtkWidget* dialog = gtk_dialog_new_with_buttons(
+        "Recording stopped", nullptr,
+        static_cast<GtkDialogFlags>(GTK_DIALOG_MODAL | GTK_DIALOG_DESTROY_WITH_PARENT),
+        "_Save for later", 1,
+        "_Discard",        2,
+        "_Submit",         GTK_RESPONSE_OK,
+        nullptr);
+
+    GtkWidget* content = gtk_dialog_get_content_area(GTK_DIALOG(dialog));
+    gtk_container_set_border_width(GTK_CONTAINER(content), 12);
+
+    // Headline
+    double seconds = sample_count > 0
+        ? static_cast<double>(sample_count) / static_cast<double>(SAMPLE_RATE)
+        : 0.0;
+    int mins = static_cast<int>(seconds) / 60;
+    int secs = static_cast<int>(seconds) % 60;
+    char headline[160];
+    std::snprintf(headline, sizeof(headline),
+                  "Recording captured: %d:%02d (%.1f MB)\nWhat would you like to do?",
+                  mins, secs,
+                  static_cast<double>(sample_count) * sizeof(int16_t) / (1024.0 * 1024.0));
+    GtkWidget* head_lbl = gtk_label_new(headline);
+    gtk_label_set_xalign(GTK_LABEL(head_lbl), 0.0f);
+    gtk_box_pack_start(GTK_BOX(content), head_lbl, FALSE, FALSE, 4);
+
+    // Path + per-button explanation
+    std::string path_hint = "Staging path: " + wav_path.string();
+    GtkWidget* path_lbl = gtk_label_new(path_hint.c_str());
+    gtk_label_set_xalign(GTK_LABEL(path_lbl), 0.0f);
+    gtk_label_set_selectable(GTK_LABEL(path_lbl), TRUE);
+    gtk_widget_set_opacity(path_lbl, 0.7);
+    gtk_box_pack_start(GTK_BOX(content), path_lbl, FALSE, FALSE, 4);
+
+    GtkWidget* help_lbl = gtk_label_new(
+        "  • Submit         — send to daemon for transcription + summary now\n"
+        "  • Discard        — delete the WAV immediately (no upload, no compute)\n"
+        "  • Save for later — keep the WAV in staging; resume later");
+    gtk_label_set_xalign(GTK_LABEL(help_lbl), 0.0f);
+    gtk_box_pack_start(GTK_BOX(content), help_lbl, FALSE, FALSE, 4);
+
+    gtk_widget_show_all(dialog);
+    gint response = gtk_dialog_run(GTK_DIALOG(dialog));
+    gtk_widget_destroy(dialog);
+
+    switch (response) {
+        case GTK_RESPONSE_OK: return StopDisposition::Submit;
+        case 1:              return StopDisposition::SaveForLater;
+        case 2:              return StopDisposition::Discard;
+        default:             return StopDisposition::Cancelled;
+    }
+}
+
 // --- Recording (via IPC) ---
 
 static void on_record(GtkMenuItem*, gpointer) {
+    // Phase B.2: tray-local recording. Daemon connection is no longer
+    // a hard prerequisite — recording works offline and the operator
+    // can Save-for-later if the daemon is unreachable. The downloading
+    // guard remains so model downloads in flight don't get clobbered.
     if (g_tray.recording || g_tray.downloading) return;
-
-    if (!g_tray.daemon_connected) {
-        if (!connect_to_daemon()) {
-            notify("Daemon not running",
-                   "Start recmeet-daemon first, or use recmeet CLI in standalone mode.");
-            return;
-        }
+    if (g_tray.capture_state.waiting_disposition) {
+        notify("Pending recording",
+               "An earlier recording is awaiting Submit / Discard / Save. "
+               "Pick a disposition before starting a new one.");
+        return;
     }
 
-    // Resolve API key from env / per-provider store / legacy
+    // Resolve API key from env / per-provider store / legacy. We still
+    // do this up front so the user gets prompted before recording
+    // (a recording is no use without a path to summarization).
     if (g_tray.cfg.llm_model.empty()) {
         const auto* prov = find_provider(g_tray.cfg.provider);
         if (prov) {
@@ -694,88 +1022,231 @@ static void on_record(GtkMenuItem*, gpointer) {
             if (!key.empty()) {
                 g_tray.cfg.api_key = key;
             } else if (!g_tray.cfg.no_summary) {
-                // No key found — prompt user
                 std::string entered = prompt_api_key(*prov);
                 if (!entered.empty()) {
                     g_tray.cfg.api_keys[prov->name] = entered;
                     g_tray.cfg.api_key = entered;
                     save_config(g_tray.cfg);
+                    // Push the fresh key over to the daemon for the
+                    // current session so the Submit path picks it up.
+                    if (g_tray.daemon_connected && g_tray.session_inited) {
+                        JsonMap creds;
+                        creds["provider"] = g_tray.cfg.provider;
+                        creds["api_key"]  = entered;
+                        IpcResponse cr; IpcError ce;
+                        g_tray.ipc.session_update_credentials(creds, cr, ce, 5000);
+                    }
                 }
-                // else: user cancelled — proceed without summary below
             }
         }
     }
 
-    // Build params — use a copy so we can suppress summary for this run only
-    Config run_cfg = g_tray.cfg;
-    if (!run_cfg.no_summary && run_cfg.api_key.empty() && run_cfg.llm_model.empty())
-        run_cfg.no_summary = true;
+    std::string mic_source = tray_resolve_mic_source();
+    if (mic_source.empty()) {
+        notify("No microphone source",
+               "Pick a mic source from the tray menu (Mic Source >).");
+        return;
+    }
 
-    // Send record.start with current config (now includes api_key)
-    JsonMap params = config_to_map(run_cfg);
+    std::string start_err;
+    if (!tray::start_capture(mic_source, start_err)) {
+        notify("Recording failed", start_err);
+        log_error("[tray] start_capture failed: %s", start_err.c_str());
+        return;
+    }
+
+    // Captions: snapshot the config value at recording start. Mid-
+    // recording toggles do not take effect; same semantics as Phase 5.1.
+    g_tray.cap.captions_enabled_for_recording = g_tray.cfg.captions_enabled;
+    if (g_tray.cfg.captions_enabled) {
+        // Pre-create the overlay window so the first caption event has
+        // somewhere to render. Captions during local recording are
+        // handled by the (future) C.10 streaming uploader; for B.2 the
+        // overlay stays hidden if no caption events arrive.
+        caption_overlay_create();
+    }
+
+    update_state(true, g_tray.postprocessing, false, false);
+
+    // Open non-modal context dialog (always — there is no reprocess
+    // path through on_record any more; reprocess flows through Submit).
+    show_context_window();
+}
+
+// Phase B.3 — disposition handlers, split out of on_stop so each is
+// testable and the failure paths stay symmetric.
+
+namespace tray {
+
+// Discard the staged WAV immediately. Plan acceptance line: "Discard-
+// on-stop: WAV gone in <100 ms; no upload, no compute." We unlink the
+// file and clear the staging path; nothing else fires.
+void apply_discard() {
+    fs::path wav_path = g_tray.capture_state.wav_path;
+    std::error_code ec;
+    fs::remove(wav_path, ec);
+    if (ec) {
+        log_warn("[tray] discard: unlink failed for %s: %s",
+                 wav_path.c_str(), ec.message().c_str());
+    } else {
+        log_info("[tray] discarded WAV: %s", wav_path.c_str());
+    }
+    g_tray.capture_state.wav_path.clear();
+    g_tray.capture_state.wav_timestamp.clear();
+    g_tray.capture_state.wav_source.clear();
+    g_tray.capture_state.waiting_disposition = false;
+}
+
+// Phase B.5 — submit the staged WAV to the daemon via record.start
+// with `reprocess_dir`. This is the transitional submission path
+// (lives until Phase C's `process.submit` IPC). Local-host only.
+//
+// Returns true on successful IPC dispatch; false on connect / call
+// failure. On failure the WAV stays in staging so the operator can
+// pick Save-for-later or retry without re-recording.
+bool apply_submit(std::string& err_msg) {
+    if (!g_tray.daemon_connected) {
+        if (!connect_to_daemon()) {
+            err_msg = "daemon not running — start recmeet-daemon and try again";
+            return false;
+        }
+    }
+
+    JsonMap params;
+    params["reprocess_dir"] = g_tray.capture_state.wav_path.string();
 
     IpcResponse resp;
     IpcError err;
     if (!g_tray.ipc.call("record.start", params, resp, err, 10000)) {
-        std::string msg = err.message.empty() ? "Unknown error" : err.message;
-        notify("Recording failed", msg);
-        log_error("[tray] record.start failed: %s", msg.c_str());
-        return;
+        err_msg = err.message.empty() ? "record.start failed" : err.message;
+        return false;
     }
 
-    // Phase 5.1 — captions are bound to the record.start params at recording
-    // start. Toggling the menu mid-recording does NOT take effect until the
-    // next recording. Snapshot the param value here so caption events know
-    // whether to render.
-    g_tray.cap.captions_enabled_for_recording = run_cfg.captions_enabled;
-    if (run_cfg.captions_enabled) {
-        // Pre-create the overlay window so the first caption event has
-        // somewhere to render. Stays hidden until the first event arrives.
-        caption_overlay_create();
-    }
+    log_info("[tray] submitted WAV for reprocess: %s",
+             g_tray.capture_state.wav_path.c_str());
 
-    bool reproc = !g_tray.cfg.reprocess_dir.empty();
-    update_state(true, g_tray.postprocessing, false, reproc);
-
-    // Open non-modal context dialog (not for reprocess)
-    if (!reproc)
-        show_context_window();
+    // The WAV is now owned by the daemon's reprocess flow (iter 64
+    // "reuse audio parent dir" applies). Clear the staging path so the
+    // tray returns to Idle; the daemon will broadcast progress events
+    // that update the postprocessing indicator.
+    g_tray.capture_state.wav_path.clear();
+    g_tray.capture_state.wav_timestamp.clear();
+    g_tray.capture_state.wav_source.clear();
+    g_tray.capture_state.waiting_disposition = false;
+    return true;
 }
 
-static void on_stop(GtkMenuItem*, gpointer) {
-    if (!g_tray.recording && !g_tray.postprocessing) return;
-
-    // Capture context from dialog before stopping recording
-    if (g_tray.recording && g_tray.ctx.window) {
-        auto captured = capture_and_clear_context();
-        if (!captured.context_inline.empty()) {
-            JsonMap ctx_params;
-            ctx_params["context_inline"] = captured.context_inline;
-            if (!captured.vocab_additions.empty())
-                ctx_params["vocabulary_append"] = captured.vocab_additions;
-            IpcResponse ctx_resp;
-            IpcError ctx_err;
-            if (!g_tray.ipc.call("job.context", ctx_params, ctx_resp, ctx_err, 5000))
-                log_warn("[tray] job.context failed: %s", ctx_err.message.c_str());
-        }
+// Phase B.3 — leave the WAV in staging and drop a `.pending` sidecar
+// so D.5 can resume the disposition flow after a tray restart. The
+// sidecar shape is intentionally minimal (D.5 will tighten it).
+void apply_save_for_later() {
+    bool ok = tray_capture::write_pending_sidecar(
+        g_tray.capture_state.wav_path,
+        g_tray.capture_state.wav_timestamp,
+        g_tray.capture_state.wav_source,
+        g_tray.cap.captions_enabled_for_recording);
+    if (!ok) {
+        log_warn("[tray] save-for-later: failed to write .pending sidecar for %s",
+                 g_tray.capture_state.wav_path.c_str());
+    } else {
+        log_info("[tray] saved WAV for later: %s",
+                 g_tray.capture_state.wav_path.c_str());
     }
+    // Clear the active staging fields — the WAV is now "saved",
+    // outside the active capture lifecycle.
+    g_tray.capture_state.wav_path.clear();
+    g_tray.capture_state.wav_timestamp.clear();
+    g_tray.capture_state.wav_source.clear();
+    g_tray.capture_state.waiting_disposition = false;
+}
 
-    // Send stop with appropriate target.
-    // When both recording and postprocessing are active (concurrent jobs),
-    // only stop the recording — postprocessing belongs to a previous job.
-    JsonMap params;
-    if (g_tray.recording)
-        params["target"] = std::string("recording");
-    else
-        params["target"] = std::string("postprocessing");
+}  // namespace tray
 
-    IpcResponse resp;
-    IpcError err;
-    if (!g_tray.ipc.call("record.stop", params, resp, err, 5000)) {
-        log_error("[tray] record.stop failed: %s", err.message.c_str());
+static void on_stop(GtkMenuItem*, gpointer) {
+    // Phase B.2: stop covers three independent state machines now:
+    //   1. Local recording → invoke tray::stop_capture, run B.3 dialog,
+    //      apply chosen disposition.
+    //   2. No local recording but daemon postprocessing → ask the
+    //      daemon to cancel postprocessing.
+    //   3. Neither → no-op.
+    if (g_tray.recording) {
+        // Capture context from dialog before stopping — kept for the
+        // job.context IPC after Submit so the daemon sees vocab + notes.
+        CapturedContext captured_ctx;
+        if (g_tray.ctx.window)
+            captured_ctx = capture_and_clear_context();
+
+        std::string stop_err;
+        if (!tray::stop_capture(stop_err)) {
+            notify("Recording stop failed", stop_err);
+            log_error("[tray] stop_capture failed: %s", stop_err.c_str());
+            update_state(false, g_tray.postprocessing, g_tray.downloading);
+            return;
+        }
+        update_state(false, g_tray.postprocessing, g_tray.downloading);
+
+        std::size_t sample_count = 0;
+        // The buffer is already drained inside stop_capture; recover
+        // count from on-disk WAV via libsndfile would be a round-trip.
+        // Use the file size instead (PCM-16 mono → bytes/2 == samples).
+        std::error_code ec;
+        auto sz = fs::file_size(g_tray.capture_state.wav_path, ec);
+        if (!ec && sz >= 44) sample_count = (sz - 44) / sizeof(int16_t);
+
+        StopDisposition choice =
+            tray_run_disposition_dialog(g_tray.capture_state.wav_path, sample_count);
+
+        switch (choice) {
+            case StopDisposition::Submit: {
+                std::string sub_err;
+                if (!tray::apply_submit(sub_err)) {
+                    notify("Submit failed", sub_err);
+                    // WAV remains in staging; tray stays in
+                    // waiting_disposition so the operator can retry or
+                    // pick Save-for-later. Re-present dialog state via
+                    // build_menu so the indicator reflects reality.
+                    build_menu();
+                    return;
+                }
+                // Send context-window data along with the submit so the
+                // daemon's job.context handler folds it into the
+                // running reprocess job. We send it AFTER record.start
+                // so the daemon has the job ready.
+                if (!captured_ctx.context_inline.empty()) {
+                    JsonMap ctx_params;
+                    ctx_params["context_inline"] = captured_ctx.context_inline;
+                    if (!captured_ctx.vocab_additions.empty())
+                        ctx_params["vocabulary_append"] = captured_ctx.vocab_additions;
+                    IpcResponse ctx_resp;
+                    IpcError ctx_err;
+                    if (!g_tray.ipc.call("job.context", ctx_params, ctx_resp, ctx_err, 5000))
+                        log_warn("[tray] job.context failed: %s", ctx_err.message.c_str());
+                }
+                break;
+            }
+            case StopDisposition::Discard:
+                tray::apply_discard();
+                break;
+            case StopDisposition::SaveForLater:
+            case StopDisposition::Cancelled:
+                tray::apply_save_for_later();
+                break;
+        }
+        build_menu();
         return;
     }
-    // No optimistic state transition — wait for daemon's state.changed event
+
+    if (g_tray.postprocessing) {
+        // Daemon-side postprocess cancel — same as the legacy on_cancel_pp.
+        JsonMap params;
+        params["target"] = std::string("postprocessing");
+        IpcResponse resp;
+        IpcError err;
+        if (!g_tray.ipc.call("record.stop", params, resp, err, 5000)) {
+            log_error("[tray] record.stop (postprocessing) failed: %s",
+                      err.message.c_str());
+        }
+    }
 }
 
 static void on_cancel_pp(GtkMenuItem*, gpointer) {
