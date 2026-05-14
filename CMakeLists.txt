@@ -266,6 +266,7 @@ set(CORE_SOURCES
     src/audio_monitor.cpp
     src/audio_file.cpp
     src/audio_mixer.cpp
+    src/job_queue.cpp
     src/model_manager.cpp
     src/transcribe.cpp
     src/summarize.cpp
@@ -447,6 +448,7 @@ if(RECMEET_BUILD_TESTS)
         tests/test_recmeet_capture.cpp
         tests/test_ipc_reprocess_b5.cpp
         tests/test_tray_capture.cpp
+        tests/test_job_queue.cpp
     )
     target_link_libraries(recmeet_tests PRIVATE recmeet_core Catch2::Catch2WithMain)
     if(RECMEET_BUILD_WEB)

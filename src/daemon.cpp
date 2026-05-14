@@ -7,6 +7,7 @@
 #include "device_enum.h"
 #include "ipc_protocol.h"
 #include "ipc_server.h"
+#include "job_queue.h"
 #include "ndjson_parse.h"
 #include "session_merge.h"
 #include "speaker_id.h"
@@ -42,13 +43,42 @@
 using namespace recmeet;
 
 // ---------------------------------------------------------------------------
-// Daemon state — independent atomics for concurrent recording + postprocessing
+// Daemon state — Phase C.7: the three loose atomics (g_recording /
+// g_postprocessing / g_downloading) and their g_state_mu admission gate, plus
+// the separate single-FIFO g_job_queue, are folded into a typed-slot
+// JobQueue. The postprocess and model_download slots' "running" markers are
+// the authoritative successors of g_postprocessing / g_downloading.
+//
+// `g_recording` survives as a standalone atomic: live recording via
+// record.start is NOT a JobQueue slot — it is the legacy daemon-side capture
+// path that C.9 removes (the `streaming` slot is reserved for C.10a's
+// streaming producer, a different thing). `g_rec_mu` is its small admission
+// gate, the recording-only remnant of the old g_state_mu.
 // ---------------------------------------------------------------------------
 
 static std::atomic<bool> g_recording{false};
-static std::atomic<bool> g_postprocessing{false};
-static std::atomic<bool> g_downloading{false};
-static std::mutex g_state_mu;  // guards multi-flag transitions
+static std::mutex g_rec_mu;  // admission gate for the legacy recording path
+
+// Atomic-handoff bridge. The pre-C.7 rec_worker set `g_postprocessing=true`
+// BEFORE clearing `g_recording` so there was never a transient "idle" between
+// recording finishing and postprocessing starting. With C.7 the postprocess
+// slot only reads "busy" once the pp_worker has *dequeued* the job — a
+// non-atomic window. `g_pp_handoff` closes that window: rec_worker raises it
+// inside the same atomic-handoff critical section, and pp_worker lowers it
+// the instant it owns a dequeued job. `jq_postprocessing()` ORs it in.
+// C.9 retires this along with the recording path.
+static std::atomic<bool> g_pp_handoff{false};
+
+// Recording-side job-id counter for the legacy record.start path. It tags
+// the live `caption` events and the record.start response. The *postprocess*
+// job gets its own id from JobQueue::enqueue() at handoff time — the two id
+// spaces are independent until C.9 unifies them by retiring record.start.
+static std::atomic<int64_t> g_next_rec_job_id{1};
+
+// The typed-slot job queue (postprocess / streaming / model_download). Owns
+// the job_id -> client_id binding C.3 will consume. Initialised in main()
+// once Config is loaded so slot capacities reflect `[server] slot.*`.
+static std::unique_ptr<JobQueue> g_jobs;
 
 static Config g_config;
 static std::mutex g_config_mu;
@@ -59,22 +89,15 @@ static StopToken g_pp_stop;
 
 // Worker threads
 static std::thread g_rec_worker;
-static std::thread g_pp_worker;   // long-lived, drains job queue
-static std::thread g_dl_worker;
+static std::thread g_pp_worker;   // long-lived, drains the postprocess slot
+static std::thread g_dl_worker;   // long-lived, drains the model_download slot
 
-// Postprocessing job queue
-static std::atomic<int64_t> g_next_job_id{1};
-
-struct PostprocessJob {
-    int64_t job_id;
-    PostprocessInput input;
-    Config cfg;
-};
-
-static std::mutex g_queue_mu;
-static std::queue<PostprocessJob> g_job_queue;
-static std::condition_variable g_queue_cv;
-static bool g_queue_shutdown{false};
+// PostprocessJob — pre-C.7 this was a standalone struct holding the inline
+// FIFO payload. C.7 keeps the name as a thin alias of the unified `Job`
+// record (which threads `client_id` and folds in the slot machinery) so the
+// surviving record.start / pp_worker / write_job_config call sites read
+// unchanged. C.9 will retire the alias along with record.start.
+using PostprocessJob = Job;
 
 // Whether the current recording is a reprocess (poll-thread-only variable,
 // set via server.post() from the recording worker)
@@ -96,10 +119,21 @@ static IpcServer* g_server = nullptr;
 // State helpers
 // ---------------------------------------------------------------------------
 
+// State reporting derives the postprocessing / downloading flags from the
+// JobQueue slot "running" markers (the C.7 successors of g_postprocessing /
+// g_downloading); recording stays its own atomic until C.9.
+static bool jq_postprocessing() {
+    return g_pp_handoff.load() ||
+           (g_jobs && g_jobs->slot_busy(JobKind::Postprocess));
+}
+static bool jq_downloading() {
+    return g_jobs && g_jobs->slot_busy(JobKind::ModelDownload);
+}
+
 static std::string composite_state_name() {
     bool rec = g_recording.load();
-    bool pp  = g_postprocessing.load();
-    bool dl  = g_downloading.load();
+    bool pp  = jq_postprocessing();
+    bool dl  = jq_downloading();
     if (rec && pp) return g_is_reprocess ? "reprocessing+postprocessing" : "recording+postprocessing";
     if (rec)       return g_is_reprocess ? "reprocessing" : "recording";
     if (pp)        return "postprocessing";
@@ -110,8 +144,8 @@ static std::string composite_state_name() {
 static void fill_state_fields(JsonMap& data) {
     data["state"] = composite_state_name();
     data["recording"] = g_recording.load();
-    data["postprocessing"] = g_postprocessing.load();
-    data["downloading"] = g_downloading.load();
+    data["postprocessing"] = jq_postprocessing();
+    data["downloading"] = jq_downloading();
 }
 
 // For worker threads — schedules broadcast on the poll thread
@@ -172,50 +206,14 @@ static void signal_handler(int sig) {
 static void whisper_null_log(enum ggml_log_level, const char*, void*) {}
 
 // ---------------------------------------------------------------------------
-// Helper: ensure models are ready (non-interactive)
+// Phase C.7 note: the pre-C.7 `ensure_models()` helper — which the
+// record.start handler called inline-synchronously on the handler thread —
+// has been removed. Model readiness is now resolved at *job-dequeue time*
+// by the JobQueue: the ModelResolver / ModelCacheChecker wired in main()
+// (mirroring the old ensure_models() decision logic) drive an auto-enqueued
+// JobKind::ModelDownload in the model_download slot, and the dependent
+// postprocess job is parked until the download completes.
 // ---------------------------------------------------------------------------
-
-static bool ensure_models(Config& cfg) {
-    try {
-        ensure_whisper_model(cfg.whisper_model);
-    } catch (const RecmeetError& e) {
-        log_error("daemon: whisper model: %s", e.what());
-        return false;
-    }
-
-    if (!cfg.no_summary && !cfg.llm_model.empty()) {
-        try {
-            ensure_llama_model(cfg.llm_model);
-        } catch (const RecmeetError& e) {
-            log_error("daemon: llama model: %s", e.what());
-            cfg.no_summary = true;
-        }
-    }
-
-#if RECMEET_USE_SHERPA
-    if (cfg.diarize && !is_sherpa_model_cached()) {
-        try {
-            ensure_sherpa_models();
-        } catch (const RecmeetError& e) {
-            log_error("daemon: sherpa models: %s", e.what());
-            cfg.diarize = false;
-        }
-    }
-    if (cfg.vad && !is_vad_model_cached()) {
-        try {
-            ensure_vad_model();
-        } catch (const RecmeetError& e) {
-            log_error("daemon: VAD model: %s", e.what());
-            cfg.vad = false;
-        }
-    }
-#else
-    cfg.diarize = false;
-    cfg.vad = false;
-#endif
-
-    return true;
-}
 
 // ---------------------------------------------------------------------------
 // Subprocess helpers
@@ -287,8 +285,12 @@ static bool poll_child_alive(pid_t pid) {
 // pp_worker_loop is currently single-threaded sequential, so checking
 // queue + child running covers all in-flight postprocess work.
 static bool pp_queue_empty() {
-    std::lock_guard<std::mutex> lk(g_queue_mu);
-    return g_job_queue.empty();
+    // C.7: the postprocess slot is empty when nothing is queued and nothing
+    // is running. (The pp slot is capacity-1 and sequential, so this still
+    // covers all in-flight postprocess work.)
+    return g_jobs &&
+           g_jobs->queued_count(JobKind::Postprocess) == 0 &&
+           !g_jobs->slot_busy(JobKind::Postprocess);
 }
 static bool pp_child_running() {
     return g_pp_child_pid.load() > 0;
@@ -366,35 +368,35 @@ static void kill_pp_child_with_grace(pid_t pid) {
 static void pp_worker_loop(IpcServer& server) {
     log_debug("daemon: pp_worker_loop ENTER (tid=%d)", (int)syscall(SYS_gettid));
     while (true) {
-        PostprocessJob job;
-        bool already_flagged = false;
-        {
-            std::unique_lock<std::mutex> lock(g_queue_mu);
-            g_queue_cv.wait(lock, [] {
-                return !g_job_queue.empty() || g_queue_shutdown;
-            });
-            if (g_queue_shutdown) {
-                log_debug("daemon: pp_worker_loop EXIT (shutdown)");
-                return;
-            }
-            job = std::move(g_job_queue.front());
-            g_job_queue.pop();
-            log_debug("daemon: pp_worker dequeued job=%ld (queue_size=%zu)", (long)job.job_id, g_job_queue.size());
-
-            // Check if recording worker already set g_postprocessing
-            // (atomic handoff — avoids transient idle)
-            already_flagged = g_postprocessing.load();
+        // Phase C.7: block on the JobQueue's postprocess slot. `dequeue`
+        // returns the job already marked Running (slot "running" marker set
+        // — the successor of g_postprocessing). It auto-triggers a model
+        // download and parks the job internally if a required model is
+        // uncached; the daemon's job_event_sink emits `progress.job` with
+        // phase `downloading_model` while parked. `dequeue` returns
+        // std::nullopt only on shutdown.
+        std::optional<Job> dq = g_jobs->dequeue(JobKind::Postprocess);
+        if (!dq.has_value()) {
+            log_debug("daemon: pp_worker_loop EXIT (shutdown)");
+            return;
         }
+        PostprocessJob job = std::move(*dq);
+        log_debug("daemon: pp_worker dequeued job=%ld (slot_queued=%zu)",
+                  (long)job.job_id, g_jobs->queued_count(JobKind::Postprocess));
 
-        if (!already_flagged) {
-            {
-                std::lock_guard<std::mutex> lock(g_state_mu);
-                g_postprocessing.store(true);
-                log_debug("daemon: state postprocessing=true");
-            }
-            broadcast_state(server);
-        }
+        // Atomic-handoff bridge: the job is now owned by this worker and the
+        // slot's "running" marker is set, so the handoff window is closed —
+        // lower g_pp_handoff (no-op for non-record.start enqueuers).
+        g_pp_handoff.store(false);
+        broadcast_state(server);
         g_pp_stop.reset();
+
+        // C.7 job outcome — fed to g_jobs->finish() at clear_state. Default
+        // to failure so the early `goto clear_state` paths (pipe/fork
+        // failure) report the slot job as Failed; the result-interpretation
+        // block below flips this to success or a specific error.
+        bool job_ok = false;
+        std::string job_err = "postprocessing did not start";
 
         // Subprocess must always reprocess (never record new audio).
         // The daemon already captured the audio; point the subprocess at it.
@@ -710,6 +712,8 @@ static void pp_worker_loop(IpcServer& server) {
 
             // Interpret result
             if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
+                job_ok = true;
+                job_err.clear();
                 int64_t jid = job.job_id;
                 bool batch_job = job.cfg.batch_mode;
                 server.post([&server, captured_note_path, captured_output_dir, jid, batch_job]() {
@@ -722,6 +726,11 @@ static void pp_worker_loop(IpcServer& server) {
                     server.broadcast(ev);
                 });
             } else if (WIFEXITED(status) && WEXITSTATUS(status) == 2) {
+                // Exit code 2 = cancelled. Leave the slot job's verdict to
+                // g_jobs->finish(): if cancel() already marked it Cancelled
+                // that verdict is preserved; otherwise it lands as Failed.
+                job_ok = false;
+                job_err = "cancelled";
                 log_info("Postprocessing cancelled for job %ld", (long)job.job_id);
             } else {
                 std::string msg;
@@ -746,15 +755,120 @@ static void pp_worker_loop(IpcServer& server) {
                 log_error("daemon: %s", msg.c_str());
                 notify("Postprocessing failed", msg);
                 broadcast_state(server, msg);
+                job_ok = false;
+                job_err = msg;
             }
         }
 
     clear_state:
-        {
-            std::lock_guard<std::mutex> lock(g_state_mu);
-            g_postprocessing.store(false);
-            log_debug("daemon: state postprocessing=false");
+        // Phase C.7: release the postprocess slot. g_jobs->finish() clears the
+        // slot's "running" marker (successor of g_postprocessing=false) so the
+        // next queued postprocess job can be dequeued; a Cancelled verdict set
+        // by cancel() is preserved over `job_ok`.
+        g_jobs->finish(job.job_id, job_ok, job_err);
+        log_debug("daemon: pp_worker released slot for job=%ld (ok=%d)",
+                  (long)job.job_id, job_ok ? 1 : 0);
+        broadcast_state(server);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Phase C.7 — model_download slot worker
+// ---------------------------------------------------------------------------
+//
+// `model_id` convention (logical identifiers carried on JobKind::ModelDownload
+// jobs, both auto-triggered and explicit `models.ensure` / `models.update`):
+//
+//     whisper/<name>        -> ensure_whisper_model / download_whisper_model
+//     llama/<name>          -> ensure_llama_model (download not supported)
+//     sherpa/diarization    -> ensure_sherpa_models / download_sherpa_models
+//     vad                   -> ensure_vad_model / download_vad_model
+//
+// `force` (Job::force_download) selects ensure_* (no-op if cached) vs
+// download_* (always re-fetch — the models.update refresh semantic).
+// Per-model atomic-rename on the actual file write lives in
+// model_manager.cpp's download_file(); this worker only dispatches.
+
+static void perform_model_download(const std::string& model_id, bool force) {
+    if (model_id.rfind("whisper/", 0) == 0) {
+        std::string name = model_id.substr(8);
+        if (force) download_whisper_model(name);
+        else       ensure_whisper_model(name);
+        return;
+    }
+    if (model_id.rfind("llama/", 0) == 0) {
+#if RECMEET_USE_LLAMA
+        // llama models have no download URL registry — ensure_llama_model
+        // resolves a local path or throws. `force` has no effect.
+        ensure_llama_model(model_id.substr(6));
+#else
+        throw RecmeetError("llama support not built in");
+#endif
+        return;
+    }
+#if RECMEET_USE_SHERPA
+    if (model_id == "sherpa/diarization") {
+        if (force) download_sherpa_models();
+        else       ensure_sherpa_models();
+        return;
+    }
+    if (model_id == "vad") {
+        if (force) download_vad_model();
+        else       ensure_vad_model();
+        return;
+    }
+#endif
+    throw RecmeetError("Unknown model id: " + model_id);
+}
+
+static void model_dl_worker_loop(IpcServer& server) {
+    log_debug("daemon: model_dl_worker_loop ENTER (tid=%d)",
+              (int)syscall(SYS_gettid));
+    while (true) {
+        std::optional<Job> dq = g_jobs->dequeue(JobKind::ModelDownload);
+        if (!dq.has_value()) {
+            log_debug("daemon: model_dl_worker_loop EXIT (shutdown)");
+            return;
         }
+        Job job = std::move(*dq);
+        log_debug("daemon: model_dl_worker dequeued job=%ld model=%s force=%d",
+                  (long)job.job_id, job.model_id.c_str(),
+                  job.force_download ? 1 : 0);
+        broadcast_state(server);   // downloading -> visible in state.changed
+
+        auto broadcast_dl = [&server](const std::string& model,
+                                      const std::string& status,
+                                      const std::string& error = "") {
+            server.post([&server, model, status, error]() {
+                IpcEvent ev;
+                ev.event = "model.downloading";
+                ev.data["model"] = model;
+                ev.data["status"] = status;
+                if (!error.empty()) ev.data["error"] = error;
+                server.broadcast(ev);
+            });
+        };
+
+        bool ok = true;
+        std::string err;
+        broadcast_dl(job.model_id, "downloading");
+        try {
+            perform_model_download(job.model_id, job.force_download);
+            broadcast_dl(job.model_id, "complete");
+        } catch (const std::exception& e) {
+            ok = false;
+            err = e.what();
+            log_error("daemon: model download failed (%s): %s",
+                      job.model_id.c_str(), err.c_str());
+            broadcast_dl(job.model_id, "error", err);
+        }
+
+        // finish_download() clears the model_download slot AND re-arms (or
+        // fails) every postprocess job parked on this download — the
+        // cross-slot dependency resolution.
+        g_jobs->finish_download(job.job_id, ok, err);
+        log_debug("daemon: model_dl_worker released slot for job=%ld (ok=%d)",
+                  (long)job.job_id, ok ? 1 : 0);
         broadcast_state(server);
     }
 }
@@ -869,6 +983,21 @@ int main(int argc, char* argv[]) {
     // Note: don't auto-disable no_summary here — the decision is made per-job
     // based on the merged config (client may send an API key)
 
+    // Phase C.7 — construct the typed-slot JobQueue. Slot capacities come
+    // from `[server] slot.*` (all default 1); the auto-download machinery
+    // (ModelResolver / ModelCacheChecker / JobEventSink) is wired below,
+    // after the IpcServer exists (the event sink captures it).
+    {
+        JobQueue::SlotCapacities caps;
+        caps.postprocess = g_config.slot_postprocess;
+        caps.streaming = g_config.slot_streaming;
+        caps.model_download = g_config.slot_model_download;
+        g_jobs = std::make_unique<JobQueue>(caps);
+        log_info("daemon: JobQueue slots — postprocess=%d streaming=%d "
+                 "model_download=%d",
+                 caps.postprocess, caps.streaming, caps.model_download);
+    }
+
     notify_init();
 
     // Resolve path to recmeet binary for subprocess postprocessing
@@ -887,6 +1016,82 @@ int main(int argc, char* argv[]) {
     // Create server
     IpcServer server(socket_path);
     g_server = &server;
+
+    // Phase C.7 — wire the JobQueue auto-download machinery now that the
+    // IpcServer exists (the JobEventSink captures it). The ModelResolver
+    // enumerates the models a postprocess job requires (mirroring the old
+    // ensure_models() decision logic); the ModelCacheChecker is the
+    // model_manager `is_*_cached` helpers lifted to job-dequeue time; the
+    // JobEventSink emits `progress.job` — in particular phase
+    // `downloading_model` while a postprocess job is parked on a download.
+
+    // ModelCacheChecker — returns true when a logical model_id is on disk.
+    g_jobs->set_model_cache_checker([](const std::string& model_id) -> bool {
+        try {
+            if (model_id.rfind("whisper/", 0) == 0)
+                return is_whisper_model_cached(model_id.substr(8));
+#if RECMEET_USE_SHERPA
+            if (model_id == "sherpa/diarization")
+                return is_sherpa_model_cached();
+            if (model_id == "vad")
+                return is_vad_model_cached();
+#endif
+            // llama models have no cache-probe registry — ensure_llama_model
+            // resolves a local path or throws. Treat as "cached" so we never
+            // auto-enqueue a download that perform_model_download can't do.
+            if (model_id.rfind("llama/", 0) == 0)
+                return true;
+        } catch (const std::exception& e) {
+            log_warn("job_queue cache check failed for '%s': %s",
+                     model_id.c_str(), e.what());
+        }
+        return true;  // unknown id — don't block the job on a phantom download.
+    });
+
+    // ModelResolver — enumerates the models a postprocess job requires.
+    g_jobs->set_model_resolver([](const Job& job) -> std::vector<std::string> {
+        std::vector<std::string> needed;
+        if (job.kind != JobKind::Postprocess) return needed;
+        const Config& c = job.cfg;
+        // Transcription needs the whisper model unless the recording phase
+        // already produced transcript text.
+        if (job.input.transcript_text.empty() && !c.whisper_model.empty())
+            needed.push_back("whisper/" + c.whisper_model);
+#if RECMEET_USE_SHERPA
+        if (c.diarize) needed.push_back("sherpa/diarization");
+        if (c.vad)     needed.push_back("vad");
+#endif
+        return needed;
+    });
+
+    // JobEventSink — emit `progress.job` for the notable transitions.
+    g_jobs->set_job_event_sink([&server](const Job& job) {
+        std::string phase;
+        switch (job.state) {
+            case JobState::WaitingOnDownload: phase = "downloading_model"; break;
+            case JobState::Queued:            phase = "resumed";          break;
+            case JobState::Done:              phase = "done";             break;
+            case JobState::Failed:            phase = "failed";           break;
+            case JobState::Cancelled:         phase = "cancelled";        break;
+            default:                          return;  // Running etc — no event.
+        }
+        int64_t jid = job.job_id;
+        std::string kind = job_kind_name(job.kind);
+        std::string model = job.model_id;
+        std::string errmsg = job.error;
+        server.post([&server, jid, phase, kind, model, errmsg]() {
+            IpcEvent ev;
+            ev.event = "progress.job";
+            ev.data["job_id"] = jid;
+            ev.data["kind"] = kind;
+            ev.data["phase"] = phase;
+            if (!model.empty()) ev.data["model"] = model;
+            if (!errmsg.empty()) ev.data["error"] = errmsg;
+            // C.7 owns/populates the job_id->client_id binding; converting
+            // this broadcast() to send_to_client() is explicitly C.3's job.
+            server.broadcast(ev);
+        });
+    });
 
     // Phase A.2: apply the NDJSON line cap from config before start().
     // Default is 8 MB; a daemon.yaml override via `[ipc] max_message_bytes`
@@ -921,10 +1126,10 @@ int main(int argc, char* argv[]) {
 
     server.on("status.get", [](const IpcRequest& req, IpcResponse& resp, IpcError&) {
         fill_state_fields(resp.result);
-        {
-            std::lock_guard<std::mutex> lock(g_queue_mu);
-            resp.result["queue_depth"] = static_cast<int64_t>(g_job_queue.size());
-        }
+        // C.7: `queue_depth` reports the postprocess slot's queued count
+        // (the successor of the pre-C.7 single g_job_queue size).
+        resp.result["queue_depth"] = static_cast<int64_t>(
+            g_jobs ? g_jobs->queued_count(JobKind::Postprocess) : 0);
         return true;
     });
 
@@ -1210,10 +1415,13 @@ int main(int argc, char* argv[]) {
             }
         }
 
-        // Guard: !g_recording && !g_downloading (allow during postprocessing)
+        // Guard: !g_recording && !downloading (allow during postprocessing).
+        // C.7: recording admission is the legacy recording path's own gate
+        // (g_rec_mu / g_recording); the "downloading" half now reads the
+        // JobQueue model_download slot's "running" marker.
         {
-            std::lock_guard<std::mutex> lock(g_state_mu);
-            if (g_recording.load() || g_downloading.load()) {
+            std::lock_guard<std::mutex> lock(g_rec_mu);
+            if (g_recording.load() || jq_downloading()) {
                 err.code = static_cast<int>(IpcErrorCode::Busy);
                 err.message = "Daemon is busy (" + composite_state_name() + ")";
                 return false;
@@ -1256,17 +1464,18 @@ int main(int argc, char* argv[]) {
             }
         }
 
-        if (!ensure_models(cfg)) {
-            std::lock_guard<std::mutex> lock(g_state_mu);
-            g_recording.store(false);
-            err.code = static_cast<int>(IpcErrorCode::InternalError);
-            err.message = "Model setup failed";
-            return false;
-        }
+        // Phase C.7: the pre-C.7 inline-synchronous `ensure_models(cfg)` call
+        // is GONE. Model readiness is no longer resolved on the handler
+        // thread — it is lifted to *job-dequeue time*: when the postprocess
+        // job dequeues, JobQueue checks the model cache (via the wired
+        // ModelResolver + ModelCacheChecker) and, for any required-but-
+        // uncached model, auto-enqueues a JobKind::ModelDownload into the
+        // model_download slot and parks the postprocess job until the
+        // download completes. See pp_worker_loop / model_dl_worker_loop.
 
-        // Assign job_id for this recording
-        int64_t job_id = g_next_job_id.fetch_add(1);
-        log_info("daemon: record.start (mode=%s, job=%ld)",
+        // Assign a recording-side job_id (legacy record.start path).
+        int64_t job_id = g_next_rec_job_id.fetch_add(1);
+        log_info("daemon: record.start (mode=%s, rec_job=%ld)",
                  is_reprocess ? "reprocess" : "recording", (long)job_id);
 
         // Set reprocess flag on poll thread and broadcast
@@ -1278,7 +1487,12 @@ int main(int argc, char* argv[]) {
         // Join any previous recording worker
         if (g_rec_worker.joinable()) g_rec_worker.join();
 
-        g_rec_worker = std::thread([&server, cfg, is_reprocess, job_id]() {
+        // Owning client of the resulting postprocess job — C.7 threads this
+        // onto the JobQueue Job so the job_id -> client_id binding C.3 will
+        // consume is populated. May be empty (pre-session / stray request).
+        std::string rec_client_id = req.client_id;
+
+        g_rec_worker = std::thread([&server, cfg, is_reprocess, job_id, rec_client_id]() {
             log_debug("daemon: rec_worker ENTER (tid=%d, job=%ld)", (int)syscall(SYS_gettid), (long)job_id);
             auto on_phase = [&server](const std::string& phase) {
                 server.post([&server, phase]() {
@@ -1377,49 +1591,57 @@ int main(int argc, char* argv[]) {
                     }
                 }
 
-                // Enqueue postprocessing job
+                // Build the postprocess job. C.7: the payload moves into the
+                // unified JobQueue Job; `client_id` is threaded on so the
+                // job_id -> client_id binding is populated for C.3.
                 PostprocessJob job;
-                job.job_id = job_id;
                 job.input = std::move(input);
                 job.cfg = job_cfg;
+                // job.job_id is assigned by JobQueue::enqueue() below.
 
-                log_debug("daemon: rec_worker handoff to pp (job=%ld)", (long)job_id);
-                {
-                    std::lock_guard<std::mutex> qlock(g_queue_mu);
-                    g_job_queue.push(std::move(job));
-                }
+                // Atomic handoff (INVARIANT — preserved from pre-C.7,
+                // daemon.cpp's "set postprocessing BEFORE clearing
+                // recording"): the postprocess slot only reports "running"
+                // once the pp_worker has *dequeued* the job, which is a
+                // non-atomic window after enqueue(). g_pp_handoff bridges
+                // it — raised here BEFORE g_recording is cleared so
+                // composite_state_name() never reports a transient "idle";
+                // the pp_worker lowers it the instant it owns the job.
+                g_pp_handoff.store(true);
 
-                // Atomic handoff: set postprocessing BEFORE clearing recording
-                {
-                    std::lock_guard<std::mutex> lock(g_state_mu);
-                    g_postprocessing.store(true);
-                    log_debug("daemon: state postprocessing=true");
-                    g_recording.store(false);
-                }
+                int64_t pp_job_id = g_jobs->enqueue(std::move(job),
+                                                    JobKind::Postprocess,
+                                                    rec_client_id);
+                log_debug("daemon: rec_worker handoff to pp (rec_job=%ld -> "
+                          "pp_job=%ld, client=%s)",
+                          (long)job_id, (long)pp_job_id,
+                          rec_client_id.c_str());
+
+                g_recording.store(false);
 
                 // Clear reprocess flag and broadcast new state
                 server.post([&server]() {
                     g_is_reprocess = false;
                 });
                 broadcast_state(server);
-
-                // Wake the pp worker
-                g_queue_cv.notify_one();
-                log_debug("daemon: rec_worker EXIT (job=%ld)", (long)job_id);
+                log_debug("daemon: rec_worker EXIT (rec_job=%ld)", (long)job_id);
 
             } catch (const std::exception& e) {
                 fprintf(stderr, "Recording error: %s\n", e.what());
                 log_error("daemon: recording error: %s", e.what());
 
+                // Recording failed before any handoff — clear the recording
+                // gate; no postprocess job was enqueued so nothing to do on
+                // the JobQueue side (g_pp_handoff was never raised here).
                 {
-                    std::lock_guard<std::mutex> lock(g_state_mu);
+                    std::lock_guard<std::mutex> lock(g_rec_mu);
                     g_recording.store(false);
                 }
                 server.post([&server]() {
                     g_is_reprocess = false;
                 });
                 broadcast_state(server, e.what());
-                log_debug("daemon: rec_worker EXIT (job=%ld)", (long)job_id);
+                log_debug("daemon: rec_worker EXIT (rec_job=%ld)", (long)job_id);
             }
         });
 
@@ -1440,7 +1662,7 @@ int main(int argc, char* argv[]) {
         }
 
         bool rec = g_recording.load();
-        bool pp  = g_postprocessing.load();
+        bool pp  = jq_postprocessing();
 
         if (!rec && !pp) {
             err.code = static_cast<int>(IpcErrorCode::NotRecording);
@@ -1586,162 +1808,109 @@ int main(int argc, char* argv[]) {
         return true;
     });
 
-    server.on("models.ensure", [&server](const IpcRequest& req, IpcResponse& resp, IpcError& err) {
-        // Guard: !g_recording && !g_downloading (allow during postprocessing)
-        {
-            std::lock_guard<std::mutex> lock(g_state_mu);
-            if (g_recording.load() || g_downloading.load()) {
-                err.code = static_cast<int>(IpcErrorCode::Busy);
-                err.message = "Daemon is busy (" + composite_state_name() + ")";
-                return false;
-            }
-            g_downloading.store(true);
-        }
-
-        // Determine what to download
+    // C.7: models.ensure / models.update no longer spawn an ad-hoc
+    // g_dl_worker thread guarded by g_downloading. They enqueue
+    // JobKind::ModelDownload jobs into the JobQueue's model_download slot;
+    // the long-lived model_dl_worker_loop drains it. The slot's capacity-1
+    // FIFO is the single admission point — explicit downloads queue behind
+    // any auto-triggered one (and vice-versa) instead of racing.
+    server.on("models.ensure", [](const IpcRequest& req, IpcResponse& resp, IpcError& err) {
         Config cfg;
+        bool allow_dl;
         {
             std::lock_guard<std::mutex> lock(g_config_mu);
             cfg = g_config;
+            allow_dl = g_config.allow_client_downloads;
         }
+        // Download initiation policy (C.7): operator-disablable via
+        // `[server] allow_client_downloads`. Any PSK-authenticated client
+        // may trigger downloads when enabled (the default).
+        if (!allow_dl) {
+            err.code = static_cast<int>(IpcErrorCode::PermissionDenied);
+            err.message = "Client-initiated model downloads are disabled "
+                          "([server] allow_client_downloads=false)";
+            return false;
+        }
+
         auto it = req.params.find("whisper_model");
         std::string whisper_model = (it != req.params.end())
             ? json_val_as_string(it->second) : cfg.whisper_model;
-        bool want_sherpa = cfg.diarize;
-        bool want_vad = cfg.vad;
 
-        if (g_dl_worker.joinable()) g_dl_worker.join();
+        std::vector<std::string> enqueued;
+        auto enqueue_if_missing = [&](const std::string& model_id, bool missing) {
+            if (!missing) return;
+            Job j;
+            j.model_id = model_id;
+            j.force_download = false;   // ensure semantics: no-op if cached.
+            g_jobs->enqueue(std::move(j), JobKind::ModelDownload, req.client_id);
+            enqueued.push_back(model_id);
+        };
 
-        broadcast_state_inline(server);
-
-        g_dl_worker = std::thread([&server, whisper_model, want_sherpa, want_vad]() {
-            log_debug("daemon: dl_worker ENTER (tid=%d)", (int)syscall(SYS_gettid));
-            auto broadcast_dl = [&server](const std::string& model, const std::string& status) {
-                server.post([&server, model, status]() {
-                    IpcEvent ev;
-                    ev.event = "model.downloading";
-                    ev.data["model"] = model;
-                    ev.data["status"] = status;
-                    server.broadcast(ev);
-                });
-            };
-
-            try {
-                if (!is_whisper_model_cached(whisper_model)) {
-                    broadcast_dl("whisper/" + whisper_model, "downloading");
-                    ensure_whisper_model(whisper_model);
-                    broadcast_dl("whisper/" + whisper_model, "complete");
-                }
-
+        try {
+            enqueue_if_missing("whisper/" + whisper_model,
+                               !is_whisper_model_cached(whisper_model));
+        } catch (const std::exception& e) {
+            err.code = static_cast<int>(IpcErrorCode::InvalidParams);
+            err.message = e.what();
+            return false;
+        }
 #if RECMEET_USE_SHERPA
-                if (want_sherpa && !is_sherpa_model_cached()) {
-                    broadcast_dl("sherpa/diarization", "downloading");
-                    ensure_sherpa_models();
-                    broadcast_dl("sherpa/diarization", "complete");
-                }
-                if (want_vad && !is_vad_model_cached()) {
-                    broadcast_dl("vad", "downloading");
-                    ensure_vad_model();
-                    broadcast_dl("vad", "complete");
-                }
+        if (cfg.diarize)
+            enqueue_if_missing("sherpa/diarization", !is_sherpa_model_cached());
+        if (cfg.vad)
+            enqueue_if_missing("vad", !is_vad_model_cached());
 #endif
-            } catch (const std::exception& e) {
-                log_error("daemon: model download failed: %s", e.what());
-                server.post([&server, what = std::string(e.what())]() {
-                    IpcEvent ev;
-                    ev.event = "model.downloading";
-                    ev.data["status"] = std::string("error");
-                    ev.data["error"] = what;
-                    server.broadcast(ev);
-                });
-            }
-
-            {
-                std::lock_guard<std::mutex> lock(g_state_mu);
-                g_downloading.store(false);
-            }
-            log_debug("daemon: dl_worker EXIT");
-            broadcast_state(server);
-        });
 
         resp.result["ok"] = true;
+        resp.result["enqueued"] = static_cast<int64_t>(enqueued.size());
         return true;
     });
 
-    server.on("models.update", [&server](const IpcRequest&, IpcResponse& resp, IpcError& err) {
-        // Guard: !g_recording && !g_downloading (allow during postprocessing)
+    server.on("models.update", [](const IpcRequest& req, IpcResponse& resp, IpcError& err) {
+        bool allow_dl;
         {
-            std::lock_guard<std::mutex> lock(g_state_mu);
-            if (g_recording.load() || g_downloading.load()) {
-                err.code = static_cast<int>(IpcErrorCode::Busy);
-                err.message = "Daemon is busy (" + composite_state_name() + ")";
-                return false;
-            }
-            g_downloading.store(true);
+            std::lock_guard<std::mutex> lock(g_config_mu);
+            allow_dl = g_config.allow_client_downloads;
+        }
+        if (!allow_dl) {
+            err.code = static_cast<int>(IpcErrorCode::PermissionDenied);
+            err.message = "Client-initiated model downloads are disabled "
+                          "([server] allow_client_downloads=false)";
+            return false;
         }
 
-        if (g_dl_worker.joinable()) g_dl_worker.join();
-
-        broadcast_state_inline(server);
-
-        g_dl_worker = std::thread([&server]() {
-            log_debug("daemon: dl_worker ENTER (tid=%d)", (int)syscall(SYS_gettid));
-            auto broadcast_dl = [&server](const std::string& model, const std::string& status) {
-                server.post([&server, model, status]() {
-                    IpcEvent ev;
-                    ev.event = "model.downloading";
-                    ev.data["model"] = model;
-                    ev.data["status"] = status;
-                    server.broadcast(ev);
-                });
-            };
-
-            auto models = list_cached_models();
-            bool sherpa_updated = false;
-
-            for (const auto& m : models) {
-                if (!m.cached) continue;
-
-                try {
-                    std::string label = m.category + "/" + m.name;
-                    if (m.category == "whisper") {
-                        broadcast_dl(label, "downloading");
-                        download_whisper_model(m.name);
-                        broadcast_dl(label, "complete");
-                    }
+        // Refresh every currently-cached model: one ModelDownload job per
+        // model, force_download=true so it re-fetches even when cached.
+        auto models = list_cached_models();
+        std::vector<std::string> enqueued;
+        bool sherpa_enqueued = false;
+        for (const auto& m : models) {
+            if (!m.cached) continue;
+            std::string model_id;
+            if (m.category == "whisper") {
+                model_id = "whisper/" + m.name;
+            }
 #if RECMEET_USE_SHERPA
-                    else if (m.category == "sherpa" && !sherpa_updated) {
-                        broadcast_dl("sherpa/diarization", "downloading");
-                        download_sherpa_models();
-                        broadcast_dl("sherpa/diarization", "complete");
-                        sherpa_updated = true;
-                    } else if (m.category == "vad") {
-                        broadcast_dl("vad", "downloading");
-                        download_vad_model();
-                        broadcast_dl("vad", "complete");
-                    }
+            else if (m.category == "sherpa") {
+                if (sherpa_enqueued) continue;
+                model_id = "sherpa/diarization";
+                sherpa_enqueued = true;
+            } else if (m.category == "vad") {
+                model_id = "vad";
+            }
 #endif
-                } catch (const std::exception& e) {
-                    log_error("daemon: model update failed: %s", e.what());
-                    server.post([&server, what = std::string(e.what())]() {
-                        IpcEvent ev;
-                        ev.event = "model.downloading";
-                        ev.data["status"] = std::string("error");
-                        ev.data["error"] = what;
-                        server.broadcast(ev);
-                    });
-                }
+            else {
+                continue;
             }
-
-            {
-                std::lock_guard<std::mutex> lock(g_state_mu);
-                g_downloading.store(false);
-            }
-            log_debug("daemon: dl_worker EXIT");
-            broadcast_state(server);
-        });
+            Job j;
+            j.model_id = model_id;
+            j.force_download = true;
+            g_jobs->enqueue(std::move(j), JobKind::ModelDownload, req.client_id);
+            enqueued.push_back(model_id);
+        }
 
         resp.result["ok"] = true;
+        resp.result["enqueued"] = static_cast<int64_t>(enqueued.size());
         return true;
     });
 
@@ -1754,8 +1923,11 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    // Start the long-lived postprocessing worker
+    // Start the long-lived slot workers: one drains the JobQueue's
+    // postprocess slot, one drains its model_download slot. Both block in
+    // JobQueue::dequeue() until shutdown() wakes them with std::nullopt.
     g_pp_worker = std::thread([&server]() { pp_worker_loop(server); });
+    g_dl_worker = std::thread([&server]() { model_dl_worker_loop(server); });
 
     // Signal handlers
     struct sigaction sa{};
@@ -1777,12 +1949,10 @@ int main(int argc, char* argv[]) {
     g_pp_stop.request();
     { pid_t child = g_pp_child_pid.load(); if (child > 0) kill(child, SIGTERM); }
 
-    // Shut down the pp worker queue
-    {
-        std::lock_guard<std::mutex> lock(g_queue_mu);
-        g_queue_shutdown = true;
-    }
-    g_queue_cv.notify_one();
+    // Shut down the JobQueue: wakes every dequeue() caller (pp_worker and
+    // model_dl_worker) with std::nullopt so both slot workers exit their
+    // loops. Successor of the pre-C.7 g_queue_shutdown + g_queue_cv model.
+    if (g_jobs) g_jobs->shutdown();
 
     log_debug("daemon: shutdown: joining rec_worker...");
     if (g_rec_worker.joinable()) g_rec_worker.join();

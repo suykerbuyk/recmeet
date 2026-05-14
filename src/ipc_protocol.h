@@ -116,6 +116,10 @@ enum class IpcErrorCode : int {
     AlreadyRecording = 1,
     NotRecording     = 2,
     Busy             = 3,
+    // Phase C.7 — operator policy refused the request (e.g.
+    // `[server] allow_client_downloads=false` blocking a client-initiated
+    // model download). Distinct from Busy: retrying will not help.
+    PermissionDenied = 4,
 };
 
 // ---------------------------------------------------------------------------

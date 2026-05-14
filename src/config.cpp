@@ -307,6 +307,30 @@ Config load_config(const fs::path& config_path) {
                          cfg.max_clients);
         }
     }
+    {
+        // Phase C.7 — `[server] slot.*` JobQueue capacities and
+        // `allow_client_downloads`. Same warn-and-fallback shape as the
+        // [ipc] knobs above: a zero/negative slot override is a typo, not
+        // an opt-out, so the struct default of 1 is kept.
+        auto parse_slot = [&](const char* key, int& dst) {
+            std::string v = get_val(entries, "server", key, "");
+            if (v.empty()) return;
+            long long n = std::atoll(v.c_str());
+            if (n > 0) dst = static_cast<int>(n);
+            else
+                log_warn("config: invalid [server] slot.%s=%s; keeping "
+                         "default %d", key, v.c_str(), dst);
+        };
+        parse_slot("slot.postprocess", cfg.slot_postprocess);
+        parse_slot("slot.streaming", cfg.slot_streaming);
+        parse_slot("slot.model_download", cfg.slot_model_download);
+
+        std::string acd = get_val(entries, "server", "allow_client_downloads", "");
+        if (!acd.empty()) {
+            cfg.allow_client_downloads =
+                (acd == "true" || acd == "1" || acd == "yes" || acd == "on");
+        }
+    }
 
     return cfg;
 }
@@ -474,9 +498,27 @@ void save_config(const Config& cfg, const fs::path& config_path) {
         if (cfg.max_clients != 16)
             out << "  max_clients: " << cfg.max_clients << "\n";
     }
-    if (cfg.max_upload_bytes != 4ull * 1024 * 1024 * 1024) {
-        out << "\nserver:\n"
-            << "  max_upload_bytes: " << cfg.max_upload_bytes << "\n";
+    {
+        // Phase C.7 — emit a [server] section when any server-scoped knob
+        // diverges from its struct default. max_upload_bytes plus the
+        // C.7 JobQueue slot capacities and allow_client_downloads.
+        bool emit_server_section =
+            cfg.max_upload_bytes != 4ull * 1024 * 1024 * 1024 ||
+            cfg.slot_postprocess != 1 || cfg.slot_streaming != 1 ||
+            cfg.slot_model_download != 1 || !cfg.allow_client_downloads;
+        if (emit_server_section) {
+            out << "\nserver:\n";
+            if (cfg.max_upload_bytes != 4ull * 1024 * 1024 * 1024)
+                out << "  max_upload_bytes: " << cfg.max_upload_bytes << "\n";
+            if (cfg.slot_postprocess != 1)
+                out << "  slot.postprocess: " << cfg.slot_postprocess << "\n";
+            if (cfg.slot_streaming != 1)
+                out << "  slot.streaming: " << cfg.slot_streaming << "\n";
+            if (cfg.slot_model_download != 1)
+                out << "  slot.model_download: " << cfg.slot_model_download << "\n";
+            if (!cfg.allow_client_downloads)
+                out << "  allow_client_downloads: false\n";
+        }
     }
 
     out.close();

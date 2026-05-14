@@ -33,11 +33,29 @@ void download_file(const std::string& url, const fs::path& dest) {
     // Use libcurl to download with progress
     auto data = http_get(url);
 
-    std::ofstream out(dest, std::ios::binary);
-    if (!out)
-        throw RecmeetError("Cannot write to: " + dest.string());
-    out.write(data.data(), data.size());
-    out.close();
+    // Phase C.7 — atomic rename on download write. Write the bytes to a
+    // per-destination `*.tmp` sidecar and atomically rename it onto the
+    // final path only once the whole payload is on disk. This makes the
+    // download of one model race-free against concurrent *reads* of an
+    // already-cached different model: a reader either sees the old file,
+    // the fully-written new file, or nothing — never a half-written one.
+    fs::path tmp = dest;
+    tmp += ".tmp";
+    {
+        std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
+        if (!out)
+            throw RecmeetError("Cannot write to: " + tmp.string());
+        out.write(data.data(), data.size());
+        out.close();
+        if (!out)
+            throw RecmeetError("Write failed for: " + tmp.string());
+    }
+    std::error_code ec;
+    fs::rename(tmp, dest, ec);
+    if (ec) {
+        fs::remove(tmp, ec);
+        throw RecmeetError("Cannot publish download to: " + dest.string());
+    }
 
     log_info("Downloaded: %s (%.1f MB)", dest.filename().c_str(),
             data.size() / (1024.0 * 1024.0));

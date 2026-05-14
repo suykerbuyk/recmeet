@@ -164,6 +164,25 @@ struct Config {
     // listen backlog is automatically raised to `max_clients * 2` so the
     // kernel queue does not bottleneck before the daemon-side cap engages.
     size_t max_clients = 16;
+
+    // Phase C.7 — server-side JobQueue typed-slot capacities. The daemon's
+    // three independent capacity-1 slots: postprocess, streaming, and
+    // model_download. A postprocess + a streaming + a model_download job
+    // can all run concurrently; two jobs of the same kind queue serially.
+    // Wired from `[server] slot.postprocess` / `slot.streaming` /
+    // `slot.model_download`. Defaults all 1 (the typed-slot invariant);
+    // a zero/negative override is treated as a typo and falls back to 1.
+    int slot_postprocess = 1;
+    int slot_streaming = 1;
+    int slot_model_download = 1;
+
+    // Phase C.7 — download initiation policy. When true (default) any
+    // PSK-authenticated client may trigger a model download (directly via
+    // models.ensure / models.update, or implicitly when a job it owns
+    // dequeues against an uncached model). Operators set
+    // `[server] allow_client_downloads: false` to disable client-driven
+    // downloads entirely. Wired from `[server] allow_client_downloads`.
+    bool allow_client_downloads = true;
 };
 
 /// Load config. Uses path if provided, otherwise ~/.config/recmeet/config.yaml.
