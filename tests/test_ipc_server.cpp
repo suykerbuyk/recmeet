@@ -1472,3 +1472,172 @@ TEST_CASE("A.4: broadcast() still fans out to every connected client",
     server.stop();
     srv.join();
 }
+
+// ---------------------------------------------------------------------------
+// Phase A.5 — Wire protocol versioning (auth.ok carries protocol_version,
+// client rejects mismatched/missing field)
+// ---------------------------------------------------------------------------
+
+TEST_CASE("A.5: auth.ok carries IPC_PROTOCOL_VERSION (Unix)",
+          "[ipc][a5]") {
+    // Daemon must stamp `protocol_version` into the synthetic auth.ok
+    // frame on the Unix accept path. We read the raw bytes off the fd
+    // (bypassing IpcClient so the assertion is on the wire shape, not
+    // the parser) and check both fields are present.
+    unlink(TEST_SOCK);
+    IpcServer server(TEST_SOCK);
+    REQUIRE(server.start());
+    std::thread srv([&server]() { server.run(); });
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+    int fd = a4_connect_raw(TEST_SOCK);
+    REQUIRE(fd >= 0);
+
+    std::string line = read_line(fd, 2000);
+    REQUIRE_FALSE(line.empty());
+    CHECK(line.find("\"type\":\"auth.ok\"") != std::string::npos);
+    CHECK(line.find("\"client_id\":\"") != std::string::npos);
+    // Wire shape: `"protocol_version":1` (no quotes, unescaped integer).
+    const std::string expected = "\"protocol_version\":"
+                                 + std::to_string(IPC_PROTOCOL_VERSION);
+    CHECK(line.find(expected) != std::string::npos);
+
+    close(fd);
+    server.stop();
+    srv.join();
+}
+
+TEST_CASE("A.5: auth.ok carries IPC_PROTOCOL_VERSION (TCP)",
+          "[ipc][a5]") {
+    // Same wire-shape check on the TCP path. We can use IpcClient here
+    // because the matching-version path is the happy case (no need to
+    // bypass parsing); we then sanity-check the public getters surface
+    // the constant.
+    const char* prev = std::getenv("RECMEET_AUTH_TOKEN");
+    std::string prev_str = prev ? prev : "";
+    setenv("RECMEET_AUTH_TOKEN", "a5-tcp-token", 1);
+
+    IpcServer server("127.0.0.1:19896");
+    server.set_psk("a5-tcp-token");
+    REQUIRE(server.start());
+    std::thread srv([&server]() { server.run(); });
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+    IpcClient c("127.0.0.1:19896");
+    REQUIRE(c.connect());
+
+    CHECK_FALSE(c.client_id().empty());
+    CHECK(c.protocol_version() == IPC_PROTOCOL_VERSION);
+    CHECK_FALSE(c.protocol_mismatch());
+
+    c.close_connection();
+    // After close, protocol_version() returns 0 for symmetry with client_id().
+    CHECK(c.protocol_version() == 0);
+
+    server.stop();
+    srv.join();
+
+    if (prev) setenv("RECMEET_AUTH_TOKEN", prev_str.c_str(), 1);
+    else      unsetenv("RECMEET_AUTH_TOKEN");
+}
+
+TEST_CASE("A.5: mismatched protocol_version fails connect and latches flag",
+          "[ipc][a5]") {
+    // Use the test seam to make the server stamp a different version
+    // than the client expects. IpcClient::connect() must return false,
+    // protocol_mismatch() must be true, and client_id() must remain empty.
+    unlink(TEST_SOCK);
+    IpcServer server(TEST_SOCK);
+    // Pretend the server speaks a future version that the client does
+    // not understand. Reusing IPC_PROTOCOL_VERSION + 1 guarantees a
+    // mismatch regardless of the current constant.
+    server.set_protocol_version_for_test(IPC_PROTOCOL_VERSION + 1);
+    REQUIRE(server.start());
+    std::thread srv([&server]() { server.run(); });
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+    IpcClient c(TEST_SOCK);
+    CHECK_FALSE(c.connect());
+    CHECK(c.protocol_mismatch());
+    CHECK(c.client_id().empty());
+    // The seen value is captured so operators can debug what the server
+    // reported even after the connection is torn down.
+    CHECK(c.protocol_version() == IPC_PROTOCOL_VERSION + 1);
+    CHECK_FALSE(c.connected());
+
+    server.stop();
+    srv.join();
+}
+
+TEST_CASE("A.5: missing protocol_version is treated as mismatch",
+          "[ipc][a5]") {
+    // Pre-A.5 daemon simulation: stamp a negative version so the server
+    // emits the auth.ok frame WITHOUT a `protocol_version` field. The
+    // client must reject the same way as a numeric mismatch and the
+    // mismatch flag must surface true with seen=0.
+    unlink(TEST_SOCK);
+    IpcServer server(TEST_SOCK);
+    server.set_protocol_version_for_test(-1);  // suppress field
+    REQUIRE(server.start());
+    std::thread srv([&server]() { server.run(); });
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+    // Sanity-check the wire shape directly before involving IpcClient:
+    // the field really should be absent on this path.
+    int fd = a4_connect_raw(TEST_SOCK);
+    REQUIRE(fd >= 0);
+    std::string line = read_line(fd, 2000);
+    REQUIRE_FALSE(line.empty());
+    CHECK(line.find("\"type\":\"auth.ok\"") != std::string::npos);
+    CHECK(line.find("\"protocol_version\"") == std::string::npos);
+    close(fd);
+
+    // Now run the same scenario through IpcClient and confirm it
+    // rejects the handshake.
+    IpcClient c(TEST_SOCK);
+    CHECK_FALSE(c.connect());
+    CHECK(c.protocol_mismatch());
+    CHECK(c.client_id().empty());
+    // Absent field → reported version is 0 (no observable wire value).
+    CHECK(c.protocol_version() == 0);
+
+    server.stop();
+    srv.join();
+}
+
+TEST_CASE("A.5: successful reconnect clears prior mismatch flag",
+          "[ipc][a5]") {
+    // The plan body specifies that `protocol_mismatch_` is latched
+    // through the failed connect's return and only cleared on the next
+    // connect(). Drive a mismatch, then re-point at a daemon speaking
+    // the matching version and confirm the flag is clean.
+    unlink(TEST_SOCK);
+    IpcServer bad_server(TEST_SOCK);
+    bad_server.set_protocol_version_for_test(IPC_PROTOCOL_VERSION + 42);
+    REQUIRE(bad_server.start());
+    std::thread bad_srv([&bad_server]() { bad_server.run(); });
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+    IpcClient c(TEST_SOCK);
+    CHECK_FALSE(c.connect());
+    CHECK(c.protocol_mismatch());
+
+    bad_server.stop();
+    bad_srv.join();
+    unlink(TEST_SOCK);
+
+    // Stand up a fresh server at the matching version and reconnect.
+    IpcServer good_server(TEST_SOCK);
+    REQUIRE(good_server.start());
+    std::thread good_srv([&good_server]() { good_server.run(); });
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+    CHECK(c.connect());
+    CHECK_FALSE(c.protocol_mismatch());
+    CHECK(c.protocol_version() == IPC_PROTOCOL_VERSION);
+    CHECK_FALSE(c.client_id().empty());
+
+    c.close_connection();
+    good_server.stop();
+    good_srv.join();
+}
