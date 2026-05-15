@@ -25,6 +25,16 @@
 //                             - the daemon broadcasts caption /
 //                               caption.degraded IPC events
 //   process.stream.cancel  -> StreamingSessionManager::cancel()
+//   process.stream.commit  -> StreamingSessionManager::commit()
+//                             (C.10b) — flush + close the temp WAV, reserve
+//                             a Postprocess job_id, enqueue a postprocess Job
+//                             whose `input.out_dir` / `cfg.reprocess_dir` point
+//                             at the temp WAV's parent directory, release the
+//                             streaming slot (mark the streaming job Done).
+//                             The temp WAV is NOT unlinked — the postprocess
+//                             subprocess will read it. The client monitors
+//                             the new postprocess job_id via `progress.job` +
+//                             `process.fetch`.
 //   TCP drop mid-stream    -> StreamingSessionManager::on_client_disconnect()
 //                             - marks the JobQueue job failed
 //                             - discards the ASR session
@@ -159,6 +169,35 @@ private:
     int64_t      bytes_written_ = 0;
 
     std::unique_ptr<CaptionEngine> engine_;
+
+    /// Phase C.10b — per-session config snapshot captured at create() time.
+    /// Mirrors C.2's UploadSession::pp_cfg_snapshots_ pattern: the daemon
+    /// freezes the live `Config` (which already folds in session.init
+    /// preferences via session.update_* merges into g_config) so that a
+    /// concurrent config.reload between `process.stream` and
+    /// `process.stream.commit` cannot surprise the postprocess handoff.
+    /// Used by `commit()` to populate `Job.cfg` for the new Postprocess
+    /// job.
+    Config       pp_cfg_;
+
+    /// Phase C.10b — the meeting context the client passed at
+    /// `process.stream` time. Forwarded to the postprocess subprocess at
+    /// commit via `Job.cfg.context_inline`, matching what
+    /// process.submit does with its `context` parameter.
+    std::string  context_inline_;
+
+    /// Phase C.10b — true once `commit()` has rewritten `Job.cfg` and
+    /// successfully enqueued a Postprocess job whose input is THIS
+    /// session's temp WAV. When set:
+    ///   * `~StreamingSession` must NOT unlink the WAV — it is the
+    ///     postprocess subprocess's input, owned by the new Job's
+    ///     `input.out_dir`.
+    ///   * `teardown_locked()` likewise skips the unlink.
+    /// We picked the bool-flag option (option ii in the C.10b plan) over
+    /// option i (clear `wav_path_`) because tests and logs still want the
+    /// committed path for assertions, and over option iii (restructure)
+    /// because the smaller surface is safer this late in Phase C.
+    bool         committed_ = false;
 };
 
 // ---------------------------------------------------------------------------
@@ -202,9 +241,17 @@ public:
     /// On any failure nothing is left allocated — the slot is released, the
     /// WAV unlinked. `temp_dir` is where the staging WAV is created
     /// (defaults to the system temp dir when empty).
+    ///
+    /// Phase C.10b — `pp_cfg` is the per-client postprocess config snapshot
+    /// the daemon captures at `process.stream` time (mirrors C.2's
+    /// `process.submit` snapshot). The session freezes it for use at
+    /// `commit()` time, so the postprocess Job built then reflects the
+    /// preferences live at start-of-stream rather than a stale or
+    /// concurrently-reloaded daemon Config. Tests can pass a default Config{}.
     CreateResult create(const std::string& client_id,
                         const StreamRequest& req,
-                        const fs::path& temp_dir = {});
+                        const fs::path& temp_dir = {},
+                        const Config& pp_cfg = Config{});
 
     /// Route a `0x03` streaming-audio payload (raw S16LE PCM bytes) to the
     /// session identified by `stream_token`. Appends the PCM to the
@@ -240,6 +287,58 @@ public:
     /// active session is bound to `job_id` (e.g. the streaming job is
     /// already finalized or in a terminal state).
     bool cancel_by_job_id(int64_t job_id);
+
+    /// Phase C.10b — `process.stream.commit` result. `ok=false` carries a
+    /// human-readable `error` and an `IpcErrorCode`-compatible `code` for
+    /// the handler. On success, `postprocess_job_id` is a fresh
+    /// JobQueue::Postprocess job_id (different from the streaming job_id)
+    /// the client uses to monitor the postprocess pipeline via
+    /// `progress.job` + `process.fetch`.
+    struct CommitResult {
+        bool        ok = false;
+        int         code = 0;              ///< IpcErrorCode value on failure
+        std::string error;
+        int64_t     postprocess_job_id = 0;
+    };
+
+    /// Phase C.10b — finalize the streaming session referenced by
+    /// `stream_token` and hand the accumulated audio off to a normal
+    /// postprocess job. Validation:
+    ///   * unknown `stream_token`               → InvalidParams.
+    ///   * session not owned by `client_id`     → PermissionDenied.
+    ///   * session already committed / torn down → InvalidParams
+    ///     (defensive — `commit()` erases the session from the map at the
+    ///     end of its critical section, so a second commit hits the
+    ///     "unknown stream_token" path. This branch covers a hypothetical
+    ///     post-erase residue and matches the plan's "not in a
+    ///     committable state" guard).
+    /// Action (under the manager's mutex, in this order):
+    ///   a. Stop the CaptionEngine (flush + join its worker thread). The
+    ///      engine's final partial caption tokens fire through the existing
+    ///      sink path on the way out.
+    ///   b. sf_close() the temp WAV — header rewritten with the final
+    ///      data-chunk size, file is now a valid WAV.
+    ///   c. Do NOT unlink the temp WAV — the postprocess subprocess is
+    ///      about to read it. The session's `committed_` flag is set so
+    ///      `~StreamingSession` skips the unlink too.
+    ///   d. Reserve a Postprocess job_id via
+    ///      `JobQueue::reserve_job_id(Postprocess, client_id)`.
+    ///   e. Build a `Job` with `input.out_dir` / `cfg.reprocess_dir` set
+    ///      to the temp WAV's parent directory, `cfg` copied from the
+    ///      session's preference snapshot (the daemon's pp_worker writes
+    ///      the cfg JSON the subprocess consumes — same shape as C.2's
+    ///      process.submit finalize).
+    ///   f. `JobQueue::enqueue_reserved(reserved_id, std::move(job))` so
+    ///      the job becomes runnable.
+    ///   g. Call `JobQueue::finish(stream_job_id, /*ok=*/true)` to release
+    ///      the streaming slot (the streaming-slot job lands as Done).
+    ///   h. Erase the session from the map.
+    /// Returns a `CommitResult` whose `postprocess_job_id` is the new
+    /// Postprocess job's id; the client monitors it via `progress.job` +
+    /// `process.fetch`. The streaming-side `job_id` is not returned —
+    /// it is in terminal Done state and not useful afterwards.
+    CommitResult commit(const std::string& client_id,
+                        const std::string& stream_token);
 
     /// Handle a client disconnect. Aborts every session owned by
     /// `client_id`: marks each JobQueue job Failed, stops the engine,

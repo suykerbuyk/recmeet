@@ -483,6 +483,7 @@ if(RECMEET_BUILD_TESTS)
         tests/streaming_capture_tests.cpp
         tests/streaming_engine_tests.cpp
         tests/test_streaming_session.cpp
+        tests/test_stream_commit.cpp
         tests/test_upload_session.cpp
         tests/test_caption_ipc_integration.cpp
         tests/test_caption_model_manager.cpp

@@ -1828,7 +1828,25 @@ int main(int argc, char* argv[]) {
         sr.latency_budget_ms = static_cast<int>(gi("latency_budget_ms",
                                                    sr.latency_budget_ms));
 
-        auto cr = g_streaming->create(req.client_id, sr);
+        // Phase C.10b — snapshot the per-client postprocess config at
+        // `process.stream` time, exactly as `process.submit` does at
+        // submit time. The streaming session freezes this snapshot so a
+        // later `process.stream.commit` builds its postprocess Job from
+        // the preferences live when the stream STARTED (not from a
+        // concurrently-reloaded daemon Config). The default temp_dir
+        // (system temp) is used here; production daemons can swap it
+        // later via a config knob.
+        Config stream_pp_cfg;
+        {
+            std::lock_guard<std::mutex> lock(g_config_mu);
+            stream_pp_cfg = g_config;
+        }
+        // Mirror process.submit: clear any stale `reprocess_dir` from the
+        // global Config snapshot; commit() sets it from the temp WAV's
+        // parent directory.
+        stream_pp_cfg.reprocess_dir.clear();
+
+        auto cr = g_streaming->create(req.client_id, sr, {}, stream_pp_cfg);
         if (!cr.ok) {
             err.code = cr.code;
             err.message = cr.error;
@@ -1863,6 +1881,58 @@ int main(int argc, char* argv[]) {
         }
         broadcast_state_inline(server);
         resp.result["ok"] = true;
+        return true;
+    });
+
+    // --- Phase C.10b — process.stream.commit (finalize handoff) ---
+    //
+    // process.stream.commit — finalize a streaming session: flush + close
+    //                         the temp WAV, hand the accumulated audio off
+    //                         to a fresh Postprocess job (transcribe +
+    //                         diarize + summarize), release the streaming
+    //                         slot. Request: { stream_token }. Response:
+    //                         { job_id: <postprocess job_id>, ok: true }.
+    //                         The client monitors the new job via
+    //                         `progress.job` + `process.fetch` exactly as
+    //                         it would for a `process.submit` job.
+    //
+    // Validation chain (narrowest reject first):
+    //   1. Missing `stream_token`              → InvalidParams
+    //   2. Unknown stream_token                → InvalidParams
+    //   3. Stream not owned by req.client_id   → PermissionDenied
+    //   4. Session not in a committable state  → InvalidParams
+    //
+    // The full action is documented at StreamingSessionManager::commit;
+    // the daemon handler is a thin shell over it.
+    server.on("process.stream.commit",
+              [&server](const IpcRequest& req, IpcResponse& resp, IpcError& err) {
+        if (!g_streaming) {
+            err.code = static_cast<int>(IpcErrorCode::InternalError);
+            err.message = "streaming subsystem unavailable";
+            return false;
+        }
+        auto it = req.params.find("stream_token");
+        if (it == req.params.end() || json_val_as_string(it->second).empty()) {
+            err.code = static_cast<int>(IpcErrorCode::InvalidParams);
+            err.message = "process.stream.commit: missing 'stream_token'";
+            return false;
+        }
+        std::string token = json_val_as_string(it->second);
+        auto cr = g_streaming->commit(req.client_id, token);
+        if (!cr.ok) {
+            err.code = cr.code;
+            err.message = cr.error;
+            return false;
+        }
+        // `job_id` on the wire is the NEW postprocess job_id (not the
+        // streaming job's id). The client uses it for progress.job +
+        // process.fetch follow-ups.
+        resp.result["job_id"] = cr.postprocess_job_id;
+        resp.result["ok"] = true;
+        broadcast_state_inline(server);
+        log_info("daemon: process.stream.commit OK (postprocess_job=%ld "
+                 "client=%s)",
+                 (long)cr.postprocess_job_id, req.client_id.c_str());
         return true;
     });
 

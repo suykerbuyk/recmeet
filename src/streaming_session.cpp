@@ -121,7 +121,13 @@ StreamingSession::~StreamingSession() {
         sf_close(static_cast<SNDFILE*>(wav_));
         wav_ = nullptr;
     }
-    unlink_quiet(wav_path_);
+    // Phase C.10b — a committed session must NOT unlink its WAV: the file is
+    // the postprocess subprocess's input and the new Postprocess Job's
+    // `input.out_dir` directory owns it. The commit() path closes the WAV
+    // BEFORE setting `committed_` (so libsndfile flushes the header) and
+    // erases the session from the manager's map; this destructor still runs
+    // for the unique_ptr's value, and the flag tells us to skip the unlink.
+    if (!committed_) unlink_quiet(wav_path_);
 }
 
 // ===========================================================================
@@ -157,14 +163,23 @@ void StreamingSessionManager::teardown_locked(StreamingSession* sess) {
         sf_close(static_cast<SNDFILE*>(sess->wav_));
         sess->wav_ = nullptr;
     }
-    unlink_quiet(sess->wav_path_);
-    sess->wav_path_.clear();
+    // Phase C.10b — `cancel()` / disconnect paths reach here with
+    // `committed_ == false`, so they unlink as before. `commit()` does NOT
+    // call teardown_locked — it has its own do-not-unlink finalize path —
+    // but we keep this guard symmetric with the destructor's so a future
+    // caller can't accidentally trip a double-teardown that would unlink a
+    // committed WAV out from under the postprocess subprocess.
+    if (!sess->committed_) {
+        unlink_quiet(sess->wav_path_);
+        sess->wav_path_.clear();
+    }
 }
 
 StreamingSessionManager::CreateResult
 StreamingSessionManager::create(const std::string& client_id,
                                 const StreamRequest& req,
-                                const fs::path& temp_dir) {
+                                const fs::path& temp_dir,
+                                const Config& pp_cfg) {
     CreateResult res;
 
     // --- Validate request shape (cheap checks first, before any allocation).
@@ -272,6 +287,13 @@ StreamingSessionManager::create(const std::string& client_id,
     sess->wav_path_ = wav_path;
     sess->wav_ = wav;
     sess->bytes_written_ = 0;
+    // Phase C.10b — freeze the per-client postprocess config snapshot the
+    // daemon passed in. We do NOT clear `reprocess_dir` here: the daemon
+    // already passes a snapshot with whatever reprocess context it wants;
+    // commit() unconditionally overwrites it with the streaming temp WAV's
+    // parent directory, mirroring C.2's process.submit finalize.
+    sess->pp_cfg_ = pp_cfg;
+    sess->context_inline_ = req.context;
     StreamingSession* sess_ptr = sess.get();
 
     // --- Start the CaptionEngine (the producer migrates to feed_audio()).
@@ -448,6 +470,162 @@ bool StreamingSessionManager::cancel_by_job_id(int64_t job_id) {
     log_debug("[streaming] cancel_by_job_id: no live session for job=%ld",
               (long)job_id);
     return false;
+}
+
+StreamingSessionManager::CommitResult
+StreamingSessionManager::commit(const std::string& client_id,
+                                const std::string& stream_token) {
+    CommitResult res;
+
+    // Build the postprocess Job OUTSIDE the JobQueue calls but UNDER the
+    // manager's mutex — same shape as cancel_session_locked: lock the map,
+    // do all the local teardown + Job assembly, then run the JobQueue
+    // mutations. `enqueue_reserved` takes its own JobQueue lock; we keep
+    // the manager lock around it so a concurrent disconnect / cancel
+    // cannot race the commit. The two locks form a strict order
+    // (manager mutex → JobQueue mutex) in this direction only; no other
+    // call path inverts it.
+    int64_t reserved_pp_id = 0;
+    int64_t stream_job_id = 0;
+    fs::path wav_dir;
+    Job pp_job;
+    bool need_finish_stream = false;
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        auto it = sessions_.find(stream_token);
+        if (it == sessions_.end()) {
+            res.code = static_cast<int>(IpcErrorCode::InvalidParams);
+            res.error = "process.stream.commit: unknown stream_token";
+            return res;
+        }
+        StreamingSession* sess = it->second.get();
+        if (sess->client_id_ != client_id) {
+            res.code = static_cast<int>(IpcErrorCode::PermissionDenied);
+            res.error = "process.stream.commit: stream_token is not owned "
+                        "by this client";
+            return res;
+        }
+        // Committable-state guard. Today the only way to reach here with a
+        // session that is mid-teardown is a race we cannot create (cancel /
+        // disconnect both erase under mu_, and commit() likewise erases at
+        // the end of its own critical section). The check is defensive
+        // against future code paths that might leave a session in the map
+        // post-teardown (e.g. a partial-failure recovery). `wav_ == null`
+        // means the engine was torn down out from under us — refuse rather
+        // than enqueue a Job that points at a closed / unlinked file.
+        if (sess->committed_) {
+            res.code = static_cast<int>(IpcErrorCode::InvalidParams);
+            res.error = "process.stream.commit: session already committed";
+            return res;
+        }
+        if (!sess->wav_) {
+            // Engine path was set up but the disk-backed WAV is gone — the
+            // streaming session has no buffered audio to hand off.
+            res.code = static_cast<int>(IpcErrorCode::InvalidParams);
+            res.error = "process.stream.commit: session has no buffered "
+                        "audio (WAV not open)";
+            return res;
+        }
+
+        stream_job_id = sess->job_id_;
+        wav_dir = sess->wav_path_.parent_path();
+
+        // (a) Stop the CaptionEngine — flush + join its worker thread. Any
+        //     final partial-caption tokens fire through the existing sink
+        //     path on the way out, before this returns. Mirrors the
+        //     teardown_locked ordering: engine before WAV close.
+        if (sess->engine_) {
+            sess->engine_->stop();
+            sess->engine_.reset();
+        }
+
+        // (b) Close the temp WAV. libsndfile rewrites the data-chunk size
+        //     header on close, so the file on disk is a valid WAV after
+        //     this returns. We do this BEFORE the JobQueue handoff so the
+        //     postprocess subprocess opens a file with a correct header.
+        sf_close(static_cast<SNDFILE*>(sess->wav_));
+        sess->wav_ = nullptr;
+
+        // (c) Mark the session committed so ~StreamingSession (and the
+        //     defensive teardown_locked branch) skip the unlink. We set
+        //     this BEFORE reserving the postprocess id so even an
+        //     enqueue_reserved failure leaves the WAV intact for retry
+        //     visibility — the alternative (unlink on failure) would
+        //     silently delete the operator's recording.
+        sess->committed_ = true;
+
+        // (d) Reserve a Postprocess job_id. The reservation creates a
+        //     registry entry in WaitingForUpload (the C.2 sentinel —
+        //     conceptually analogous: "the job exists but is not yet
+        //     runnable"); enqueue_reserved flips it to Queued.
+        reserved_pp_id = jobs_.reserve_job_id(JobKind::Postprocess, client_id);
+
+        // (e) Build the Job payload. `input.out_dir` and `cfg.reprocess_dir`
+        //     both point at the temp WAV's parent directory — exactly the
+        //     shape C.2's UploadSession::feed_chunk produces at finalize.
+        //     The pp_worker_loop will set `cfg.reprocess_dir` from
+        //     `input.out_dir` if not set, but we set it explicitly so the
+        //     contract is visible at the seam.
+        pp_job.kind = JobKind::Postprocess;
+        pp_job.input.out_dir = wav_dir;
+        pp_job.input.audio_path = sess->wav_path_;
+        pp_job.cfg = sess->pp_cfg_;
+        pp_job.cfg.reprocess_dir = wav_dir.string();
+        if (!sess->context_inline_.empty())
+            pp_job.cfg.context_inline = sess->context_inline_;
+
+        // (f) Place the populated job into the postprocess FIFO. If the
+        //     reservation was cancelled meanwhile (e.g. process.cancel
+        //     hit the reserved id between (d) and (f) — vanishingly rare
+        //     because we hold the manager mutex, but cancel() does not
+        //     touch this manager, only JobQueue), enqueue_reserved
+        //     returns false; we surface that as a clean error and the
+        //     caller learns the commit did not stick.
+        bool placed = jobs_.enqueue_reserved(reserved_pp_id, std::move(pp_job));
+        if (!placed) {
+            log_warn("[streaming] commit: reservation pp_job=%ld no longer "
+                     "WaitingForUpload — stream commit failed",
+                     (long)reserved_pp_id);
+            // Best-effort: surface an internal error and let the next
+            // commit attempt / cancel pick up. We do NOT roll back the
+            // streaming slot's `running` marker here — see step (g).
+            res.code = static_cast<int>(IpcErrorCode::InternalError);
+            res.error = "process.stream.commit: postprocess reservation "
+                        "was cancelled before placement";
+            // Still finish the streaming job + erase the session so the
+            // streaming slot frees up; the temp WAV stays around (we set
+            // committed_ above) but is orphaned. The orphan is harmless —
+            // the disk-temp directory is best-effort anyway.
+            need_finish_stream = true;
+            // fall through to the slot-release + erase block.
+        } else {
+            need_finish_stream = true;
+            log_info("[streaming] commit: stream_job=%ld -> postprocess_job=%ld "
+                     "client=%s wav_dir=%s",
+                     (long)stream_job_id, (long)reserved_pp_id,
+                     client_id.c_str(), wav_dir.string().c_str());
+            res.ok = true;
+            res.postprocess_job_id = reserved_pp_id;
+        }
+
+        // (g) Release the streaming slot. We mark the streaming job Done
+        //     (ok=true) — the stream completed normally; the postprocess
+        //     job is a SEPARATE job, not a state transition on the
+        //     streaming one. JobQueue::finish clears the slot's running
+        //     marker so the next process.stream can open immediately.
+        //     We deliberately call finish() AFTER enqueue_reserved so an
+        //     enqueue failure does not advance state past a broken handoff.
+        if (need_finish_stream) {
+            jobs_.finish(stream_job_id, /*ok=*/true, "");
+        }
+
+        // (h) Erase the session from the map. The unique_ptr destructor
+        //     runs ~StreamingSession; `committed_` is set so the unlink
+        //     branch is skipped. wav_ is already null (closed in step b).
+        sessions_.erase(it);
+    } // release manager mutex
+
+    return res;
 }
 
 void StreamingSessionManager::cancel_session_locked(
