@@ -72,6 +72,12 @@ enum class JobState {
                         ///< downloading. The dependency is tracked inside
                         ///< JobQueue; the job re-enters the slot front once
                         ///< the download completes.
+    WaitingForUpload,   ///< Phase C.2 reservation — id minted by
+                        ///< `reserve_job_id()` so `process.submit` can return
+                        ///< it to the client immediately; the job is NOT yet
+                        ///< in any FIFO. `enqueue_reserved()` flips it to
+                        ///< Queued once the binary upload finalizes; cancel()
+                        ///< marks it Cancelled if the upload never completes.
     Running,            ///< Dequeued and executing (slot's running marker set).
     Done,               ///< Completed successfully.
     Failed,             ///< Completed with an error.
@@ -185,6 +191,30 @@ public:
     /// call; the caller fills the payload fields (`input`/`cfg` or
     /// `model_id`).
     int64_t enqueue(Job job, JobKind kind, const std::string& client_id);
+
+    /// Phase C.2 — pre-allocate a job_id without enqueuing the job yet.
+    /// `process.submit` needs to return a `job_id` to the client at request
+    /// time, but the underlying postprocess job cannot become runnable until
+    /// the upload completes (otherwise pp_worker_loop would dequeue an
+    /// empty-input job). `reserve_job_id()` mints the id and creates a
+    /// registry entry in a sentinel `WaitingForUpload` state so the binding
+    /// is queryable (status / client_for_job) the instant the response is
+    /// sent. The reserved id does NOT consume the slot's running marker or
+    /// occupy the FIFO — `enqueue_reserved()` performs the real placement
+    /// once the upload finalizes. `cancel(job_id)` is the matching teardown
+    /// for a reservation that never gets finalized (e.g. process.submit.cancel
+    /// or client disconnect mid-upload).
+    int64_t reserve_job_id(JobKind kind, const std::string& client_id);
+
+    /// Phase C.2 — finalize a reservation made by `reserve_job_id()`. Moves
+    /// the existing registry entry from WaitingForUpload to Queued, places
+    /// it at the back of the slot FIFO, and notifies the slot's worker. The
+    /// caller passes the fully-populated `Job` payload (input/cfg etc.); the
+    /// `job_id`, `kind`, and `client_id` fields on `job` are ignored — those
+    /// were set by `reserve_job_id` and stay authoritative. Returns true on
+    /// success; false if the reservation does not exist or is no longer in
+    /// WaitingForUpload (e.g. cancelled meanwhile).
+    bool enqueue_reserved(int64_t job_id, Job job);
 
     /// Block until a job for `kind` is available and ready to run, then
     /// return it with `state == Running` (the slot's running marker is set).

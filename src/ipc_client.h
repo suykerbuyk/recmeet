@@ -121,6 +121,17 @@ public:
     // Phase C.10a: convenience overload taking int16 samples directly.
     bool send_stream_audio(const int16_t* samples, std::size_t n);
 
+    // Phase C.2: send a `0x01` upload-chunk frame carrying raw bytes for a
+    // `process.submit` upload session. `bytes` is the payload; the helper
+    // prepends the `0x01` discriminator + 4-byte big-endian length via
+    // `frame_binary()`. Same blocking-write loop as `send_stream_audio`:
+    // returns false on a write error (the connection is closed) or when
+    // not connected. Fire-and-forget — the daemon emits `progress.job`
+    // (phase=`uploading`) and a final `progress.job` (phase=`done`)
+    // asynchronously as the upload finalizes and the postprocess runs.
+    // C.2 does NOT add client-side queueing/retry — Phase D's job.
+    bool send_upload_chunk(const std::string& bytes);
+
 private:
     void process_line(const std::string& line);
     bool connect_unix();

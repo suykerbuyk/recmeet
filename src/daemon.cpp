@@ -17,6 +17,7 @@
 #include "notify.h"
 #include "pipeline.h"
 #include "streaming_session.h"
+#include "upload_session.h"
 #include "util.h"
 #include "version.h"
 
@@ -88,6 +89,12 @@ static std::unique_ptr<JobQueue> g_jobs;
 // event sink). One streaming session at a time (C.7 streaming slot is
 // capacity-1).
 static std::unique_ptr<StreamingSessionManager> g_streaming;
+
+// Phase C.2 — the server-side upload-session registry. Owns the
+// `upload_token -> UploadSession` map; routes inbound `0x01` frames by
+// client_id; holds each upload's per-job staging directory + JobQueue
+// postprocess reservation. Constructed in main() after g_jobs exists.
+static std::unique_ptr<UploadSessionManager> g_uploads;
 
 static Config g_config;
 static std::mutex g_config_mu;
@@ -1184,6 +1191,44 @@ int main(int argc, char* argv[]) {
                  model_dir.c_str());
     }
 
+    // Phase C.2 — construct the UploadSessionManager. The progress sink
+    // mirrors C.10a's caption-event sink: it marshals onto the poll thread
+    // via server.post() and broadcast()s a `progress.job` event with phase
+    // `uploading` so the tray can render an upload progress bar. C.2 uses
+    // broadcast() exactly like C.10a; C.3/C.10b convert to send_to_client().
+    {
+        UploadProgressSink upsink;
+        upsink.on_progress = [&server](int64_t job_id,
+                                       const std::string& client_id,
+                                       int64_t bytes_received,
+                                       int64_t audio_size) {
+            // `feed_chunk` already runs on the poll thread (the binary-frame
+            // handler), so we could broadcast inline. We still go through
+            // server.post() to keep the dispatch lane uniform with the rest
+            // of the daemon's event emission and to avoid taking the manager
+            // mutex while building the event (the sink fires AFTER the
+            // mutex is released; this just keeps the post-thread invariant
+            // explicit).
+            server.post([&server, job_id, client_id, bytes_received, audio_size]() {
+                IpcEvent ev;
+                ev.event = "progress.job";
+                ev.data["job_id"] = job_id;
+                ev.data["kind"] = std::string("postprocess");
+                ev.data["phase"] = std::string("uploading");
+                ev.data["bytes_received"] = bytes_received;
+                ev.data["bytes_total"]    = audio_size;
+                (void)client_id;  // C.3 converts broadcast→send_to_client(client_id)
+                server.broadcast(ev);
+            });
+        };
+        // Staging root: empty falls back to system temp at create-time, which
+        // mirrors the streaming-session policy. A future op-tunable knob
+        // could expose this via `[server] upload_staging_root`; deferred.
+        g_uploads = std::make_unique<UploadSessionManager>(
+            *g_jobs, /*staging_root=*/fs::path{}, std::move(upsink));
+        log_info("daemon: upload session manager ready");
+    }
+
     // Phase C.10a — route inbound `0x03` streaming-audio frames into the
     // matching streaming session. The binary-frame handler runs on the poll
     // thread; it is the migrated *producer* side of the per-session
@@ -1194,29 +1239,39 @@ int main(int argc, char* argv[]) {
     server.on_binary_frame([](const std::string& client_id,
                               FrameType type,
                               const std::string& payload) -> bool {
-        if (type != FrameType::StreamAudio) {
-            // C.2/C.4 will consume 0x01/0x02; until then an upload/artifact
-            // frame has no handler — discard it without closing the
-            // connection (NDJSON traffic keeps flowing). Not a violation.
-            log_debug("daemon: binary frame type=0x%02x from client=%s — "
-                      "no handler (discarded)",
-                      static_cast<unsigned>(type), client_id.c_str());
-            return true;
+        if (type == FrameType::StreamAudio) {
+            // `0x03` streaming audio. The wire framing carries no stream_token
+            // — it is implicit: the capacity-1 streaming slot means a client
+            // has at most one live streaming session, and the binary-frame
+            // handler already knows the originating client_id. Route by
+            // client_id to that client's session token.
+            if (!g_streaming) return false;
+            std::string token = g_streaming->token_for_client(client_id);
+            if (token.empty()) {
+                log_warn("daemon: 0x03 streaming frame from client=%s with no "
+                         "live streaming session — protocol violation",
+                         client_id.c_str());
+                return false;
+            }
+            return g_streaming->feed_audio(token, payload);
         }
-        // `0x03` streaming audio. The wire framing carries no stream_token —
-        // it is implicit: the capacity-1 streaming slot means a client has
-        // at most one live streaming session, and the binary-frame handler
-        // already knows the originating client_id. Route by client_id to
-        // that client's session token.
-        if (!g_streaming) return false;
-        std::string token = g_streaming->token_for_client(client_id);
-        if (token.empty()) {
-            log_warn("daemon: 0x03 streaming frame from client=%s with no "
-                     "live streaming session — protocol violation",
-                     client_id.c_str());
-            return false;
+        if (type == FrameType::BinaryUpload) {
+            // Phase C.2 — `0x01` postprocess-upload payload. The wire framing
+            // carries no upload_token; it is implicit by client_id (the
+            // capacity-1 postprocess-upload invariant means a client has at
+            // most one outstanding upload). `feed_chunk` returns false on
+            // protocol violations: unknown client, bytes-overflow vs
+            // declared audio_size, short staging-write — any of which
+            // should tear the connection down.
+            if (!g_uploads) return false;
+            return g_uploads->feed_chunk(client_id, payload);
         }
-        return g_streaming->feed_audio(token, payload);
+        // C.4 will consume 0x02 (artifact download); until then discard
+        // without closing the connection — NDJSON traffic keeps flowing.
+        log_debug("daemon: binary frame type=0x%02x from client=%s — "
+                  "no handler (discarded)",
+                  static_cast<unsigned>(type), client_id.c_str());
+        return true;
     });
 
     // Phase C.10a — on client disconnect, abort any streaming session the
@@ -1224,13 +1279,23 @@ int main(int argc, char* argv[]) {
     // unlink the temp WAV, release the streaming slot. Runs inline on the
     // poll thread from remove_client().
     server.on_client_disconnect([&server](const std::string& client_id) {
-        if (!g_streaming) return;
-        int aborted = g_streaming->on_client_disconnect(client_id);
-        if (aborted > 0) {
+        // Both the streaming and upload managers need a disconnect callback:
+        // a TCP drop must abort any in-flight session the client owned (a
+        // streaming-caption session AND/OR a postprocess upload). We
+        // ALWAYS call both — a client could legitimately have one of each
+        // (one streaming + one upload, since they live in different slots).
+        int stream_aborted = 0;
+        int upload_aborted = 0;
+        if (g_streaming) stream_aborted = g_streaming->on_client_disconnect(client_id);
+        if (g_uploads)   upload_aborted = g_uploads->on_client_disconnect(client_id);
+        if (stream_aborted > 0)
             log_info("daemon: aborted %d streaming session(s) for "
-                     "disconnected client=%s", aborted, client_id.c_str());
+                     "disconnected client=%s", stream_aborted, client_id.c_str());
+        if (upload_aborted > 0)
+            log_info("daemon: aborted %d upload session(s) for "
+                     "disconnected client=%s", upload_aborted, client_id.c_str());
+        if (stream_aborted > 0 || upload_aborted > 0)
             broadcast_state_inline(server);
-        }
     });
 
     // Phase A.2: apply the NDJSON line cap from config before start().
@@ -1931,6 +1996,108 @@ int main(int argc, char* argv[]) {
         if (!g_streaming->cancel(req.client_id, token)) {
             err.code = static_cast<int>(IpcErrorCode::InvalidParams);
             err.message = "process.stream.cancel: unknown stream_token "
+                          "(or not owned by this client)";
+            return false;
+        }
+        broadcast_state_inline(server);
+        resp.result["ok"] = true;
+        return true;
+    });
+
+    // --- Phase C.2 — process.submit (batch postprocess upload) ---
+    //
+    // process.submit         — open an upload session. The client then sends
+    //                          `0x01` upload frames; on completion the daemon
+    //                          enqueues a postprocess job (which the existing
+    //                          pp_worker_loop drains exactly as a legacy
+    //                          record.start handoff did).
+    // process.submit.cancel  — discard an in-flight upload session (unlinks
+    //                          the staging dir, releases the reservation).
+    //                          C.5 will add cancel-for-running-postprocess.
+    //
+    // C.2 scope: opening and finalizing an UPLOAD. Cancelling a postprocess
+    // job that is already enqueued/running is C.5. Fetching artifacts is
+    // C.4. Removing record.start is C.9.
+    server.on("process.submit",
+              [](const IpcRequest& req, IpcResponse& resp, IpcError& err) {
+        if (!g_uploads) {
+            err.code = static_cast<int>(IpcErrorCode::InternalError);
+            err.message = "upload subsystem unavailable";
+            return false;
+        }
+        SubmitRequest sr;
+        auto gs = [&](const char* k, const std::string& def) {
+            auto it = req.params.find(k);
+            return it != req.params.end() ? json_val_as_string(it->second) : def;
+        };
+        auto gi = [&](const char* k, int64_t def) {
+            auto it = req.params.find(k);
+            return it != req.params.end() ? json_val_as_int(it->second) : def;
+        };
+        sr.audio_size   = gi("audio_size", 0);
+        sr.format       = gs("format", sr.format);
+        sr.sample_rate  = static_cast<int32_t>(gi("sample_rate", sr.sample_rate));
+        sr.channels     = static_cast<int32_t>(gi("channels", sr.channels));
+        sr.context      = gs("context", sr.context);
+        sr.mode         = gs("mode", sr.mode);
+        // `speaker_hints` is accepted-and-ignored in C.2 (reserved for v2
+        // multi-server). We deliberately do not read it.
+
+        // Snapshot the per-client postprocess config for the eventual Job.
+        // The recipe matches what record.start does at handoff: take the
+        // global Config (which already reflects session.init preferences
+        // because session.update_* merges into it), then layer the
+        // per-submit context. The full session-state weave will be revisited
+        // in C.9 when record.start is removed; for now the cleanest path is
+        // to pass the live Config snapshot through to the upload manager,
+        // which freezes it for the upload's lifetime so a concurrent
+        // config.reload between submit and finalize can't surprise us.
+        Config cfg;
+        size_t max_upload_bytes = 0;
+        {
+            std::lock_guard<std::mutex> lock(g_config_mu);
+            cfg = g_config;
+            max_upload_bytes = g_config.max_upload_bytes;
+        }
+        // Force the subprocess into reprocess mode (the staging dir IS the
+        // out_dir). pp_worker_loop sets this from input.out_dir, but be
+        // explicit so a stale reprocess_dir from the snapshot does not
+        // leak into the staging job.
+        cfg.reprocess_dir.clear();
+
+        auto cr = g_uploads->create(req.client_id, sr, cfg, max_upload_bytes);
+        if (!cr.ok) {
+            err.code = cr.code;
+            err.message = cr.error;
+            return false;
+        }
+        resp.result["job_id"]       = cr.job_id;
+        resp.result["upload_token"] = cr.upload_token;
+        resp.result["max_size"]     = cr.max_size;
+        log_info("daemon: process.submit OK (job=%ld client=%s "
+                 "audio_size=%lld format=%s)",
+                 (long)cr.job_id, req.client_id.c_str(),
+                 (long long)sr.audio_size, sr.format.c_str());
+        return true;
+    });
+
+    server.on("process.submit.cancel",
+              [&server](const IpcRequest& req, IpcResponse& resp, IpcError& err) {
+        if (!g_uploads) {
+            err.code = static_cast<int>(IpcErrorCode::InternalError);
+            err.message = "upload subsystem unavailable";
+            return false;
+        }
+        auto it = req.params.find("upload_token");
+        if (it == req.params.end() || json_val_as_string(it->second).empty()) {
+            err.code = static_cast<int>(IpcErrorCode::InvalidParams);
+            err.message = "process.submit.cancel: missing 'upload_token'";
+            return false;
+        }
+        std::string token = json_val_as_string(it->second);
+        if (!g_uploads->cancel(req.client_id, token)) {
+            err.code = static_cast<int>(IpcErrorCode::InvalidParams);
+            err.message = "process.submit.cancel: unknown upload_token "
                           "(or not owned by this client)";
             return false;
         }

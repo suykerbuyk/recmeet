@@ -317,6 +317,13 @@ target_sources(recmeet_core PRIVATE src/caption_engine.cpp)
 # guard; the daemon links it transitively.
 target_sources(recmeet_core PRIVATE src/streaming_session.cpp)
 
+# Phase C.2 — server-side upload session for process.submit. Owns the
+# upload_token -> session map, the per-job staging directory + audio file
+# (libsndfile for raw PCM, std::ofstream for container formats), and the
+# JobQueue postprocess reservation. Same composition story as C.10a — lives
+# in recmeet_core; the daemon links it transitively.
+target_sources(recmeet_core PRIVATE src/upload_session.cpp)
+
 # CLI binary
 add_executable(recmeet src/main.cpp)
 target_link_libraries(recmeet PRIVATE recmeet_core)
@@ -448,6 +455,7 @@ if(RECMEET_BUILD_TESTS)
         tests/streaming_capture_tests.cpp
         tests/streaming_engine_tests.cpp
         tests/test_streaming_session.cpp
+        tests/test_upload_session.cpp
         tests/test_caption_ipc_integration.cpp
         tests/test_caption_model_manager.cpp
         tests/test_caption_format.cpp

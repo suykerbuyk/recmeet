@@ -30,6 +30,7 @@ const char* job_state_name(JobState s) {
     switch (s) {
         case JobState::Queued:            return "queued";
         case JobState::WaitingOnDownload: return "waiting_on_download";
+        case JobState::WaitingForUpload:  return "waiting_for_upload";
         case JobState::Running:           return "running";
         case JobState::Done:              return "done";
         case JobState::Failed:            return "failed";
@@ -137,6 +138,71 @@ int64_t JobQueue::enqueue(Job job, JobKind kind, const std::string& client_id) {
     lock.unlock();
     slot.cv.notify_all();
     return id;
+}
+
+// ---------------------------------------------------------------------------
+// reserve_job_id / enqueue_reserved — Phase C.2 split-enqueue
+// ---------------------------------------------------------------------------
+//
+// `process.submit` needs to hand the client a job_id at request time, but the
+// actual postprocess work cannot become runnable until the binary upload
+// finalizes. Splitting `enqueue` into a reservation + a finalize step keeps
+// the JobQueue invariant simple: a job in the slot FIFO is always something
+// that pp_worker_loop can dequeue and run. The reservation holds the id +
+// the binding (client_for_job / status) but stays *outside* the FIFO until
+// `enqueue_reserved()`.
+
+int64_t JobQueue::reserve_job_id(JobKind kind, const std::string& client_id) {
+    std::unique_lock<std::mutex> lock(mu_);
+    int64_t id = next_job_id_++;
+    Job r;
+    r.job_id = id;
+    r.kind = kind;
+    r.client_id = client_id;
+    r.state = JobState::WaitingForUpload;
+    jobs_[id] = std::move(r);
+    log_debug("job_queue: reserve job=%ld kind=%s client=%s",
+              (long)id, job_kind_name(kind), client_id.c_str());
+    // No FIFO insertion, no slot cv notification — the reservation is not
+    // yet runnable. `record_event_locked` is NOT called either: the sink
+    // dispatches on the state values it knows about (downloading_model /
+    // resumed / done / failed / cancelled), and a fresh WaitingForUpload
+    // entry has no progress.job phase to emit until enqueue_reserved or
+    // cancel transitions it.
+    return id;
+}
+
+bool JobQueue::enqueue_reserved(int64_t job_id, Job job) {
+    std::unique_lock<std::mutex> lock(mu_);
+    auto it = jobs_.find(job_id);
+    if (it == jobs_.end()) return false;
+    Job& slot_job = it->second;
+    if (slot_job.state != JobState::WaitingForUpload) {
+        // Cancelled meanwhile (process.submit.cancel, client disconnect),
+        // or never reserved. Caller responsibility to react.
+        log_warn("job_queue: enqueue_reserved job=%ld is not "
+                 "WaitingForUpload (state=%s) — refusing",
+                 (long)job_id, job_state_name(slot_job.state));
+        return false;
+    }
+    JobKind kind = slot_job.kind;
+    std::string client_id = slot_job.client_id;
+    // Move the caller-supplied payload in, then re-stamp the authoritative
+    // fields (id / kind / client_id) so a careless caller can't drift them.
+    job.job_id = job_id;
+    job.kind = kind;
+    job.client_id = client_id;
+    job.state = JobState::Queued;
+    slot_job = std::move(job);
+    slot_for(kind).fifo.push(job_id);
+    log_debug("job_queue: enqueue_reserved job=%ld kind=%s client=%s "
+              "(slot_queued=%zu)",
+              (long)job_id, job_kind_name(kind), client_id.c_str(),
+              slot_for(kind).fifo.size());
+    Slot& slot = slot_for(kind);
+    lock.unlock();
+    slot.cv.notify_all();
+    return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -368,11 +434,15 @@ bool JobQueue::cancel(int64_t job_id) {
 
         case JobState::Queued:
         case JobState::WaitingOnDownload:
+        case JobState::WaitingForUpload:
         case JobState::Running:
             // Mark Cancelled. A Queued/Waiting job is lazily removed from its
             // slot FIFO by pick_runnable_locked(); a Running job's worker is
             // expected to observe the verdict (via status()) and stop —
-            // finish() then preserves the Cancelled verdict.
+            // finish() then preserves the Cancelled verdict. A
+            // WaitingForUpload reservation has no FIFO entry yet, so cancel
+            // just terminates the registry record — process.submit.cancel /
+            // client-disconnect-mid-upload are the call sites.
             job.state = JobState::Cancelled;
             record_event_locked(job);
             log_info("job_queue: cancel job=%ld kind=%s",
