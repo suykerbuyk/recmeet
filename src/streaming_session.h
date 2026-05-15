@@ -230,6 +230,17 @@ public:
     /// client than `client_id` (a client may only cancel its own stream).
     bool cancel(const std::string& client_id, const std::string& stream_token);
 
+    /// Phase C.5 — `process.cancel` adapter. Locates the session by
+    /// `job_id` (rather than by wire-facing `stream_token`) and runs the
+    /// same teardown path as `cancel()`: stops the engine, unlinks the
+    /// temp WAV, marks the JobQueue job Cancelled, releases the streaming
+    /// slot. Ownership is NOT checked here — the caller (the
+    /// `process.cancel` handler) is responsible for the ownership check
+    /// via `JobQueue::client_for_job(job_id)`. Returns false when no
+    /// active session is bound to `job_id` (e.g. the streaming job is
+    /// already finalized or in a terminal state).
+    bool cancel_by_job_id(int64_t job_id);
+
     /// Handle a client disconnect. Aborts every session owned by
     /// `client_id`: marks each JobQueue job Failed, stops the engine,
     /// unlinks the temp WAV, releases the slot. Returns the number of
@@ -250,6 +261,16 @@ private:
     /// map entry. Centralizes the resource-release order so cancel() /
     /// disconnect() / a failed create() cannot drift.
     void teardown_locked(StreamingSession* sess);
+
+    /// Phase C.5 — shared body of `cancel()` and `cancel_by_job_id()`.
+    /// Called with `mu_` held. The iterator `it` must reference a live
+    /// session in `sessions_`. Runs the full cancel-teardown sequence
+    /// (teardown + JobQueue::cancel + JobQueue::finish + erase) and
+    /// returns the JobQueue::cancel return for logging. After this call
+    /// `it` is invalidated.
+    void cancel_session_locked(
+        std::map<std::string,
+                 std::unique_ptr<StreamingSession>>::iterator it);
 
     mutable std::mutex mu_;
     JobQueue&          jobs_;

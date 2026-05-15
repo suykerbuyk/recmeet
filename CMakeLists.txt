@@ -472,6 +472,7 @@ if(RECMEET_BUILD_TESTS)
         tests/test_job_queue.cpp
         tests/test_routed_events.cpp
         tests/test_fetch.cpp
+        tests/test_cancel.cpp
     )
     target_link_libraries(recmeet_tests PRIVATE recmeet_core Catch2::Catch2WithMain)
     if(RECMEET_BUILD_WEB)

@@ -246,6 +246,18 @@ public:
     /// unknown OR belongs to a different client than `client_id`.
     bool cancel(const std::string& client_id, const std::string& upload_token);
 
+    /// Phase C.5 — `process.cancel` adapter. Locates the upload session by
+    /// `job_id` (rather than by wire-facing `upload_token`) and runs the
+    /// same teardown path as `cancel()`: closes + unlinks the staging
+    /// file, marks the JobQueue reservation Cancelled. Ownership is NOT
+    /// checked here — the caller (the `process.cancel` handler) is
+    /// responsible for the ownership check via
+    /// `JobQueue::client_for_job(job_id)`. Returns false when no active
+    /// upload session is bound to `job_id` (e.g. the upload finalized
+    /// into a Queued postprocess job — the JobQueue::cancel() in the
+    /// handler covers that path).
+    bool cancel_by_job_id(int64_t job_id);
+
     /// Handle a client disconnect. Aborts every session owned by
     /// `client_id`: unlinks the staging file, marks the JobQueue
     /// reservation Failed (the client did not ask to stop). Returns the
@@ -267,6 +279,15 @@ private:
     /// Called with `mu_` held. Tears down `*sess`'s staging file/dir without
     /// touching the JobQueue or the map. Centralizes resource release order.
     void teardown_locked(UploadSession* sess);
+
+    /// Phase C.5 — shared body of `cancel()` and `cancel_by_job_id()`.
+    /// Called with `mu_` held. The iterator `it` must reference a live
+    /// session in `sessions_`. Runs the full cancel-teardown sequence
+    /// (teardown + JobQueue::cancel + erase + side-table cleanup).
+    /// After this call `it` is invalidated.
+    void cancel_session_locked(
+        std::map<std::string,
+                 std::unique_ptr<UploadSession>>::iterator it);
 
     mutable std::mutex mu_;
     JobQueue&          jobs_;

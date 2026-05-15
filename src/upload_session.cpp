@@ -556,10 +556,41 @@ bool UploadSessionManager::cancel(const std::string& client_id,
                  client_id.c_str());
         return false;
     }
-    int64_t job_id = sess->job_id_;
     log_info("[upload] cancel: job=%ld client=%s token=%s",
-             (long)job_id, client_id.c_str(), upload_token.c_str());
+             (long)sess->job_id_, client_id.c_str(), upload_token.c_str());
+    cancel_session_locked(it);
+    return true;
+}
 
+bool UploadSessionManager::cancel_by_job_id(int64_t job_id) {
+    std::lock_guard<std::mutex> lk(mu_);
+    // Phase C.5: `process.cancel` enters here with a job_id. Scan for the
+    // bound session; the capacity-1 postprocess slot makes the scan at most
+    // one entry deep in practice. Ownership is NOT checked here — the
+    // `process.cancel` handler authorizes via `client_for_job` before
+    // calling us. Returns false when no live upload session is bound to
+    // `job_id` (e.g. the upload finalized into a Queued postprocess job —
+    // the handler's `JobQueue::cancel(job_id)` covers that path on its own;
+    // returning false here is the signal that no upload-specific teardown
+    // is needed).
+    for (auto it = sessions_.begin(); it != sessions_.end(); ++it) {
+        if (it->second->job_id_ != job_id) continue;
+        log_info("[upload] cancel_by_job_id: job=%ld token=%s",
+                 (long)job_id, it->first.c_str());
+        cancel_session_locked(it);
+        return true;
+    }
+    log_debug("[upload] cancel_by_job_id: no live upload for job=%ld",
+              (long)job_id);
+    return false;
+}
+
+void UploadSessionManager::cancel_session_locked(
+        std::map<std::string,
+                 std::unique_ptr<UploadSession>>::iterator it) {
+    // Shared body of cancel() and cancel_by_job_id(). Caller holds `mu_`.
+    UploadSession* sess = it->second.get();
+    int64_t job_id = sess->job_id_;
     teardown_locked(sess);
     // The reservation is still in WaitingForUpload — `JobQueue::cancel`
     // transitions it to Cancelled without ever touching a slot FIFO.
@@ -567,7 +598,6 @@ bool UploadSessionManager::cancel(const std::string& client_id,
     sessions_.erase(it);
     pp_cfg_snapshots_.erase(job_id);
     pp_context_overrides_.erase(job_id);
-    return true;
 }
 
 int UploadSessionManager::on_client_disconnect(const std::string& client_id) {

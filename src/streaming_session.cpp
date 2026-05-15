@@ -418,10 +418,42 @@ bool StreamingSessionManager::cancel(const std::string& client_id,
         return false;
     }
 
-    int64_t job_id = sess->job_id_;
     log_info("[streaming] cancel: job=%ld client=%s token=%s",
-             (long)job_id, client_id.c_str(), stream_token.c_str());
+             (long)sess->job_id_, client_id.c_str(), stream_token.c_str());
+    cancel_session_locked(it);
+    return true;
+}
 
+bool StreamingSessionManager::cancel_by_job_id(int64_t job_id) {
+    std::lock_guard<std::mutex> lk(mu_);
+    // Phase C.5: `process.cancel` enters here with a job_id (the wire-facing
+    // routing key is the stream_token, but the new general-cancel verb only
+    // carries job_id). Locate the session by its bound job_id; the C.7
+    // capacity-1 streaming slot makes the scan at most one entry deep in
+    // practice, but we iterate defensively in case that invariant ever
+    // changes. Ownership is NOT checked here — the `process.cancel` handler
+    // performs the check via `JobQueue::client_for_job(job_id)` BEFORE
+    // calling us, so by the time we run the requester has already been
+    // authorized for this job. Returns false when no active streaming
+    // session is bound to `job_id` (e.g. the job is already in a terminal
+    // state, or the streaming session was finalized between status() and
+    // this call — a benign race that the handler treats as "no work left").
+    for (auto it = sessions_.begin(); it != sessions_.end(); ++it) {
+        if (it->second->job_id_ != job_id) continue;
+        log_info("[streaming] cancel_by_job_id: job=%ld token=%s",
+                 (long)job_id, it->first.c_str());
+        cancel_session_locked(it);
+        return true;
+    }
+    log_debug("[streaming] cancel_by_job_id: no live session for job=%ld",
+              (long)job_id);
+    return false;
+}
+
+void StreamingSessionManager::cancel_session_locked(
+        std::map<std::string,
+                 std::unique_ptr<StreamingSession>>::iterator it) {
+    // Shared body of cancel() and cancel_by_job_id(). Caller holds `mu_`.
     // Release resources (engine stopped, WAV closed + unlinked), then settle
     // the JobQueue job. Two calls, in order:
     //   1. cancel()  — sets the job state to Cancelled (the authoritative
@@ -433,11 +465,12 @@ bool StreamingSessionManager::cancel(const std::string& client_id,
     // C.7's cancel() alone does NOT clear the running marker for a Running
     // job — "the worker is expected to observe this and stop"; the streaming
     // model has no per-job worker, so the manager settles the slot itself.
+    StreamingSession* sess = it->second.get();
+    int64_t job_id = sess->job_id_;
     teardown_locked(sess);
     jobs_.cancel(job_id);
     jobs_.finish(job_id, /*ok=*/false, "stream cancelled by client");
     sessions_.erase(it);
-    return true;
 }
 
 int StreamingSessionManager::on_client_disconnect(const std::string& client_id) {

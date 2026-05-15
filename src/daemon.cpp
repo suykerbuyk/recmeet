@@ -2269,6 +2269,188 @@ int main(int argc, char* argv[]) {
         return true;
     });
 
+    // --- Phase C.5 — process.cancel (general, job_id-routed) ---
+    //
+    // process.cancel — unified cancellation surface. Request: { job_id }.
+    //                  Cancels a job regardless of lifecycle state (Queued /
+    //                  WaitingOnDownload / WaitingForUpload / Running) and
+    //                  regardless of which slot it lives in. Routes to the
+    //                  right teardown path by inspecting the job's kind +
+    //                  state via JobQueue::status.
+    //
+    //   kind / state                        → action
+    //   ─────────────────────────────────── ──────────────────────────────
+    //   Postprocess + Queued                → g_jobs->cancel(job_id)
+    //                                         lazy FIFO removal at next
+    //                                         pick_runnable_locked.
+    //   Postprocess + WaitingOnDownload     → g_jobs->cancel(job_id);
+    //                                         finish_download will see the
+    //                                         Cancelled verdict and skip
+    //                                         re-arming.
+    //   Postprocess + WaitingForUpload      → g_jobs->cancel(job_id) AND
+    //                                         g_uploads->cancel_by_job_id —
+    //                                         tear down staging file + slot
+    //                                         reservation.
+    //   Postprocess + Running               → g_jobs->cancel(job_id) AND
+    //                                         g_pp_stop.request() AND
+    //                                         kill(g_pp_child_pid, SIGTERM)
+    //                                         if a child is alive (mirrors
+    //                                         the record.stop path).
+    //   Streaming + any non-terminal        → g_streaming->cancel_by_job_id
+    //                                         (stops engine + WAV + slot).
+    //   ModelDownload + non-terminal       → g_jobs->cancel(job_id); the
+    //                                         download worker observes via
+    //                                         finish_download's Cancelled
+    //                                         guard and dependents fail
+    //                                         cleanly through the existing
+    //                                         finish_download path.
+    //   any kind + terminal                → InvalidParams "already
+    //                                         in terminal state".
+    //
+    // Scope discipline — process.cancel is NEW; the narrower verbs
+    // process.stream.cancel and process.submit.cancel stay in place for
+    // backward compatibility (and as token-anchored entry points). C.5 does
+    // NOT remove them — they coexist with the general verb.
+    //
+    // record.stop (legacy) is left untouched — it remains the v1 path that
+    // C.9 will retire. The two coexist until then; this handler is the v2
+    // thin-client cancellation entry point.
+    server.on("process.cancel",
+              [&server](const IpcRequest& req, IpcResponse& resp,
+                        IpcError& err) {
+        if (!g_jobs) {
+            err.code = static_cast<int>(IpcErrorCode::InternalError);
+            err.message = "job queue unavailable";
+            return false;
+        }
+
+        // (1) job_id required and positive.
+        auto jit = req.params.find("job_id");
+        if (jit == req.params.end()) {
+            err.code = static_cast<int>(IpcErrorCode::InvalidParams);
+            err.message = "process.cancel: missing 'job_id'";
+            return false;
+        }
+        const int64_t job_id = json_val_as_int(jit->second, 0);
+        if (job_id <= 0) {
+            err.code = static_cast<int>(IpcErrorCode::InvalidParams);
+            err.message = "process.cancel: 'job_id' must be a positive integer";
+            return false;
+        }
+
+        // (2) Snapshot the job. We read kind/state under JobQueue's mutex
+        // via status(); after we release that snapshot we are racing the
+        // worker, but the manager-side teardown paths all re-validate.
+        auto snap = g_jobs->status(job_id);
+        if (!snap.has_value()) {
+            err.code = static_cast<int>(IpcErrorCode::InvalidParams);
+            err.message = "process.cancel: unknown job_id "
+                        + std::to_string(job_id);
+            return false;
+        }
+        const JobKind  kind  = snap->kind;
+        const JobState state = snap->state;
+
+        // (3) Ownership: only the originating client may cancel its own job.
+        // Uses the C.3 binding (job_id → client_id). An empty req.client_id
+        // (defensive — the IPC server stamps a client_id on every accepted
+        // connection) would fail this check naturally because no live job
+        // is bound to "".
+        auto owner = g_jobs->client_for_job(job_id);
+        if (!owner.has_value() || *owner != req.client_id) {
+            err.code = static_cast<int>(IpcErrorCode::PermissionDenied);
+            err.message = "process.cancel: job_id "
+                        + std::to_string(job_id)
+                        + " is not owned by this client";
+            return false;
+        }
+
+        // (4) Terminal-state reject — there is nothing to cancel.
+        if (state == JobState::Done ||
+            state == JobState::Failed ||
+            state == JobState::Cancelled) {
+            err.code = static_cast<int>(IpcErrorCode::InvalidParams);
+            err.message = "process.cancel: job is already in terminal "
+                          "state " + std::string(job_state_name(state));
+            return false;
+        }
+
+        // (5) Dispatch by kind + state.
+        log_info("daemon: process.cancel job=%ld kind=%s state=%s "
+                 "client=%s",
+                 (long)job_id, job_kind_name(kind),
+                 job_state_name(state), req.client_id.c_str());
+
+        switch (kind) {
+        case JobKind::Postprocess: {
+            switch (state) {
+            case JobState::Queued:
+            case JobState::WaitingOnDownload:
+                // Lazy FIFO removal at the next pick_runnable_locked, OR
+                // observed by finish_download as a Cancelled dependent.
+                g_jobs->cancel(job_id);
+                break;
+            case JobState::WaitingForUpload:
+                // Tear down the in-flight upload first (so the staging
+                // file is unlinked and the slot reservation released),
+                // then mark the JobQueue entry Cancelled. The upload
+                // manager's cancel_by_job_id() also calls g_jobs->cancel
+                // internally; calling cancel() here is idempotent (the
+                // second cancel hits the Cancelled-state guard and is a
+                // no-op). Order matters: tear down resources before
+                // settling state, so an observer racing on status()
+                // sees a clean lifecycle.
+                if (g_uploads) g_uploads->cancel_by_job_id(job_id);
+                g_jobs->cancel(job_id);
+                break;
+            case JobState::Running: {
+                // Mark Cancelled FIRST so the pp_worker_loop's exit-code-2
+                // path (which calls finish(false, "cancelled")) preserves
+                // the Cancelled verdict via finish()'s state guard. Then
+                // poke the subprocess: g_pp_stop is the cooperative
+                // signal; SIGTERM is the kick if a child PID is live.
+                g_jobs->cancel(job_id);
+                g_pp_stop.request();
+                pid_t child = g_pp_child_pid.load();
+                if (child > 0) ::kill(child, SIGTERM);
+                break;
+            }
+            default:
+                // Unreachable — terminal states reject above.
+                break;
+            }
+            break;
+        }
+        case JobKind::Streaming: {
+            // The streaming manager owns the slot + engine + temp WAV. Its
+            // cancel_by_job_id runs the full teardown (engine stop, WAV
+            // close+unlink, JobQueue::cancel, JobQueue::finish to release
+            // the running marker). Returns false only if the session is
+            // no longer live — a benign race; the JobQueue verdict is
+            // either already Cancelled or terminal, which the post-status
+            // re-check above caught.
+            if (g_streaming) g_streaming->cancel_by_job_id(job_id);
+            else             g_jobs->cancel(job_id);
+            break;
+        }
+        case JobKind::ModelDownload: {
+            // The model_download worker checks status before finishing —
+            // a Cancelled verdict propagates through finish_download(),
+            // and any parked Postprocess dependents land Failed via the
+            // existing finish_download dependent path.
+            g_jobs->cancel(job_id);
+            break;
+        }
+        case JobKind::_count:
+            // Unreachable — sentinel.
+            break;
+        }
+
+        broadcast_state_inline(server);
+        resp.result["ok"] = true;
+        return true;
+    });
+
     // --- Phase C.4 — process.fetch (artifact download) ---
     //
     // process.fetch — download the artifacts of a completed postprocess job.
