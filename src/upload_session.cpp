@@ -181,19 +181,24 @@ UploadSessionManager::create(const std::string& client_id,
 
     // --- Validate request shape (cheap checks first, before any allocation).
 
-    // Mode guard: only "transcribe" is wired in C.2. "enroll" is C.8 — accept
-    // it in the request schema but reject with a clear message rather than
-    // half-implementing it. Treating enroll as a guard, not a feature.
+    // Mode guard. Phase C.8 wires `mode == "enroll"`: the upload finalizes
+    // into a Postprocess job whose `cfg.enroll_mode = true`, which the
+    // subprocess runs as diarize-only (skip transcribe / summarize /
+    // note-write). The enroll-mode finalize requires a non-empty
+    // `enroll_name` so the eventual `enroll.finalize` knows the label;
+    // catch the missing-name case here at create-time rather than at
+    // finalize.
     if (req.mode == "enroll") {
-        res.code = static_cast<int>(IpcErrorCode::InvalidParams);
-        res.error = "process.submit: mode='enroll' is not yet implemented "
-                    "(C.8 not landed)";
-        return res;
-    }
-    if (req.mode != "transcribe" && !req.mode.empty()) {
+        if (req.enroll_name.empty()) {
+            res.code = static_cast<int>(IpcErrorCode::InvalidParams);
+            res.error = "process.submit: mode='enroll' requires "
+                        "'enroll_name'";
+            return res;
+        }
+    } else if (req.mode != "transcribe" && !req.mode.empty()) {
         res.code = static_cast<int>(IpcErrorCode::InvalidParams);
         res.error = "process.submit: unknown mode '" + req.mode +
-                    "' (expected 'transcribe')";
+                    "' (expected 'transcribe' or 'enroll')";
         return res;
     }
 
@@ -337,6 +342,13 @@ UploadSessionManager::create(const std::string& client_id,
     // per active upload, removed on finalize / teardown.
     pp_cfg_snapshots_[job_id] = pp_cfg;
     pp_context_overrides_[job_id] = req.context;
+    // Phase C.8 — stash the mode + enroll_name so finalize can stamp them
+    // on the outgoing Job.cfg. Skip the entries entirely for transcribe
+    // mode so we don't litter the map with empty strings.
+    if (req.mode == "enroll") {
+        pp_modes_[job_id] = req.mode;
+        pp_enroll_names_[job_id] = req.enroll_name;
+    }
 
     log_info("[upload] session created: job=%ld client=%s token=%s "
              "dir=%s audio_size=%lld format=%s",
@@ -363,6 +375,8 @@ bool UploadSessionManager::feed_chunk(const std::string& client_id,
     fs::path staging_dir;
     Config  pp_cfg;
     std::string context_inline;
+    std::string pp_mode;        // Phase C.8 — captured under the lock
+    std::string pp_enroll_name; // Phase C.8 — captured under the lock
     {
         std::lock_guard<std::mutex> lk(mu_);
         UploadSession* sess = nullptr;
@@ -483,16 +497,25 @@ bool UploadSessionManager::feed_chunk(const std::string& client_id,
             sess->finalized_ = true;
             staging_audio_path_str = sess->staging_audio_path_.string();
             staging_dir = sess->staging_dir_;
-            // Pull the cfg / context_inline snapshots from the side tables.
+            // Pull the cfg / context_inline / mode / enroll_name snapshots
+            // from the side tables. We capture them into locals BEFORE
+            // erasing the entries so the outside-the-lock finalize block
+            // can stamp them on the outgoing Job.
             auto cit = pp_cfg_snapshots_.find(job_id);
             if (cit != pp_cfg_snapshots_.end()) pp_cfg = cit->second;
             auto xit = pp_context_overrides_.find(job_id);
             if (xit != pp_context_overrides_.end()) context_inline = xit->second;
+            auto mit = pp_modes_.find(job_id);
+            if (mit != pp_modes_.end()) pp_mode = mit->second;
+            auto nit = pp_enroll_names_.find(job_id);
+            if (nit != pp_enroll_names_.end()) pp_enroll_name = nit->second;
             // Remove the session BEFORE leaving the lock so the next
             // process.submit from the same client is admitted cleanly.
             sessions_.erase(token_key);
             pp_cfg_snapshots_.erase(job_id);
             pp_context_overrides_.erase(job_id);
+            pp_modes_.erase(job_id);
+            pp_enroll_names_.erase(job_id);
             finalize_now = true;
         }
     }
@@ -520,6 +543,14 @@ bool UploadSessionManager::feed_chunk(const std::string& client_id,
         // same staging dir; pp_worker_loop already sets this from
         // input.out_dir, but be explicit.
         j.cfg.reprocess_dir = staging_dir.string();
+        // Phase C.8 — enroll mode is carried via the locals captured under
+        // the lock above (the side-table entries are already erased by
+        // this point). Stamp the outgoing Job.cfg so the subprocess
+        // inspects the flag and runs the diarize-only path.
+        if (pp_mode == "enroll") {
+            j.cfg.enroll_mode = true;
+            j.cfg.enroll_name = pp_enroll_name;
+        }
 
         bool placed = jobs_.enqueue_reserved(job_id, std::move(j));
         if (!placed) {
@@ -598,6 +629,8 @@ void UploadSessionManager::cancel_session_locked(
     sessions_.erase(it);
     pp_cfg_snapshots_.erase(job_id);
     pp_context_overrides_.erase(job_id);
+    pp_modes_.erase(job_id);
+    pp_enroll_names_.erase(job_id);
 }
 
 int UploadSessionManager::on_client_disconnect(const std::string& client_id) {
@@ -627,6 +660,8 @@ int UploadSessionManager::on_client_disconnect(const std::string& client_id) {
         it = sessions_.erase(it);
         pp_cfg_snapshots_.erase(job_id);
         pp_context_overrides_.erase(job_id);
+        pp_modes_.erase(job_id);
+        pp_enroll_names_.erase(job_id);
         ++aborted;
     }
     return aborted;

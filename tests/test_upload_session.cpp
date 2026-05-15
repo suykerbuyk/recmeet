@@ -198,8 +198,12 @@ TEST_CASE("UploadSession: create reserves job and returns token",
 }
 
 // ===========================================================================
-// 2. Format validation: enroll mode is rejected with a clear C.8 message;
+// 2. Format validation: enroll mode without enroll_name is rejected;
 //    unknown mode is rejected; unsupported format is rejected.
+//
+// Pre-C.8 this case rejected enroll mode entirely with a "C.8 not landed"
+// message. C.8 wires enroll mode, but still rejects when `enroll_name` is
+// missing (the eventual enroll.finalize requires it).
 // ===========================================================================
 TEST_CASE("UploadSession: validation rejects enroll mode and unknown formats",
           "[upload-session]") {
@@ -208,14 +212,15 @@ TEST_CASE("UploadSession: validation rejects enroll mode and unknown formats",
     UploadSessionManager mgr(q, test_temp_dir("validate"), null_progress_sink());
     Config cfg;
 
-    // mode=="enroll" → InvalidParams with explicit "C.8 not landed" message.
+    // mode=="enroll" with no enroll_name → InvalidParams.
     {
         auto r = default_req(1024);
         r.mode = "enroll";
+        // r.enroll_name deliberately empty
         auto res = mgr.create("c", r, cfg, 1<<20);
         CHECK_FALSE(res.ok);
         CHECK(res.code == static_cast<int>(IpcErrorCode::InvalidParams));
-        CHECK(res.error.find("C.8") != std::string::npos);
+        CHECK(res.error.find("enroll_name") != std::string::npos);
     }
     // Unknown mode → InvalidParams.
     {

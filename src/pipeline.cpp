@@ -549,6 +549,60 @@ std::string build_initial_prompt(const std::vector<std::string>& speaker_names,
     return result;
 }
 
+// ---------------------------------------------------------------------------
+// Phase C.8 — diarization.json artifact writer used by the enroll-mode
+// subprocess path. The daemon reads this file back to populate the
+// DiarizationCache; the format is purely subprocess→daemon (not on any
+// wire), so we hand-roll a minimal flat JSON rather than pulling in a full
+// JSON encoder. Schema:
+//
+//   {
+//     "num_speakers": N,
+//     "clusters": [
+//       { "idx": 0, "duration_ms": 12345, "embedding": [f, f, ...] },
+//       ...
+//     ]
+//   }
+//
+// Visible for unit tests via the namespace forward decl in pipeline.h is
+// NOT exported; the daemon's reader (`load_diarization_json` in
+// diarization_cache.cpp's pp_worker helper) only needs the file format,
+// not the writer.
+// ---------------------------------------------------------------------------
+namespace {
+
+void write_diarization_artifact(const fs::path& out_dir,
+                                int num_speakers,
+                                const std::vector<int64_t>& duration_ms,
+                                const std::vector<std::vector<float>>& embeddings) {
+    fs::create_directories(out_dir);
+    fs::path p = out_dir / "diarization.json";
+    std::ofstream out(p);
+    if (!out) throw RecmeetError("Could not write " + p.string());
+    out << "{\n";
+    out << "  \"num_speakers\": " << num_speakers << ",\n";
+    out << "  \"clusters\": [\n";
+    for (int i = 0; i < num_speakers; ++i) {
+        out << "    { \"idx\": " << i
+            << ", \"duration_ms\": " << duration_ms[i]
+            << ", \"embedding\": [";
+        const auto& emb = (i < static_cast<int>(embeddings.size()))
+                              ? embeddings[i]
+                              : std::vector<float>{};
+        for (size_t j = 0; j < emb.size(); ++j) {
+            if (j > 0) out << ", ";
+            out << emb[j];
+        }
+        out << "] }";
+        if (i + 1 < num_speakers) out << ",";
+        out << "\n";
+    }
+    out << "  ]\n";
+    out << "}\n";
+}
+
+} // anonymous namespace
+
 PipelineResult run_postprocessing(const Config& cfg, const PostprocessInput& input,
                                   PhaseCallback on_phase, ProgressCallback on_progress,
                                   StopToken* stop) {
@@ -564,6 +618,85 @@ PipelineResult run_postprocessing(const Config& cfg, const PostprocessInput& inp
     };
 
     int threads = cfg.threads > 0 ? cfg.threads : default_thread_count();
+
+    // -----------------------------------------------------------------------
+    // Phase C.8 — enroll-mode bypass.
+    //
+    // When the daemon's `process.submit` carried `mode=enroll`, the
+    // resulting Job's `cfg.enroll_mode` is true. We run diarization ONLY
+    // (skip transcribe / summarize / note-write), extract one centroid
+    // per discovered cluster, and write `diarization.json` to the
+    // out_dir so the daemon's pp_worker reads it back and populates the
+    // server-side DiarizationCache. The eventual `enroll.finalize` IPC
+    // verb consumes the cache to write the speakers DB.
+    //
+    // We deliberately leave `note_path` empty in the PipelineResult so
+    // the daemon's existing job.complete emission logic sees an empty
+    // `note_path` (the daemon's enroll-aware lift below replaces the
+    // event shape entirely; the legacy field is ignored).
+    // -----------------------------------------------------------------------
+#if RECMEET_USE_SHERPA
+    if (cfg.enroll_mode) {
+        log_info("pipeline: enroll-mode — diarize only, no transcribe/summarize");
+
+        auto samples = read_wav_float(input.audio_path);
+        if (samples.empty())
+            throw RecmeetError("enroll-mode: cannot read audio from "
+                               + input.audio_path.string());
+
+        phase("diarizing");
+        DiarizeProgressCallback diar_progress;
+        if (on_progress) {
+            diar_progress = [&on_progress](int done, int total) {
+                on_progress("diarizing", total > 0 ? done * 100 / total : 0);
+            };
+        }
+        check_cancel();
+        DiarizeResult diar = diarize(samples.data(), samples.size(),
+                                     cfg.num_speakers, threads,
+                                     cfg.cluster_threshold, diar_progress);
+
+        // Extract one centroid per cluster (raw, non-normalized — matches
+        // the CLI --enroll flow's `profile.embeddings.push_back(...)`
+        // semantic).
+        std::vector<std::vector<float>> centroids(diar.num_speakers);
+        std::vector<int64_t> durations_ms(diar.num_speakers, 0);
+        for (const auto& seg : diar.segments) {
+            if (seg.speaker >= 0 && seg.speaker < diar.num_speakers) {
+                durations_ms[seg.speaker] +=
+                    static_cast<int64_t>((seg.end - seg.start) * 1000.0);
+            }
+        }
+
+        if (diar.num_speakers > 0) {
+            phase("identifying speakers");
+            if (on_progress) on_progress("identifying speakers", 0);
+            auto model_paths = ensure_sherpa_models();
+            SpeakerEmbeddingSession sess(model_paths.embedding, threads);
+            for (int i = 0; i < diar.num_speakers; ++i) {
+                check_cancel();
+                auto emb = extract_speaker_embedding(
+                    sess, samples.data(), samples.size(), diar, i);
+                centroids[i] = std::move(emb);
+                if (on_progress)
+                    on_progress("identifying speakers",
+                                (i + 1) * 100 / diar.num_speakers);
+            }
+        }
+
+        write_diarization_artifact(input.out_dir, diar.num_speakers,
+                                   durations_ms, centroids);
+        log_info("pipeline: enroll-mode complete — wrote %s/diarization.json "
+                 "(%d clusters)",
+                 input.out_dir.c_str(), diar.num_speakers);
+
+        PipelineResult r;
+        r.output_dir = input.out_dir;
+        // r.note_path intentionally empty — enroll runs produce no note.
+        phase("complete");
+        return r;
+    }
+#endif  // RECMEET_USE_SHERPA
 
     // Build initial_prompt from enrolled speaker names + vocabulary hints
     std::string initial_prompt;

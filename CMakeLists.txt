@@ -328,6 +328,12 @@ target_sources(recmeet_core PRIVATE src/streaming_session.cpp)
 # in recmeet_core; the daemon links it transitively.
 target_sources(recmeet_core PRIVATE src/upload_session.cpp)
 
+# Phase C.8 — server-resident per-job diarization cache. Pure stdlib; no
+# sherpa dependency (consumes already-extracted centroids). Lives in
+# recmeet_core so the daemon and pipeline.cpp's writer share the file
+# format constants. Header-only API into the daemon's enroll.finalize.
+target_sources(recmeet_core PRIVATE src/diarization_cache.cpp)
+
 # CLI binary
 add_executable(recmeet src/main.cpp)
 target_link_libraries(recmeet PRIVATE recmeet_core)
@@ -474,6 +480,7 @@ if(RECMEET_BUILD_TESTS)
         tests/test_fetch.cpp
         tests/test_cancel.cpp
         tests/test_job_query.cpp
+        tests/test_enroll.cpp
     )
     target_link_libraries(recmeet_tests PRIVATE recmeet_core Catch2::Catch2WithMain)
     if(RECMEET_BUILD_WEB)

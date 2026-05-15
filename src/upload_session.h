@@ -97,7 +97,11 @@ struct SubmitRequest {
     int32_t     sample_rate = 16000;
     int32_t     channels = 1;
     std::string context;              ///< Meeting context forwarded to summarize.
-    std::string mode = "transcribe";  ///< "transcribe" only in C.2; "enroll" is C.8.
+    std::string mode = "transcribe";  ///< "transcribe" or "enroll" (C.8).
+    /// Phase C.8 — user-visible label the eventual `enroll.finalize` will
+    /// store the voiceprint under. Required when `mode == "enroll"`.
+    /// Ignored for `mode == "transcribe"`.
+    std::string enroll_name;
 };
 
 /// Supported formats. Raw PCM formats are wrapped as WAV on the staging side
@@ -309,6 +313,14 @@ private:
     /// disconnect so the side tables track sessions_ exactly.
     std::map<int64_t, Config>      pp_cfg_snapshots_;
     std::map<int64_t, std::string> pp_context_overrides_;
+
+    /// Phase C.8 — per-upload mode + enroll_name snapshots. Stashed at
+    /// `create()` and consumed at finalize, where they land on the
+    /// outgoing `Job.cfg.enroll_mode` / `Job.cfg.enroll_name`. Tracked
+    /// in step with `sessions_` (insert on create, erase on finalize /
+    /// cancel / disconnect) so a closed session leaves nothing behind.
+    std::map<int64_t, std::string> pp_modes_;
+    std::map<int64_t, std::string> pp_enroll_names_;
 };
 
 } // namespace recmeet

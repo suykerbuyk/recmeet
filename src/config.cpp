@@ -330,6 +330,20 @@ Config load_config(const fs::path& config_path) {
             cfg.allow_client_downloads =
                 (acd == "true" || acd == "1" || acd == "yes" || acd == "on");
         }
+
+        // Phase C.8 — `[server] diarization_cache_ttl_secs`. Same warn-and-
+        // fallback shape as the [ipc] knobs above: a negative override is
+        // a typo, not an opt-out (use 0 explicitly for "never expire").
+        std::string dct = get_val(entries, "server",
+                                  "diarization_cache_ttl_secs", "");
+        if (!dct.empty()) {
+            long long v = std::atoll(dct.c_str());
+            if (v >= 0) cfg.diarization_cache_ttl_secs = static_cast<int64_t>(v);
+            else
+                log_warn("config: invalid [server] diarization_cache_ttl_secs=%s; "
+                         "keeping default %lld", dct.c_str(),
+                         (long long)cfg.diarization_cache_ttl_secs);
+        }
     }
 
     return cfg;

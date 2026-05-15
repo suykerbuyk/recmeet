@@ -92,6 +92,12 @@ JsonMap config_to_map(const Config& cfg) {
         m["note_tags"] = joined;
     }
 
+    // Phase C.8 — enroll mode flags. Round-trip through the daemon →
+    // subprocess JSON-config so the subprocess inspects the flag and
+    // skips transcribe / summarize / note-write.
+    m["enroll_mode"] = cfg.enroll_mode;
+    m["enroll_name"] = cfg.enroll_name;
+
     // Per-provider API keys (flat dot-prefixed to avoid nested JSON)
     for (const auto& [name, key] : cfg.api_keys) {
         if (!key.empty())
@@ -211,6 +217,9 @@ Config config_from_map(const JsonMap& m) {
             }
         }
     }
+
+    b("enroll_mode", cfg.enroll_mode);
+    str("enroll_name", cfg.enroll_name);
 
     // Per-provider API keys (dot-prefixed)
     const std::string prefix = "api_keys.";

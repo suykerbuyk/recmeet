@@ -5,6 +5,7 @@
 #include "config.h"
 #include "config_json.h"
 #include "device_enum.h"
+#include "diarization_cache.h"
 #include "fetch_artifacts.h"
 #include "ipc_protocol.h"
 #include "ipc_server.h"
@@ -97,6 +98,16 @@ static std::unique_ptr<StreamingSessionManager> g_streaming;
 // client_id; holds each upload's per-job staging directory + JobQueue
 // postprocess reservation. Constructed in main() after g_jobs exists.
 static std::unique_ptr<UploadSessionManager> g_uploads;
+
+// Phase C.8 — server-resident per-job diarization cache. Populated by
+// pp_worker_loop on every successful Postprocess job that produced
+// diarization (the enroll-mode path always populates; future
+// transcribe-mode jobs land here too when the subprocess writes a
+// diarization.json — currently only enroll mode does, but the cache
+// machinery is shape-compatible with adding a transcribe-side artifact
+// in C.8.1+). Consumed by `enroll.finalize` to extract the user-picked
+// cluster's embedding and append to the speakers DB.
+static std::unique_ptr<DiarizationCache> g_diar_cache;
 
 static Config g_config;
 static std::mutex g_config_mu;
@@ -774,6 +785,53 @@ static void pp_worker_loop(IpcServer& server) {
                 job_err.clear();
                 int64_t jid = job.job_id;
                 bool batch_job = job.cfg.batch_mode;
+                bool enroll_job = job.cfg.enroll_mode;
+
+                // Phase C.8 — enroll-mode aftercare. Read the
+                // `diarization.json` artifact the subprocess wrote, populate
+                // the server-side DiarizationCache so `enroll.finalize` can
+                // consume it, and build the speakers[] event payload. On
+                // any failure here we log and emit a stripped event — the
+                // job still counts as Done (the audio was processed), but
+                // the client will see an empty speakers[] and can re-submit.
+                std::string speakers_array_json;
+                if (enroll_job && g_diar_cache) {
+                    fs::path diar_path =
+                        fs::path(captured_output_dir).empty()
+                            ? job.input.out_dir / "diarization.json"
+                            : fs::path(captured_output_dir) / "diarization.json";
+                    // Fall back to job's out_dir if the subprocess did not
+                    // emit an output_dir field (it does in practice, but
+                    // the daemon should be defensive — the artifact lives
+                    // in input.out_dir by spec).
+                    if (!fs::exists(diar_path))
+                        diar_path = job.input.out_dir / "diarization.json";
+                    try {
+                        auto clusters =
+                            DiarizationCache::load_diarization_artifact(diar_path);
+                        // Build speakers[] JSON before move-into-cache.
+                        speakers_array_json = "[";
+                        for (size_t i = 0; i < clusters.size(); ++i) {
+                            if (i > 0) speakers_array_json += ",";
+                            speakers_array_json +=
+                                "{\"idx\":" + std::to_string(clusters[i].idx)
+                                + ",\"duration_ms\":"
+                                + std::to_string(clusters[i].duration_ms)
+                                + "}";
+                        }
+                        speakers_array_json += "]";
+                        g_diar_cache->put(jid, std::move(clusters));
+                        log_info("daemon: enroll-mode job=%ld cached "
+                                 "diarization (path=%s)", (long)jid,
+                                 diar_path.c_str());
+                    } catch (const std::exception& e) {
+                        log_warn("daemon: enroll-mode job=%ld could not load "
+                                 "diarization.json (%s) — emitting empty "
+                                 "speakers[]", (long)jid, e.what());
+                        speakers_array_json = "[]";
+                    }
+                }
+
                 // Phase C.3 — route job.complete to the originating client.
                 // The Job's `client_id` was bound at enqueue time and the C.7
                 // binding is retained even after the job lands in a terminal
@@ -784,13 +842,23 @@ static void pp_worker_loop(IpcServer& server) {
                 // client_id → broadcast fallback so legacy / pre-session jobs
                 // still surface a completion event.
                 server.post([&server, captured_note_path, captured_output_dir,
-                             jid, batch_job]() {
+                             jid, batch_job, enroll_job,
+                             speakers_array_json]() {
                     IpcEvent ev;
                     ev.event = "job.complete";
-                    ev.data["note_path"] = captured_note_path;
-                    ev.data["output_dir"] = captured_output_dir;
                     ev.data["job_id"] = jid;
                     ev.data["batch_job"] = batch_job;
+                    if (enroll_job) {
+                        // Phase C.8 — enroll-mode shape: speakers[] in
+                        // place of note_path / output_dir. `enroll_mode`
+                        // discriminator lets the thin client switch
+                        // handlers off a single event verb.
+                        ev.data["enroll_mode"] = true;
+                        ev.data["speakers"] = speakers_array_json;
+                    } else {
+                        ev.data["note_path"] = captured_note_path;
+                        ev.data["output_dir"] = captured_output_dir;
+                    }
                     if (auto cid = g_jobs->client_for_job(jid);
                         cid && !cid->empty()) {
                         server.send_to_client(*cid, std::move(ev));
@@ -1123,6 +1191,16 @@ int main(int argc, char* argv[]) {
         log_info("daemon: JobQueue slots — postprocess=%d streaming=%d "
                  "model_download=%d",
                  caps.postprocess, caps.streaming, caps.model_download);
+    }
+
+    // Phase C.8 — construct the diarization cache. TTL comes from
+    // `[server] diarization_cache_ttl_secs`, default 24h. In-memory only,
+    // by design (see diarization_cache.h header for the rationale).
+    {
+        g_diar_cache = std::make_unique<DiarizationCache>(
+            g_config.diarization_cache_ttl_secs);
+        log_info("daemon: diarization cache ready (ttl=%lld s)",
+                 (long long)g_config.diarization_cache_ttl_secs);
     }
 
     notify_init();
@@ -2203,6 +2281,7 @@ int main(int argc, char* argv[]) {
         sr.channels     = static_cast<int32_t>(gi("channels", sr.channels));
         sr.context      = gs("context", sr.context);
         sr.mode         = gs("mode", sr.mode);
+        sr.enroll_name  = gs("enroll_name", sr.enroll_name);  // C.8
         // `speaker_hints` is accepted-and-ignored in C.2 (reserved for v2
         // multi-server). We deliberately do not read it.
 
@@ -2828,6 +2907,184 @@ int main(int argc, char* argv[]) {
         log_debug("daemon: job.list client=%s count=%zu",
                   req.client_id.c_str(), jobs.size());
         return true;
+    });
+
+    // --- Phase C.8 — enroll.finalize (voiceprint enrollment second step) ---
+    //
+    // Two flows feed `enroll.finalize`. Both end at the same code path here:
+    //
+    //   Flow (a) — fresh enrollment audio:
+    //     client → process.submit { mode="enroll", enroll_name=Alice, ... }
+    //                              → daemon reserves Postprocess job_id
+    //     client → 0x01 upload frames (audio)
+    //     daemon → enqueue Postprocess job with cfg.enroll_mode = true
+    //              → subprocess runs diarize-only, writes diarization.json
+    //              → daemon reads diarization.json, populates
+    //                DiarizationCache[job_id], emits job.complete with
+    //                speakers[] payload + enroll_mode=true.
+    //     client picks `target_speaker` from speakers[].
+    //     client → enroll.finalize { job_id, target_speaker, enroll_name }.
+    //              → handler extracts embedding for target_speaker from
+    //                cached centroids, appends to SpeakerProfile under
+    //                enroll_name, persists speakers DB.
+    //
+    //   Flow (b) — reuse existing diarization from a prior postprocess job:
+    //     client → enroll.finalize { existing_job_id, target_speaker,
+    //                                enroll_name }.
+    //              → handler uses the same cache lookup.
+    //
+    // Both flows share the cache-lookup + extract + persist body below.
+    //
+    // Validation chain (matches `process.fetch` posture):
+    //   1. Missing job_id / target_speaker / enroll_name → InvalidParams.
+    //   2. Unknown job_id                                → InvalidParams.
+    //   3. Job not owned by req.client_id                → PermissionDenied.
+    //   4. Job state not Done                            → JobNotReady.
+    //   5. Diarization cache miss or expired             → InvalidParams
+    //                                                      "diarization no
+    //                                                       longer cached
+    //                                                       (TTL=...)".
+    //   6. target_speaker out of cluster range           → InvalidParams.
+    //
+    // Action: load the speakers DB, find or create the profile for
+    // `enroll_name`, append the cluster's centroid as a new embedding,
+    // bump `updated`, save. Returns `{ok, enroll_name, embedding_count}`.
+    server.on("enroll.finalize",
+              [](const IpcRequest& req, IpcResponse& resp, IpcError& err) {
+        if (!g_jobs || !g_diar_cache) {
+            err.code = static_cast<int>(IpcErrorCode::InternalError);
+            err.message = "enroll.finalize: subsystem unavailable";
+            return false;
+        }
+        auto jit = req.params.find("job_id");
+        if (jit == req.params.end()) {
+            err.code = static_cast<int>(IpcErrorCode::InvalidParams);
+            err.message = "enroll.finalize: missing 'job_id'";
+            return false;
+        }
+        const int64_t job_id = json_val_as_int(jit->second, 0);
+        if (job_id <= 0) {
+            err.code = static_cast<int>(IpcErrorCode::InvalidParams);
+            err.message = "enroll.finalize: 'job_id' must be a positive integer";
+            return false;
+        }
+        auto sit = req.params.find("target_speaker");
+        if (sit == req.params.end()) {
+            err.code = static_cast<int>(IpcErrorCode::InvalidParams);
+            err.message = "enroll.finalize: missing 'target_speaker'";
+            return false;
+        }
+        const int64_t target_speaker = json_val_as_int(sit->second, -1);
+        if (target_speaker < 0) {
+            err.code = static_cast<int>(IpcErrorCode::InvalidParams);
+            err.message = "enroll.finalize: 'target_speaker' must be >= 0";
+            return false;
+        }
+        auto nit = req.params.find("enroll_name");
+        if (nit == req.params.end()) {
+            err.code = static_cast<int>(IpcErrorCode::InvalidParams);
+            err.message = "enroll.finalize: missing 'enroll_name'";
+            return false;
+        }
+        std::string enroll_name = json_val_as_string(nit->second);
+        if (enroll_name.empty()) {
+            err.code = static_cast<int>(IpcErrorCode::InvalidParams);
+            err.message = "enroll.finalize: 'enroll_name' must be non-empty";
+            return false;
+        }
+
+        auto snap = g_jobs->status(job_id);
+        if (!snap.has_value()) {
+            err.code = static_cast<int>(IpcErrorCode::InvalidParams);
+            err.message = "enroll.finalize: unknown job_id "
+                        + std::to_string(job_id);
+            return false;
+        }
+        auto owner = g_jobs->client_for_job(job_id);
+        if (!owner.has_value() || *owner != req.client_id) {
+            err.code = static_cast<int>(IpcErrorCode::PermissionDenied);
+            err.message = "enroll.finalize: job_id "
+                        + std::to_string(job_id)
+                        + " is not owned by this client";
+            return false;
+        }
+        if (snap->state != JobState::Done) {
+            err.code = static_cast<int>(IpcErrorCode::JobNotReady);
+            err.message = std::string(
+                              "enroll.finalize: finalize is only valid for "
+                              "Done jobs; current state=")
+                        + job_state_name(snap->state);
+            return false;
+        }
+
+        auto entry = g_diar_cache->get(job_id);
+        if (!entry.has_value()) {
+            err.code = static_cast<int>(IpcErrorCode::InvalidParams);
+            err.message = "enroll.finalize: diarization no longer cached "
+                          "(TTL=" + std::to_string(g_diar_cache->ttl_secs())
+                        + "s; re-submit the job)";
+            return false;
+        }
+        if (target_speaker >= static_cast<int64_t>(entry->clusters.size())) {
+            err.code = static_cast<int>(IpcErrorCode::InvalidParams);
+            err.message = "enroll.finalize: target_speaker "
+                        + std::to_string(target_speaker)
+                        + " out of range (clusters=0.."
+                        + std::to_string(entry->clusters.size()) + ")";
+            return false;
+        }
+        const auto& cluster = entry->clusters[target_speaker];
+        if (cluster.embedding.empty()) {
+            err.code = static_cast<int>(IpcErrorCode::InternalError);
+            err.message = "enroll.finalize: cluster "
+                        + std::to_string(target_speaker)
+                        + " has no cached embedding (subprocess may have "
+                          "skipped extraction)";
+            return false;
+        }
+
+        // Append the cluster centroid to the SpeakerProfile keyed by
+        // `enroll_name`. Mirrors the CLI's `profile.embeddings.push_back(...)`
+        // semantic — the on-disk format stays append-one-embedding.
+        fs::path db_dir;
+        {
+            std::lock_guard<std::mutex> lock(g_config_mu);
+            db_dir = g_config.speaker_db.empty()
+                ? default_speaker_db_dir() : g_config.speaker_db;
+        }
+        try {
+            auto profiles = load_speaker_db(db_dir);
+            SpeakerProfile profile;
+            for (const auto& p : profiles) {
+                if (p.name == enroll_name) {
+                    profile = p;
+                    break;
+                }
+            }
+            if (profile.name.empty()) {
+                profile.name = enroll_name;
+                profile.created = iso_now();
+            }
+            profile.embeddings.push_back(cluster.embedding);
+            profile.updated = iso_now();
+            if (profile.created.empty()) profile.created = profile.updated;
+            save_speaker(db_dir, profile);
+
+            resp.result["ok"] = true;
+            resp.result["enroll_name"] = enroll_name;
+            resp.result["embedding_count"] =
+                static_cast<int64_t>(profile.embeddings.size());
+            log_info("daemon: enroll.finalize OK (job=%ld client=%s "
+                     "name=%s target=%d count=%zu)",
+                     (long)job_id, req.client_id.c_str(),
+                     enroll_name.c_str(), (int)target_speaker,
+                     profile.embeddings.size());
+            return true;
+        } catch (const std::exception& e) {
+            err.code = static_cast<int>(IpcErrorCode::InternalError);
+            err.message = std::string("enroll.finalize: ") + e.what();
+            return false;
+        }
     });
 
     // --- Speaker management handlers ---

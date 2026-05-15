@@ -183,6 +183,34 @@ struct Config {
     // `[server] allow_client_downloads: false` to disable client-driven
     // downloads entirely. Wired from `[server] allow_client_downloads`.
     bool allow_client_downloads = true;
+
+    // Phase C.8 — server-resident voiceprint enrollment via process.submit.
+    //
+    // `enroll_mode` is set to true on Job::cfg by the daemon when the
+    // originating process.submit carried `mode=enroll`. It is NOT a user-
+    // facing knob — operators do not set it in config.yaml. The
+    // pp_worker subprocess inspects this flag and runs the
+    // diarization-only path: skip transcribe, skip summarize, skip
+    // note-write, but persist a `diarization.json` artifact in
+    // `out_dir` so the daemon can read the centroids back and populate
+    // the diarization cache. `enroll_name` is the user-supplied name
+    // the eventual `enroll.finalize` will store the voiceprint under;
+    // the subprocess does not write to the speakers DB itself (the
+    // daemon's `enroll.finalize` handler is the single writer, called
+    // after the user picks a target cluster via the IPC dance).
+    //
+    // Both fields round-trip through `config_to_map` / `config_from_map`
+    // so they survive the daemon → subprocess JSON-config write_job_config
+    // boundary.
+    bool        enroll_mode = false;
+    std::string enroll_name;
+
+    // Phase C.8 — diarization cache TTL. Cache entries past this age are
+    // lazily evicted on lookup. Default 24 h (86400 s). 0 = never expire
+    // (useful for tests; not recommended in production — the cache is
+    // in-memory only so a long-running daemon would accumulate forever).
+    // Wired from `[server] diarization_cache_ttl_secs`.
+    int64_t diarization_cache_ttl_secs = 86400;
 };
 
 /// Load config. Uses path if provided, otherwise ~/.config/recmeet/config.yaml.
