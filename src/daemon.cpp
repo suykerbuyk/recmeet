@@ -2653,6 +2653,183 @@ int main(int argc, char* argv[]) {
         return true;
     });
 
+    // --- Phase C.6 — job.status / job.list (read-only queries) ---
+    //
+    // Two thin read-only verbs that surface the JobQueue registry to clients.
+    // Both wire over the existing `JobQueue::status` / `JobQueue::list_by_client`
+    // / `JobQueue::client_for_job` API — no new mutation paths and no new
+    // wire-shape surface beyond the response body.
+    //
+    // job.status — request  : { "job_id": int64 }
+    //              response : { "job_id"   : int64,
+    //                           "kind"     : "postprocess"|"streaming"|"model_download",
+    //                           "state"    : "queued"|"waiting_on_download"|
+    //                                        "waiting_for_upload"|"running"|
+    //                                        "done"|"failed"|"cancelled",
+    //                           "client_id": "<owner>",
+    //                           "model_id" : "<empty for non-download>",
+    //                           "error"    : "<empty unless state==failed>" }
+    //              Validation chain:
+    //                1. Missing/non-positive job_id   -> InvalidParams
+    //                2. Unknown job_id                -> InvalidParams
+    //                3. job not owned by req.client_id -> PermissionDenied
+    //              Use case (D.3): on reconnect a client re-syncs the state of
+    //              a single known job_id. Terminal jobs are retained in the
+    //              registry (C.7) so a Done/Failed/Cancelled verdict survives.
+    //
+    // job.list — request  : {} (no params; scoped server-side by req.client_id)
+    //            response : { "jobs": [ ...same shape as job.status... ],
+    //                         "count": int64 }
+    //            Use case (D.5): on tray restart a client re-syncs every job
+    //            it owns across all kinds, including terminal jobs. Ordering
+    //            is ascending job_id (std::map iteration order inside
+    //            `list_by_client`); we preserve it on the wire.
+    //
+    // Scope discipline: `Job::input` (PostprocessInput) and `Job::cfg` (Config)
+    // are NOT serialized. They carry config secrets (api_keys, output_dir
+    // paths) and are not part of the wire surface. The intentional positive
+    // assertion in the test suite is that these keys are ABSENT from the
+    // response.
+    //
+    // Serialization approach for the `jobs[]` array follows the same precedent
+    // as `process.fetch`'s `artifacts[]` (a few hundred lines up): we build
+    // a raw JSON-array substring and stash it as a JsonVal::string. The
+    // JsonMap value type is flat — nested objects/arrays round-trip cleanly
+    // through `parse_json_object`'s nested-substring branch — so emitting
+    // pre-serialized JSON via a string is the established C.4 pattern. We
+    // factor the per-job object out into a local `serialize_job_object`
+    // helper so `job.status` (single object) and `job.list` (array element)
+    // share the exact same field set, ordering, and escaping behavior. A
+    // divergence between the two responses would be a Phase D re-sync
+    // correctness bug.
+
+    auto serialize_job_object = [](const Job& job) -> std::string {
+        std::string out;
+        out.reserve(160);
+        out += "{\"job_id\":";
+        out += std::to_string(job.job_id);
+        out += ",\"kind\":\"";
+        out += job_kind_name(job.kind);
+        out += "\",\"state\":\"";
+        out += job_state_name(job.state);
+        out += "\",\"client_id\":\"";
+        out += json_escape(job.client_id);
+        out += "\",\"model_id\":\"";
+        out += json_escape(job.model_id);
+        out += "\",\"error\":\"";
+        out += json_escape(job.error);
+        out += "\"}";
+        return out;
+    };
+
+    server.on("job.status",
+              [](const IpcRequest& req, IpcResponse& resp,
+                 IpcError& err) {
+        if (!g_jobs) {
+            err.code = static_cast<int>(IpcErrorCode::InternalError);
+            err.message = "job queue unavailable";
+            return false;
+        }
+
+        // (1) job_id required and positive.
+        auto jit = req.params.find("job_id");
+        if (jit == req.params.end()) {
+            err.code = static_cast<int>(IpcErrorCode::InvalidParams);
+            err.message = "job.status: missing 'job_id'";
+            return false;
+        }
+        const int64_t job_id = json_val_as_int(jit->second, 0);
+        if (job_id <= 0) {
+            err.code = static_cast<int>(IpcErrorCode::InvalidParams);
+            err.message = "job.status: 'job_id' must be a positive integer";
+            return false;
+        }
+
+        // (2) Snapshot — the registry retains terminal jobs (C.7), so a
+        // Done/Failed/Cancelled job is fully queryable here.
+        auto snap = g_jobs->status(job_id);
+        if (!snap.has_value()) {
+            err.code = static_cast<int>(IpcErrorCode::InvalidParams);
+            err.message = "job.status: unknown job_id "
+                        + std::to_string(job_id);
+            return false;
+        }
+
+        // (3) Ownership — same posture as process.fetch / process.cancel.
+        // We do NOT leak another client's job state even on a guessed id.
+        auto owner = g_jobs->client_for_job(job_id);
+        if (!owner.has_value() || *owner != req.client_id) {
+            err.code = static_cast<int>(IpcErrorCode::PermissionDenied);
+            err.message = "job.status: job_id "
+                        + std::to_string(job_id)
+                        + " is not owned by this client";
+            return false;
+        }
+
+        // Single-job response — emit each field flat under `result`. The
+        // IpcResponse top-level wrapper is `{"id":N,"result":{...}}`, so we
+        // expose the per-job fields directly at the result level (not
+        // nested under a "job" key) — that matches the doc-comment shape
+        // above. We emit `model_id`/`error` unconditionally even when
+        // empty: a missing key vs. an empty string would be an unnecessary
+        // client-side branch and the wire byte cost is negligible.
+        //
+        // `serialize_job_object` produces a raw JSON-object string used by
+        // job.list's array elements (raw-substring C.4 pattern). For
+        // job.status the response wrapper is itself an object, so we use
+        // the flat JsonMap path instead — the resulting wire shape is
+        // byte-for-byte the same set of {kind/state/client_id/model_id/
+        // error/job_id} fields the array-element form emits.
+        resp.result["job_id"]    = static_cast<int64_t>(snap->job_id);
+        resp.result["kind"]      = std::string(job_kind_name(snap->kind));
+        resp.result["state"]     = std::string(job_state_name(snap->state));
+        resp.result["client_id"] = snap->client_id;
+        resp.result["model_id"]  = snap->model_id;
+        resp.result["error"]     = snap->error;
+
+        log_debug("daemon: job.status job=%ld kind=%s state=%s client=%s",
+                  (long)job_id, job_kind_name(snap->kind),
+                  job_state_name(snap->state), req.client_id.c_str());
+        return true;
+    });
+
+    server.on("job.list",
+              [serialize_job_object](const IpcRequest& req, IpcResponse& resp,
+                                     IpcError& err) {
+        if (!g_jobs) {
+            err.code = static_cast<int>(IpcErrorCode::InternalError);
+            err.message = "job queue unavailable";
+            return false;
+        }
+
+        // No params required — server-side scoping is by req.client_id.
+        // An empty req.client_id (defensive — the IPC server stamps a
+        // client_id on every accepted connection) would naturally return
+        // an empty list because no live job binding is "".
+        std::vector<Job> jobs = g_jobs->list_by_client(req.client_id);
+
+        // Build the `jobs[]` raw JSON array. Same C.4 raw-substring pattern
+        // as `process.fetch`'s `artifacts[]` — pre-serialize the array, then
+        // stash it on the response as a string. The client-side parser
+        // (`parse_json_object`'s nested-`[...]` branch) treats it as a raw
+        // substring and re-parses on the receive side. Ordering is the
+        // ascending-job_id order `list_by_client` returns (std::map
+        // iteration order); we preserve it byte-for-byte on the wire.
+        std::string arr = "[";
+        for (size_t i = 0; i < jobs.size(); ++i) {
+            if (i > 0) arr += ",";
+            arr += serialize_job_object(jobs[i]);
+        }
+        arr += "]";
+
+        resp.result["jobs"]  = arr;
+        resp.result["count"] = static_cast<int64_t>(jobs.size());
+
+        log_debug("daemon: job.list client=%s count=%zu",
+                  req.client_id.c_str(), jobs.size());
+        return true;
+    });
+
     // --- Speaker management handlers ---
 
     server.on("speakers.list", [](const IpcRequest&, IpcResponse& resp, IpcError& err) {
