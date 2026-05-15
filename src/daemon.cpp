@@ -5,6 +5,7 @@
 #include "config.h"
 #include "config_json.h"
 #include "device_enum.h"
+#include "fetch_artifacts.h"
 #include "ipc_protocol.h"
 #include "ipc_server.h"
 #include "job_queue.h"
@@ -32,6 +33,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <memory>
 #include <mutex>
 #include <queue>
 #include <thread>
@@ -2264,6 +2266,208 @@ int main(int argc, char* argv[]) {
         }
         broadcast_state_inline(server);
         resp.result["ok"] = true;
+        return true;
+    });
+
+    // --- Phase C.4 — process.fetch (artifact download) ---
+    //
+    // process.fetch — download the artifacts of a completed postprocess job.
+    //                 Request:  { "job_id": int64 }
+    //                 Response: { "job_id": int64,
+    //                             "artifacts": [
+    //                               {"name": "...", "size": int64,
+    //                                "content_type": "..."}, ...],
+    //                             "total_size": int64 }
+    //                 Then, in the same `client_id`'s outbound stream, one
+    //                 `0x02` BinaryArtifact frame per `artifacts[]` entry,
+    //                 in the same order. NDJSON events for unrelated jobs
+    //                 may interleave fine — the client demultiplexes by
+    //                 counting `0x02` frames specifically.
+    //
+    // Validation chain (in this order — narrowest reject first):
+    //   1. Missing/non-positive job_id        -> InvalidParams
+    //   2. Unknown job_id                     -> InvalidParams
+    //   3. job not owned by req.client_id     -> PermissionDenied
+    //   4. job not in Done state              -> JobNotReady
+    //   5. out_dir missing/unreadable         -> InternalError
+    //   6. any artifact > max_binary_frame_bytes -> InternalError
+    //                                            (chunking deferred — C.4
+    //                                             rejects with a clear msg)
+    //
+    // Scope discipline (NOT in this handler — later phases):
+    //   * Cancellation                        — C.5 (process.cancel)
+    //   * job.status / job.list verbs         — C.6
+    //   * Cleanup / retention of old artifacts— out of v1 scope
+    //   * Chunked transfer for huge artifacts — future; today they reject
+    server.on("process.fetch",
+              [&server](const IpcRequest& req, IpcResponse& resp, IpcError& err) {
+        if (!g_jobs) {
+            err.code = static_cast<int>(IpcErrorCode::InternalError);
+            err.message = "job queue unavailable";
+            return false;
+        }
+
+        // (1) job_id is required and positive.
+        auto jit = req.params.find("job_id");
+        if (jit == req.params.end()) {
+            err.code = static_cast<int>(IpcErrorCode::InvalidParams);
+            err.message = "process.fetch: missing 'job_id'";
+            return false;
+        }
+        const int64_t job_id = json_val_as_int(jit->second, 0);
+        if (job_id <= 0) {
+            err.code = static_cast<int>(IpcErrorCode::InvalidParams);
+            err.message = "process.fetch: 'job_id' must be a positive integer";
+            return false;
+        }
+
+        // (2) The job_id must be known.
+        auto snap = g_jobs->status(job_id);
+        if (!snap.has_value()) {
+            err.code = static_cast<int>(IpcErrorCode::InvalidParams);
+            err.message = "process.fetch: unknown job_id "
+                        + std::to_string(job_id);
+            return false;
+        }
+        const Job& job = *snap;
+
+        // (3) Ownership: the requester must be the originator. We do NOT
+        // expose another client's artifacts even if the job_id is guessed.
+        // The check goes through `client_for_job()` (the C.3 binding) so a
+        // raced disconnect-then-reconnect mints a fresh client_id and is
+        // correctly rejected — the new connection does not inherit the
+        // departed client's job artifacts.
+        auto owner = g_jobs->client_for_job(job_id);
+        if (!owner.has_value() || *owner != req.client_id) {
+            err.code = static_cast<int>(IpcErrorCode::PermissionDenied);
+            err.message = "process.fetch: job_id "
+                        + std::to_string(job_id)
+                        + " is not owned by this client";
+            return false;
+        }
+
+        // (4) State must be terminal-Done. Other states are valid lifecycle
+        // points but produce no artifacts to ship.
+        if (job.state != JobState::Done) {
+            err.code = static_cast<int>(IpcErrorCode::JobNotReady);
+            err.message = std::string("process.fetch: fetch is only valid for "
+                                      "Done jobs; current state=")
+                        + job_state_name(job.state);
+            return false;
+        }
+
+        // (5) `out_dir` must exist on disk. Enumeration handles the absent /
+        // unreadable cases and returns an explanatory error string.
+        const fs::path& out_dir = job.input.out_dir;
+        if (out_dir.empty()) {
+            err.code = static_cast<int>(IpcErrorCode::InternalError);
+            err.message = "process.fetch: job has no out_dir on record";
+            return false;
+        }
+        std::string enum_err;
+        std::vector<ArtifactInfo> arts = enumerate_artifacts(out_dir, &enum_err);
+        if (!enum_err.empty()) {
+            err.code = static_cast<int>(IpcErrorCode::InternalError);
+            err.message = "process.fetch: " + enum_err;
+            return false;
+        }
+
+        // (6) Cap check: each artifact rides one `0x02` frame. C.1's transport
+        // cap (default 16 MiB) bounds the payload of a single frame. A note
+        // at typical sizes (<100 KB) clears this trivially, but a malformed
+        // / huge artifact would not — reject rather than truncate.
+        const size_t frame_cap = server.max_binary_frame_bytes();
+        for (const auto& a : arts) {
+            if (static_cast<size_t>(a.size) > frame_cap) {
+                err.code = static_cast<int>(IpcErrorCode::InternalError);
+                err.message = "process.fetch: artifact '" + a.name
+                            + "' (" + std::to_string(a.size)
+                            + " bytes) exceeds max_binary_frame_bytes ("
+                            + std::to_string(frame_cap)
+                            + "); raise [ipc] max_upload_bytes on the daemon "
+                              "or omit this artifact";
+                return false;
+            }
+        }
+
+        // Read the bytes BEFORE sending the metadata response. If a read
+        // fails (file vanished between enumerate and read) we want the
+        // failure to surface as the response error, not as a torn binary
+        // stream halfway through. This sequence preserves the wire invariant
+        // "metadata first → exactly N `0x02` frames after". On success we
+        // hand the buffers to the post-response binary fan-out below.
+        std::vector<std::string> bodies;
+        bodies.reserve(arts.size());
+        int64_t total_size = 0;
+        for (const auto& a : arts) {
+            std::ifstream in(a.path, std::ios::binary);
+            if (!in) {
+                err.code = static_cast<int>(IpcErrorCode::InternalError);
+                err.message = "process.fetch: cannot open artifact '"
+                            + a.name + "' for read";
+                return false;
+            }
+            std::string body;
+            body.reserve(static_cast<size_t>(a.size));
+            body.assign(std::istreambuf_iterator<char>(in),
+                        std::istreambuf_iterator<char>());
+            total_size += static_cast<int64_t>(body.size());
+            bodies.push_back(std::move(body));
+        }
+
+        // Build the metadata JSON. We emit `artifacts` as a raw JSON array
+        // string because the JsonMap value type is flat — nested arrays
+        // are stored as their raw substring and round-trip cleanly through
+        // the parser on the client side (see parse_json_object's nested
+        // object/array branch in ipc_protocol.cpp).
+        std::string arr = "[";
+        for (size_t i = 0; i < arts.size(); ++i) {
+            if (i > 0) arr += ",";
+            arr += "{\"name\":\"" + json_escape(arts[i].name) + "\""
+                +  ",\"size\":" + std::to_string(arts[i].size)
+                +  ",\"content_type\":\"" + json_escape(arts[i].content_type)
+                +  "\"}";
+        }
+        arr += "]";
+
+        resp.result["job_id"]     = job_id;
+        resp.result["artifacts"]  = arr;
+        resp.result["total_size"] = total_size;
+
+        // The metadata response is dispatched by the IPC machinery once we
+        // return `true`. The binary fan-out must happen AFTER that response
+        // hits the client's outbound queue (or at least, after the response
+        // is enqueued on the same fd) so the client's "wait for response,
+        // then expect N binary frames" pump path is happy. We `post()` the
+        // binary sends onto the poll thread so they enqueue on the SAME
+        // outbound queue AFTER this handler's response — preserving order
+        // because `send_to()` appends to the per-fd `outbound` deque.
+        //
+        // We capture `bodies` + `arts` BY MOVE into the posted callback so
+        // no copying happens for large artifacts.
+        const std::string client_id = req.client_id;
+        auto bodies_p = std::make_shared<std::vector<std::string>>(std::move(bodies));
+        auto arts_p   = std::make_shared<std::vector<ArtifactInfo>>(std::move(arts));
+        server.post([&server, client_id, bodies_p, arts_p]() {
+            // Iterate `artifacts[]` order (which is `bodies` order — built
+            // in lockstep above). Each `send_binary_to_client` enqueues one
+            // `0x02` frame on the client's outbound queue; the queue
+            // preserves enqueue order, so the wire sees them in the same
+            // order as the metadata array.
+            for (size_t i = 0; i < bodies_p->size(); ++i) {
+                server.send_binary_to_client(client_id,
+                                             FrameType::BinaryArtifact,
+                                             (*bodies_p)[i],
+                                             MessageClass::Response);
+            }
+            log_debug("daemon: process.fetch dispatched %zu artifact frame(s) "
+                      "to client=%s", bodies_p->size(), client_id.c_str());
+        });
+
+        log_info("daemon: process.fetch OK (job=%ld client=%s "
+                 "artifacts=%zu total_size=%lld)",
+                 (long)job_id, req.client_id.c_str(),
+                 arts_p->size(), (long long)total_size);
         return true;
     });
 

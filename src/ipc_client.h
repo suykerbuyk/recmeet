@@ -5,8 +5,11 @@
 
 #include "ipc_protocol.h"
 
+#include <cstdint>
+#include <filesystem>
 #include <functional>
 #include <string>
+#include <vector>
 
 namespace recmeet {
 
@@ -132,6 +135,32 @@ public:
     // C.2 does NOT add client-side queueing/retry — Phase D's job.
     bool send_upload_chunk(const std::string& bytes);
 
+    // Phase C.4 — fetch artifacts for a completed postprocess job.
+    //
+    // Sends a `process.fetch {job_id}` request and waits for the metadata
+    // response. On success, the daemon then writes N `0x02` BinaryArtifact
+    // frames in the same order as the response's `artifacts[]` array.
+    // `fetch_artifacts` reads exactly N binary frames from the connection
+    // (dispatching any interleaved NDJSON events to the registered
+    // `event_callback` so events keep flowing during the fetch), writes
+    // each artifact's bytes to `output_dir / artifact.name`, and returns
+    // the list of absolute paths written.
+    //
+    // On any error — request rejected by the daemon, wrong frame type in
+    // the binary phase, size mismatch, write error — leaves `err` populated
+    // with the failure reason and returns an empty vector. `output_dir` is
+    // created if missing; existing files of the same name are overwritten.
+    //
+    // The fetch is a synchronous request/response/binary exchange — the
+    // caller waits for the full set of artifacts before this function
+    // returns. `timeout_ms` bounds the metadata-response wait; the binary
+    // phase uses the same budget for the remaining frames.
+    std::vector<std::filesystem::path> fetch_artifacts(
+            int64_t job_id,
+            const std::filesystem::path& output_dir,
+            IpcError& err,
+            int timeout_ms = 30000);
+
 private:
     void process_line(const std::string& line);
     bool connect_unix();
@@ -142,7 +171,27 @@ private:
     // binary frames (no client-side consumer in C.1). Returns false on a
     // terminal framing error (unknown discriminator / oversized frame);
     // the caller then closes the connection.
-    bool drain_frames();
+    //
+    // Phase C.4: when `capture_binary_out` is non-null, `0x02` BinaryArtifact
+    // frames are captured into it (in order) instead of discarded — this is
+    // the synchronous mode used by `fetch_artifacts()` to demultiplex the
+    // exact-N-frame binary phase. Non-`0x02` binary frames (`0x01`/`0x03`)
+    // remain discarded for the capture mode too — they are not expected on
+    // a client receive stream.
+    bool drain_frames(std::vector<std::string>* capture_binary_out = nullptr);
+
+    // Phase C.4 — synchronous "expect N more `0x02` frames" pump. Drives
+    // `read_and_dispatch` in capture mode until `expected` BinaryArtifact
+    // frames have been collected into `out`, or the deadline expires, or a
+    // protocol-level failure tears the connection down. NDJSON frames
+    // arriving mid-binary phase are dispatched through `process_line()` so
+    // event callbacks keep firing — only the binary frames are captured.
+    // Returns true on success (exactly `expected` frames in `out`), false
+    // on error (`fail_reason` populated). Used only by `fetch_artifacts`.
+    bool pump_binary_frames(size_t expected,
+                            std::vector<std::string>& out,
+                            int timeout_ms,
+                            std::string& fail_reason);
 
     // Phase A.6: send a request whose params are a pre-serialized JSON
     // object (e.g. `{"credentials":{...},"preferences":{...}}`). The
@@ -191,6 +240,16 @@ private:
     // (including the "field missing" case). Surfaced via
     // `protocol_mismatch()`. Cleared on the next successful connect.
     bool protocol_mismatch_ = false;
+
+    // Phase C.4: per-connection FIFO of received `0x02` BinaryArtifact frame
+    // payloads. The C.1 path discards binary frames on the client side
+    // (no consumer); C.4 needs them buffered because `process.fetch` is a
+    // request/response/binary exchange — the binary frames can race the
+    // metadata response and arrive in the same read(). On every drain pass
+    // (in `read_and_dispatch` / `drain_frames`) any received `0x02` frame
+    // is appended here; `fetch_artifacts` drains this stash first and then
+    // pumps more from the socket as needed. Cleared on `close_connection`.
+    std::vector<std::string> stashed_artifact_frames_;
 
     // For blocking call(): stores the response/error for the pending request ID.
     int64_t pending_id_ = 0;

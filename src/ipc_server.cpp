@@ -412,6 +412,32 @@ void IpcServer::send_to_client(const std::string& client_id, IpcEvent ev) {
     send_to(fd, std::move(wire), MessageClass::Event);
 }
 
+void IpcServer::send_binary_to_client(const std::string& client_id,
+                                      FrameType type,
+                                      std::string payload,
+                                      MessageClass cls) {
+    // Phase C.4 routing primitive for `0x01`/`0x02`/`0x03` frames. Mirrors
+    // `send_to_client()` for NDJSON events: the `client_id → fd` reverse
+    // map is the authoritative lookup; a missing entry means the client
+    // disconnected between handler return and this call, and we drop the
+    // frame with a debug trace rather than logging at warn.
+    auto rit = client_id_to_fd_.find(client_id);
+    if (rit == client_id_to_fd_.end()) {
+        log_debug("ipc_server: send_binary_to_client dropping frame for "
+                  "unknown client_id=%s (type=0x%02x, len=%zu)",
+                  client_id.c_str(), static_cast<unsigned>(type),
+                  payload.size());
+        return;
+    }
+    int fd = rit->second;
+    // `frame_binary` produces a complete length-prefixed binary wire frame.
+    // The caller has already populated `type` with one of the binary
+    // discriminators (0x01/0x02/0x03); `frame_binary` ignores `FrameType::Ndjson`
+    // defensively and degrades to `BinaryUpload` if misused.
+    std::string wire = frame_binary(type, payload);
+    send_to(fd, std::move(wire), cls);
+}
+
 void IpcServer::post(std::function<void()> fn) {
     log_debug("ipc: post() from tid=%d", (int)syscall(SYS_gettid));
     {

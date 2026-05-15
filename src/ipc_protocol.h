@@ -120,6 +120,14 @@ enum class IpcErrorCode : int {
     // `[server] allow_client_downloads=false` blocking a client-initiated
     // model download). Distinct from Busy: retrying will not help.
     PermissionDenied = 4,
+    // Phase C.4 — the request targets a job that is not in a terminal Done
+    // state (it is Queued / WaitingForUpload / WaitingOnDownload / Running /
+    // Failed / Cancelled). Surfaced today by `process.fetch`, which requires
+    // the job to have produced artifacts before they can be downloaded.
+    // Distinct from `InvalidParams`: the params parsed cleanly, the job_id
+    // is real, but the lifecycle state forbids the operation. Retrying once
+    // the job reaches Done is the expected fix.
+    JobNotReady = 5,
 };
 
 // ---------------------------------------------------------------------------

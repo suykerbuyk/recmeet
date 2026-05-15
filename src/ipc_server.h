@@ -229,6 +229,28 @@ public:
     // before serialization.
     void send_to_client(const std::string& client_id, IpcEvent ev);
 
+    // Phase C.4: route a binary frame (`0x01`/`0x02`/`0x03`) to a specific
+    // client by `client_id`. Wraps `payload` via `frame_binary(type, ...)`
+    // and enqueues it on the per-fd outbound queue, observing the same
+    // back-pressure semantics as every other write.
+    //
+    // `cls` controls the overflow policy:
+    //   - `MessageClass::Response` (the C.4 `process.fetch` policy) closes
+    //     the client on outbound-queue overflow. Fetch is a request/response
+    //     exchange — silently dropping an artifact frame would leave the
+    //     client awaiting bytes that never arrive, so closing is the correct
+    //     overflow behavior.
+    //   - `MessageClass::Event` would drop-oldest on overflow — appropriate
+    //     for future server-pushed binary streams (none today). Not used by
+    //     C.4.
+    //
+    // Best-effort delivery on a missing client (raced disconnect): the
+    // frame is dropped with a debug trace. Caller does not hold any lock.
+    void send_binary_to_client(const std::string& client_id,
+                               FrameType type,
+                               std::string payload,
+                               MessageClass cls = MessageClass::Response);
+
     // Wake the poll loop from a worker thread (e.g., after job completion).
     // The callback will be invoked on the poll thread.
     void post(std::function<void()> fn);

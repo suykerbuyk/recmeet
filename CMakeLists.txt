@@ -219,6 +219,10 @@ set(IPC_SOURCES
     src/ipc_server.cpp
     src/session_merge.cpp
     src/caption_format.cpp
+    # Phase C.4 — artifact enumeration for process.fetch. Pure
+    # std::filesystem; lives in recmeet_ipc so the IPC layer can resolve
+    # the artifact list at request time without dragging in recmeet_core.
+    src/fetch_artifacts.cpp
 )
 
 add_library(recmeet_ipc STATIC ${IPC_SOURCES})
@@ -467,6 +471,7 @@ if(RECMEET_BUILD_TESTS)
         tests/test_tray_capture.cpp
         tests/test_job_queue.cpp
         tests/test_routed_events.cpp
+        tests/test_fetch.cpp
     )
     target_link_libraries(recmeet_tests PRIVATE recmeet_core Catch2::Catch2WithMain)
     if(RECMEET_BUILD_WEB)

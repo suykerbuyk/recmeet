@@ -6,9 +6,12 @@
 
 #include <cassert>
 #include <cctype>
+#include <cerrno>
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
+#include <system_error>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <netinet/in.h>
@@ -396,6 +399,10 @@ void IpcClient::close_connection() {
     // cleared here — it documents the reason this connection was torn
     // down, and the next `connect()` call clears it before retrying.
     protocol_version_ = 0;
+    // Phase C.4: discard any unconsumed `0x02` BinaryArtifact frames
+    // received during this connection. A stale stash carried into a
+    // reconnect would surface as a phantom artifact for the next fetch.
+    stashed_artifact_frames_.clear();
 }
 
 bool IpcClient::call_with_raw_params_json(const std::string& method,
@@ -611,6 +618,249 @@ bool IpcClient::send_stream_audio(const int16_t* samples, std::size_t n) {
         reinterpret_cast<const char*>(samples), n * sizeof(int16_t)));
 }
 
+// Phase C.4 — minimal parser for the `artifacts` array that the daemon
+// emits inside the `process.fetch` response. Wire shape:
+//   [{"name":"...","size":N,"content_type":"..."}, ...]
+//
+// We do NOT route this through the project's general-purpose JSON parser
+// because that parser stores nested objects as raw substrings (see
+// parse_json_object in ipc_protocol.cpp). The daemon's emitter writes a
+// well-known shape and field set — a focused parser keeps this routine
+// small, allocation-light, and self-contained. Field order is irrelevant
+// to the parser (the daemon emits name/size/content_type in that order
+// today, but the parser handles any permutation).
+//
+// Returns true on success with `out_artifacts` populated; false on a
+// malformed input. The caller treats failure as a protocol violation.
+namespace {
+struct FetchArtifact {
+    std::string name;
+    int64_t     size = 0;
+    std::string content_type;
+};
+size_t fa_skip_ws(const std::string& s, size_t i) {
+    while (i < s.size() && (s[i]==' '||s[i]=='\t'||s[i]=='\r'||s[i]=='\n')) ++i;
+    return i;
+}
+bool fa_parse_string(const std::string& s, size_t& i, std::string& out) {
+    if (i >= s.size() || s[i] != '"') return false;
+    ++i;
+    out.clear();
+    while (i < s.size()) {
+        char c = s[i];
+        if (c == '"') { ++i; return true; }
+        if (c == '\\' && i + 1 < s.size()) {
+            switch (s[i+1]) {
+                case '"':  out += '"';  i += 2; break;
+                case '\\': out += '\\'; i += 2; break;
+                case '/':  out += '/';  i += 2; break;
+                case 'n':  out += '\n'; i += 2; break;
+                case 'r':  out += '\r'; i += 2; break;
+                case 't':  out += '\t'; i += 2; break;
+                default:   out += '\\'; out += s[i+1]; i += 2; break;
+            }
+            continue;
+        }
+        out += c;
+        ++i;
+    }
+    return false;  // unterminated
+}
+bool fa_parse_int(const std::string& s, size_t& i, int64_t& out) {
+    int sign = 1;
+    if (i < s.size() && (s[i] == '+' || s[i] == '-')) {
+        if (s[i] == '-') sign = -1;
+        ++i;
+    }
+    if (i >= s.size() || !std::isdigit(static_cast<unsigned char>(s[i])))
+        return false;
+    int64_t v = 0;
+    while (i < s.size() && std::isdigit(static_cast<unsigned char>(s[i]))) {
+        v = v * 10 + (s[i] - '0');
+        ++i;
+    }
+    out = sign * v;
+    return true;
+}
+bool fa_parse_artifact_obj(const std::string& s, size_t& i, FetchArtifact& a) {
+    i = fa_skip_ws(s, i);
+    if (i >= s.size() || s[i] != '{') return false;
+    ++i;
+    bool first = true;
+    while (true) {
+        i = fa_skip_ws(s, i);
+        if (i < s.size() && s[i] == '}') { ++i; return true; }
+        if (!first) {
+            if (i >= s.size() || s[i] != ',') return false;
+            ++i; i = fa_skip_ws(s, i);
+        }
+        first = false;
+        std::string key;
+        if (!fa_parse_string(s, i, key)) return false;
+        i = fa_skip_ws(s, i);
+        if (i >= s.size() || s[i] != ':') return false;
+        ++i; i = fa_skip_ws(s, i);
+        if (key == "name") {
+            if (!fa_parse_string(s, i, a.name)) return false;
+        } else if (key == "size") {
+            if (!fa_parse_int(s, i, a.size)) return false;
+        } else if (key == "content_type") {
+            if (!fa_parse_string(s, i, a.content_type)) return false;
+        } else {
+            // Tolerate unknown fields — skip the value (string / number /
+            // bool / null only; the daemon emits no nested values inside
+            // an artifact entry today).
+            if (i < s.size() && s[i] == '"') {
+                std::string ignored;
+                if (!fa_parse_string(s, i, ignored)) return false;
+            } else {
+                // Skip until next ',' or '}'.
+                while (i < s.size() && s[i] != ',' && s[i] != '}') ++i;
+            }
+        }
+    }
+}
+bool fa_parse_artifacts_array(const std::string& s,
+                              std::vector<FetchArtifact>& out) {
+    out.clear();
+    size_t i = fa_skip_ws(s, 0);
+    if (i >= s.size() || s[i] != '[') return false;
+    ++i; i = fa_skip_ws(s, i);
+    if (i < s.size() && s[i] == ']') return true;  // empty
+    while (true) {
+        FetchArtifact a;
+        if (!fa_parse_artifact_obj(s, i, a)) return false;
+        out.push_back(std::move(a));
+        i = fa_skip_ws(s, i);
+        if (i >= s.size()) return false;
+        if (s[i] == ']') return true;
+        if (s[i] != ',') return false;
+        ++i; i = fa_skip_ws(s, i);
+    }
+}
+} // anonymous namespace
+
+std::vector<std::filesystem::path> IpcClient::fetch_artifacts(
+        int64_t job_id,
+        const std::filesystem::path& output_dir,
+        IpcError& err,
+        int timeout_ms) {
+    std::vector<std::filesystem::path> written;
+    if (fd_ < 0) {
+        err.code = static_cast<int>(IpcErrorCode::InternalError);
+        err.message = "fetch_artifacts: not connected";
+        return written;
+    }
+
+    // (1) Send process.fetch and wait for the metadata response. Re-uses
+    // the existing call() pump — interleaved events while we wait are
+    // dispatched normally to event_cb_; binary frames received in the same
+    // window are discarded by the C.1 path because call() runs
+    // `drain_frames()` without capture.
+    //
+    // Subtle ordering: the daemon's handler posts the binary fan-out via
+    // `IpcServer::post()` AFTER writing the response. So the response
+    // arrives FIRST; subsequent `0x02` frames land in the steady-state
+    // FrameReader buffer where the post-response pump can demultiplex them.
+    JsonMap params;
+    params["job_id"] = job_id;
+    IpcResponse resp;
+    if (!call("process.fetch", params, resp, err, timeout_ms)) {
+        // err is already populated by call() — either daemon-supplied
+        // (PermissionDenied / JobNotReady / InternalError / InvalidParams)
+        // or framework-level (timeout, disconnect).
+        return written;
+    }
+
+    // (2) Parse the metadata.
+    auto ait = resp.result.find("artifacts");
+    if (ait == resp.result.end()) {
+        err.code = static_cast<int>(IpcErrorCode::InternalError);
+        err.message = "fetch_artifacts: response missing 'artifacts' field";
+        return written;
+    }
+    std::vector<FetchArtifact> arts;
+    if (!fa_parse_artifacts_array(json_val_as_string(ait->second), arts)) {
+        err.code = static_cast<int>(IpcErrorCode::InternalError);
+        err.message = "fetch_artifacts: malformed 'artifacts' array in response";
+        return written;
+    }
+
+    // Early exit: no artifacts to ship — no `0x02` frames will follow.
+    if (arts.empty()) {
+        return written;
+    }
+
+    // (3) Pump exactly N binary frames. Interleaved NDJSON events dispatch
+    // normally through process_line() so unrelated event traffic on the
+    // same connection (e.g. progress events for OTHER jobs the client
+    // owns) keeps flowing.
+    std::vector<std::string> bodies;
+    std::string fail_reason;
+    if (!pump_binary_frames(arts.size(), bodies, timeout_ms, fail_reason)) {
+        err.code = static_cast<int>(IpcErrorCode::InternalError);
+        err.message = "fetch_artifacts: " + fail_reason;
+        return written;
+    }
+
+    // (4) Validate size and write each artifact. Order MUST match arts[]
+    // because the daemon sends them in `arts[]` order — `pump_binary_frames`
+    // preserves that order.
+    std::error_code ec;
+    std::filesystem::create_directories(output_dir, ec);
+    if (ec) {
+        err.code = static_cast<int>(IpcErrorCode::InternalError);
+        err.message = "fetch_artifacts: cannot create output_dir "
+                    + output_dir.string() + ": " + ec.message();
+        return written;
+    }
+    for (size_t i = 0; i < arts.size(); ++i) {
+        const FetchArtifact& a = arts[i];
+        const std::string& body = bodies[i];
+        if (static_cast<int64_t>(body.size()) != a.size) {
+            err.code = static_cast<int>(IpcErrorCode::InternalError);
+            err.message = "fetch_artifacts: artifact '" + a.name
+                        + "' size mismatch (expected "
+                        + std::to_string(a.size) + ", got "
+                        + std::to_string(body.size()) + ")";
+            written.clear();
+            return written;
+        }
+        // Safety: refuse to write a filename containing path separators or
+        // a leading dot. The daemon-side enumerator already filters dotfiles
+        // and only emits basenames, but the client should not blindly trust
+        // a server with a `name` that escapes `output_dir`.
+        if (a.name.empty()
+            || a.name.find('/')  != std::string::npos
+            || a.name.find('\\') != std::string::npos
+            || a.name[0] == '.') {
+            err.code = static_cast<int>(IpcErrorCode::InternalError);
+            err.message = "fetch_artifacts: refusing suspicious filename '"
+                        + a.name + "' from daemon";
+            written.clear();
+            return written;
+        }
+        std::filesystem::path dst = output_dir / a.name;
+        std::ofstream out(dst, std::ios::binary | std::ios::trunc);
+        if (!out) {
+            err.code = static_cast<int>(IpcErrorCode::InternalError);
+            err.message = "fetch_artifacts: cannot open '" + dst.string()
+                        + "' for write";
+            written.clear();
+            return written;
+        }
+        out.write(body.data(), static_cast<std::streamsize>(body.size()));
+        if (!out) {
+            err.code = static_cast<int>(IpcErrorCode::InternalError);
+            err.message = "fetch_artifacts: write failed for '" + dst.string() + "'";
+            written.clear();
+            return written;
+        }
+        written.push_back(dst);
+    }
+    return written;
+}
+
 // Phase C.2: send a `0x01` upload-chunk frame. Same blocking-write loop as
 // `send_stream_audio` above (and the same rationale — the fd is blocking
 // in steady state; a hard write error closes the connection).
@@ -662,12 +912,33 @@ bool IpcClient::read_events(const std::string& until_event, int timeout_ms) {
 
 // Phase C.1: drain every complete frame the FrameReader can assemble from
 // the bytes received so far, dispatching each NDJSON frame through
-// `process_line()`. Binary frames (`0x01`/`0x02`/`0x03`) have no consumer
-// on the client in C.1 — they are decoded off the wire and discarded.
+// `process_line()`. The C.1 baseline discarded `0x01`/`0x02`/`0x03`
+// binary frames on the client side because no client-side consumer
+// existed yet.
+//
+// Phase C.4: `0x02` BinaryArtifact frames are NOW stashed onto
+// `stashed_artifact_frames_` instead of discarded — `fetch_artifacts()`
+// drains the stash first and then pumps more from the socket as needed.
+// This matters because `process.fetch`'s wire shape interleaves NDJSON
+// response + N binary frames; a single `read()` after the metadata
+// arrives can pull the response AND one or more `0x02` frames into the
+// same call's drain pass. Without stashing, the call()-internal drain
+// would throw the binary frames away.
+//
+// `0x01` (upload) and `0x03` (streaming-audio) frames remain unconsumed
+// on the client side — they are server-bound discriminators that should
+// never appear on a client receive stream.
+//
+// `capture_binary_out` is reserved for the future case where a caller
+// wants exact-frame capture without going through the per-client stash.
+// Today's only caller (`pump_binary_frames`) consumes from the stash, so
+// this parameter is unused; we keep the signature for forward compat.
+//
 // Returns false when the framing state machine reports a terminal error
 // (unknown discriminator / oversized binary frame) — the caller closes
 // the connection. Returns true otherwise (including NeedMore).
-bool IpcClient::drain_frames() {
+bool IpcClient::drain_frames(std::vector<std::string>* capture_binary_out) {
+    (void)capture_binary_out;  // currently unused — stash is the single sink
     for (;;) {
         Frame frame;
         FrameStatus st = reader_.next(frame);
@@ -681,7 +952,13 @@ bool IpcClient::drain_frames() {
             return false;
         }
         if (frame.type != FrameType::Ndjson) {
-            // No client-side consumer for binary frames in C.1.
+            if (frame.type == FrameType::BinaryArtifact) {
+                // Phase C.4: stash for `fetch_artifacts` to consume.
+                stashed_artifact_frames_.push_back(std::move(frame.payload));
+                continue;
+            }
+            // No client-side consumer for `0x01`/`0x03` on a receive
+            // stream — these are server-bound discriminators.
             log_debug("ipc_client: discarding binary frame type=0x%02x len=%zu",
                       static_cast<unsigned>(frame.type), frame.payload.size());
             continue;
@@ -725,6 +1002,131 @@ bool IpcClient::read_and_dispatch(int timeout_ms) {
     }
     if (pending_done_) return true;
 
+    return true;
+}
+
+// Phase C.4 — collect `expected` `0x02` BinaryArtifact frame payloads into
+// `out`. Source of truth is `stashed_artifact_frames_`, which is populated
+// on every `drain_frames()` pass (so frames that arrive in the same read()
+// as the metadata response are not lost). When the stash is short of
+// `expected`, the pump polls the socket and reads more bytes, dispatching
+// interleaved NDJSON through `process_line()` so event callbacks keep
+// firing. The pump returns true exactly when `out.size() == expected`; on
+// any error path (framing failure, disconnect, timeout, too many frames)
+// it returns false with `fail_reason` populated.
+bool IpcClient::pump_binary_frames(size_t expected,
+                                   std::vector<std::string>& out,
+                                   int timeout_ms,
+                                   std::string& fail_reason) {
+    out.clear();
+    out.reserve(expected);
+
+    // Helper: move N frames from the stash into `out`, capped by `expected`.
+    auto drain_stash_into_out = [&]() {
+        while (out.size() < expected
+               && !stashed_artifact_frames_.empty()) {
+            out.push_back(std::move(stashed_artifact_frames_.front()));
+            stashed_artifact_frames_.erase(stashed_artifact_frames_.begin());
+        }
+    };
+
+    // First, flush whatever the reader has already accumulated into the
+    // stash (the response read may have included `0x02` frames behind it),
+    // then drain the stash into `out`.
+    if (!drain_frames()) {
+        fail_reason = "framing error in initial drain";
+        close_connection();
+        return false;
+    }
+    drain_stash_into_out();
+    if (out.size() == expected) {
+        // Defensive: if more frames are in the stash, the daemon sent more
+        // than promised — that's a protocol violation.
+        if (!stashed_artifact_frames_.empty()) {
+            fail_reason = "received " + std::to_string(out.size()
+                                + stashed_artifact_frames_.size())
+                        + " binary frames, expected " + std::to_string(expected);
+            stashed_artifact_frames_.clear();
+            return false;
+        }
+        return true;
+    }
+    if (fd_ < 0) {
+        fail_reason = "connection lost before binary phase";
+        return false;
+    }
+    if (expected == 0) {
+        // No frames expected and stash is empty — success.
+        return true;
+    }
+
+    auto deadline = std::chrono::steady_clock::now()
+        + std::chrono::milliseconds(timeout_ms > 0 ? timeout_ms : 30000);
+
+    while (out.size() < expected) {
+        auto now = std::chrono::steady_clock::now();
+        auto remaining_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            deadline - now).count();
+        if (remaining_ms <= 0) {
+            fail_reason = "timeout waiting for binary frames "
+                          "(got " + std::to_string(out.size())
+                        + ", expected " + std::to_string(expected) + ")";
+            return false;
+        }
+
+        struct pollfd pfd;
+        pfd.fd = fd_;
+        pfd.events = POLLIN;
+        pfd.revents = 0;
+        int pr = poll(&pfd, 1, static_cast<int>(remaining_ms));
+        if (pr < 0) {
+            if (errno == EINTR) continue;
+            fail_reason = std::string("poll error: ") + std::strerror(errno);
+            return false;
+        }
+        if (pr == 0) continue;  // loop checks deadline at top
+        if (pfd.revents & (POLLHUP | POLLERR)) {
+            // Drain whatever is buffered before giving up — POLLHUP can
+            // arrive with a final readable buffer.
+            char buf[4096];
+            ssize_t n = read(fd_, buf, sizeof(buf));
+            if (n > 0) {
+                reader_.feed(buf, static_cast<size_t>(n));
+                if (!drain_frames()) {
+                    fail_reason = "framing error on final drain";
+                    close_connection();
+                    return false;
+                }
+                drain_stash_into_out();
+                if (out.size() == expected) return true;
+            }
+            fail_reason = "connection lost mid-binary-phase";
+            close_connection();
+            return false;
+        }
+
+        char buf[4096];
+        ssize_t n = read(fd_, buf, sizeof(buf));
+        if (n <= 0) {
+            fail_reason = "read returned " + std::to_string(n)
+                        + " mid-binary-phase";
+            close_connection();
+            return false;
+        }
+        reader_.feed(buf, static_cast<size_t>(n));
+        if (!drain_frames()) {
+            fail_reason = "framing error mid-binary-phase";
+            close_connection();
+            return false;
+        }
+        drain_stash_into_out();
+        if (!stashed_artifact_frames_.empty() && out.size() == expected) {
+            fail_reason = "received extra binary frames beyond expected "
+                        + std::to_string(expected);
+            stashed_artifact_frames_.clear();
+            return false;
+        }
+    }
     return true;
 }
 
