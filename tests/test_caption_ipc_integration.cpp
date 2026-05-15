@@ -54,7 +54,7 @@ const char* CAPTION_SOCK = "/tmp/recmeet_test_caption.sock";
 
 // ---------------------------------------------------------------------------
 // CaptionDaemonSim — minimal daemon simulator focused on the caption broadcast
-// path. record.start spins up a real CaptionEngine (model-free) when
+// path. process.submit spins up a real CaptionEngine (model-free) when
 // captions_enabled=true, and wires the caption hooks via the same pattern
 // the production daemon uses (function pointer + heap ctx + post()).
 // ---------------------------------------------------------------------------
@@ -122,7 +122,7 @@ struct CaptionDaemonSim {
             return true;
         });
 
-        server.on("record.start",
+        server.on("process.submit",
                   [this](const IpcRequest& req, IpcResponse& resp, IpcError& err) {
             // Single-instance busy guard, mirroring daemon.cpp:961.
             {
@@ -245,7 +245,7 @@ struct CaptionDaemonSim {
             return true;
         });
 
-        server.on("record.stop", [this](const IpcRequest&, IpcResponse& resp, IpcError& err) {
+        server.on("process.submit.cancel", [this](const IpcRequest&, IpcResponse& resp, IpcError& err) {
             if (!recording.load()) {
                 err.code = static_cast<int>(IpcErrorCode::NotRecording);
                 err.message = "Not recording";
@@ -347,7 +347,7 @@ bool sherpa_on() {
 // 1. Caption events received under broadcast with correct job_id.
 //    We invoke the captured hook directly (simulating the engine's worker
 //    callback) and assert the IPC client receives the event with the same
-//    job_id that record.start returned.
+//    job_id that process.submit returned.
 // ===========================================================================
 TEST_CASE("caption events received with correct job_id",
           "[ipc][integration][captions]") {
@@ -363,7 +363,7 @@ TEST_CASE("caption events received with correct job_id",
     IpcError err;
     JsonMap params;
     params["captions_enabled"] = true;
-    REQUIRE(starter->call("record.start", params, resp, err));
+    REQUIRE(starter->call("process.submit", params, resp, err));
     int64_t job_id = json_val_as_int(resp.result["job_id"]);
 
     // Simulate two engine emissions via the captured hooks.
@@ -386,13 +386,13 @@ TEST_CASE("caption events received with correct job_id",
     }
     CHECK(seen == 2);
 
-    starter->call("record.stop", params, resp, err);
+    starter->call("process.submit.cancel", params, resp, err);
 }
 
 // ===========================================================================
-// 2. record.start honors captions_enabled=false (no engine spun up).
+// 2. process.submit honors captions_enabled=false (no engine spun up).
 // ===========================================================================
-TEST_CASE("record.start with captions_enabled=false does not start engine",
+TEST_CASE("process.submit with captions_enabled=false does not start engine",
           "[ipc][integration][captions]") {
     CaptionDaemonSim sim;
     sim.start();
@@ -405,7 +405,7 @@ TEST_CASE("record.start with captions_enabled=false does not start engine",
     IpcError err;
     JsonMap params;
     params["captions_enabled"] = false;
-    REQUIRE(client->call("record.start", params, resp, err));
+    REQUIRE(client->call("process.submit", params, resp, err));
 
     drain_caption_events(*client, 200);
 
@@ -415,7 +415,7 @@ TEST_CASE("record.start with captions_enabled=false does not start engine",
     CHECK(!evs.has_event("caption"));
     CHECK(!evs.has_event("caption.degraded"));
 
-    client->call("record.stop", params, resp, err);
+    client->call("process.submit.cancel", params, resp, err);
 }
 
 // ===========================================================================
@@ -423,7 +423,7 @@ TEST_CASE("record.start with captions_enabled=false does not start engine",
 //    In the no-recognizer test mode, the model param is recorded but unused;
 //    we just verify the daemon doesn't reject the field.
 // ===========================================================================
-TEST_CASE("record.start accepts caption_model override",
+TEST_CASE("process.submit accepts caption_model override",
           "[ipc][integration][captions]") {
     CaptionDaemonSim sim;
     sim.start();
@@ -434,11 +434,11 @@ TEST_CASE("record.start accepts caption_model override",
     JsonMap params;
     params["captions_enabled"] = true;
     params["caption_model"] = std::string("en-small-v2");
-    REQUIRE(client->call("record.start", params, resp, err));
+    REQUIRE(client->call("process.submit", params, resp, err));
 
     CHECK(sim.captions_enabled_for_active);
 
-    client->call("record.stop", params, resp, err);
+    client->call("process.submit.cancel", params, resp, err);
 }
 
 // ===========================================================================
@@ -466,7 +466,7 @@ TEST_CASE("caption.degraded fires on synthetic ring overflow",
     IpcError err;
     JsonMap params;
     params["captions_enabled"] = true;
-    REQUIRE(client->call("record.start", params, resp, err));
+    REQUIRE(client->call("process.submit", params, resp, err));
     int64_t job_id = json_val_as_int(resp.result["job_id"]);
 
     // Force overflow: 4× ring capacity in a single push.
@@ -491,7 +491,7 @@ TEST_CASE("caption.degraded fires on synthetic ring overflow",
     }
     CHECK(found);
 
-    client->call("record.stop", params, resp, err);
+    client->call("process.submit.cancel", params, resp, err);
 }
 
 // ===========================================================================
@@ -512,12 +512,12 @@ TEST_CASE("engine teardown happens between cap.stop() and cap.drain()",
     IpcError err;
     JsonMap params;
     params["captions_enabled"] = true;
-    REQUIRE(client->call("record.start", params, resp, err));
+    REQUIRE(client->call("process.submit", params, resp, err));
     REQUIRE(sim.engine != nullptr);
 
-    REQUIRE(client->call("record.stop", params, resp, err));
+    REQUIRE(client->call("process.submit.cancel", params, resp, err));
 
-    // Three ordered timestamps captured inside the record.stop handler.
+    // Three ordered timestamps captured inside the process.cancel handler.
     int64_t t_stop  = sim.cap_stop_at.load();
     int64_t t_eng   = sim.engine_stop_at.load();
     int64_t t_drain = sim.cap_drain_at.load();
@@ -532,9 +532,9 @@ TEST_CASE("engine teardown happens between cap.stop() and cap.drain()",
 }
 
 // ===========================================================================
-// 6. Captions disabled by default — bare record.start {} produces no events.
+// 6. Captions disabled by default — bare process.submit {} produces no events.
 // ===========================================================================
-TEST_CASE("captions disabled by default for bare record.start",
+TEST_CASE("captions disabled by default for bare process.submit",
           "[ipc][integration][captions]") {
     CaptionDaemonSim sim;
     sim.start();
@@ -545,7 +545,7 @@ TEST_CASE("captions disabled by default for bare record.start",
 
     IpcResponse resp;
     IpcError err;
-    REQUIRE(client->call("record.start", resp, err));  // no params
+    REQUIRE(client->call("process.submit", resp, err));  // no params
     CHECK(!sim.captions_enabled_for_active);
     CHECK(sim.engine == nullptr);
 
@@ -553,14 +553,14 @@ TEST_CASE("captions disabled by default for bare record.start",
     CHECK(!evs.has_event("caption"));
     CHECK(!evs.has_event("caption.degraded"));
 
-    client->call("record.stop", resp, err);
+    client->call("process.submit.cancel", resp, err);
 }
 
 // ===========================================================================
-// 7. record.start with captions_enabled while busy is rejected; no second
+// 7. process.submit with captions_enabled while busy is rejected; no second
 //    engine spun up.
 // ===========================================================================
-TEST_CASE("record.start busy ignores captions_enabled flag",
+TEST_CASE("process.submit busy ignores captions_enabled flag",
           "[ipc][integration][captions]") {
     CaptionDaemonSim sim;
     sim.start();
@@ -570,21 +570,21 @@ TEST_CASE("record.start busy ignores captions_enabled flag",
     IpcError err;
 
     // First start (captions OFF).
-    REQUIRE(client->call("record.start", resp, err));
+    REQUIRE(client->call("process.submit", resp, err));
     CHECK(!sim.captions_enabled_for_active);
     CHECK(sim.engine == nullptr);
 
     // Second start with captions=true: must be rejected with Busy.
     JsonMap params;
     params["captions_enabled"] = true;
-    bool ok = client->call("record.start", params, resp, err);
+    bool ok = client->call("process.submit", params, resp, err);
     CHECK(!ok);
     CHECK(err.code == static_cast<int>(IpcErrorCode::Busy));
     // No engine spun up for the rejected request.
     CHECK(!sim.captions_enabled_for_active);
     CHECK(sim.engine == nullptr);
 
-    client->call("record.stop", params, resp, err);
+    client->call("process.submit.cancel", params, resp, err);
 }
 
 // ===========================================================================
@@ -606,7 +606,7 @@ TEST_CASE("partial then final caption events broadcast in order",
     IpcError err;
     JsonMap params;
     params["captions_enabled"] = true;
-    REQUIRE(starter->call("record.start", params, resp, err));
+    REQUIRE(starter->call("process.submit", params, resp, err));
     REQUIRE(sim.hooks.on_result != nullptr);
 
     // Partial then final for the same utterance.
@@ -631,11 +631,11 @@ TEST_CASE("partial then final caption events broadcast in order",
     CHECK(texts[0] == "HELLO");
     CHECK(texts[1] == "HELLO WORLD");
 
-    starter->call("record.stop", params, resp, err);
+    starter->call("process.submit.cancel", params, resp, err);
 }
 
 // ===========================================================================
-// 9a. No-sherpa stub: record.start {captions_enabled: true} broadcasts a
+// 9a. No-sherpa stub: process.submit {captions_enabled: true} broadcasts a
 //     single caption.degraded {reason: "engine_error"} and recording
 //     proceeds. (Sherpa-ON builds also exercise this path if a model
 //     directory is missing — the assertion is build-conditional.)
@@ -660,7 +660,7 @@ TEST_CASE("no-sherpa stub broadcasts engine_error degraded event",
     IpcError err;
     JsonMap params;
     params["captions_enabled"] = true;
-    REQUIRE(client->call("record.start", params, resp, err));
+    REQUIRE(client->call("process.submit", params, resp, err));
 
     drain_caption_events(*client, 200);
 
@@ -677,7 +677,7 @@ TEST_CASE("no-sherpa stub broadcasts engine_error degraded event",
     CHECK(engine_error_count == 1);
     CHECK(err_msg == "captions require RECMEET_USE_SHERPA=ON build");
 
-    client->call("record.stop", resp, err);
+    client->call("process.submit.cancel", resp, err);
 }
 
 // ===========================================================================
@@ -705,7 +705,7 @@ TEST_CASE("caption.degraded is rate-limited under sustained overflow",
     IpcError err;
     JsonMap params;
     params["captions_enabled"] = true;
-    REQUIRE(client->call("record.start", params, resp, err));
+    REQUIRE(client->call("process.submit", params, resp, err));
     REQUIRE(sim.engine != nullptr);
 
     // Sustain overflow for ~3 s.
@@ -725,7 +725,7 @@ TEST_CASE("caption.degraded is rate-limited under sustained overflow",
     CHECK(n >= 1);
     CHECK(n <= 4);
 
-    client->call("record.stop", params, resp, err);
+    client->call("process.submit.cancel", params, resp, err);
 }
 
 // ===========================================================================
@@ -758,7 +758,7 @@ TEST_CASE("captions_enabled=true creates captions.vtt with finals only",
     IpcError err;
     JsonMap params;
     params["captions_enabled"] = true;
-    REQUIRE(starter->call("record.start", params, resp, err));
+    REQUIRE(starter->call("process.submit", params, resp, err));
     REQUIRE(sim.captions_enabled_for_active);
     REQUIRE(sim.hooks.on_result != nullptr);
 
@@ -781,7 +781,7 @@ TEST_CASE("captions_enabled=true creates captions.vtt with finals only",
     caption_fanout_sim_on_result(f2, &adapter);
 
     drain_caption_events(*observer, 200);
-    starter->call("record.stop", params, resp, err);
+    starter->call("process.submit.cancel", params, resp, err);
     adapter.vtt.reset();  // close fd
 
     // File exists and starts with the WEBVTT header.
@@ -821,13 +821,13 @@ TEST_CASE("captions_enabled=false produces no captions.vtt sidecar",
     IpcError err;
     JsonMap params;
     params["captions_enabled"] = false;
-    REQUIRE(client->call("record.start", params, resp, err));
+    REQUIRE(client->call("process.submit", params, resp, err));
 
     // No engine, no hooks, no fan-out adapter → no writer, no file.
     REQUIRE_FALSE(sim.captions_enabled_for_active);
     REQUIRE_FALSE(fs::exists(vtt_path));
 
-    client->call("record.stop", params, resp, err);
+    client->call("process.submit.cancel", params, resp, err);
     REQUIRE_FALSE(fs::exists(vtt_path));
 
     fs::remove_all(meeting_dir);

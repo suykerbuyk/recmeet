@@ -54,7 +54,16 @@ namespace recmeet {
 // a discriminator. The A.5 `protocol_version` handshake is what makes the
 // break safe: a stale peer fails `verify_auth_ok_and_capture()` and the
 // connection is closed before any non-auth frame is exchanged.
-inline constexpr int IPC_PROTOCOL_VERSION = 2;
+//
+// Phase C.9: bumped 2 → 3. C.9 retires the daemon-side live-recording path
+// and reshapes `state.changed`: the `recording` boolean is gone from the
+// data map (the daemon no longer captures audio), the composite-state
+// names `"recording"` / `"reprocessing"` / `"recording+postprocessing"` /
+// `"reprocessing+postprocessing"` are removed, and the verbs `record.start`,
+// `record.stop`, `job.context`, and `sources.list` no longer exist. A v2
+// client that reads `state.changed.recording` would now see a missing
+// field; the handshake bump forces it off the wire before it can misread.
+inline constexpr int IPC_PROTOCOL_VERSION = 3;
 
 // JSON value: string, int64, double, bool, or null (monostate)
 using JsonVal = std::variant<std::monostate, bool, int64_t, double, std::string>;

@@ -298,12 +298,12 @@ TEST_CASE("pre-flight: missing model would prompt or disable",
 // ===========================================================================
 // 5. Missing-model degrade-to-warning in daemon mode (Phase 3 baseline).
 //
-// The daemon's `record.start` already broadcasts a single
+// The daemon's `process.stream` (C.10a) broadcasts a single
 // caption.degraded {reason: "engine_error"} when the engine fails to
 // start (caption_engine reports a clear error string when start() is
 // called with a missing model_dir). Phase 4 adds:
 //   * is_caption_model_cached() so the caller can see the missing-model
-//     state BEFORE calling record.start;
+//     state BEFORE calling process.stream;
 //   * the CLI pre-flight handles the standalone path so the CLI doesn't
 //     even ask the engine to start when the model is missing.
 //

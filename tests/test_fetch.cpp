@@ -606,7 +606,7 @@ TEST_CASE("process.fetch: audio WAV in out_dir is not delivered",
 
     fs::path out_dir = test_temp_dir("audio_filter");
     write_file(out_dir / "Meeting_test.md", "note");
-    // Various staging-WAV / record.start-WAV / format-mp3 names — all filtered.
+    // Various staging-WAV / process.submit-WAV / format-mp3 names — all filtered.
     write_file(out_dir / "audio.wav", "wav-bytes");
     write_file(out_dir / "audio_2026-05-15_10-30.wav", "wav-bytes");
     write_file(out_dir / "mic.wav", "mic-bytes");

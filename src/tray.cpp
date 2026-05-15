@@ -33,6 +33,7 @@
 #include <cstdlib>
 #include <ctime>
 #include <filesystem>
+#include <fstream>
 #include <memory>
 #include <mutex>
 #include <thread>
@@ -176,6 +177,14 @@ struct TrayState {
     // the connect() call returns. The flag prevents duplicate sends and
     // resets on disconnect (handled in close-side code).
     bool session_inited = false;
+
+    // Phase C.9 — the most-recent postprocess job_id the tray dispatched
+    // via `process.submit`. Used by the cancel-postprocess paths
+    // (on_cancel_pp / on_stop's pp branch) which previously called
+    // `record.stop target=postprocessing` — that verb is gone; v2 uses
+    // `process.cancel { job_id }`. Cleared on job.complete / job.failed
+    // / cancel-success.
+    int64_t last_pp_job_id = 0;
 };
 
 static TrayState g_tray;
@@ -390,36 +399,19 @@ static void handle_ipc_event(const IpcEvent& ev) {
             if (!error.empty())
                 notify("Pipeline error", error);
         }
-        // Phase B.2: tray owns its own `recording` state. The daemon
-        // continues to broadcast `recording=true` whenever it has an
-        // active reprocess job in the live-recording slot, but from the
-        // tray operator's perspective that's a postprocess (the
-        // recording is already done; the WAV is being chewed on). Fold
-        // the daemon's `recording` / `reprocessing` flags into the
-        // local `postprocessing` indicator instead.
-        bool was_recording = g_tray.recording;
-        auto rec_it = ev.data.find("recording");
-        if (rec_it != ev.data.end()) {
-            bool daemon_rec = json_val_as_bool(rec_it->second);
-            bool pp  = json_val_as_bool(ev.data.at("postprocessing"));
-            bool dl  = json_val_as_bool(ev.data.at("downloading"));
-            // Preserve the local recording indicator — only the daemon
-            // post-recording phases drive the tray's pp/dl bits now.
-            update_state(g_tray.recording, pp || daemon_rec, dl, false);
-        } else {
-            // Legacy fallback: parse state string. Daemon-side recording
-            // / reprocessing are remapped to local postprocessing as
-            // above.
-            std::string state = json_val_as_string(ev.data.at("state"));
-            if (state == "idle") update_state(g_tray.recording, false, false);
-            else if (state == "recording" || state == "reprocessing")
-                update_state(g_tray.recording, true, false, false);
-            else if (state == "postprocessing")
-                update_state(g_tray.recording, true, false);
-            else if (state == "downloading")
-                update_state(g_tray.recording, false, true);
-        }
-        (void)was_recording;
+        // Phase C.9: the daemon no longer broadcasts a `recording`
+        // boolean (the legacy live-recording path is gone). The tray's
+        // local `recording` flag is the sole driver of the recording
+        // indicator. We fold the daemon's `postprocessing` /
+        // `downloading` / `streaming` bits into our local state.
+        bool pp = false, dl = false;
+        auto pp_it = ev.data.find("postprocessing");
+        if (pp_it != ev.data.end()) pp = json_val_as_bool(pp_it->second);
+        auto dl_it = ev.data.find("downloading");
+        if (dl_it != ev.data.end()) dl = json_val_as_bool(dl_it->second);
+        // (streaming is reflected separately in the captions overlay
+        // flow; it doesn't change the postprocessing indicator.)
+        update_state(g_tray.recording, pp, dl, false);
     } else if (ev.event == "job.complete") {
         std::string note = json_val_as_string(ev.data.at("note_path"));
         std::string dir = json_val_as_string(ev.data.at("output_dir"));
@@ -531,37 +523,29 @@ static bool connect_to_daemon() {
     g_tray.daemon_connected = true;
     setup_ipc_watch();
 
-    // Sync state. Phase B.2 — the tray's local `recording` field is the
-    // sole driver of the recording indicator; the daemon's
-    // recording/reprocessing flags fold into the postprocessing
-    // indicator (same shape as in the state.changed event handler).
+    // Sync state. Phase C.9 — the daemon's `state.changed` /
+    // `status.get` no longer carries a `recording` boolean (the
+    // live-recording path is gone). The tray's local `recording` field
+    // is the sole driver of the recording indicator; the daemon's
+    // postprocessing / downloading bits fold in unchanged.
     IpcResponse resp;
     IpcError err;
     if (g_tray.ipc.call("status.get", resp, err, 2000)) {
-        auto rec_it = resp.result.find("recording");
-        if (rec_it != resp.result.end()) {
-            bool daemon_rec = json_val_as_bool(rec_it->second);
-            bool pp  = json_val_as_bool(resp.result["postprocessing"]);
-            bool dl  = json_val_as_bool(resp.result["downloading"]);
-            update_state(g_tray.recording, pp || daemon_rec, dl, false);
-        } else {
-            // Legacy fallback
-            std::string state = json_val_as_string(resp.result["state"]);
-            if (state == "recording" || state == "reprocessing")
-                update_state(g_tray.recording, true, false, false);
-            else if (state == "postprocessing")
-                update_state(g_tray.recording, true, false);
-            else if (state == "downloading")
-                update_state(g_tray.recording, false, true);
-            else update_state(g_tray.recording, false, false);
-        }
+        bool pp = false, dl = false;
+        auto pp_it = resp.result.find("postprocessing");
+        if (pp_it != resp.result.end()) pp = json_val_as_bool(pp_it->second);
+        auto dl_it = resp.result.find("downloading");
+        if (dl_it != resp.result.end()) dl = json_val_as_bool(dl_it->second);
+        update_state(g_tray.recording, pp, dl, false);
     }
 
     // Phase A.6 + B-bonus — establish the per-client session credential /
-    // preference slot on the daemon. This replaces the per-`record.start`
-    // config_to_map() blob; after the session.init, `record.start`
-    // requests carry only `reprocess_dir`. The handshake is one-shot per
-    // IPC connection; the flag clears on disconnect.
+    // preference slot on the daemon. Pre-C.9 this replaced the
+    // per-`record.start` config_to_map() blob; post-C.9 the same slot
+    // is consumed by `process.submit` / `process.stream` (the v2 verbs
+    // freeze the live Config + session prefs into the per-job
+    // snapshot). The handshake is one-shot per IPC connection; the
+    // flag clears on disconnect.
     if (!g_tray.session_inited) {
         JsonMap creds;
         creds["provider"] = g_tray.cfg.provider;
@@ -1247,14 +1231,31 @@ void apply_discard() {
     g_tray.capture_state.waiting_disposition = false;
 }
 
-// Phase B.5 — submit the staged WAV to the daemon via record.start
-// with `reprocess_dir`. This is the transitional submission path
-// (lives until Phase C's `process.submit` IPC). Local-host only.
+// Phase C.9 — submit the staged WAV to the daemon via `process.submit` +
+// 0x01 upload-chunk frames. Pre-C.9 the tray called `record.start
+// reprocess_dir=<staging-wav>` (Phase B.5 transitional glue) — the
+// daemon's live-recording path is gone in C.9 so the tray now uploads
+// the WAV in chunks over the IPC socket. Local-host only (the staging
+// dir is also local, so the actual byte volume is small, but the wire
+// shape mirrors what a future cross-host thin client will use).
 //
-// Returns true on successful IPC dispatch; false on connect / call
-// failure. On failure the WAV stays in staging so the operator can
-// pick Save-for-later or retry without re-recording.
-bool apply_submit(std::string& err_msg) {
+// Wire sequence:
+//   1. `process.submit { audio_size, format, sample_rate, channels,
+//                        context, mode }`
+//   2. Receive `{ job_id, upload_token, max_size }`. The job is reserved
+//      in the postprocess slot but parked (`WaitingForUpload`) until
+//      bytes_received == audio_size.
+//   3. Stream the WAV in 64 KiB chunks via `send_upload_chunk` (each one
+//      a 0x01 binary frame; the daemon writes into the staging file).
+//   4. The daemon auto-finalizes when bytes_received hits audio_size —
+//      the postprocess job becomes runnable and pp_worker drains it.
+//   5. We return immediately; progress events arrive via the existing
+//      event stream (subscribers update the postprocess indicator).
+//
+// Returns true on successful upload dispatch; false on connect / call /
+// chunk-write failure. On failure the WAV stays in staging so the
+// operator can pick Save-for-later or retry without re-recording.
+bool apply_submit_with_context(const CapturedContext& ctx, std::string& err_msg) {
     if (!g_tray.daemon_connected) {
         if (!connect_to_daemon()) {
             err_msg = "daemon not running — start recmeet-daemon and try again";
@@ -1262,27 +1263,116 @@ bool apply_submit(std::string& err_msg) {
         }
     }
 
-    JsonMap params;
-    params["reprocess_dir"] = g_tray.capture_state.wav_path.string();
-
-    IpcResponse resp;
-    IpcError err;
-    if (!g_tray.ipc.call("record.start", params, resp, err, 10000)) {
-        err_msg = err.message.empty() ? "record.start failed" : err.message;
+    // Resolve the WAV file size — `audio_size` is what the daemon uses to
+    // know when the upload is complete (see UploadSession::feed_chunk).
+    std::error_code ec;
+    const auto wav_path = g_tray.capture_state.wav_path;
+    auto wav_size = fs::file_size(wav_path, ec);
+    if (ec || wav_size == 0) {
+        err_msg = "cannot stat staged WAV: " +
+                  (ec ? ec.message() : std::string("file is empty"));
         return false;
     }
 
-    log_info("[tray] submitted WAV for reprocess: %s",
-             g_tray.capture_state.wav_path.c_str());
+    // Open the WAV file BEFORE issuing process.submit so a transient
+    // I/O error here doesn't leave a half-reserved upload slot on the
+    // daemon.
+    std::ifstream wav_in(wav_path, std::ios::binary);
+    if (!wav_in) {
+        err_msg = "cannot open staged WAV for read: " + wav_path.string();
+        return false;
+    }
 
-    // The WAV is now owned by the daemon's reprocess flow (iter 64
-    // "reuse audio parent dir" applies). Clear the staging path so the
-    // tray returns to Idle; the daemon will broadcast progress events
-    // that update the postprocessing indicator.
+    // Step 1: process.submit. The staging WAV is the tray's
+    // canonical PCM-16 mono recording (B.1 tray_capture writes
+    // 44-byte RIFF header + S16LE mono samples). The daemon parses
+    // it through libsndfile in the pp subprocess.
+    JsonMap params;
+    params["audio_size"]  = static_cast<int64_t>(wav_size);
+    params["format"]      = std::string("wav");
+    params["sample_rate"] = static_cast<int64_t>(SAMPLE_RATE);
+    params["channels"]    = static_cast<int64_t>(1);
+    params["mode"]        = std::string("transcribe");
+    // Phase C.9: fold captured pre-recording context into the submit
+    // call. Pre-C.9 the tray sent context via a follow-up `job.context`
+    // verb after `record.start`; the verb is gone, and process.submit's
+    // `context` field carries the same payload up-front (the daemon's
+    // upload session freezes it into the per-job Config snapshot).
+    if (!ctx.context_inline.empty()) {
+        std::string combined = ctx.context_inline;
+        if (!ctx.vocab_additions.empty()) {
+            if (!combined.empty()) combined += "\n";
+            combined += "Vocabulary: " + ctx.vocab_additions;
+        }
+        params["context"] = combined;
+    }
+
+    IpcResponse resp;
+    IpcError err;
+    if (!g_tray.ipc.call("process.submit", params, resp, err, 10000)) {
+        err_msg = err.message.empty() ? "process.submit failed" : err.message;
+        return false;
+    }
+
+    // The daemon's response carries the upload_token implicitly — every
+    // subsequent 0x01 frame on this connection is routed to the
+    // requesting client_id's pending upload session. The token's job is
+    // to let `process.submit.cancel` reference the upload; we keep it
+    // around (logged) but don't have to re-send it on each chunk.
+    auto tok_it = resp.result.find("upload_token");
+    auto job_it = resp.result.find("job_id");
+    std::string upload_token =
+        (tok_it != resp.result.end()) ? json_val_as_string(tok_it->second) : "";
+    int64_t job_id =
+        (job_it != resp.result.end()) ? json_val_as_int(job_it->second) : 0;
+    if (upload_token.empty() || job_id <= 0) {
+        err_msg = "process.submit response missing upload_token / job_id";
+        return false;
+    }
+    log_info("[tray] process.submit OK (job=%lld token=%s size=%llu)",
+             (long long)job_id, upload_token.c_str(),
+             (unsigned long long)wav_size);
+    g_tray.last_pp_job_id = job_id;  // for the cancel-postprocess paths
+
+    // Step 2: stream the file in chunks. 64 KiB is a comfortable
+    // trade-off between IPC syscall overhead and tray responsiveness.
+    // The daemon's UploadSession::feed_chunk caps each chunk against
+    // `max_size` (the per-session limit echoed back in process.submit's
+    // response), but on local-host loopback we never hit that.
+    constexpr std::size_t CHUNK_BYTES = 64 * 1024;
+    std::vector<char> buf(CHUNK_BYTES);
+    std::uint64_t sent = 0;
+    while (sent < wav_size) {
+        std::size_t want = std::min<std::size_t>(CHUNK_BYTES, wav_size - sent);
+        wav_in.read(buf.data(), static_cast<std::streamsize>(want));
+        std::streamsize got = wav_in.gcount();
+        if (got <= 0) {
+            err_msg = "WAV read short at offset " + std::to_string(sent);
+            return false;
+        }
+        std::string chunk(buf.data(), static_cast<std::size_t>(got));
+        if (!g_tray.ipc.send_upload_chunk(chunk)) {
+            err_msg = "send_upload_chunk failed at offset " + std::to_string(sent);
+            return false;
+        }
+        sent += static_cast<std::uint64_t>(got);
+    }
+    log_info("[tray] submitted WAV via process.submit upload: %s (job=%lld)",
+             wav_path.c_str(), (long long)job_id);
+
+    // Step 3: the daemon's UploadSessionManager auto-finalizes once
+    // bytes_received hits audio_size, transitioning the postprocess
+    // job from `WaitingForUpload` to `Queued`. The pp_worker dequeues
+    // it and the existing progress / job.complete event stream takes
+    // over from there. No further IPC from this thread is needed.
     g_tray.capture_state.wav_path.clear();
     g_tray.capture_state.wav_timestamp.clear();
     g_tray.capture_state.wav_source.clear();
     g_tray.capture_state.waiting_disposition = false;
+    // The local staging WAV is now redundant (the daemon owns the
+    // bytes in its own staging dir). Leave it on disk — the next
+    // recording will overwrite it, and ops can find it for forensics
+    // if a submit-then-pp-failure trace is needed.
     return true;
 }
 
@@ -1348,8 +1438,12 @@ static void on_stop(GtkMenuItem*, gpointer) {
 
         switch (choice) {
             case StopDisposition::Submit: {
+                // Phase C.9: pre-submit, fold captured context into the
+                // submit call. The legacy two-step (record.start +
+                // post-submit job.context) is gone — `process.submit`'s
+                // `context` field carries the same payload up-front.
                 std::string sub_err;
-                if (!tray::apply_submit(sub_err)) {
+                if (!tray::apply_submit_with_context(captured_ctx, sub_err)) {
                     notify("Submit failed", sub_err);
                     // WAV remains in staging; tray stays in
                     // waiting_disposition so the operator can retry or
@@ -1357,20 +1451,6 @@ static void on_stop(GtkMenuItem*, gpointer) {
                     // build_menu so the indicator reflects reality.
                     build_menu();
                     return;
-                }
-                // Send context-window data along with the submit so the
-                // daemon's job.context handler folds it into the
-                // running reprocess job. We send it AFTER record.start
-                // so the daemon has the job ready.
-                if (!captured_ctx.context_inline.empty()) {
-                    JsonMap ctx_params;
-                    ctx_params["context_inline"] = captured_ctx.context_inline;
-                    if (!captured_ctx.vocab_additions.empty())
-                        ctx_params["vocabulary_append"] = captured_ctx.vocab_additions;
-                    IpcResponse ctx_resp;
-                    IpcError ctx_err;
-                    if (!g_tray.ipc.call("job.context", ctx_params, ctx_resp, ctx_err, 5000))
-                        log_warn("[tray] job.context failed: %s", ctx_err.message.c_str());
                 }
                 break;
             }
@@ -1388,13 +1468,24 @@ static void on_stop(GtkMenuItem*, gpointer) {
 
     if (g_tray.postprocessing) {
         // Daemon-side postprocess cancel — same as the legacy on_cancel_pp.
-        JsonMap params;
-        params["target"] = std::string("postprocessing");
-        IpcResponse resp;
-        IpcError err;
-        if (!g_tray.ipc.call("record.stop", params, resp, err, 5000)) {
-            log_error("[tray] record.stop (postprocessing) failed: %s",
-                      err.message.c_str());
+        // Phase C.9: `record.stop target=postprocessing` is gone; use
+        // `process.cancel { job_id }` (C.5) against the last job_id we
+        // dispatched via process.submit. If the tray has lost track of
+        // the job_id (e.g. tray restart after the daemon enqueued the
+        // job) the daemon's `job.list` could be queried — but the menu
+        // entry only appears when postprocessing is live AND we own the
+        // job, so an empty `last_pp_job_id` is a programming error.
+        if (g_tray.last_pp_job_id <= 0) {
+            log_warn("[tray] postprocess cancel requested but no last_pp_job_id");
+        } else {
+            JsonMap params;
+            params["job_id"] = g_tray.last_pp_job_id;
+            IpcResponse resp;
+            IpcError err;
+            if (!g_tray.ipc.call("process.cancel", params, resp, err, 5000)) {
+                log_error("[tray] process.cancel (job=%lld) failed: %s",
+                          (long long)g_tray.last_pp_job_id, err.message.c_str());
+            }
         }
     }
 }
@@ -1402,13 +1493,19 @@ static void on_stop(GtkMenuItem*, gpointer) {
 static void on_cancel_pp(GtkMenuItem*, gpointer) {
     if (!g_tray.postprocessing) return;
 
+    // Phase C.9: `record.stop target=postprocessing` → `process.cancel`.
+    if (g_tray.last_pp_job_id <= 0) {
+        log_warn("[tray] cancel-pp requested but no last_pp_job_id");
+        return;
+    }
     JsonMap params;
-    params["target"] = std::string("postprocessing");
+    params["job_id"] = g_tray.last_pp_job_id;
 
     IpcResponse resp;
     IpcError err;
-    if (!g_tray.ipc.call("record.stop", params, resp, err, 5000)) {
-        log_error("[tray] cancel postprocessing failed: %s", err.message.c_str());
+    if (!g_tray.ipc.call("process.cancel", params, resp, err, 5000)) {
+        log_error("[tray] cancel postprocessing (job=%lld) failed: %s",
+                  (long long)g_tray.last_pp_job_id, err.message.c_str());
     }
 }
 
@@ -2377,11 +2474,20 @@ int main(int argc, char* argv[]) {
             RECMEET_VERSION, g_tray.mics.size(), g_tray.monitors.size());
     gtk_main();
 
-    // Cleanup — runs whether exited via on_quit, SIGTERM, or SIGINT
-    if ((g_tray.recording || g_tray.postprocessing) && g_tray.daemon_connected) {
+    // Cleanup — runs whether exited via on_quit, SIGTERM, or SIGINT.
+    // Phase C.9: `record.stop` is gone. If a postprocess job is still in
+    // flight we cancel it via `process.cancel { job_id }`; the local
+    // capture state is torn down by tray destruction (PipeWireCapture
+    // dtor stops the loop). If `recording` is set but `last_pp_job_id`
+    // is unset, the recording is still local-only (no daemon
+    // involvement) and there is nothing on the wire to cancel.
+    if (g_tray.postprocessing && g_tray.last_pp_job_id > 0 &&
+        g_tray.daemon_connected) {
         IpcResponse resp;
         IpcError err;
-        g_tray.ipc.call("record.stop", resp, err, 2000);
+        JsonMap params;
+        params["job_id"] = g_tray.last_pp_job_id;
+        g_tray.ipc.call("process.cancel", params, resp, err, 2000);
     }
     teardown_ipc_watch();
     g_tray.ipc.close_connection();

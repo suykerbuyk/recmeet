@@ -4,7 +4,6 @@
 #include "backend_info.h"
 #include "config.h"
 #include "config_json.h"
-#include "device_enum.h"
 #include "diarization_cache.h"
 #include "fetch_artifacts.h"
 #include "ipc_protocol.h"
@@ -48,37 +47,21 @@
 using namespace recmeet;
 
 // ---------------------------------------------------------------------------
-// Daemon state — Phase C.7: the three loose atomics (g_recording /
-// g_postprocessing / g_downloading) and their g_state_mu admission gate, plus
-// the separate single-FIFO g_job_queue, are folded into a typed-slot
-// JobQueue. The postprocess and model_download slots' "running" markers are
-// the authoritative successors of g_postprocessing / g_downloading.
+// Daemon state — Phase C.7 + C.9. The pre-C.7 trio (g_recording /
+// g_postprocessing / g_downloading) is folded into a typed-slot JobQueue;
+// the postprocess and model_download slots' "running" markers are the
+// authoritative successors of g_postprocessing / g_downloading.
 //
-// `g_recording` survives as a standalone atomic: live recording via
-// record.start is NOT a JobQueue slot — it is the legacy daemon-side capture
-// path that C.9 removes (the `streaming` slot is reserved for C.10a's
-// streaming producer, a different thing). `g_rec_mu` is its small admission
-// gate, the recording-only remnant of the old g_state_mu.
+// Phase C.9 retired the daemon-side live-recording path entirely: the
+// `record.start` / `record.stop` / `job.context` handlers, the legacy
+// `g_recording` atomic + `g_rec_mu` admission gate, the `g_pp_handoff`
+// recording→postprocessing bridge, the `g_next_rec_job_id` counter, and the
+// `g_rec_worker` thread are all gone. The tray now captures audio locally
+// (see `recmeet_capture` / `tray_capture`) and submits batch jobs via
+// `process.submit` + `0x01` upload frames; live captions arrive via
+// `process.stream` (C.10a). The `streaming` slot reserves a different
+// thing — a streaming caption session — and is unchanged by C.9.
 // ---------------------------------------------------------------------------
-
-static std::atomic<bool> g_recording{false};
-static std::mutex g_rec_mu;  // admission gate for the legacy recording path
-
-// Atomic-handoff bridge. The pre-C.7 rec_worker set `g_postprocessing=true`
-// BEFORE clearing `g_recording` so there was never a transient "idle" between
-// recording finishing and postprocessing starting. With C.7 the postprocess
-// slot only reads "busy" once the pp_worker has *dequeued* the job — a
-// non-atomic window. `g_pp_handoff` closes that window: rec_worker raises it
-// inside the same atomic-handoff critical section, and pp_worker lowers it
-// the instant it owns a dequeued job. `jq_postprocessing()` ORs it in.
-// C.9 retires this along with the recording path.
-static std::atomic<bool> g_pp_handoff{false};
-
-// Recording-side job-id counter for the legacy record.start path. It tags
-// the live `caption` events and the record.start response. The *postprocess*
-// job gets its own id from JobQueue::enqueue() at handoff time — the two id
-// spaces are independent until C.9 unifies them by retiring record.start.
-static std::atomic<int64_t> g_next_rec_job_id{1};
 
 // The typed-slot job queue (postprocess / streaming / model_download). Owns
 // the job_id -> client_id binding C.3 will consume. Initialised in main()
@@ -112,31 +95,20 @@ static std::unique_ptr<DiarizationCache> g_diar_cache;
 static Config g_config;
 static std::mutex g_config_mu;
 
-// Stop tokens — separate for independent cancellation
-static StopToken g_rec_stop;
+// Stop tokens — separate for independent cancellation. C.9 dropped
+// `g_rec_stop` along with the legacy recording worker; only the postprocess
+// kill-switch survives.
 static StopToken g_pp_stop;
 
-// Worker threads
-static std::thread g_rec_worker;
+// Worker threads (C.9 retired g_rec_worker)
 static std::thread g_pp_worker;   // long-lived, drains the postprocess slot
 static std::thread g_dl_worker;   // long-lived, drains the model_download slot
 static std::thread g_stream_worker;  // C.10a — drains the streaming slot
 
-// PostprocessJob — pre-C.7 this was a standalone struct holding the inline
-// FIFO payload. C.7 keeps the name as a thin alias of the unified `Job`
-// record (which threads `client_id` and folds in the slot machinery) so the
-// surviving record.start / pp_worker / write_job_config call sites read
-// unchanged. C.9 will retire the alias along with record.start.
+// PostprocessJob — pre-C.7 this was a standalone struct; the C.7/C.9 typed
+// JobQueue surfaces postprocess work as `Job`. The alias is kept so the
+// pp_worker / write_job_config call sites read unchanged.
 using PostprocessJob = Job;
-
-// Whether the current recording is a reprocess (poll-thread-only variable,
-// set via server.post() from the recording worker)
-static bool g_is_reprocess = false;
-
-// Pending context from tray dialog (sent via job.context before record.stop)
-static std::mutex g_context_mu;
-static std::string g_pending_context;
-static std::string g_pending_vocab;
 
 // Subprocess postprocessing state
 static std::atomic<pid_t> g_pp_child_pid{-1};
@@ -149,30 +121,27 @@ static IpcServer* g_server = nullptr;
 // State helpers
 // ---------------------------------------------------------------------------
 
-// State reporting derives the postprocessing / downloading flags from the
-// JobQueue slot "running" markers (the C.7 successors of g_postprocessing /
-// g_downloading); recording stays its own atomic until C.9.
+// State reporting derives the postprocessing / downloading / streaming
+// flags from the JobQueue slot "running" markers. Phase C.9 dropped the
+// `recording` flag and its composite-state branches: the daemon no longer
+// captures audio on its own thread.
 static bool jq_postprocessing() {
-    return g_pp_handoff.load() ||
-           (g_jobs && g_jobs->slot_busy(JobKind::Postprocess));
+    return g_jobs && g_jobs->slot_busy(JobKind::Postprocess);
 }
 static bool jq_downloading() {
     return g_jobs && g_jobs->slot_busy(JobKind::ModelDownload);
 }
 // Phase C.10a — true while a streaming-caption job occupies the JobQueue
-// `streaming` slot (a `process.stream` is live). Independent of recording /
-// postprocessing / downloading: all four slots can be busy simultaneously.
+// `streaming` slot (a `process.stream` is live). Independent of
+// postprocessing / downloading: the slots may be busy simultaneously.
 static bool jq_streaming() {
     return g_jobs && g_jobs->slot_busy(JobKind::Streaming);
 }
 
 static std::string composite_state_name() {
-    bool rec = g_recording.load();
     bool pp  = jq_postprocessing();
     bool dl  = jq_downloading();
     bool st  = jq_streaming();
-    if (rec && pp) return g_is_reprocess ? "reprocessing+postprocessing" : "recording+postprocessing";
-    if (rec)       return g_is_reprocess ? "reprocessing" : "recording";
     if (pp)        return "postprocessing";
     if (st)        return "streaming";
     if (dl)        return "downloading";
@@ -180,8 +149,10 @@ static std::string composite_state_name() {
 }
 
 static void fill_state_fields(JsonMap& data) {
+    // C.9 wire change: the `recording` boolean is gone from the data map.
+    // Clients that need to know whether something is in flight read
+    // `state` (the composite name) or the per-slot booleans below.
     data["state"] = composite_state_name();
-    data["recording"] = g_recording.load();
     data["postprocessing"] = jq_postprocessing();
     data["downloading"] = jq_downloading();
     data["streaming"] = jq_streaming();
@@ -235,8 +206,9 @@ static void signal_handler(int sig) {
         }
         return;
     }
-    // SIGINT/SIGTERM → stop all workers, then exit
-    g_rec_stop.request();
+    // SIGINT/SIGTERM → stop all workers, then exit. C.9 retired the
+    // legacy g_rec_stop along with the daemon-side recording worker;
+    // only the postprocess kill-switch remains.
     g_pp_stop.request();
     if (g_server) g_server->stop();
 }
@@ -423,10 +395,11 @@ static void pp_worker_loop(IpcServer& server) {
         log_debug("daemon: pp_worker dequeued job=%ld (slot_queued=%zu)",
                   (long)job.job_id, g_jobs->queued_count(JobKind::Postprocess));
 
-        // Atomic-handoff bridge: the job is now owned by this worker and the
-        // slot's "running" marker is set, so the handoff window is closed —
-        // lower g_pp_handoff (no-op for non-record.start enqueuers).
-        g_pp_handoff.store(false);
+        // The job is now owned by this worker and the slot's "running"
+        // marker is set. C.9 retired the recording→postprocessing handoff
+        // bridge (`g_pp_handoff`) along with the legacy record.start path;
+        // all v2 producers (process.submit, enroll.finalize, etc.) hand
+        // off through JobQueue::enqueue() directly.
         broadcast_state(server);
         g_pp_stop.reset();
 
@@ -1538,27 +1511,11 @@ int main(int argc, char* argv[]) {
         return true;
     });
 
-    server.on("sources.list", [](const IpcRequest& req, IpcResponse& resp, IpcError& err) {
-        try {
-            auto sources = list_sources();
-            // Return as a JSON array string in result
-            std::string arr = "[";
-            for (size_t i = 0; i < sources.size(); ++i) {
-                if (i > 0) arr += ",";
-                arr += "{\"name\":\"" + json_escape(sources[i].name)
-                    + "\",\"description\":\"" + json_escape(sources[i].description)
-                    + "\",\"is_monitor\":" + (sources[i].is_monitor ? "true" : "false") + "}";
-            }
-            arr += "]";
-            resp.result["sources"] = arr;
-            resp.result["count"] = static_cast<int64_t>(sources.size());
-            return true;
-        } catch (const std::exception& e) {
-            err.code = static_cast<int>(IpcErrorCode::InternalError);
-            err.message = e.what();
-            return false;
-        }
-    });
+    // Phase C.9 — `sources.list` is gone. Audio-device enumeration is a
+    // client-local concern in the thin-client model: the tray (and the CLI
+    // in standalone mode) link `recmeet_capture` and call its `list_sources()`
+    // directly. The daemon no longer links PipeWire/PulseAudio so it could
+    // not honour this verb anyway.
 
     server.on("config.reload", [](const IpcRequest& req, IpcResponse& resp, IpcError& err) {
         try {
@@ -1808,359 +1765,23 @@ int main(int argc, char* argv[]) {
         return true;
     });
 
-    server.on("record.start", [&server](const IpcRequest& req, IpcResponse& resp, IpcError& err) {
-        bool is_reprocess = false;
-
-        // Check if this is a reprocess request (peek at params before full config merge)
-        {
-            auto it = req.params.find("reprocess_dir");
-            if (it != req.params.end()) {
-                std::string val = json_val_as_string(it->second);
-                is_reprocess = !val.empty();
-            }
-        }
-
-        // Guard: !g_recording && !downloading (allow during postprocessing).
-        // C.7: recording admission is the legacy recording path's own gate
-        // (g_rec_mu / g_recording); the "downloading" half now reads the
-        // JobQueue model_download slot's "running" marker.
-        {
-            std::lock_guard<std::mutex> lock(g_rec_mu);
-            if (g_recording.load() || jq_downloading()) {
-                err.code = static_cast<int>(IpcErrorCode::Busy);
-                err.message = "Daemon is busy (" + composite_state_name() + ")";
-                return false;
-            }
-            g_recording.store(true);
-        }
-
-        // Phase A.6: per-request config overrides are GONE. record.start no
-        // longer merges `req.params` into Config — the per-`client_id`
-        // session state established via `session.init` is the only client-
-        // supplied input. The credential precedence chain (env > session >
-        // daemon.yaml) is resolved by `merge_creds_for_job()` at this
-        // point so the recording (and the downstream postprocess job)
-        // sees the final view. `record.start` still accepts the
-        // `reprocess_dir` shape param above; everything else is ignored.
-        Config cfg;
-        {
-            std::lock_guard<std::mutex> lock(g_config_mu);
-            cfg = g_config;
-        }
-        {
-            SessionCredentials sess_creds;
-            SessionPreferences sess_prefs;
-            // Empty client_id → no session (e.g. a stray request before
-            // session.init landed). `get_session` returns false and the
-            // merge falls through to env > daemon.yaml.
-            if (!req.client_id.empty())
-                server.get_session(req.client_id, sess_creds, sess_prefs);
-            cfg = merge_creds_for_job_with_real_env(cfg, sess_creds, sess_prefs);
-        }
-        // Backwards compatibility: also honor `reprocess_dir` directly on
-        // req.params — it is the only non-session param record.start
-        // accepts. Tray + reprocess_batch send it via the existing
-        // `params["reprocess_dir"]` path.
-        {
-            auto rit = req.params.find("reprocess_dir");
-            if (rit != req.params.end()) {
-                std::string val = json_val_as_string(rit->second);
-                if (!val.empty()) cfg.reprocess_dir = val;
-            }
-        }
-
-        // Phase C.7: the pre-C.7 inline-synchronous `ensure_models(cfg)` call
-        // is GONE. Model readiness is no longer resolved on the handler
-        // thread — it is lifted to *job-dequeue time*: when the postprocess
-        // job dequeues, JobQueue checks the model cache (via the wired
-        // ModelResolver + ModelCacheChecker) and, for any required-but-
-        // uncached model, auto-enqueues a JobKind::ModelDownload into the
-        // model_download slot and parks the postprocess job until the
-        // download completes. See pp_worker_loop / model_dl_worker_loop.
-
-        // Assign a recording-side job_id (legacy record.start path).
-        int64_t job_id = g_next_rec_job_id.fetch_add(1);
-        log_info("daemon: record.start (mode=%s, rec_job=%ld)",
-                 is_reprocess ? "reprocess" : "recording", (long)job_id);
-
-        // Set reprocess flag on poll thread and broadcast
-        g_is_reprocess = is_reprocess;
-        broadcast_state_inline(server);
-
-        g_rec_stop.reset();
-
-        // Join any previous recording worker
-        if (g_rec_worker.joinable()) g_rec_worker.join();
-
-        // Owning client of the resulting postprocess job — C.7 threads this
-        // onto the JobQueue Job so the job_id -> client_id binding C.3 will
-        // consume is populated. May be empty (pre-session / stray request).
-        std::string rec_client_id = req.client_id;
-
-        g_rec_worker = std::thread([&server, cfg, is_reprocess, job_id, rec_client_id]() {
-            log_debug("daemon: rec_worker ENTER (tid=%d, job=%ld)", (int)syscall(SYS_gettid), (long)job_id);
-            // Phase C.3 — route recording-side `phase` / `caption` /
-            // `caption.degraded` to the request originator. `rec_client_id`
-            // was captured from `req.client_id` when the record.start
-            // handler scheduled this worker; the recording-side job_id is
-            // an independent counter (`g_next_rec_job_id`), so there is no
-            // JobQueue binding to consult — we route directly. Empty
-            // client_id (pre-session record.start — possible until C.9
-            // removes record.start) falls back to broadcast.
-            auto on_phase = [&server, rec_client_id](const std::string& phase) {
-                std::string cid = rec_client_id;
-                server.post([&server, cid, phase]() {
-                    IpcEvent ev;
-                    ev.event = "phase";
-                    ev.data["name"] = phase;
-                    if (!cid.empty()) {
-                        server.send_to_client(cid, std::move(ev));
-                    } else {
-                        log_debug("daemon: rec_worker phase event has empty "
-                                  "client_id — broadcast fallback");
-                        server.broadcast(ev);
-                    }
-                });
-            };
-
-            // Caption hooks. Captions fire on the engine's worker thread, so
-            // every callback marshals onto the IPC poll thread via post()
-            // before touching the server (not thread-safe). The
-            // CaptionBroadcastCtx is heap-allocated and outlives both the
-            // engine and this stack frame because run_recording() may
-            // post-and-return before the engine's worker has fully drained;
-            // the unique_ptr keeps the daemon clean of leak warnings.
-            // C.3 threads `client_id` onto the ctx so the hook lambdas can
-            // route to the recording's originator without re-looking-up.
-            struct CaptionBroadcastCtx {
-                IpcServer* server;
-                int64_t job_id;
-                std::string client_id;
-            };
-            auto ctx = std::make_unique<CaptionBroadcastCtx>(
-                CaptionBroadcastCtx{&server, job_id, rec_client_id});
-
-            CaptionHooks hooks;
-            hooks.result_ud = ctx.get();
-            hooks.degraded_ud = ctx.get();
-            hooks.engine_error_ud = ctx.get();
-            hooks.on_result = +[](const CaptionResult& r, void* ud) {
-                auto* c = static_cast<CaptionBroadcastCtx*>(ud);
-                IpcServer* s = c->server;
-                int64_t jid = c->job_id;
-                std::string cid = c->client_id;
-                std::string text = r.text;
-                bool is_partial = r.is_partial;
-                int64_t ts = r.timestamp_ms;
-                s->post([s, jid, cid, text, is_partial, ts]() {
-                    IpcEvent ev = make_caption_event(jid, text, is_partial, ts);
-                    if (!cid.empty()) {
-                        s->send_to_client(cid, std::move(ev));
-                    } else {
-                        log_debug("daemon: rec_worker caption event has empty "
-                                  "client_id — broadcast fallback");
-                        s->broadcast(ev);
-                    }
-                });
-            };
-            hooks.on_degraded = +[](CaptionDegradedReason reason, void* ud) {
-                auto* c = static_cast<CaptionBroadcastCtx*>(ud);
-                IpcServer* s = c->server;
-                int64_t jid = c->job_id;
-                std::string cid = c->client_id;
-                const char* reason_str =
-                    (reason == CaptionDegradedReason::BufferOverrun) ? "buffer_overrun"
-                                                                     : "unknown";
-                int64_t ts = std::chrono::duration_cast<std::chrono::milliseconds>(
-                    std::chrono::steady_clock::now().time_since_epoch()).count();
-                std::string r_str(reason_str);
-                s->post([s, jid, cid, r_str, ts]() {
-                    IpcEvent ev = make_caption_degraded_event(jid, r_str, ts);
-                    if (!cid.empty()) {
-                        s->send_to_client(cid, std::move(ev));
-                    } else {
-                        log_debug("daemon: rec_worker caption.degraded has "
-                                  "empty client_id — broadcast fallback");
-                        s->broadcast(ev);
-                    }
-                });
-            };
-            hooks.on_engine_error = +[](const std::string& msg, void* ud) {
-                auto* c = static_cast<CaptionBroadcastCtx*>(ud);
-                IpcServer* s = c->server;
-                int64_t jid = c->job_id;
-                std::string cid = c->client_id;
-                int64_t ts = std::chrono::duration_cast<std::chrono::milliseconds>(
-                    std::chrono::steady_clock::now().time_since_epoch()).count();
-                std::string m = msg;
-                s->post([s, jid, cid, m, ts]() {
-                    // One-shot degraded event with reason=engine_error and the
-                    // message attached so clients can show the operator why.
-                    IpcEvent ev = make_caption_degraded_event(jid, "engine_error", ts);
-                    ev.data["error"] = m;
-                    if (!cid.empty()) {
-                        s->send_to_client(cid, std::move(ev));
-                    } else {
-                        log_debug("daemon: rec_worker engine_error has empty "
-                                  "client_id — broadcast fallback");
-                        s->broadcast(ev);
-                    }
-                });
-            };
-
-            try {
-                auto input = run_recording(cfg, g_rec_stop, on_phase,
-                                           cfg.captions_enabled ? &hooks : nullptr);
-
-                // Apply any context sent by tray before stop
-                Config job_cfg = cfg;
-                {
-                    std::lock_guard<std::mutex> ctx_lock(g_context_mu);
-                    if (!g_pending_context.empty()) {
-                        job_cfg.context_inline = g_pending_context;
-                        g_pending_context.clear();
-                    }
-                    if (!g_pending_vocab.empty()) {
-                        if (!job_cfg.vocabulary.empty()) job_cfg.vocabulary += ", ";
-                        job_cfg.vocabulary += g_pending_vocab;
-                        g_pending_vocab.clear();
-                    }
-                }
-                // Persist context for future reprocessing.
-                // Outside g_context_mu — file I/O must not block concurrent job.context IPC.
-                if (cfg.reprocess_dir.empty()) {
-                    try {
-                        save_meeting_context(input.out_dir, job_cfg.context_inline,
-                                             job_cfg.context_file, input.timestamp);
-                    } catch (const std::exception& e) {
-                        log_warn("save_meeting_context failed: %s", e.what());
-                    }
-                }
-
-                // Build the postprocess job. C.7: the payload moves into the
-                // unified JobQueue Job; `client_id` is threaded on so the
-                // job_id -> client_id binding is populated for C.3.
-                PostprocessJob job;
-                job.input = std::move(input);
-                job.cfg = job_cfg;
-                // job.job_id is assigned by JobQueue::enqueue() below.
-
-                // Atomic handoff (INVARIANT — preserved from pre-C.7,
-                // daemon.cpp's "set postprocessing BEFORE clearing
-                // recording"): the postprocess slot only reports "running"
-                // once the pp_worker has *dequeued* the job, which is a
-                // non-atomic window after enqueue(). g_pp_handoff bridges
-                // it — raised here BEFORE g_recording is cleared so
-                // composite_state_name() never reports a transient "idle";
-                // the pp_worker lowers it the instant it owns the job.
-                g_pp_handoff.store(true);
-
-                int64_t pp_job_id = g_jobs->enqueue(std::move(job),
-                                                    JobKind::Postprocess,
-                                                    rec_client_id);
-                log_debug("daemon: rec_worker handoff to pp (rec_job=%ld -> "
-                          "pp_job=%ld, client=%s)",
-                          (long)job_id, (long)pp_job_id,
-                          rec_client_id.c_str());
-
-                g_recording.store(false);
-
-                // Clear reprocess flag and broadcast new state
-                server.post([&server]() {
-                    g_is_reprocess = false;
-                });
-                broadcast_state(server);
-                log_debug("daemon: rec_worker EXIT (rec_job=%ld)", (long)job_id);
-
-            } catch (const std::exception& e) {
-                fprintf(stderr, "Recording error: %s\n", e.what());
-                log_error("daemon: recording error: %s", e.what());
-
-                // Recording failed before any handoff — clear the recording
-                // gate; no postprocess job was enqueued so nothing to do on
-                // the JobQueue side (g_pp_handoff was never raised here).
-                {
-                    std::lock_guard<std::mutex> lock(g_rec_mu);
-                    g_recording.store(false);
-                }
-                server.post([&server]() {
-                    g_is_reprocess = false;
-                });
-                broadcast_state(server, e.what());
-                log_debug("daemon: rec_worker EXIT (rec_job=%ld)", (long)job_id);
-            }
-        });
-
-        resp.result["ok"] = true;
-        resp.result["job_id"] = job_id;
-        return true;
-    });
-
-    server.on("record.stop", [](const IpcRequest& req, IpcResponse& resp, IpcError& err) {
-        // Parse optional target param: "recording", "postprocessing", "all" (default)
-        std::string target = "all";
-        {
-            auto it = req.params.find("target");
-            if (it != req.params.end()) {
-                std::string val = json_val_as_string(it->second);
-                if (!val.empty()) target = val;
-            }
-        }
-
-        bool rec = g_recording.load();
-        bool pp  = jq_postprocessing();
-
-        if (!rec && !pp) {
-            err.code = static_cast<int>(IpcErrorCode::NotRecording);
-            err.message = "Not recording";
-            return false;
-        }
-
-        if (target == "recording") {
-            if (!rec) {
-                err.code = static_cast<int>(IpcErrorCode::NotRecording);
-                err.message = "Not recording";
-                return false;
-            }
-            g_rec_stop.request();
-        } else if (target == "postprocessing") {
-            if (!pp) {
-                err.code = static_cast<int>(IpcErrorCode::NotRecording);
-                err.message = "Not postprocessing";
-                return false;
-            }
-            g_pp_stop.request();
-            { pid_t child = g_pp_child_pid.load(); if (child > 0) kill(child, SIGTERM); }
-        } else {
-            // "all" — stop everything
-            if (rec) g_rec_stop.request();
-            if (pp) {
-                g_pp_stop.request();
-                pid_t child = g_pp_child_pid.load();
-                if (child > 0) kill(child, SIGTERM);
-            }
-        }
-
-        resp.result["ok"] = true;
-        return true;
-    });
-
-    server.on("job.context", [](const IpcRequest& req, IpcResponse& resp, IpcError& err) {
-        if (!g_recording.load()) {
-            err.code = static_cast<int>(IpcErrorCode::NotRecording);
-            err.message = "No active recording";
-            return false;
-        }
-        std::lock_guard<std::mutex> lock(g_context_mu);
-        auto ctx_it = req.params.find("context_inline");
-        if (ctx_it != req.params.end())
-            g_pending_context = json_val_as_string(ctx_it->second);
-        auto vocab_it = req.params.find("vocabulary_append");
-        if (vocab_it != req.params.end())
-            g_pending_vocab = json_val_as_string(vocab_it->second);
-        resp.result["ok"] = true;
-        return true;
-    });
+    // ---------------------------------------------------------------------------
+    // Phase C.9 — REMOVED handlers: record.start, record.stop, job.context.
+    //
+    // Until C.9 the daemon owned a live-recording path: record.start spawned a
+    // worker thread that called pipeline::run_recording (PipeWire/PulseAudio
+    // capture + optional CaptionEngine), and record.stop / job.context fed it.
+    // C.9 retired the entire path. The tray now captures audio locally (via
+    // recmeet_capture) and either:
+    //   - submits a finished WAV via  + 0x01 upload frames
+    //     (the daemon enqueues a postprocess Job; pp_worker_loop drains it),
+    //   - opens a streaming-caption session via  + 0x03 audio
+    //     frames (the streaming_session manager owns the CaptionEngine).
+    //
+    // record.stop / job.context callers should migrate to process.cancel /
+    // (per-submit) context fields in process.submit. The wire-side 
+    // boolean on state.changed is also gone in C.9 (IPC_PROTOCOL_VERSION bump).
+    // ---------------------------------------------------------------------------
 
     // --- Phase C.10a — streaming-caption handlers ---
     //
@@ -3318,9 +2939,9 @@ int main(int argc, char* argv[]) {
 
     server.run();
 
-    // Cleanup — shut down all workers
+    // Cleanup — shut down all workers. C.9 retired the rec_worker (legacy
+    // record.start path); only pp_worker / dl_worker / stream_worker remain.
     log_info("daemon: shutting down");
-    g_rec_stop.request();
     g_pp_stop.request();
     { pid_t child = g_pp_child_pid.load(); if (child > 0) kill(child, SIGTERM); }
 
@@ -3329,8 +2950,6 @@ int main(int argc, char* argv[]) {
     // loops. Successor of the pre-C.7 g_queue_shutdown + g_queue_cv model.
     if (g_jobs) g_jobs->shutdown();
 
-    log_debug("daemon: shutdown: joining rec_worker...");
-    if (g_rec_worker.joinable()) g_rec_worker.join();
     log_debug("daemon: shutdown: joining pp_worker...");
     if (g_pp_worker.joinable()) g_pp_worker.join();
     if (g_dl_worker.joinable()) g_dl_worker.join();

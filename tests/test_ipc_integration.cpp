@@ -92,7 +92,7 @@ struct DaemonSim {
     std::string pending_vocab;
 
     // Per-recording output dir + timestamp (mirrors PostprocessInput).
-    // Set by record.start (from `output_dir` param when provided), consumed
+    // Set by process.submit (from `output_dir` param when provided), consumed
     // by rec_worker to call save_meeting_context() — mirroring the
     // production fix in daemon::rec_worker.
     fs::path current_out_dir;
@@ -203,7 +203,7 @@ struct DaemonSim {
             return true;
         });
 
-        server.on("record.start", [this](const IpcRequest& req, IpcResponse& resp, IpcError& err) {
+        server.on("process.submit", [this](const IpcRequest& req, IpcResponse& resp, IpcError& err) {
             {
                 std::lock_guard<std::mutex> lk(params_mu);
                 last_record_params = req.params;
@@ -327,7 +327,7 @@ struct DaemonSim {
             return true;
         });
 
-        server.on("record.stop", [this](const IpcRequest& req, IpcResponse& resp, IpcError& err) {
+        server.on("process.submit.cancel", [this](const IpcRequest& req, IpcResponse& resp, IpcError& err) {
             std::string target = "all";
             {
                 auto it = req.params.find("target");
@@ -548,7 +548,7 @@ std::unique_ptr<IpcClient> make_client(const char* sock = INTEGRATION_SOCK) {
 // Category 1: State Broadcast Completeness
 // ===========================================================================
 
-TEST_CASE("record.start broadcasts state.changed: recording", "[ipc][integration]") {
+TEST_CASE("process.submit broadcasts state.changed: recording", "[ipc][integration]") {
     DaemonSim sim;
     sim.start();
 
@@ -559,7 +559,7 @@ TEST_CASE("record.start broadcasts state.changed: recording", "[ipc][integration
     auto starter = make_client();
     IpcResponse resp;
     IpcError err;
-    REQUIRE(starter->call("record.start", resp, err));
+    REQUIRE(starter->call("process.submit", resp, err));
 
     drain_events(*observer, 200);
 
@@ -579,8 +579,8 @@ TEST_CASE("recording->postprocessing broadcasts state.changed", "[ipc][integrati
 
     IpcResponse resp;
     IpcError err;
-    REQUIRE(client->call("record.start", resp, err));
-    REQUIRE(client->call("record.stop", resp, err));
+    REQUIRE(client->call("process.submit", resp, err));
+    REQUIRE(client->call("process.submit.cancel", resp, err));
 
     drain_events(*client, 500);
 
@@ -597,8 +597,8 @@ TEST_CASE("postprocessing->idle broadcasts state.changed + job.complete", "[ipc]
 
     IpcResponse resp;
     IpcError err;
-    REQUIRE(client->call("record.start", resp, err));
-    REQUIRE(client->call("record.stop", resp, err));
+    REQUIRE(client->call("process.submit", resp, err));
+    REQUIRE(client->call("process.submit.cancel", resp, err));
 
     drain_events(*client, 500);
 
@@ -616,7 +616,7 @@ TEST_CASE("pipeline error broadcasts state.changed: idle with error", "[ipc][int
 
     IpcResponse resp;
     IpcError err;
-    REQUIRE(client->call("record.start", resp, err));
+    REQUIRE(client->call("process.submit", resp, err));
 
     sim.inject_error.store(true);
     sim.rec_cv.notify_all();
@@ -647,8 +647,8 @@ TEST_CASE("full lifecycle event sequence is ordered", "[ipc][integration]") {
 
     IpcResponse resp;
     IpcError err;
-    REQUIRE(client->call("record.start", resp, err));
-    REQUIRE(client->call("record.stop", resp, err));
+    REQUIRE(client->call("process.submit", resp, err));
+    REQUIRE(client->call("process.submit.cancel", resp, err));
 
     REQUIRE(sim.wait_for_state(SIdle, 3000));
     drain_events(*client, 300);
@@ -694,7 +694,7 @@ TEST_CASE("broadcast reaches all connected clients", "[ipc][integration]") {
 
     IpcResponse resp;
     IpcError err;
-    REQUIRE(c1->call("record.start", resp, err));
+    REQUIRE(c1->call("process.submit", resp, err));
 
     // Drain both clients — interleave to avoid one consuming all timeout
     auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(400);
@@ -717,13 +717,13 @@ TEST_CASE("client connected mid-recording receives subsequent events", "[ipc][in
     auto starter = make_client();
     IpcResponse resp;
     IpcError err;
-    REQUIRE(starter->call("record.start", resp, err));
+    REQUIRE(starter->call("process.submit", resp, err));
 
     auto late = make_client();
     EventCollector late_events;
     late->set_event_callback(late_events.callback());
 
-    REQUIRE(starter->call("record.stop", resp, err));
+    REQUIRE(starter->call("process.submit.cancel", resp, err));
 
     drain_events(*late, 500);
 
@@ -748,7 +748,7 @@ TEST_CASE("disconnected client doesn't block broadcast", "[ipc][integration]") {
 
     IpcResponse resp;
     IpcError err;
-    REQUIRE(c1->call("record.start", resp, err));
+    REQUIRE(c1->call("process.submit", resp, err));
 
     drain_events(*c1, 200);
     drain_events(*c3, 200);
@@ -771,7 +771,7 @@ TEST_CASE("status.get during recording returns recording", "[ipc][integration]")
     auto starter = make_client();
     IpcResponse resp;
     IpcError err;
-    REQUIRE(starter->call("record.start", resp, err));
+    REQUIRE(starter->call("process.submit", resp, err));
 
     auto checker = make_client();
     REQUIRE(checker->call("status.get", resp, err));
@@ -788,8 +788,8 @@ TEST_CASE("status.get during postprocessing returns postprocessing", "[ipc][inte
     auto client = make_client();
     IpcResponse resp;
     IpcError err;
-    REQUIRE(client->call("record.start", resp, err));
-    REQUIRE(client->call("record.stop", resp, err));
+    REQUIRE(client->call("process.submit", resp, err));
+    REQUIRE(client->call("process.submit.cancel", resp, err));
 
     REQUIRE(sim.wait_for_state(SPostprocessing, 2000));
 
@@ -942,7 +942,7 @@ TEST_CASE("rapid broadcast burst: no events lost", "[ipc][integration]") {
 // Category 5: Concurrency & Error Handling
 // ===========================================================================
 
-TEST_CASE("concurrent record.start: one succeeds, one gets Busy", "[ipc][integration]") {
+TEST_CASE("concurrent process.submit: one succeeds, one gets Busy", "[ipc][integration]") {
     DaemonSim sim;
     sim.start();
 
@@ -952,8 +952,8 @@ TEST_CASE("concurrent record.start: one succeeds, one gets Busy", "[ipc][integra
     IpcResponse r1, r2;
     IpcError e1, e2;
 
-    std::thread t1([&]() { c1->call("record.start", r1, e1); });
-    std::thread t2([&]() { c2->call("record.start", r2, e2); });
+    std::thread t1([&]() { c1->call("process.submit", r1, e1); });
+    std::thread t2([&]() { c2->call("process.submit", r2, e2); });
     t1.join();
     t2.join();
 
@@ -969,7 +969,7 @@ TEST_CASE("concurrent record.start: one succeeds, one gets Busy", "[ipc][integra
     sim.rec_cv.notify_all();
 }
 
-TEST_CASE("record.stop from different client than starter", "[ipc][integration]") {
+TEST_CASE("process.cancel from different client than starter", "[ipc][integration]") {
     DaemonSim sim;
     sim.start();
 
@@ -981,8 +981,8 @@ TEST_CASE("record.stop from different client than starter", "[ipc][integration]"
 
     IpcResponse resp;
     IpcError err;
-    REQUIRE(starter->call("record.start", resp, err));
-    REQUIRE(stopper->call("record.stop", resp, err));
+    REQUIRE(starter->call("process.submit", resp, err));
+    REQUIRE(stopper->call("process.submit.cancel", resp, err));
 
     drain_events(*stopper, 500);
 
@@ -990,14 +990,14 @@ TEST_CASE("record.stop from different client than starter", "[ipc][integration]"
     CHECK(stop_events.has_state_event("idle"));
 }
 
-TEST_CASE("record.stop when idle returns NotRecording", "[ipc][integration]") {
+TEST_CASE("process.cancel when idle returns NotRecording", "[ipc][integration]") {
     DaemonSim sim;
     sim.start();
 
     auto client = make_client();
     IpcResponse resp;
     IpcError err;
-    CHECK_FALSE(client->call("record.stop", resp, err));
+    CHECK_FALSE(client->call("process.submit.cancel", resp, err));
     CHECK(err.code == static_cast<int>(IpcErrorCode::NotRecording));
 }
 
@@ -1009,7 +1009,7 @@ TEST_CASE("client disconnect during recording doesn't affect daemon", "[ipc][int
         auto starter = make_client();
         IpcResponse resp;
         IpcError err;
-        REQUIRE(starter->call("record.start", resp, err));
+        REQUIRE(starter->call("process.submit", resp, err));
     }
 
     CHECK(sim.recording.load());
@@ -1017,7 +1017,7 @@ TEST_CASE("client disconnect during recording doesn't affect daemon", "[ipc][int
     auto stopper = make_client();
     IpcResponse resp;
     IpcError err;
-    REQUIRE(stopper->call("record.stop", resp, err));
+    REQUIRE(stopper->call("process.submit.cancel", resp, err));
 
     REQUIRE(sim.wait_for_state(SIdle, 3000));
 }
@@ -1040,7 +1040,7 @@ TEST_CASE("reprocess broadcasts state.changed: reprocessing (not recording)", "[
     IpcError err;
     JsonMap params;
     params["reprocess_dir"] = std::string("/tmp/fake_meeting");
-    REQUIRE(starter->call("record.start", params, resp, err));
+    REQUIRE(starter->call("process.submit", params, resp, err));
 
     drain_events(*observer, 500);
 
@@ -1061,7 +1061,7 @@ TEST_CASE("reprocess completes full lifecycle without stop", "[ipc][integration]
     IpcError err;
     JsonMap params;
     params["reprocess_dir"] = std::string("/tmp/fake_meeting");
-    REQUIRE(client->call("record.start", params, resp, err));
+    REQUIRE(client->call("process.submit", params, resp, err));
 
     // Reprocess should complete on its own — no stop needed
     REQUIRE(sim.wait_for_state(SIdle, 3000));
@@ -1101,7 +1101,7 @@ TEST_CASE("status.get during reprocess returns reprocessing", "[ipc][integration
     IpcError err;
     JsonMap params;
     params["reprocess_dir"] = std::string("/tmp/fake_meeting");
-    REQUIRE(starter->call("record.start", params, resp, err));
+    REQUIRE(starter->call("process.submit", params, resp, err));
 
     // The reprocess worker runs fast but postprocessing has a 30ms sleep.
     // Check state during postprocessing at least.
@@ -1112,7 +1112,7 @@ TEST_CASE("status.get during reprocess returns reprocessing", "[ipc][integration
     CHECK(json_val_as_string(resp.result["state"]) == "postprocessing");
 }
 
-TEST_CASE("record.start during reprocess returns Busy", "[ipc][integration]") {
+TEST_CASE("process.submit during reprocess returns Busy", "[ipc][integration]") {
     DaemonSim sim;
     sim.start();
 
@@ -1120,7 +1120,7 @@ TEST_CASE("record.start during reprocess returns Busy", "[ipc][integration]") {
     auto c1 = make_client();
     IpcResponse resp;
     IpcError err;
-    REQUIRE(c1->call("record.start", resp, err));
+    REQUIRE(c1->call("process.submit", resp, err));
 
     // Try to start a reprocess while recording — should get Busy
     auto c2 = make_client();
@@ -1128,14 +1128,14 @@ TEST_CASE("record.start during reprocess returns Busy", "[ipc][integration]") {
     IpcError e2;
     JsonMap params;
     params["reprocess_dir"] = std::string("/tmp/fake_meeting");
-    CHECK_FALSE(c2->call("record.start", params, r2, e2));
+    CHECK_FALSE(c2->call("process.submit", params, r2, e2));
     CHECK(e2.code == static_cast<int>(IpcErrorCode::Busy));
 
     sim.rec_stop.store(true);
     sim.rec_cv.notify_all();
 }
 
-TEST_CASE("record.start during reprocess from another client returns Busy", "[ipc][integration]") {
+TEST_CASE("process.submit during reprocess from another client returns Busy", "[ipc][integration]") {
     DaemonSim sim;
     sim.start();
 
@@ -1149,8 +1149,8 @@ TEST_CASE("record.start during reprocess from another client returns Busy", "[ip
     // Instead, start a normal recording (holds lock as SRecording), try reprocess.
     // The complementary test: start reprocess, try normal recording — but reprocess
     // completes too fast in DaemonSim. We can verify via the state transition that
-    // the lock was held: if reprocess was SReprocessing, another record.start would
-    // need to wait. The "concurrent record.start" test already covers the CAS race.
+    // the lock was held: if reprocess was SReprocessing, another process.submit would
+    // need to wait. The "concurrent process.submit" test already covers the CAS race.
 
     // This test verifies the inverse: reprocess blocks normal recording.
     // Use inject_error to make the reprocess worker hang.
@@ -1169,10 +1169,10 @@ TEST_CASE("record.start during reprocess from another client returns Busy", "[ip
     // First reprocess starts and completes quickly, second should either succeed
     // (if first finished) or get Busy (if still running).
     // With the 30ms postprocessing sleep, there's a window.
-    REQUIRE(c1->call("record.start", params, r1, e1));
+    REQUIRE(c1->call("process.submit", params, r1, e1));
 
     // Immediately try second — may or may not be busy depending on timing
-    bool ok2 = c2->call("record.start", params, r2, e2);
+    bool ok2 = c2->call("process.submit", params, r2, e2);
     if (!ok2) {
         CHECK(e2.code == static_cast<int>(IpcErrorCode::Busy));
     }
@@ -1180,7 +1180,7 @@ TEST_CASE("record.start during reprocess from another client returns Busy", "[ip
     REQUIRE(sim.wait_for_state(SIdle, 3000));
 }
 
-TEST_CASE("record.stop during reprocess succeeds", "[ipc][integration]") {
+TEST_CASE("process.cancel during reprocess succeeds", "[ipc][integration]") {
     DaemonSim sim;
     sim.start();
     auto client = make_client();
@@ -1193,13 +1193,13 @@ TEST_CASE("record.stop during reprocess succeeds", "[ipc][integration]") {
 
     IpcResponse resp;
     IpcError err;
-    REQUIRE(client->call("record.start", params, resp, err));
+    REQUIRE(client->call("process.submit", params, resp, err));
     CHECK(resp.result.count("ok"));
 
     // Issue stop — may arrive during reprocessing or postprocessing
     IpcResponse stop_resp;
     IpcError stop_err;
-    bool stop_ok = client->call("record.stop", stop_resp, stop_err, 3000);
+    bool stop_ok = client->call("process.submit.cancel", stop_resp, stop_err, 3000);
     // Stop may fail if reprocess already completed — that's fine
     if (!stop_ok) {
         // Should only fail with NotRecording if already past reprocessing
@@ -1224,7 +1224,7 @@ TEST_CASE("reprocess stop triggers postprocessing lifecycle", "[ipc][integration
 
     IpcResponse resp;
     IpcError err;
-    REQUIRE(client->call("record.start", params, resp, err));
+    REQUIRE(client->call("process.submit", params, resp, err));
 
     // Wait for full lifecycle to complete
     REQUIRE(sim.wait_idle(3000));
@@ -1358,7 +1358,7 @@ TEST_CASE("speakers.remove round-trip via IPC", "[ipc][integration]") {
 // Category 8: API Key Handling
 // ===========================================================================
 
-TEST_CASE("record.start with api_key param: daemon receives client key", "[ipc][integration]") {
+TEST_CASE("process.submit with api_key param: daemon receives client key", "[ipc][integration]") {
     DaemonSim sim;
     sim.start();
 
@@ -1368,7 +1368,7 @@ TEST_CASE("record.start with api_key param: daemon receives client key", "[ipc][
 
     JsonMap params;
     params["api_key"] = std::string("sk-client-key-42");
-    REQUIRE(client->call("record.start", params, resp, err));
+    REQUIRE(client->call("process.submit", params, resp, err));
 
     // Verify the daemon received the api_key param
     {
@@ -1382,7 +1382,7 @@ TEST_CASE("record.start with api_key param: daemon receives client key", "[ipc][
     sim.rec_cv.notify_all();
 }
 
-TEST_CASE("record.start without api_key: param not present", "[ipc][integration]") {
+TEST_CASE("process.submit without api_key: param not present", "[ipc][integration]") {
     DaemonSim sim;
     sim.start();
 
@@ -1390,8 +1390,8 @@ TEST_CASE("record.start without api_key: param not present", "[ipc][integration]
     IpcResponse resp;
     IpcError err;
 
-    // Send record.start with no api_key — just default params
-    REQUIRE(client->call("record.start", resp, err));
+    // Send process.submit with no api_key — just default params
+    REQUIRE(client->call("process.submit", resp, err));
 
     // Verify api_key was sent (config_to_map now includes it) but is empty
     {
@@ -1407,7 +1407,7 @@ TEST_CASE("record.start without api_key: param not present", "[ipc][integration]
     sim.rec_cv.notify_all();
 }
 
-TEST_CASE("record.start api_key not leaked in state.changed events", "[ipc][integration]") {
+TEST_CASE("process.submit api_key not leaked in state.changed events", "[ipc][integration]") {
     DaemonSim sim;
     sim.start();
 
@@ -1421,9 +1421,9 @@ TEST_CASE("record.start api_key not leaked in state.changed events", "[ipc][inte
     IpcError err;
     JsonMap params;
     params["api_key"] = std::string("sk-secret-must-not-leak");
-    REQUIRE(starter->call("record.start", params, resp, err));
+    REQUIRE(starter->call("process.submit", params, resp, err));
 
-    REQUIRE(starter->call("record.stop", resp, err));
+    REQUIRE(starter->call("process.submit.cancel", resp, err));
     REQUIRE(sim.wait_for_state(SIdle, 3000));
     drain_events(*observer, 300);
 
@@ -1478,7 +1478,7 @@ TEST_CASE("speakers.reset round-trip via IPC", "[ipc][integration]") {
 // Category 9: Concurrent Recording During Postprocessing
 // ===========================================================================
 
-TEST_CASE("record.start allowed during postprocessing", "[ipc][integration][concurrent]") {
+TEST_CASE("process.submit allowed during postprocessing", "[ipc][integration][concurrent]") {
     DaemonSim sim;
     sim.pp_delay_ms = 500;
     sim.start();
@@ -1488,8 +1488,8 @@ TEST_CASE("record.start allowed during postprocessing", "[ipc][integration][conc
     IpcError err;
 
     // Start first recording, stop it to trigger postprocessing
-    REQUIRE(client->call("record.start", resp, err));
-    REQUIRE(client->call("record.stop", resp, err));
+    REQUIRE(client->call("process.submit", resp, err));
+    REQUIRE(client->call("process.submit.cancel", resp, err));
 
     // Wait for postprocessing to start
     REQUIRE(sim.wait_postprocessing());
@@ -1498,21 +1498,21 @@ TEST_CASE("record.start allowed during postprocessing", "[ipc][integration][conc
     auto c2 = make_client();
     IpcResponse r2;
     IpcError e2;
-    REQUIRE(c2->call("record.start", r2, e2));
+    REQUIRE(c2->call("process.submit", r2, e2));
     CHECK(json_val_as_bool(r2.result["ok"]));
 
     sim.rec_stop.store(true);
     sim.rec_cv.notify_all();
 }
 
-TEST_CASE("record.start returns job_id", "[ipc][integration][concurrent]") {
+TEST_CASE("process.submit returns job_id", "[ipc][integration][concurrent]") {
     DaemonSim sim;
     sim.start();
 
     auto client = make_client();
     IpcResponse resp;
     IpcError err;
-    REQUIRE(client->call("record.start", resp, err));
+    REQUIRE(client->call("process.submit", resp, err));
 
     auto jid_it = resp.result.find("job_id");
     REQUIRE(jid_it != resp.result.end());
@@ -1532,10 +1532,10 @@ TEST_CASE("job.complete includes job_id", "[ipc][integration][concurrent]") {
 
     IpcResponse resp;
     IpcError err;
-    REQUIRE(client->call("record.start", resp, err));
+    REQUIRE(client->call("process.submit", resp, err));
     int64_t my_job_id = json_val_as_int(resp.result["job_id"]);
 
-    REQUIRE(client->call("record.stop", resp, err));
+    REQUIRE(client->call("process.submit.cancel", resp, err));
     REQUIRE(sim.wait_idle());
     drain_events(*client, 300);
 
@@ -1562,7 +1562,7 @@ TEST_CASE("state.changed includes boolean fields", "[ipc][integration][concurren
 
     IpcResponse resp;
     IpcError err;
-    REQUIRE(client->call("record.start", resp, err));
+    REQUIRE(client->call("process.submit", resp, err));
 
     drain_events(*client, 200);
 
@@ -1613,8 +1613,8 @@ TEST_CASE("no transient idle between recording and postprocessing", "[ipc][integ
 
     IpcResponse resp;
     IpcError err;
-    REQUIRE(client->call("record.start", resp, err));
-    REQUIRE(client->call("record.stop", resp, err));
+    REQUIRE(client->call("process.submit", resp, err));
+    REQUIRE(client->call("process.submit.cancel", resp, err));
 
     REQUIRE(sim.wait_idle());
     drain_events(*client, 300);
@@ -1647,15 +1647,15 @@ TEST_CASE("concurrent recording+postprocessing state string", "[ipc][integration
     IpcError err;
 
     // Start and stop first recording to start postprocessing
-    REQUIRE(client->call("record.start", resp, err));
-    REQUIRE(client->call("record.stop", resp, err));
+    REQUIRE(client->call("process.submit", resp, err));
+    REQUIRE(client->call("process.submit.cancel", resp, err));
     REQUIRE(sim.wait_postprocessing());
 
     // Start second recording during postprocessing
     auto c2 = make_client();
     IpcResponse r2;
     IpcError e2;
-    REQUIRE(c2->call("record.start", r2, e2));
+    REQUIRE(c2->call("process.submit", r2, e2));
 
     // Check status — should show recording+postprocessing
     auto checker = make_client();
@@ -1672,7 +1672,7 @@ TEST_CASE("concurrent recording+postprocessing state string", "[ipc][integration
     sim.rec_cv.notify_all();
 }
 
-TEST_CASE("record.stop target=recording only stops recording", "[ipc][integration][concurrent]") {
+TEST_CASE("process.cancel target=recording only stops recording", "[ipc][integration][concurrent]") {
     DaemonSim sim;
     sim.pp_delay_ms = 500;
     sim.start();
@@ -1682,22 +1682,22 @@ TEST_CASE("record.stop target=recording only stops recording", "[ipc][integratio
     IpcError err;
 
     // Start and stop first recording to enter postprocessing
-    REQUIRE(client->call("record.start", resp, err));
-    REQUIRE(client->call("record.stop", resp, err));
+    REQUIRE(client->call("process.submit", resp, err));
+    REQUIRE(client->call("process.submit.cancel", resp, err));
     REQUIRE(sim.wait_postprocessing());
 
     // Start second recording during postprocessing
     auto c2 = make_client();
     IpcResponse r2;
     IpcError e2;
-    REQUIRE(c2->call("record.start", r2, e2));
+    REQUIRE(c2->call("process.submit", r2, e2));
 
     // Stop only recording
     JsonMap stop_params;
     stop_params["target"] = std::string("recording");
     IpcResponse sr;
     IpcError se;
-    REQUIRE(c2->call("record.stop", stop_params, sr, se));
+    REQUIRE(c2->call("process.submit.cancel", stop_params, sr, se));
 
     // Give it a moment to process
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
@@ -1707,7 +1707,7 @@ TEST_CASE("record.stop target=recording only stops recording", "[ipc][integratio
     CHECK_FALSE(sim.recording.load());
 }
 
-TEST_CASE("record.stop target=postprocessing only stops postprocessing", "[ipc][integration][concurrent]") {
+TEST_CASE("process.cancel target=postprocessing only stops postprocessing", "[ipc][integration][concurrent]") {
     DaemonSim sim;
     sim.pp_delay_ms = 2000;
     sim.start();
@@ -1717,8 +1717,8 @@ TEST_CASE("record.stop target=postprocessing only stops postprocessing", "[ipc][
     IpcError err;
 
     // Start and stop recording to enter postprocessing
-    REQUIRE(client->call("record.start", resp, err));
-    REQUIRE(client->call("record.stop", resp, err));
+    REQUIRE(client->call("process.submit", resp, err));
+    REQUIRE(client->call("process.submit.cancel", resp, err));
     REQUIRE(sim.wait_postprocessing());
 
     // Cancel just postprocessing
@@ -1726,24 +1726,24 @@ TEST_CASE("record.stop target=postprocessing only stops postprocessing", "[ipc][
     stop_params["target"] = std::string("postprocessing");
     IpcResponse sr;
     IpcError se;
-    REQUIRE(client->call("record.stop", stop_params, sr, se));
+    REQUIRE(client->call("process.submit.cancel", stop_params, sr, se));
 
     // Wait for postprocessing to complete (pp_stop was set)
     REQUIRE(sim.wait_idle());
 }
 
-TEST_CASE("record.stop target=postprocessing when idle returns NotRecording", "[ipc][integration][concurrent]") {
+TEST_CASE("process.cancel target=postprocessing when idle returns NotRecording", "[ipc][integration][concurrent]") {
     DaemonSim sim;
     sim.start();
 
     auto client = make_client();
     IpcResponse resp;
     IpcError err;
-    CHECK_FALSE(client->call("record.stop", resp, err));
+    CHECK_FALSE(client->call("process.submit.cancel", resp, err));
     CHECK(err.code == static_cast<int>(IpcErrorCode::NotRecording));
 }
 
-TEST_CASE("record.start blocked during recording", "[ipc][integration][concurrent]") {
+TEST_CASE("process.submit blocked during recording", "[ipc][integration][concurrent]") {
     DaemonSim sim;
     sim.start();
 
@@ -1751,19 +1751,19 @@ TEST_CASE("record.start blocked during recording", "[ipc][integration][concurren
     auto c2 = make_client();
     IpcResponse resp;
     IpcError err;
-    REQUIRE(c1->call("record.start", resp, err));
+    REQUIRE(c1->call("process.submit", resp, err));
 
     // Second recording should fail
     IpcResponse r2;
     IpcError e2;
-    CHECK_FALSE(c2->call("record.start", r2, e2));
+    CHECK_FALSE(c2->call("process.submit", r2, e2));
     CHECK(e2.code == static_cast<int>(IpcErrorCode::Busy));
 
     sim.rec_stop.store(true);
     sim.rec_cv.notify_all();
 }
 
-TEST_CASE("record.start blocked during downloading", "[ipc][integration][concurrent]") {
+TEST_CASE("process.submit blocked during downloading", "[ipc][integration][concurrent]") {
     DaemonSim sim;
     sim.start();
 
@@ -1777,7 +1777,7 @@ TEST_CASE("record.start blocked during downloading", "[ipc][integration][concurr
     auto c2 = make_client();
     IpcResponse r2;
     IpcError e2;
-    CHECK_FALSE(c2->call("record.start", r2, e2));
+    CHECK_FALSE(c2->call("process.submit", r2, e2));
     CHECK(e2.code == static_cast<int>(IpcErrorCode::Busy));
 }
 
@@ -1791,8 +1791,8 @@ TEST_CASE("models.ensure allowed during postprocessing", "[ipc][integration][con
     IpcError err;
 
     // Start and stop recording to enter postprocessing
-    REQUIRE(client->call("record.start", resp, err));
-    REQUIRE(client->call("record.stop", resp, err));
+    REQUIRE(client->call("process.submit", resp, err));
+    REQUIRE(client->call("process.submit.cancel", resp, err));
     REQUIRE(sim.wait_postprocessing());
 
     // models.ensure should succeed during postprocessing
@@ -1812,15 +1812,15 @@ TEST_CASE("error during recording doesn't affect postprocessing", "[ipc][integra
     IpcError err;
 
     // Start first recording, stop it to start postprocessing
-    REQUIRE(client->call("record.start", resp, err));
-    REQUIRE(client->call("record.stop", resp, err));
+    REQUIRE(client->call("process.submit", resp, err));
+    REQUIRE(client->call("process.submit.cancel", resp, err));
     REQUIRE(sim.wait_postprocessing());
 
     // Start second recording
     auto c2 = make_client();
     IpcResponse r2;
     IpcError e2;
-    REQUIRE(c2->call("record.start", r2, e2));
+    REQUIRE(c2->call("process.submit", r2, e2));
 
     // Inject error in second recording
     sim.inject_error.store(true);
@@ -1845,9 +1845,9 @@ TEST_CASE("two jobs complete in order via queue", "[ipc][integration][concurrent
     IpcError err;
 
     // Start first recording
-    REQUIRE(client->call("record.start", resp, err));
+    REQUIRE(client->call("process.submit", resp, err));
     int64_t job1 = json_val_as_int(resp.result["job_id"]);
-    REQUIRE(client->call("record.stop", resp, err));
+    REQUIRE(client->call("process.submit.cancel", resp, err));
 
     // Wait for postprocessing to start, then start second recording
     REQUIRE(sim.wait_postprocessing());
@@ -1855,7 +1855,7 @@ TEST_CASE("two jobs complete in order via queue", "[ipc][integration][concurrent
     auto c2 = make_client();
     IpcResponse r2;
     IpcError e2;
-    REQUIRE(c2->call("record.start", r2, e2));
+    REQUIRE(c2->call("process.submit", r2, e2));
     int64_t job2 = json_val_as_int(r2.result["job_id"]);
     CHECK(job2 > job1);
 
@@ -1888,8 +1888,8 @@ TEST_CASE("shutdown with queued jobs completes cleanly", "[ipc][integration][con
     auto client = make_client();
     IpcResponse resp;
     IpcError err;
-    REQUIRE(client->call("record.start", resp, err));
-    REQUIRE(client->call("record.stop", resp, err));
+    REQUIRE(client->call("process.submit", resp, err));
+    REQUIRE(client->call("process.submit.cancel", resp, err));
 
     REQUIRE(sim->wait_postprocessing());
 
@@ -1924,7 +1924,7 @@ TEST_CASE("job.context stores context during recording", "[ipc][integration]") {
     IpcError err;
 
     // Start recording
-    REQUIRE(client->call("record.start", resp, err));
+    REQUIRE(client->call("process.submit", resp, err));
     REQUIRE(sim.recording.load());
 
     // Send context
@@ -1942,7 +1942,7 @@ TEST_CASE("job.context stores context during recording", "[ipc][integration]") {
     }
 
     // Stop and clean up
-    REQUIRE(client->call("record.stop", resp, err));
+    REQUIRE(client->call("process.submit.cancel", resp, err));
     REQUIRE(sim.wait_idle());
 }
 
@@ -1954,7 +1954,7 @@ TEST_CASE("job.context with only context_inline (no vocabulary)", "[ipc][integra
     IpcResponse resp;
     IpcError err;
 
-    REQUIRE(client->call("record.start", resp, err));
+    REQUIRE(client->call("process.submit", resp, err));
 
     JsonMap params;
     params["context_inline"] = std::string("Just some notes");
@@ -1966,7 +1966,7 @@ TEST_CASE("job.context with only context_inline (no vocabulary)", "[ipc][integra
         CHECK(sim.pending_vocab.empty());
     }
 
-    REQUIRE(client->call("record.stop", resp, err));
+    REQUIRE(client->call("process.submit.cancel", resp, err));
     REQUIRE(sim.wait_idle());
 }
 
@@ -2048,7 +2048,7 @@ TEST_CASE("TCP reconnect: server restart detected by client", "[ipc][integration
 // dead code on every daemon path.
 //
 // Fix: save_meeting_context() is now called from daemon::rec_worker outside
-// the g_context_mu lock scope. DaemonSim's record.start handler mirrors the
+// the g_context_mu lock scope. DaemonSim's process.submit handler mirrors the
 // fix (drain pending_context, then call save_meeting_context outside the
 // mutex), so these tests exercise the same control flow.
 // ===========================================================================
@@ -2081,7 +2081,7 @@ struct TmpMeetingDir {
 };
 } // anonymous namespace
 
-TEST_CASE("record.start -> job.context -> record.stop persists context_<ts>.json",
+TEST_CASE("process.submit -> job.context -> process.cancel persists context_<ts>.json",
           "[context-persist][ipc][integration]") {
     TmpMeetingDir tmp;
     DaemonSim sim;
@@ -2094,7 +2094,7 @@ TEST_CASE("record.start -> job.context -> record.stop persists context_<ts>.json
     // Start recording with explicit output_dir so DaemonSim can save context there.
     JsonMap start_params;
     start_params["output_dir"] = tmp.path.string();
-    REQUIRE(client->call("record.start", start_params, resp, err));
+    REQUIRE(client->call("process.submit", start_params, resp, err));
     REQUIRE(sim.recording.load());
 
     // Send context mid-recording.
@@ -2104,7 +2104,7 @@ TEST_CASE("record.start -> job.context -> record.stop persists context_<ts>.json
     REQUIRE(client->call("job.context", ctx_params, resp, err));
 
     // Stop — rec_worker should drain pending_context and call save_meeting_context.
-    REQUIRE(client->call("record.stop", resp, err));
+    REQUIRE(client->call("process.submit.cancel", resp, err));
     REQUIRE(sim.wait_idle());
 
     // Verify context_<ts>.json appeared with the expected timestamp.
@@ -2119,7 +2119,7 @@ TEST_CASE("record.start -> job.context -> record.stop persists context_<ts>.json
     CHECK(found == expected);
 }
 
-TEST_CASE("record.start -> record.stop with no job.context writes no context file",
+TEST_CASE("process.submit -> process.cancel with no job.context writes no context file",
           "[context-persist][ipc][integration]") {
     TmpMeetingDir tmp;
     DaemonSim sim;
@@ -2131,11 +2131,11 @@ TEST_CASE("record.start -> record.stop with no job.context writes no context fil
 
     JsonMap start_params;
     start_params["output_dir"] = tmp.path.string();
-    REQUIRE(client->call("record.start", start_params, resp, err));
+    REQUIRE(client->call("process.submit", start_params, resp, err));
     REQUIRE(sim.recording.load());
 
     // No job.context — straight to stop.
-    REQUIRE(client->call("record.stop", resp, err));
+    REQUIRE(client->call("process.submit.cancel", resp, err));
     REQUIRE(sim.wait_idle());
 
     // Verify NO context file was written (empty inline + empty file = no save).
@@ -2145,7 +2145,7 @@ TEST_CASE("record.start -> record.stop with no job.context writes no context fil
     CHECK(find_context_file(tmp.path).empty());
 }
 
-TEST_CASE("record.start -> job.context (empty string) -> record.stop writes no context file",
+TEST_CASE("process.submit -> job.context (empty string) -> process.cancel writes no context file",
           "[context-persist][ipc][integration]") {
     TmpMeetingDir tmp;
     DaemonSim sim;
@@ -2157,7 +2157,7 @@ TEST_CASE("record.start -> job.context (empty string) -> record.stop writes no c
 
     JsonMap start_params;
     start_params["output_dir"] = tmp.path.string();
-    REQUIRE(client->call("record.start", start_params, resp, err));
+    REQUIRE(client->call("process.submit", start_params, resp, err));
     REQUIRE(sim.recording.load());
 
     // Send empty context — save_meeting_context's "both empty" guard should skip the write.
@@ -2165,7 +2165,7 @@ TEST_CASE("record.start -> job.context (empty string) -> record.stop writes no c
     ctx_params["context_inline"] = std::string("");
     REQUIRE(client->call("job.context", ctx_params, resp, err));
 
-    REQUIRE(client->call("record.stop", resp, err));
+    REQUIRE(client->call("process.submit.cancel", resp, err));
     REQUIRE(sim.wait_idle());
 
     // Verify NO context file was written.

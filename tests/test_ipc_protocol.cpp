@@ -14,19 +14,19 @@ using namespace recmeet;
 TEST_CASE("IpcRequest: serialize + parse round-trip", "[ipc]") {
     IpcRequest req;
     req.id = 42;
-    req.method = "record.start";
+    req.method = "process.submit";
     req.params["model"] = std::string("tiny");
     req.params["mic_only"] = true;
 
     std::string wire = serialize(req);
     REQUIRE(wire.find("\"id\":42") != std::string::npos);
-    REQUIRE(wire.find("\"method\":\"record.start\"") != std::string::npos);
+    REQUIRE(wire.find("\"method\":\"process.submit\"") != std::string::npos);
 
     IpcMessage msg;
     REQUIRE(parse_ipc_message(wire, msg));
     REQUIRE(msg.type == IpcMessageType::Request);
     CHECK(msg.request.id == 42);
-    CHECK(msg.request.method == "record.start");
+    CHECK(msg.request.method == "process.submit");
     CHECK(json_val_as_string(msg.request.params["model"]) == "tiny");
     CHECK(json_val_as_bool(msg.request.params["mic_only"]) == true);
 }
@@ -466,7 +466,7 @@ TEST_CASE("C.1: 0x00 NDJSON round-trip through FrameReader", "[ipc][c1]") {
     // real serialized request, frame it, decode it, and parse it back.
     IpcRequest req;
     req.id = 7;
-    req.method = "record.start";
+    req.method = "process.submit";
     req.params["model"] = std::string("tiny");
 
     std::string wire = frame_ndjson(serialize(req));
@@ -479,7 +479,7 @@ TEST_CASE("C.1: 0x00 NDJSON round-trip through FrameReader", "[ipc][c1]") {
     REQUIRE(parse_ipc_message(f.payload, msg));
     REQUIRE(msg.type == IpcMessageType::Request);
     CHECK(msg.request.id == 7);
-    CHECK(msg.request.method == "record.start");
+    CHECK(msg.request.method == "process.submit");
     CHECK(json_val_as_string(msg.request.params["model"]) == "tiny");
 
     // Reader is back at a frame boundary with nothing buffered.

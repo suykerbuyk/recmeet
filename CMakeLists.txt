@@ -242,13 +242,15 @@ if(RECMEET_USE_NOTIFY)
 endif()
 
 # Phase B.1 — audio capture + device enumeration library. Holds the
-# PipeWire / PulseAudio surface so the daemon (thin client server)
-# can stay PulseAudio-free while the tray (and CLI) own the local
-# capture lifecycle. Tray links recmeet_ipc + recmeet_capture; the
-# daemon's vestigial live-recording code (pipeline.cpp) reaches this
-# target transitively through recmeet_core until C.9 retires it.
+# PipeWire / PulseAudio surface so the daemon (thin-client server) stays
+# PulseAudio-free while the tray (and CLI) own the local capture lifecycle.
+# Phase C.9: `audio_monitor.cpp` (PulseMonitorCapture — the pa_simple
+# fallback for `.monitor` sources) joined this lib because the only
+# remaining consumer is the live-recording path (`run_recording` in
+# `src/live_recording.cpp`), which now lives in `recmeet_live_capture`.
 set(CAPTURE_SOURCES
     src/audio_capture.cpp
+    src/audio_monitor.cpp
     src/device_enum.cpp
     src/tray_capture.cpp
 )
@@ -262,12 +264,11 @@ target_link_libraries(recmeet_capture PUBLIC
     PkgConfig::SNDFILE
 )
 
-# Core library (ML pipeline — depends on recmeet_ipc and, via
-# pipeline.cpp's daemon-side live-recording path, recmeet_capture).
-# Phase B.1 moved audio_capture.cpp / device_enum.cpp to recmeet_capture;
-# every other recmeet_core source remains here.
+# Core library (ML pipeline + postprocess). Phase C.9: the live-recording
+# half of pipeline.cpp moved to `src/live_recording.cpp` (in
+# `recmeet_live_capture`), so `recmeet_core` no longer pulls in PipeWire /
+# PulseAudio. The daemon links only `recmeet_core` and stays capture-free.
 set(CORE_SOURCES
-    src/audio_monitor.cpp
     src/audio_file.cpp
     src/audio_mixer.cpp
     src/job_queue.cpp
@@ -277,7 +278,6 @@ set(CORE_SOURCES
     src/note.cpp
     src/pipeline.cpp
     src/cli.cpp
-    src/reprocess_batch.cpp
     src/diarize.cpp
     src/speaker_id.cpp
     src/vad.cpp
@@ -289,7 +289,6 @@ add_library(recmeet_core STATIC ${CORE_SOURCES})
 add_dependencies(recmeet_core recmeet_version)
 target_link_libraries(recmeet_core PUBLIC
     recmeet_ipc
-    recmeet_capture
     PkgConfig::SNDFILE
     whisper
 )
@@ -334,11 +333,30 @@ target_sources(recmeet_core PRIVATE src/upload_session.cpp)
 # format constants. Header-only API into the daemon's enroll.finalize.
 target_sources(recmeet_core PRIVATE src/diarization_cache.cpp)
 
-# CLI binary
-add_executable(recmeet src/main.cpp)
-target_link_libraries(recmeet PRIVATE recmeet_core)
+# Phase C.9 — live-recording library. Owns `run_recording()` /
+# `run_pipeline()` and the CaptionEngine-with-capture wrapper, all of which
+# the CLI standalone mode (`recmeet` without `--daemon`) still needs. The
+# daemon-side path was retired in C.9 (process.submit + process.stream
+# replace record.start), so the daemon does NOT link this lib — keeping
+# `recmeet-daemon` PipeWire/Pulse/recmeet_capture-free.
+add_library(recmeet_live_capture STATIC
+    src/live_recording.cpp
+    src/reprocess_batch.cpp  # CLI-only batch driver — calls run_pipeline()
+)
+add_dependencies(recmeet_live_capture recmeet_version)
+target_link_libraries(recmeet_live_capture PUBLIC
+    recmeet_core
+    recmeet_capture
+)
 
-# Daemon binary
+# CLI binary — links the live-capture lib so the standalone (no-daemon)
+# path can still record audio locally.
+add_executable(recmeet src/main.cpp)
+target_link_libraries(recmeet PRIVATE recmeet_core recmeet_live_capture)
+
+# Daemon binary — links recmeet_core only. After C.9 it must NOT pull in
+# PipeWire / PulseAudio / recmeet_capture. Verify with
+# `ldd build/recmeet-daemon | grep -E 'pipewire|pulse'` — expect no hits.
 add_executable(recmeet-daemon src/daemon.cpp)
 target_link_libraries(recmeet-daemon PRIVATE recmeet_core)
 
@@ -473,7 +491,12 @@ if(RECMEET_BUILD_TESTS)
         tests/test_caption_vtt.cpp
         tests/test_backend_dl.cpp
         tests/test_recmeet_capture.cpp
-        tests/test_ipc_reprocess_b5.cpp
+        # tests/test_ipc_reprocess_b5.cpp — DELETED in Phase C.9. The file
+        # exercised the B.5 transitional glue (tray staging → record.start
+        # --reprocess); record.start is gone in C.9, so the entire test
+        # surface has no v2 analogue. The v2 equivalent (process.submit
+        # upload → JobQueue → pp_worker) is covered by test_upload_session
+        # + test_job_queue + test_fetch.
         tests/test_tray_capture.cpp
         tests/test_job_queue.cpp
         tests/test_routed_events.cpp
@@ -482,7 +505,15 @@ if(RECMEET_BUILD_TESTS)
         tests/test_job_query.cpp
         tests/test_enroll.cpp
     )
-    target_link_libraries(recmeet_tests PRIVATE recmeet_core Catch2::Catch2WithMain)
+    # The test binary exercises both daemon-side surfaces (recmeet_core) and
+    # client-side / standalone surfaces (run_recording + recmeet_capture), so
+    # it must link the full stack — same as the CLI binary.
+    target_link_libraries(recmeet_tests PRIVATE
+        recmeet_core
+        recmeet_live_capture
+        recmeet_capture
+        Catch2::Catch2WithMain
+    )
     if(RECMEET_BUILD_WEB)
         target_sources(recmeet_tests PRIVATE tests/test_web.cpp vendor/cpp-httplib/httplib.cpp)
         target_include_directories(recmeet_tests PRIVATE vendor/cpp-httplib)
