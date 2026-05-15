@@ -94,16 +94,21 @@ inline constexpr int kStreamLatencyMaxMs     = 2000;
 
 /// The manager invokes this on the CaptionEngine worker thread whenever a
 /// session emits a caption result or a degraded signal. The daemon wires it
-/// to marshal onto the poll thread and `broadcast()` a `caption` /
-/// `caption.degraded` IPC event (C.10a deliberately uses broadcast — single-
-/// client dogfooding; C.3/C.10b convert to send_to_client()). `job_id`
-/// identifies the streaming job; the daemon stamps it into the event.
+/// to marshal onto the poll thread and route a `caption` / `caption.degraded`
+/// IPC event to the owning client only. `job_id` identifies the streaming
+/// job (stamped into the event payload); `client_id` is the per-session
+/// originator that the daemon uses for `send_to_client()` (C.3). The sink
+/// carries `client_id` rather than re-looking-up through
+/// `JobQueue::client_for_job(job_id)` — same result, one fewer lock acquired
+/// on every caption emission.
 struct StreamingCaptionSink {
     /// is_partial=true → mid-utterance hypothesis; false → endpointed final.
-    std::function<void(int64_t job_id, const std::string& text,
-                       bool is_partial, int64_t timestamp_ms)> on_caption;
+    std::function<void(int64_t job_id, const std::string& client_id,
+                       const std::string& text, bool is_partial,
+                       int64_t timestamp_ms)> on_caption;
     /// reason is a stable string ("buffer_overrun", "engine_error").
-    std::function<void(int64_t job_id, const std::string& reason,
+    std::function<void(int64_t job_id, const std::string& client_id,
+                       const std::string& reason,
                        int64_t timestamp_ms)> on_degraded;
 };
 

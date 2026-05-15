@@ -91,8 +91,10 @@ struct JqGuard {
 // (that needs a real model); they assert on the session lifecycle.
 StreamingCaptionSink null_sink() {
     StreamingCaptionSink s;
-    s.on_caption  = [](int64_t, const std::string&, bool, int64_t) {};
-    s.on_degraded = [](int64_t, const std::string&, int64_t) {};
+    s.on_caption  = [](int64_t, const std::string&, const std::string&,
+                       bool, int64_t) {};
+    s.on_degraded = [](int64_t, const std::string&, const std::string&,
+                       int64_t) {};
     return s;
 }
 
@@ -104,11 +106,13 @@ struct CountingSink {
     std::string last_degraded_reason;
     StreamingCaptionSink make() {
         StreamingCaptionSink s;
-        s.on_caption = [this](int64_t, const std::string&, bool, int64_t) {
+        s.on_caption = [this](int64_t, const std::string&, const std::string&,
+                              bool, int64_t) {
             std::lock_guard<std::mutex> lk(mtx);
             ++caption_calls;
         };
-        s.on_degraded = [this](int64_t, const std::string& reason, int64_t) {
+        s.on_degraded = [this](int64_t, const std::string&,
+                               const std::string& reason, int64_t) {
             std::lock_guard<std::mutex> lk(mtx);
             ++degraded_calls;
             last_degraded_reason = reason;

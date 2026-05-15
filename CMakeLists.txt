@@ -466,6 +466,7 @@ if(RECMEET_BUILD_TESTS)
         tests/test_ipc_reprocess_b5.cpp
         tests/test_tray_capture.cpp
         tests/test_job_queue.cpp
+        tests/test_routed_events.cpp
     )
     target_link_libraries(recmeet_tests PRIVATE recmeet_core Catch2::Catch2WithMain)
     if(RECMEET_BUILD_WEB)

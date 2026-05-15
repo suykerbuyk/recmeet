@@ -292,7 +292,8 @@ StreamingSessionManager::create(const std::string& client_id,
         +[](const CaptionResult& r, void* ud) {
             auto* s = static_cast<StreamingSession*>(ud);
             if (s->mgr_->sink_.on_caption)
-                s->mgr_->sink_.on_caption(s->job_id_, r.text, r.is_partial,
+                s->mgr_->sink_.on_caption(s->job_id_, s->client_id_,
+                                          r.text, r.is_partial,
                                           r.timestamp_ms);
         },
         sess_ptr,
@@ -303,7 +304,8 @@ StreamingSessionManager::create(const std::string& client_id,
                 (reason == CaptionDegradedReason::BufferOverrun)
                     ? "buffer_overrun" : "unknown";
             if (s->mgr_->sink_.on_degraded)
-                s->mgr_->sink_.on_degraded(s->job_id_, reason_str, now_ms());
+                s->mgr_->sink_.on_degraded(s->job_id_, s->client_id_,
+                                           reason_str, now_ms());
         },
         sess_ptr);
 
@@ -317,7 +319,7 @@ StreamingSessionManager::create(const std::string& client_id,
                  "streaming audio to disk only (job=%ld)",
                  err.c_str(), (long)job_id);
         if (sink_.on_degraded)
-            sink_.on_degraded(job_id, "engine_error", now_ms());
+            sink_.on_degraded(job_id, client_id, "engine_error", now_ms());
         engine.reset();      // null engine — feed_audio() skips the ring push
     }
     sess->engine_ = std::move(engine);

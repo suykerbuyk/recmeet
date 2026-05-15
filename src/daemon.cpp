@@ -641,11 +641,28 @@ static void pp_worker_loop(IpcServer& server) {
                                 last_percent = -1;  // Reset throttle on phase change
                                 std::string name = parse_ndjson_string(line, "name");
                                 last_known_phase = name;  // T1C.1
-                                server.post([&server, name]() {
+                                // Phase C.3: route phase events to the owning
+                                // client. The Job's `client_id` was captured
+                                // when the pp_worker dequeued this job; we
+                                // look it up via `client_for_job(job.job_id)`
+                                // (the C.7 binding survives the whole job
+                                // lifecycle). Empty → broadcast fallback.
+                                int64_t jid = job.job_id;
+                                server.post([&server, jid, name]() {
                                     IpcEvent ev;
                                     ev.event = "phase";
                                     ev.data["name"] = name;
-                                    server.broadcast(ev);
+                                    ev.data["job_id"] = jid;
+                                    if (auto cid = g_jobs->client_for_job(jid);
+                                        cid && !cid->empty()) {
+                                        server.send_to_client(*cid, std::move(ev));
+                                    } else {
+                                        log_debug("daemon: phase event for "
+                                                  "job=%lld has empty/missing "
+                                                  "client_id — broadcast fallback",
+                                                  (long long)jid);
+                                        server.broadcast(ev);
+                                    }
                                 });
                             } else if (event == "progress") {
                                 std::string phase = parse_ndjson_string(line, "phase");
@@ -659,12 +676,25 @@ static void pp_worker_loop(IpcServer& server) {
                                 if (last_percent < 0 || elapsed >= 120 || jump >= 10) {
                                     last_broadcast = now;
                                     last_percent = static_cast<int>(percent);
-                                    server.post([&server, phase, percent]() {
+                                    // Phase C.3 — same routing pattern as phase.
+                                    int64_t jid = job.job_id;
+                                    server.post([&server, jid, phase, percent]() {
                                         IpcEvent ev;
                                         ev.event = "progress";
                                         ev.data["phase"] = phase;
                                         ev.data["percent"] = percent;
-                                        server.broadcast(ev);
+                                        ev.data["job_id"] = jid;
+                                        if (auto cid = g_jobs->client_for_job(jid);
+                                            cid && !cid->empty()) {
+                                            server.send_to_client(*cid, std::move(ev));
+                                        } else {
+                                            log_debug("daemon: progress event "
+                                                      "for job=%lld has "
+                                                      "empty/missing client_id "
+                                                      "— broadcast fallback",
+                                                      (long long)jid);
+                                            server.broadcast(ev);
+                                        }
                                     });
                                 }
                             } else if (event == "job.complete") {
@@ -742,14 +772,32 @@ static void pp_worker_loop(IpcServer& server) {
                 job_err.clear();
                 int64_t jid = job.job_id;
                 bool batch_job = job.cfg.batch_mode;
-                server.post([&server, captured_note_path, captured_output_dir, jid, batch_job]() {
+                // Phase C.3 — route job.complete to the originating client.
+                // The Job's `client_id` was bound at enqueue time and the C.7
+                // binding is retained even after the job lands in a terminal
+                // state, so `client_for_job(jid)` resolves here even though
+                // `g_jobs->finish()` may have already been called by the time
+                // the posted lambda runs (in practice it has not — finish()
+                // happens at `clear_state:` below, after this post). Empty
+                // client_id → broadcast fallback so legacy / pre-session jobs
+                // still surface a completion event.
+                server.post([&server, captured_note_path, captured_output_dir,
+                             jid, batch_job]() {
                     IpcEvent ev;
                     ev.event = "job.complete";
                     ev.data["note_path"] = captured_note_path;
                     ev.data["output_dir"] = captured_output_dir;
                     ev.data["job_id"] = jid;
                     ev.data["batch_job"] = batch_job;
-                    server.broadcast(ev);
+                    if (auto cid = g_jobs->client_for_job(jid);
+                        cid && !cid->empty()) {
+                        server.send_to_client(*cid, std::move(ev));
+                    } else {
+                        log_debug("daemon: job.complete for job=%lld has "
+                                  "empty/missing client_id — broadcast fallback",
+                                  (long long)jid);
+                        server.broadcast(ev);
+                    }
                 });
             } else if (WIFEXITED(status) && WEXITSTATUS(status) == 2) {
                 // Exit code 2 = cancelled. Leave the slot job's verdict to
@@ -862,31 +910,46 @@ static void model_dl_worker_loop(IpcServer& server) {
                   job.force_download ? 1 : 0);
         broadcast_state(server);   // downloading -> visible in state.changed
 
-        auto broadcast_dl = [&server](const std::string& model,
-                                      const std::string& status,
-                                      const std::string& error = "") {
-            server.post([&server, model, status, error]() {
+        // Phase C.3 — route `model.downloading` to the originating client.
+        // The Job's `client_id` is the authoritative routing target (C.7
+        // populates it for auto-enqueued downloads as the dependent
+        // postprocess job's client_id, and for explicit `models.ensure`
+        // requests as the request's client_id). Empty client_id (a daemon-
+        // internal download — pre-session or absent session.init) falls
+        // back to broadcast so operator visibility is preserved.
+        std::string dl_cid = job.client_id;
+        auto emit_dl = [&server, dl_cid](const std::string& model,
+                                         const std::string& status,
+                                         const std::string& error = "") {
+            server.post([&server, dl_cid, model, status, error]() {
                 IpcEvent ev;
                 ev.event = "model.downloading";
                 ev.data["model"] = model;
                 ev.data["status"] = status;
                 if (!error.empty()) ev.data["error"] = error;
-                server.broadcast(ev);
+                if (!dl_cid.empty()) {
+                    server.send_to_client(dl_cid, std::move(ev));
+                } else {
+                    log_debug("daemon: model.downloading for model=%s has "
+                              "empty client_id — falling back to broadcast",
+                              model.c_str());
+                    server.broadcast(ev);
+                }
             });
         };
 
         bool ok = true;
         std::string err;
-        broadcast_dl(job.model_id, "downloading");
+        emit_dl(job.model_id, "downloading");
         try {
             perform_model_download(job.model_id, job.force_download);
-            broadcast_dl(job.model_id, "complete");
+            emit_dl(job.model_id, "complete");
         } catch (const std::exception& e) {
             ok = false;
             err = e.what();
             log_error("daemon: model download failed (%s): %s",
                       job.model_id.c_str(), err.c_str());
-            broadcast_dl(job.model_id, "error", err);
+            emit_dl(job.model_id, "error", err);
         }
 
         // finish_download() clears the model_download slot AND re-arms (or
@@ -1127,6 +1190,15 @@ int main(int argc, char* argv[]) {
     });
 
     // JobEventSink — emit `progress.job` for the notable transitions.
+    // Phase C.3: route to the originating client via the C.7 binding. The
+    // JobEventSink fires synchronously from JobQueue mutator paths; we
+    // capture `job.client_id` here on the calling thread (NOT from the
+    // posted lambda, which can race a `cancel`/`finish` that erases the
+    // job entry on certain transitions). The capture is the authoritative
+    // routing target — empty client_id (a pre-session or daemon-internal
+    // job: e.g. a `models.ensure` triggered before the connection's
+    // session.init landed) falls back to broadcast so the event still
+    // reaches some operator-visible surface rather than disappearing.
     g_jobs->set_job_event_sink([&server](const Job& job) {
         std::string phase;
         switch (job.state) {
@@ -1141,7 +1213,8 @@ int main(int argc, char* argv[]) {
         std::string kind = job_kind_name(job.kind);
         std::string model = job.model_id;
         std::string errmsg = job.error;
-        server.post([&server, jid, phase, kind, model, errmsg]() {
+        std::string cid = job.client_id;
+        server.post([&server, jid, phase, kind, model, errmsg, cid]() {
             IpcEvent ev;
             ev.event = "progress.job";
             ev.data["job_id"] = jid;
@@ -1149,35 +1222,68 @@ int main(int argc, char* argv[]) {
             ev.data["phase"] = phase;
             if (!model.empty()) ev.data["model"] = model;
             if (!errmsg.empty()) ev.data["error"] = errmsg;
-            // C.7 owns/populates the job_id->client_id binding; converting
-            // this broadcast() to send_to_client() is explicitly C.3's job.
-            server.broadcast(ev);
+            if (!cid.empty()) {
+                server.send_to_client(cid, std::move(ev));
+            } else {
+                log_debug("daemon: progress.job for job=%lld has empty "
+                          "client_id — falling back to broadcast",
+                          (long long)jid);
+                server.broadcast(ev);
+            }
         });
     });
 
     // Phase C.10a — construct the StreamingSessionManager. The caption event
     // sink marshals CaptionEngine worker-thread callbacks onto the IPC poll
-    // thread (via server.post()) and broadcasts `caption` / `caption.degraded`
-    // events — exactly as the legacy run_recording() caption path did. C.10a
-    // deliberately uses broadcast() (single-client dogfooding); C.3/C.10b
-    // convert to send_to_client(). The manager is wired to g_jobs (for the
-    // streaming slot) and the resolved streaming-zipformer model dir.
+    // thread (via server.post()) and emits `caption` / `caption.degraded`
+    // events — exactly as the legacy run_recording() caption path did.
+    //
+    // Phase C.3 routes each event to the originating client via
+    // `send_to_client(client_id, ev)` rather than `broadcast()`. The
+    // `client_id` is delivered by the sink (the session owns it), so we do
+    // NOT round-trip through `JobQueue::client_for_job(job_id)` — same
+    // result, one fewer lock acquisition on every caption emission. An
+    // empty `client_id` (defensive — should not occur for streaming because
+    // process.stream requires a populated `req.client_id`) falls back to
+    // broadcast() so the event still becomes visible.
     {
         StreamingCaptionSink sink;
-        sink.on_caption = [&server](int64_t job_id, const std::string& text,
+        sink.on_caption = [&server](int64_t job_id,
+                                    const std::string& client_id,
+                                    const std::string& text,
                                     bool is_partial, int64_t ts) {
             // Fires on the CaptionEngine worker thread — marshal onto the
-            // poll thread before touching server.broadcast() (not thread-safe).
+            // poll thread before touching server (not thread-safe).
             std::string t = text;
-            server.post([&server, job_id, t, is_partial, ts]() {
-                server.broadcast(make_caption_event(job_id, t, is_partial, ts));
+            std::string cid = client_id;
+            server.post([&server, job_id, cid, t, is_partial, ts]() {
+                IpcEvent ev = make_caption_event(job_id, t, is_partial, ts);
+                if (!cid.empty()) {
+                    server.send_to_client(cid, std::move(ev));
+                } else {
+                    log_debug("daemon: caption event for job=%lld has empty "
+                              "client_id — falling back to broadcast",
+                              (long long)job_id);
+                    server.broadcast(ev);
+                }
             });
         };
-        sink.on_degraded = [&server](int64_t job_id, const std::string& reason,
+        sink.on_degraded = [&server](int64_t job_id,
+                                     const std::string& client_id,
+                                     const std::string& reason,
                                      int64_t ts) {
             std::string r = reason;
-            server.post([&server, job_id, r, ts]() {
-                server.broadcast(make_caption_degraded_event(job_id, r, ts));
+            std::string cid = client_id;
+            server.post([&server, job_id, cid, r, ts]() {
+                IpcEvent ev = make_caption_degraded_event(job_id, r, ts);
+                if (!cid.empty()) {
+                    server.send_to_client(cid, std::move(ev));
+                } else {
+                    log_debug("daemon: caption.degraded for job=%lld has "
+                              "empty client_id — falling back to broadcast",
+                              (long long)job_id);
+                    server.broadcast(ev);
+                }
             });
         };
         std::string model_dir;
@@ -1193,9 +1299,16 @@ int main(int argc, char* argv[]) {
 
     // Phase C.2 — construct the UploadSessionManager. The progress sink
     // mirrors C.10a's caption-event sink: it marshals onto the poll thread
-    // via server.post() and broadcast()s a `progress.job` event with phase
-    // `uploading` so the tray can render an upload progress bar. C.2 uses
-    // broadcast() exactly like C.10a; C.3/C.10b convert to send_to_client().
+    // via server.post() and emits a `progress.job` event with phase
+    // `uploading` so the tray can render an upload progress bar.
+    //
+    // Phase C.3 routes each event to the originating client via
+    // `send_to_client(client_id, ev)`. The sink already carries the
+    // upload session's `client_id` (UploadSession owns it), so we route
+    // directly rather than re-looking-up through
+    // `JobQueue::client_for_job(job_id)`. An empty client_id (defensive —
+    // should not occur because process.submit requires a populated
+    // `req.client_id`) falls back to broadcast.
     {
         UploadProgressSink upsink;
         upsink.on_progress = [&server](int64_t job_id,
@@ -1203,13 +1316,14 @@ int main(int argc, char* argv[]) {
                                        int64_t bytes_received,
                                        int64_t audio_size) {
             // `feed_chunk` already runs on the poll thread (the binary-frame
-            // handler), so we could broadcast inline. We still go through
+            // handler), so we could route inline. We still go through
             // server.post() to keep the dispatch lane uniform with the rest
             // of the daemon's event emission and to avoid taking the manager
             // mutex while building the event (the sink fires AFTER the
             // mutex is released; this just keeps the post-thread invariant
             // explicit).
-            server.post([&server, job_id, client_id, bytes_received, audio_size]() {
+            std::string cid = client_id;
+            server.post([&server, job_id, cid, bytes_received, audio_size]() {
                 IpcEvent ev;
                 ev.event = "progress.job";
                 ev.data["job_id"] = job_id;
@@ -1217,8 +1331,14 @@ int main(int argc, char* argv[]) {
                 ev.data["phase"] = std::string("uploading");
                 ev.data["bytes_received"] = bytes_received;
                 ev.data["bytes_total"]    = audio_size;
-                (void)client_id;  // C.3 converts broadcast→send_to_client(client_id)
-                server.broadcast(ev);
+                if (!cid.empty()) {
+                    server.send_to_client(cid, std::move(ev));
+                } else {
+                    log_debug("daemon: upload progress.job for job=%lld has "
+                              "empty client_id — falling back to broadcast",
+                              (long long)job_id);
+                    server.broadcast(ev);
+                }
             });
         };
         // Staging root: empty falls back to system temp at create-time, which
@@ -1699,28 +1819,46 @@ int main(int argc, char* argv[]) {
 
         g_rec_worker = std::thread([&server, cfg, is_reprocess, job_id, rec_client_id]() {
             log_debug("daemon: rec_worker ENTER (tid=%d, job=%ld)", (int)syscall(SYS_gettid), (long)job_id);
-            auto on_phase = [&server](const std::string& phase) {
-                server.post([&server, phase]() {
+            // Phase C.3 — route recording-side `phase` / `caption` /
+            // `caption.degraded` to the request originator. `rec_client_id`
+            // was captured from `req.client_id` when the record.start
+            // handler scheduled this worker; the recording-side job_id is
+            // an independent counter (`g_next_rec_job_id`), so there is no
+            // JobQueue binding to consult — we route directly. Empty
+            // client_id (pre-session record.start — possible until C.9
+            // removes record.start) falls back to broadcast.
+            auto on_phase = [&server, rec_client_id](const std::string& phase) {
+                std::string cid = rec_client_id;
+                server.post([&server, cid, phase]() {
                     IpcEvent ev;
                     ev.event = "phase";
                     ev.data["name"] = phase;
-                    server.broadcast(ev);
+                    if (!cid.empty()) {
+                        server.send_to_client(cid, std::move(ev));
+                    } else {
+                        log_debug("daemon: rec_worker phase event has empty "
+                                  "client_id — broadcast fallback");
+                        server.broadcast(ev);
+                    }
                 });
             };
 
             // Caption hooks. Captions fire on the engine's worker thread, so
             // every callback marshals onto the IPC poll thread via post()
-            // before touching server.broadcast() (which is not thread-safe).
-            // The CaptionBroadcastCtx is heap-allocated and outlives both the
+            // before touching the server (not thread-safe). The
+            // CaptionBroadcastCtx is heap-allocated and outlives both the
             // engine and this stack frame because run_recording() may
             // post-and-return before the engine's worker has fully drained;
             // the unique_ptr keeps the daemon clean of leak warnings.
+            // C.3 threads `client_id` onto the ctx so the hook lambdas can
+            // route to the recording's originator without re-looking-up.
             struct CaptionBroadcastCtx {
                 IpcServer* server;
                 int64_t job_id;
+                std::string client_id;
             };
             auto ctx = std::make_unique<CaptionBroadcastCtx>(
-                CaptionBroadcastCtx{&server, job_id});
+                CaptionBroadcastCtx{&server, job_id, rec_client_id});
 
             CaptionHooks hooks;
             hooks.result_ud = ctx.get();
@@ -1730,40 +1868,63 @@ int main(int argc, char* argv[]) {
                 auto* c = static_cast<CaptionBroadcastCtx*>(ud);
                 IpcServer* s = c->server;
                 int64_t jid = c->job_id;
+                std::string cid = c->client_id;
                 std::string text = r.text;
                 bool is_partial = r.is_partial;
                 int64_t ts = r.timestamp_ms;
-                s->post([s, jid, text, is_partial, ts]() {
-                    s->broadcast(make_caption_event(jid, text, is_partial, ts));
+                s->post([s, jid, cid, text, is_partial, ts]() {
+                    IpcEvent ev = make_caption_event(jid, text, is_partial, ts);
+                    if (!cid.empty()) {
+                        s->send_to_client(cid, std::move(ev));
+                    } else {
+                        log_debug("daemon: rec_worker caption event has empty "
+                                  "client_id — broadcast fallback");
+                        s->broadcast(ev);
+                    }
                 });
             };
             hooks.on_degraded = +[](CaptionDegradedReason reason, void* ud) {
                 auto* c = static_cast<CaptionBroadcastCtx*>(ud);
                 IpcServer* s = c->server;
                 int64_t jid = c->job_id;
+                std::string cid = c->client_id;
                 const char* reason_str =
                     (reason == CaptionDegradedReason::BufferOverrun) ? "buffer_overrun"
                                                                      : "unknown";
                 int64_t ts = std::chrono::duration_cast<std::chrono::milliseconds>(
                     std::chrono::steady_clock::now().time_since_epoch()).count();
                 std::string r_str(reason_str);
-                s->post([s, jid, r_str, ts]() {
-                    s->broadcast(make_caption_degraded_event(jid, r_str, ts));
+                s->post([s, jid, cid, r_str, ts]() {
+                    IpcEvent ev = make_caption_degraded_event(jid, r_str, ts);
+                    if (!cid.empty()) {
+                        s->send_to_client(cid, std::move(ev));
+                    } else {
+                        log_debug("daemon: rec_worker caption.degraded has "
+                                  "empty client_id — broadcast fallback");
+                        s->broadcast(ev);
+                    }
                 });
             };
             hooks.on_engine_error = +[](const std::string& msg, void* ud) {
                 auto* c = static_cast<CaptionBroadcastCtx*>(ud);
                 IpcServer* s = c->server;
                 int64_t jid = c->job_id;
+                std::string cid = c->client_id;
                 int64_t ts = std::chrono::duration_cast<std::chrono::milliseconds>(
                     std::chrono::steady_clock::now().time_since_epoch()).count();
                 std::string m = msg;
-                s->post([s, jid, m, ts]() {
+                s->post([s, jid, cid, m, ts]() {
                     // One-shot degraded event with reason=engine_error and the
                     // message attached so clients can show the operator why.
                     IpcEvent ev = make_caption_degraded_event(jid, "engine_error", ts);
                     ev.data["error"] = m;
-                    s->broadcast(ev);
+                    if (!cid.empty()) {
+                        s->send_to_client(cid, std::move(ev));
+                    } else {
+                        log_debug("daemon: rec_worker engine_error has empty "
+                                  "client_id — broadcast fallback");
+                        s->broadcast(ev);
+                    }
                 });
             };
 
