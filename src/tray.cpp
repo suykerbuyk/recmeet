@@ -151,6 +151,24 @@ struct TrayState {
         std::string wav_timestamp;     // YYYY-MM-DD_HH-MM for sidecar
         std::string wav_source;        // mic source name used for this recording
         bool waiting_disposition = false;  // capture stopped, awaiting Submit/Discard/Save
+
+        // Phase C.10a — live-caption streaming. When captions are enabled
+        // for a recording the tray opens a `process.stream` session on the
+        // daemon and stacks a SECOND fan-out subscriber on the B.1 capture
+        // (the first is the WAV stager above). That subscriber appends PCM
+        // to `stream_buffer` (RT thread, brief lock on `stream_mtx`); a GTK
+        // timeout pump (`stream_pump_id`) drains the buffer on the GTK main
+        // thread and ships it to the daemon as `0x03` frames via
+        // IpcClient::send_stream_audio(). Draining on the GTK thread keeps
+        // all socket writes single-threaded — the same thread every other
+        // `ipc.call()` runs on — so there is no fd race with request/response
+        // traffic. `stream_token` is the handle returned by `process.stream`,
+        // used to `process.stream.cancel` on stop.
+        recmeet::PipeWireCapture::SubscriberHandle stream_handle = 0;
+        std::mutex stream_mtx;
+        std::vector<int16_t> stream_buffer;
+        std::string stream_token;       // empty → no live streaming session
+        guint stream_pump_id = 0;       // GTK timeout draining stream_buffer
     } capture_state;
 
     // Phase A.6 + B-bonus — session.init bookkeeping. The tray sends
@@ -801,6 +819,52 @@ void tray_wav_subscriber(const int16_t* samples, std::size_t n, void* /*ud*/) {
         g_tray.capture_state.wav_buffer.end(), samples, samples + n);
 }
 
+// Phase C.10a — second fan-out subscriber: stages captured PCM for the
+// live-caption streaming uploader. Runs on the PipeWire RT thread; the
+// contract is identical to tray_wav_subscriber — brief lock, append, no
+// logging, no blocking. The GTK-thread pump (tray_stream_pump) drains this
+// buffer and ships it to the daemon as `0x03` frames. Stacking this on the
+// B.1 capture alongside the WAV stager is exactly the "C.10's streaming
+// uploader can stack additional subscribers on the same handle without
+// coordination" path the start_capture comment anticipated.
+void tray_stream_subscriber(const int16_t* samples, std::size_t n, void* /*ud*/) {
+    std::lock_guard<std::mutex> lk(g_tray.capture_state.stream_mtx);
+    g_tray.capture_state.stream_buffer.insert(
+        g_tray.capture_state.stream_buffer.end(), samples, samples + n);
+}
+
+// Phase C.10a — GTK timeout pump. Drains the streaming PCM staging buffer
+// and ships it to the daemon as a single `0x03` frame. Runs on the GTK main
+// thread, so the socket write is serialized with every other `ipc.call()`
+// the tray makes — no fd race. Returns G_SOURCE_CONTINUE while the session
+// is live; G_SOURCE_REMOVE once the token is cleared (stop path) so the
+// timer self-retires.
+gboolean tray_stream_pump(gpointer) {
+    if (g_tray.capture_state.stream_token.empty())
+        return G_SOURCE_REMOVE;   // session ended — retire the pump.
+
+    std::vector<int16_t> batch;
+    {
+        std::lock_guard<std::mutex> lk(g_tray.capture_state.stream_mtx);
+        batch.swap(g_tray.capture_state.stream_buffer);
+    }
+    if (batch.empty()) return G_SOURCE_CONTINUE;
+
+    if (!g_tray.daemon_connected || !g_tray.ipc.connected()) {
+        // Daemon gone — drop this batch; the disconnect path will clean up
+        // the streaming state. Do not spin trying to reconnect here.
+        return G_SOURCE_CONTINUE;
+    }
+    if (!g_tray.ipc.send_stream_audio(batch.data(), batch.size())) {
+        log_warn("[tray] streaming: send_stream_audio failed — "
+                 "stopping live-caption stream");
+        g_tray.capture_state.stream_token.clear();
+        g_tray.capture_state.stream_pump_id = 0;
+        return G_SOURCE_REMOVE;
+    }
+    return G_SOURCE_CONTINUE;
+}
+
 // Resolve the mic source to record from. Priority: explicit
 // g_tray.cfg.mic_source > device_pattern auto-detect > system default.
 // Returns empty string if no source could be resolved; caller emits a
@@ -896,6 +960,40 @@ bool stop_capture(std::string& err_msg) {
         err_msg = "no active capture";
         return false;
     }
+
+    // Phase C.10a — tear down the live-caption stream first, while the
+    // capture is still up: retire the GTK pump, clear the token (so a
+    // pump tick already in flight self-retires), and tell the daemon to
+    // discard the streaming job + its temp WAV via process.stream.cancel.
+    // The stream subscriber is removed implicitly when the capture is
+    // destroyed below; clearing the token here makes the pump a no-op in
+    // the meantime.
+    if (!g_tray.capture_state.stream_token.empty()) {
+        std::string token = g_tray.capture_state.stream_token;
+        g_tray.capture_state.stream_token.clear();
+        if (g_tray.capture_state.stream_pump_id) {
+            g_source_remove(g_tray.capture_state.stream_pump_id);
+            g_tray.capture_state.stream_pump_id = 0;
+        }
+        if (g_tray.daemon_connected && g_tray.ipc.connected()) {
+            JsonMap cp;
+            cp["stream_token"] = token;
+            IpcResponse cr; IpcError ce;
+            if (!g_tray.ipc.call("process.stream.cancel", cp, cr, ce, 5000)) {
+                log_warn("[tray] process.stream.cancel failed (%s)",
+                         ce.message.c_str());
+            } else {
+                log_info("[tray] live-caption stream cancelled (token=%s)",
+                         token.c_str());
+            }
+        }
+    }
+    g_tray.capture_state.stream_handle = 0;
+    {
+        std::lock_guard<std::mutex> lk(g_tray.capture_state.stream_mtx);
+        g_tray.capture_state.stream_buffer.clear();
+    }
+
     // Tear down the capture first so the RT thread quiesces and no
     // late chunks land in the buffer after we drain it.
     g_tray.capture_state.pw->stop();
@@ -1060,10 +1158,62 @@ static void on_record(GtkMenuItem*, gpointer) {
     g_tray.cap.captions_enabled_for_recording = g_tray.cfg.captions_enabled;
     if (g_tray.cfg.captions_enabled) {
         // Pre-create the overlay window so the first caption event has
-        // somewhere to render. Captions during local recording are
-        // handled by the (future) C.10 streaming uploader; for B.2 the
-        // overlay stays hidden if no caption events arrive.
+        // somewhere to render.
         caption_overlay_create();
+
+        // Phase C.10a — open a live-caption streaming session on the
+        // daemon. On success the daemon hands back a `stream_token`; we
+        // stack a second fan-out subscriber on the B.1 capture and start
+        // the GTK pump that ships PCM as `0x03` frames. The `caption` /
+        // `caption.degraded` events flow back over IPC and render through
+        // the existing overlay handler (process_event, below). A failure
+        // here is non-fatal: the local WAV recording continues, just
+        // without live captions.
+        if (g_tray.daemon_connected && g_tray.ipc.connected()) {
+            JsonMap sp;
+            sp["format"]            = std::string("s16le");
+            sp["sample_rate"]       = static_cast<int64_t>(recmeet::SAMPLE_RATE);
+            sp["channels"]          = static_cast<int64_t>(recmeet::CHANNELS);
+            sp["language"]          = g_tray.cfg.language.empty()
+                                          ? std::string("en") : g_tray.cfg.language;
+            sp["captions_enabled"]  = true;
+            // latency_budget_ms — the tray has no per-config knob for this
+            // (it lives in the daemon's per-session SessionPreferences); use
+            // the protocol default 500 ms. The daemon clamps/rejects out of
+            // [200, 2000] anyway.
+            sp["latency_budget_ms"] = static_cast<int64_t>(500);
+            IpcResponse sr; IpcError se;
+            if (g_tray.ipc.call("process.stream", sp, sr, se, 5000)) {
+                auto tit = sr.result.find("stream_token");
+                std::string token = tit != sr.result.end()
+                    ? recmeet::json_val_as_string(tit->second) : "";
+                if (!token.empty()) {
+                    g_tray.capture_state.stream_token = token;
+                    {
+                        std::lock_guard<std::mutex> lk(
+                            g_tray.capture_state.stream_mtx);
+                        g_tray.capture_state.stream_buffer.clear();
+                    }
+                    if (g_tray.capture_state.pw) {
+                        g_tray.capture_state.stream_handle =
+                            g_tray.capture_state.pw->add_audio_subscriber(
+                                &tray_stream_subscriber, nullptr);
+                    }
+                    // Pump every 100 ms — matches the ~100 ms / 16 kHz
+                    // capture chunking the wire protocol is sized for.
+                    g_tray.capture_state.stream_pump_id =
+                        g_timeout_add(100, tray_stream_pump, nullptr);
+                    log_info("[tray] live-caption stream opened (token=%s)",
+                             token.c_str());
+                } else {
+                    log_warn("[tray] process.stream returned no stream_token "
+                             "— continuing without live captions");
+                }
+            } else {
+                log_warn("[tray] process.stream failed (%s) — continuing "
+                         "without live captions", se.message.c_str());
+            }
+        }
     }
 
     update_state(true, g_tray.postprocessing, false, false);

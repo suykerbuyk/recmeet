@@ -309,6 +309,14 @@ endif()
 #    header is single-source-of-truth so callers compile uniformly.
 target_sources(recmeet_core PRIVATE src/caption_engine.cpp)
 
+# Phase C.10a — server-side streaming-caption session. Owns the
+# stream_token -> session map, the per-session disk-backed temp WAV, and
+# the migrated CaptionEngine producer (network 0x03 frames feed the SPSC
+# ring in place of the old PipeWire-Capture callback). Lives in recmeet_core
+# because it composes caption_engine + job_queue + the cli.cpp English-only
+# guard; the daemon links it transitively.
+target_sources(recmeet_core PRIVATE src/streaming_session.cpp)
+
 # CLI binary
 add_executable(recmeet src/main.cpp)
 target_link_libraries(recmeet PRIVATE recmeet_core)
@@ -439,6 +447,7 @@ if(RECMEET_BUILD_TESTS)
         tests/test_integration_pipeline.cpp
         tests/streaming_capture_tests.cpp
         tests/streaming_engine_tests.cpp
+        tests/test_streaming_session.cpp
         tests/test_caption_ipc_integration.cpp
         tests/test_caption_model_manager.cpp
         tests/test_caption_format.cpp

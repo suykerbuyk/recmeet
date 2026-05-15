@@ -16,6 +16,7 @@
 #include "model_manager.h"
 #include "notify.h"
 #include "pipeline.h"
+#include "streaming_session.h"
 #include "util.h"
 #include "version.h"
 
@@ -80,6 +81,14 @@ static std::atomic<int64_t> g_next_rec_job_id{1};
 // once Config is loaded so slot capacities reflect `[server] slot.*`.
 static std::unique_ptr<JobQueue> g_jobs;
 
+// Phase C.10a — the server-side streaming-caption session registry. Owns the
+// `stream_token -> StreamingSession` map; routes inbound `0x03` frames; holds
+// each session's CaptionEngine + disk-backed temp WAV. Constructed in main()
+// after g_jobs + the IpcServer exist (it captures the server for the caption
+// event sink). One streaming session at a time (C.7 streaming slot is
+// capacity-1).
+static std::unique_ptr<StreamingSessionManager> g_streaming;
+
 static Config g_config;
 static std::mutex g_config_mu;
 
@@ -91,6 +100,7 @@ static StopToken g_pp_stop;
 static std::thread g_rec_worker;
 static std::thread g_pp_worker;   // long-lived, drains the postprocess slot
 static std::thread g_dl_worker;   // long-lived, drains the model_download slot
+static std::thread g_stream_worker;  // C.10a — drains the streaming slot
 
 // PostprocessJob — pre-C.7 this was a standalone struct holding the inline
 // FIFO payload. C.7 keeps the name as a thin alias of the unified `Job`
@@ -129,14 +139,22 @@ static bool jq_postprocessing() {
 static bool jq_downloading() {
     return g_jobs && g_jobs->slot_busy(JobKind::ModelDownload);
 }
+// Phase C.10a — true while a streaming-caption job occupies the JobQueue
+// `streaming` slot (a `process.stream` is live). Independent of recording /
+// postprocessing / downloading: all four slots can be busy simultaneously.
+static bool jq_streaming() {
+    return g_jobs && g_jobs->slot_busy(JobKind::Streaming);
+}
 
 static std::string composite_state_name() {
     bool rec = g_recording.load();
     bool pp  = jq_postprocessing();
     bool dl  = jq_downloading();
+    bool st  = jq_streaming();
     if (rec && pp) return g_is_reprocess ? "reprocessing+postprocessing" : "recording+postprocessing";
     if (rec)       return g_is_reprocess ? "reprocessing" : "recording";
     if (pp)        return "postprocessing";
+    if (st)        return "streaming";
     if (dl)        return "downloading";
     return "idle";
 }
@@ -146,6 +164,7 @@ static void fill_state_fields(JsonMap& data) {
     data["recording"] = g_recording.load();
     data["postprocessing"] = jq_postprocessing();
     data["downloading"] = jq_downloading();
+    data["streaming"] = jq_streaming();
 }
 
 // For worker threads — schedules broadcast on the poll thread
@@ -874,6 +893,42 @@ static void model_dl_worker_loop(IpcServer& server) {
 }
 
 // ---------------------------------------------------------------------------
+// Phase C.10a — streaming-slot worker loop
+//
+// Unlike the postprocess / model_download workers this loop does NOT perform
+// the work itself — a streaming job's "work" is the per-session CaptionEngine
+// worker thread plus the poll-thread `0x03`-frame feed path, both owned by
+// the StreamingSessionManager. This loop exists only to drain the JobQueue
+// `streaming` slot: `dequeue(Streaming)` flips the slot's "running" marker so
+// `slot_busy(JobKind::Streaming)` is authoritative (the C.7 typed-slot
+// invariant), and broadcasts the state change. The session's lifetime then
+// belongs to the manager; the slot is released when the manager calls
+// `JobQueue::finish()` / `JobQueue::cancel()` on the job (process.stream.cancel
+// or a client disconnect). After dequeuing, the loop blocks again in
+// `dequeue()` until the slot is free AND a new streaming job is queued, or
+// shutdown wakes it with std::nullopt.
+// ---------------------------------------------------------------------------
+
+static void stream_worker_loop(IpcServer& server) {
+    log_debug("daemon: stream_worker_loop ENTER (tid=%d)",
+              (int)syscall(SYS_gettid));
+    while (true) {
+        std::optional<Job> dq = g_jobs->dequeue(JobKind::Streaming);
+        if (!dq.has_value()) {
+            log_debug("daemon: stream_worker_loop EXIT (shutdown)");
+            return;
+        }
+        log_debug("daemon: stream_worker dequeued streaming job=%ld "
+                  "(slot running marker now set)", (long)dq->job_id);
+        // The slot's "running" marker is set; the StreamingSessionManager
+        // owns the session from here. Reflect the new state and loop back to
+        // dequeue() — which will block until finish()/cancel() releases the
+        // slot and the next process.stream enqueues a job.
+        broadcast_state(server);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Usage
 // ---------------------------------------------------------------------------
 
@@ -1091,6 +1146,91 @@ int main(int argc, char* argv[]) {
             // this broadcast() to send_to_client() is explicitly C.3's job.
             server.broadcast(ev);
         });
+    });
+
+    // Phase C.10a — construct the StreamingSessionManager. The caption event
+    // sink marshals CaptionEngine worker-thread callbacks onto the IPC poll
+    // thread (via server.post()) and broadcasts `caption` / `caption.degraded`
+    // events — exactly as the legacy run_recording() caption path did. C.10a
+    // deliberately uses broadcast() (single-client dogfooding); C.3/C.10b
+    // convert to send_to_client(). The manager is wired to g_jobs (for the
+    // streaming slot) and the resolved streaming-zipformer model dir.
+    {
+        StreamingCaptionSink sink;
+        sink.on_caption = [&server](int64_t job_id, const std::string& text,
+                                    bool is_partial, int64_t ts) {
+            // Fires on the CaptionEngine worker thread — marshal onto the
+            // poll thread before touching server.broadcast() (not thread-safe).
+            std::string t = text;
+            server.post([&server, job_id, t, is_partial, ts]() {
+                server.broadcast(make_caption_event(job_id, t, is_partial, ts));
+            });
+        };
+        sink.on_degraded = [&server](int64_t job_id, const std::string& reason,
+                                     int64_t ts) {
+            std::string r = reason;
+            server.post([&server, job_id, r, ts]() {
+                server.broadcast(make_caption_degraded_event(job_id, r, ts));
+            });
+        };
+        std::string model_dir;
+        {
+            std::lock_guard<std::mutex> lock(g_config_mu);
+            model_dir = resolve_caption_model_dir(g_config.caption_model).string();
+        }
+        g_streaming = std::make_unique<StreamingSessionManager>(
+            *g_jobs, sink, model_dir);
+        log_info("daemon: streaming session manager ready (caption_model_dir=%s)",
+                 model_dir.c_str());
+    }
+
+    // Phase C.10a — route inbound `0x03` streaming-audio frames into the
+    // matching streaming session. The binary-frame handler runs on the poll
+    // thread; it is the migrated *producer* side of the per-session
+    // CaptionEngine (the audio used to come from a PipeWire Capture callback;
+    // now it arrives as network frames). Returning false tears the
+    // connection down — a `0x03` frame with no live session (unknown
+    // stream_token) is a protocol violation.
+    server.on_binary_frame([](const std::string& client_id,
+                              FrameType type,
+                              const std::string& payload) -> bool {
+        if (type != FrameType::StreamAudio) {
+            // C.2/C.4 will consume 0x01/0x02; until then an upload/artifact
+            // frame has no handler — discard it without closing the
+            // connection (NDJSON traffic keeps flowing). Not a violation.
+            log_debug("daemon: binary frame type=0x%02x from client=%s — "
+                      "no handler (discarded)",
+                      static_cast<unsigned>(type), client_id.c_str());
+            return true;
+        }
+        // `0x03` streaming audio. The wire framing carries no stream_token —
+        // it is implicit: the capacity-1 streaming slot means a client has
+        // at most one live streaming session, and the binary-frame handler
+        // already knows the originating client_id. Route by client_id to
+        // that client's session token.
+        if (!g_streaming) return false;
+        std::string token = g_streaming->token_for_client(client_id);
+        if (token.empty()) {
+            log_warn("daemon: 0x03 streaming frame from client=%s with no "
+                     "live streaming session — protocol violation",
+                     client_id.c_str());
+            return false;
+        }
+        return g_streaming->feed_audio(token, payload);
+    });
+
+    // Phase C.10a — on client disconnect, abort any streaming session the
+    // client owned: mark the JobQueue job failed, discard the ASR session,
+    // unlink the temp WAV, release the streaming slot. Runs inline on the
+    // poll thread from remove_client().
+    server.on_client_disconnect([&server](const std::string& client_id) {
+        if (!g_streaming) return;
+        int aborted = g_streaming->on_client_disconnect(client_id);
+        if (aborted > 0) {
+            log_info("daemon: aborted %d streaming session(s) for "
+                     "disconnected client=%s", aborted, client_id.c_str());
+            broadcast_state_inline(server);
+        }
     });
 
     // Phase A.2: apply the NDJSON line cap from config before start().
@@ -1716,6 +1856,89 @@ int main(int argc, char* argv[]) {
         return true;
     });
 
+    // --- Phase C.10a — streaming-caption handlers ---
+    //
+    // process.stream         — open a streaming-caption session. The client
+    //                          then sends `0x03` audio frames; the daemon
+    //                          feeds them into a CaptionEngine and broadcasts
+    //                          `caption` / `caption.degraded` events.
+    // process.stream.cancel  — discard the streaming job + its buffered audio
+    //                          (unlinks the temp WAV), release the slot.
+    //
+    // C.10a scope: this is the streaming *core*. process.stream.commit and
+    // the stream->postprocess handoff are C.10b; converting the caption
+    // events to send_to_client() is C.3/C.10b.
+
+    server.on("process.stream",
+              [](const IpcRequest& req, IpcResponse& resp, IpcError& err) {
+        if (!g_streaming) {
+            err.code = static_cast<int>(IpcErrorCode::InternalError);
+            err.message = "streaming subsystem unavailable";
+            return false;
+        }
+        // Parse the request shape. Unknown / missing fields fall back to the
+        // StreamRequest struct defaults. `speaker_hints` is reserved for v2
+        // multi-server — accepted and ignored (we simply never read it).
+        StreamRequest sr;
+        auto gs = [&](const char* k, const std::string& def) {
+            auto it = req.params.find(k);
+            return it != req.params.end() ? json_val_as_string(it->second) : def;
+        };
+        auto gi = [&](const char* k, int64_t def) {
+            auto it = req.params.find(k);
+            return it != req.params.end() ? json_val_as_int(it->second) : def;
+        };
+        auto gb = [&](const char* k, bool def) {
+            auto it = req.params.find(k);
+            return it != req.params.end() ? json_val_as_bool(it->second) : def;
+        };
+        sr.format            = gs("format", sr.format);
+        sr.sample_rate       = static_cast<int32_t>(gi("sample_rate", sr.sample_rate));
+        sr.channels          = static_cast<int32_t>(gi("channels", sr.channels));
+        sr.context           = gs("context", sr.context);
+        sr.language          = gs("language", sr.language);
+        sr.captions_enabled  = gb("captions_enabled", sr.captions_enabled);
+        sr.latency_budget_ms = static_cast<int>(gi("latency_budget_ms",
+                                                   sr.latency_budget_ms));
+
+        auto cr = g_streaming->create(req.client_id, sr);
+        if (!cr.ok) {
+            err.code = cr.code;
+            err.message = cr.error;
+            return false;
+        }
+        resp.result["job_id"] = cr.job_id;
+        resp.result["stream_token"] = cr.stream_token;
+        log_info("daemon: process.stream OK (job=%ld client=%s)",
+                 (long)cr.job_id, req.client_id.c_str());
+        return true;
+    });
+
+    server.on("process.stream.cancel",
+              [&server](const IpcRequest& req, IpcResponse& resp, IpcError& err) {
+        if (!g_streaming) {
+            err.code = static_cast<int>(IpcErrorCode::InternalError);
+            err.message = "streaming subsystem unavailable";
+            return false;
+        }
+        auto it = req.params.find("stream_token");
+        if (it == req.params.end() || json_val_as_string(it->second).empty()) {
+            err.code = static_cast<int>(IpcErrorCode::InvalidParams);
+            err.message = "process.stream.cancel: missing 'stream_token'";
+            return false;
+        }
+        std::string token = json_val_as_string(it->second);
+        if (!g_streaming->cancel(req.client_id, token)) {
+            err.code = static_cast<int>(IpcErrorCode::InvalidParams);
+            err.message = "process.stream.cancel: unknown stream_token "
+                          "(or not owned by this client)";
+            return false;
+        }
+        broadcast_state_inline(server);
+        resp.result["ok"] = true;
+        return true;
+    });
+
     // --- Speaker management handlers ---
 
     server.on("speakers.list", [](const IpcRequest&, IpcResponse& resp, IpcError& err) {
@@ -1928,6 +2151,10 @@ int main(int argc, char* argv[]) {
     // JobQueue::dequeue() until shutdown() wakes them with std::nullopt.
     g_pp_worker = std::thread([&server]() { pp_worker_loop(server); });
     g_dl_worker = std::thread([&server]() { model_dl_worker_loop(server); });
+    // Phase C.10a — streaming-slot worker. Drains the JobQueue `streaming`
+    // slot so its "running" marker is authoritative; the session lifetime
+    // itself belongs to g_streaming.
+    g_stream_worker = std::thread([&server]() { stream_worker_loop(server); });
 
     // Signal handlers
     struct sigaction sa{};
@@ -1959,6 +2186,12 @@ int main(int argc, char* argv[]) {
     log_debug("daemon: shutdown: joining pp_worker...");
     if (g_pp_worker.joinable()) g_pp_worker.join();
     if (g_dl_worker.joinable()) g_dl_worker.join();
+    // Phase C.10a — join the streaming-slot worker (woken by g_jobs->shutdown()
+    // returning std::nullopt from dequeue). Then tear down the session
+    // manager, which aborts any still-active streaming session (stops each
+    // CaptionEngine, closes + unlinks the temp WAV).
+    if (g_stream_worker.joinable()) g_stream_worker.join();
+    g_streaming.reset();
     g_server = nullptr;
 
     // Clean up PID file

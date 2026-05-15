@@ -64,6 +64,31 @@ using MethodHandler = std::function<bool(const IpcRequest& req,
                                          IpcResponse& resp,
                                          IpcError& err)>;
 
+// Phase C.10a: binary-frame handler. Invoked on the poll thread for every
+// fully-assembled non-NDJSON frame (`0x01`/`0x02`/`0x03`) received from an
+// Authed client. `client_id` is the server-issued id of the originating
+// connection (the same value handlers see on `IpcRequest::client_id`);
+// `type` is the frame discriminator; `payload` is the raw decoded body.
+// C.10a wires this to route `0x03` streaming-audio payloads into the
+// streaming session keyed by `stream_token`; C.2/C.4 will consume
+// `0x01`/`0x02`. Returning false tears the connection down (protocol
+// violation — e.g. a `0x03` frame with no live streaming session). When
+// no handler is registered every binary frame is discarded with a debug
+// trace, preserving the C.1 behavior.
+using BinaryFrameHandler = std::function<bool(const std::string& client_id,
+                                              FrameType type,
+                                              const std::string& payload)>;
+
+// Phase C.10a: client-disconnect handler. Invoked on the poll thread from
+// `remove_client()` AFTER the fd is closed and the client maps are erased,
+// for every client that had a server-issued `client_id` (i.e. completed
+// auth). `client_id` is that id. C.10a wires this to abort any streaming
+// session the disconnected client owned (mark the JobQueue job failed,
+// unlink the temp WAV, release the streaming slot). The handler must not
+// block — it runs inline on the poll loop. Unset → no-op (pre-C.10a
+// behavior).
+using ClientDisconnectHandler = std::function<void(const std::string& client_id)>;
+
 // Per-connection authentication state for the Phase A.1 PSK gate.
 //
 // Unix-socket clients are accepted as `Authed` immediately (kernel-enforced
@@ -103,6 +128,18 @@ public:
 
     // Register a method handler. Must be called before start().
     void on(const std::string& method, MethodHandler handler);
+
+    // Phase C.10a: register the binary-frame handler. Must be called before
+    // start(). At most one handler — a second call replaces the first.
+    void on_binary_frame(BinaryFrameHandler handler) {
+        binary_frame_handler_ = std::move(handler);
+    }
+
+    // Phase C.10a: register the client-disconnect handler. Must be called
+    // before start(). At most one — a second call replaces the first.
+    void on_client_disconnect(ClientDisconnectHandler handler) {
+        client_disconnect_handler_ = std::move(handler);
+    }
 
     // Configure the pre-shared key required for TCP connections.
     // Must be called before start() if the listener is TCP.
@@ -364,6 +401,14 @@ private:
     static constexpr size_t kOutboundMaxBytes   = 256 * 1024;
 
     std::unordered_map<std::string, MethodHandler> handlers_;
+
+    // Phase C.10a: optional binary-frame handler (see BinaryFrameHandler).
+    // Unset → binary frames are discarded with a debug trace (C.1 behavior).
+    BinaryFrameHandler binary_frame_handler_;
+
+    // Phase C.10a: optional client-disconnect handler (see
+    // ClientDisconnectHandler). Unset → no-op.
+    ClientDisconnectHandler client_disconnect_handler_;
 
     std::mutex post_mu_;
     std::vector<std::function<void()>> posted_;

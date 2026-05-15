@@ -582,6 +582,35 @@ bool IpcClient::call(const std::string& method, IpcResponse& resp, IpcError& err
     return call(method, {}, resp, err, timeout_ms);
 }
 
+// Phase C.10a: send a `0x03` streaming-audio frame. The wire frame is
+// `0x03` + 4-byte big-endian length + raw PCM payload, built by
+// frame_binary(). A short write loops until the whole frame is on the
+// wire (the fd is blocking in steady state — connect() restores blocking
+// mode after the non-blocking connect handshake). A hard write error
+// closes the connection.
+bool IpcClient::send_stream_audio(const std::string& pcm) {
+    if (fd_ < 0) return false;
+    std::string wire = frame_binary(FrameType::StreamAudio, pcm);
+    size_t off = 0;
+    while (off < wire.size()) {
+        ssize_t n = write(fd_, wire.data() + off, wire.size() - off);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            log_warn("[ipc_client] send_stream_audio write failed: %s",
+                     std::strerror(errno));
+            close_connection();
+            return false;
+        }
+        off += static_cast<size_t>(n);
+    }
+    return true;
+}
+
+bool IpcClient::send_stream_audio(const int16_t* samples, std::size_t n) {
+    return send_stream_audio(std::string(
+        reinterpret_cast<const char*>(samples), n * sizeof(int16_t)));
+}
+
 bool IpcClient::read_events(const std::string& until_event, int timeout_ms) {
     until_event_ = until_event;
     event_matched_ = false;

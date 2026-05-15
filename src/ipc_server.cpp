@@ -651,18 +651,47 @@ void IpcServer::handle_client_data(int fd) {
         }
         // st == FrameStatus::Ok — `frame` holds one complete frame.
 
-        // Phase C.1: binary frames (`0x01`/`0x02`/`0x03`) are decode-able
-        // but have no consumer yet — C.2 / C.7 / C.10a wire the upload /
-        // download / streaming handlers. C.1 delivers the transport
-        // substrate only: a binary frame is parsed off the wire cleanly
-        // and discarded with a debug trace so the framing is exercised
-        // end-to-end without a half-built handler. It does NOT close the
-        // connection — NDJSON commands keep flowing on the same fd.
+        // Phase C.10a: binary frames (`0x01`/`0x02`/`0x03`) are routed to
+        // the registered binary-frame handler if one exists. C.10a wires
+        // it to feed `0x03` streaming-audio payloads into the matching
+        // streaming session; C.2/C.4 will consume `0x01`/`0x02`. A binary
+        // frame is only dispatched once the client is Authed — an
+        // unauthenticated TCP client must clear PSK first. When no handler
+        // is registered the frame is discarded with a debug trace,
+        // preserving the C.1 transport-only behavior. A handler that
+        // returns false signals a protocol violation and the connection
+        // is torn down.
         if (frame.type != FrameType::Ndjson) {
-            log_debug("ipc: received binary frame type=0x%02x len=%zu "
-                      "from fd=%d (no consumer in C.1 — discarded)",
-                      static_cast<unsigned>(frame.type),
-                      frame.payload.size(), fd);
+            if (it->second.auth_state != AuthState::Authed) {
+                log_warn("ipc_server: binary frame from non-Authed client "
+                         "(fd=%d, peer=%s); closing client",
+                         fd, it->second.peer_addr.c_str());
+                remove_client(fd);
+                return;
+            }
+            if (binary_frame_handler_) {
+                std::string client_id = it->second.client_id;
+                bool ok = binary_frame_handler_(client_id, frame.type,
+                                                frame.payload);
+                // The handler may have triggered a send_to_client() that
+                // closed the fd on Response-class overflow; re-look-up.
+                it = clients_.find(fd);
+                if (it == clients_.end()) return;
+                if (!ok) {
+                    log_warn("ipc_server: binary-frame handler rejected "
+                             "frame type=0x%02x (fd=%d, peer=%s); "
+                             "closing client",
+                             static_cast<unsigned>(frame.type), fd,
+                             it->second.peer_addr.c_str());
+                    remove_client(fd);
+                    return;
+                }
+            } else {
+                log_debug("ipc: received binary frame type=0x%02x len=%zu "
+                          "from fd=%d (no handler — discarded)",
+                          static_cast<unsigned>(frame.type),
+                          frame.payload.size(), fd);
+            }
             continue;
         }
 
@@ -755,12 +784,23 @@ void IpcServer::remove_client(int fd) {
     // a consistent "gone" view — `send_to_client()` looks up the reverse
     // map first.
     auto it = clients_.find(fd);
+    std::string gone_client_id;
     if (it != clients_.end() && !it->second.client_id.empty()) {
+        gone_client_id = it->second.client_id;
         client_id_to_fd_.erase(it->second.client_id);
     }
     log_info("ipc_server: client disconnected (fd=%d)", fd);
     close(fd);
     clients_.erase(fd);
+
+    // Phase C.10a: notify the disconnect handler AFTER the maps are
+    // consistent (fd closed, client_id_to_fd_ + clients_ erased). The
+    // handler runs inline on the poll thread and must not block — C.10a
+    // wires it to abort the disconnected client's streaming session (mark
+    // the JobQueue job failed, unlink the temp WAV, release the slot).
+    if (!gone_client_id.empty() && client_disconnect_handler_) {
+        client_disconnect_handler_(gone_client_id);
+    }
 }
 
 void IpcServer::send_to(int fd, std::string msg, MessageClass cls) {

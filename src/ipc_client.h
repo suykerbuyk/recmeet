@@ -108,6 +108,19 @@ public:
     // Returns false on disconnect.
     bool read_and_dispatch(int timeout_ms);
 
+    // Phase C.10a: send a `0x03` streaming-audio frame carrying raw PCM
+    // (S16LE host-endian — the daemon and tray are the same architecture
+    // on the v1 single-host dogfood path). `pcm` is the payload bytes;
+    // the helper prepends the `0x03` discriminator + 4-byte big-endian
+    // length via `frame_binary()`. Returns false on a write error (the
+    // connection is closed) or when not connected. This is a fire-and-
+    // forget send — there is no per-frame response; the daemon emits
+    // `caption` / `caption.degraded` events asynchronously.
+    bool send_stream_audio(const std::string& pcm);
+
+    // Phase C.10a: convenience overload taking int16 samples directly.
+    bool send_stream_audio(const int16_t* samples, std::size_t n);
+
 private:
     void process_line(const std::string& line);
     bool connect_unix();
