@@ -311,6 +311,82 @@ TEST_CASE("C.10b — process.stream.commit: happy-path handoff",
     fs::remove_all(tmp);
 }
 
+// ---------------------------------------------------------------------------
+// Phase C.11.1 — StreamRequest.meeting_id propagates onto BOTH the streaming
+// Job (stamped at create()) AND the postprocess Job that commit() enqueues.
+// ---------------------------------------------------------------------------
+
+TEST_CASE("C.11 — StreamRequest.meeting_id flows onto streaming + postprocess Jobs",
+          "[c10b][stream-commit][c11]") {
+    JobQueue q;
+    JqStreamGuard guard(q);
+    auto sink = null_sink();
+    StreamingSessionManager mgr(q, sink, "");
+    fs::path tmp = test_temp_dir("c11-stream-id");
+
+    StreamRequest req;
+    const std::string id = "abcdef01-2345-4678-9abc-def012345678";
+    req.meeting_id = id;
+
+    auto cr = mgr.create("client-A", req, tmp);
+    REQUIRE(cr.ok);
+
+    // Streaming job carries the id.
+    auto stream_st = q.status(cr.job_id);
+    REQUIRE(stream_st.has_value());
+    CHECK(stream_st->meeting_id == id);
+
+    // Feed and commit.
+    CHECK(mgr.feed_audio(cr.stream_token, make_pcm(800)));
+    REQUIRE(wait_until([&]() { return q.slot_busy(JobKind::Streaming); },
+                       std::chrono::milliseconds(500)));
+
+    auto commit = mgr.commit("client-A", cr.stream_token);
+    REQUIRE(commit.ok);
+
+    // Postprocess Job inherits the id from the session's frozen state —
+    // this is the load-bearing property for the convergence-principle
+    // commit path (pattern 1 in V2-STRATEGY.md).
+    auto pp_st = q.status(commit.postprocess_job_id);
+    REQUIRE(pp_st.has_value());
+    CHECK(pp_st->meeting_id == id);
+
+    q.cancel(commit.postprocess_job_id);
+    fs::remove_all(tmp);
+}
+
+TEST_CASE("C.11 — StreamRequest without meeting_id leaves both Jobs' meeting_id empty",
+          "[c10b][stream-commit][c11]") {
+    JobQueue q;
+    JqStreamGuard guard(q);
+    auto sink = null_sink();
+    StreamingSessionManager mgr(q, sink, "");
+    fs::path tmp = test_temp_dir("c11-stream-noid");
+
+    StreamRequest req; // meeting_id defaulted empty
+
+    auto cr = mgr.create("client-V1", req, tmp);
+    REQUIRE(cr.ok);
+
+    auto stream_st = q.status(cr.job_id);
+    REQUIRE(stream_st.has_value());
+    CHECK(stream_st->meeting_id.empty());
+
+    CHECK(mgr.feed_audio(cr.stream_token, make_pcm(800)));
+    REQUIRE(wait_until([&]() { return q.slot_busy(JobKind::Streaming); },
+                       std::chrono::milliseconds(500)));
+
+    auto commit = mgr.commit("client-V1", cr.stream_token);
+    REQUIRE(commit.ok);
+
+    auto pp_st = q.status(commit.postprocess_job_id);
+    REQUIRE(pp_st.has_value());
+    CHECK(pp_st->meeting_id.empty());
+
+    q.cancel(commit.postprocess_job_id);
+    fs::remove_all(tmp);
+}
+
 // ===========================================================================
 // 2. COMMIT UNKNOWN TOKEN → InvalidParams.
 // ===========================================================================

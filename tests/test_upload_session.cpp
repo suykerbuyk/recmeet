@@ -307,6 +307,74 @@ TEST_CASE("UploadSession: multi-chunk upload finalizes on bytes_received==audio_
     }
 }
 
+// --- Phase C.11.1 — SubmitRequest.meeting_id propagates onto Job ---------
+
+TEST_CASE("UploadSession: SubmitRequest.meeting_id is stamped onto the Job at finalize",
+          "[upload-session][c11]") {
+    JobQueue q;
+    // Capture the dequeued Job without immediately finishing it, so we can
+    // assert meeting_id on the snapshot the worker sees.
+    std::atomic<bool> seen{false};
+    std::string seen_meeting_id;
+    std::thread worker([&]() {
+        auto dq = q.dequeue(JobKind::Postprocess);
+        if (dq.has_value()) {
+            seen_meeting_id = dq->meeting_id;
+            seen.store(true);
+            q.finish(dq->job_id, /*ok=*/true, "");
+        }
+    });
+
+    fs::path tmp = test_temp_dir("c11-pp-id");
+    UploadSessionManager mgr(q, tmp, null_progress_sink());
+    Config cfg;
+
+    constexpr int64_t kTotal = 3200;
+    auto req = default_req(kTotal);
+    const std::string id = "12345678-1234-4567-89ab-1234567890ab";
+    req.meeting_id = id;
+
+    auto res = mgr.create("client-MID", req, cfg, /*max=*/1 << 20);
+    REQUIRE(res.ok);
+
+    REQUIRE(mgr.feed_chunk("client-MID", make_pcm(1600)));
+    CHECK(wait_until([&]() { return seen.load(); },
+                     std::chrono::milliseconds(1000)));
+    worker.join();
+
+    CHECK(seen_meeting_id == id);
+
+    // Status snapshot also carries the id (terminal-job registry retention).
+    auto st = q.status(res.job_id);
+    REQUIRE(st.has_value());
+    CHECK(st->meeting_id == id);
+}
+
+TEST_CASE("UploadSession: SubmitRequest without meeting_id leaves Job.meeting_id empty "
+          "(v1-shaped client back-compat)",
+          "[upload-session][c11]") {
+    JobQueue q;
+    PpDrainGuard guard(q);
+    fs::path tmp = test_temp_dir("c11-pp-noid");
+    UploadSessionManager mgr(q, tmp, null_progress_sink());
+    Config cfg;
+
+    auto req = default_req(3200);
+    // req.meeting_id deliberately unset → empty string.
+    auto res = mgr.create("client-V1", req, cfg, /*max=*/1 << 20);
+    REQUIRE(res.ok);
+    REQUIRE(mgr.feed_chunk("client-V1", make_pcm(1600)));
+
+    CHECK(wait_until([&]() {
+        auto st = q.status(res.job_id);
+        return st.has_value() && st->state == JobState::Done;
+    }, std::chrono::milliseconds(1000)));
+
+    auto st = q.status(res.job_id);
+    REQUIRE(st.has_value());
+    CHECK(st->meeting_id.empty());
+}
+
 // ===========================================================================
 // 4. feed_chunk rejects bytes_received > audio_size.
 // ===========================================================================

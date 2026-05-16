@@ -1827,6 +1827,17 @@ int main(int argc, char* argv[]) {
         sr.captions_enabled  = gb("captions_enabled", sr.captions_enabled);
         sr.latency_budget_ms = static_cast<int>(gi("latency_budget_ms",
                                                    sr.latency_budget_ms));
+        // C.11 — optional meeting_id. Empty is the v1-client fallback;
+        // non-empty must be a canonical UUID v4 or we reject at the wire
+        // boundary (defense-in-depth so a malformed id never poisons the
+        // MeetingIndex via the streaming session's frozen state).
+        sr.meeting_id        = gs("meeting_id", "");
+        if (!is_valid_meeting_id(sr.meeting_id)) {
+            err.code = static_cast<int>(IpcErrorCode::InvalidParams);
+            err.message = "process.stream: 'meeting_id' must be a canonical "
+                          "lowercase UUID v4 (or absent)";
+            return false;
+        }
 
         // Phase C.10b — snapshot the per-client postprocess config at
         // `process.stream` time, exactly as `process.submit` does at
@@ -1973,6 +1984,17 @@ int main(int argc, char* argv[]) {
         sr.context      = gs("context", sr.context);
         sr.mode         = gs("mode", sr.mode);
         sr.enroll_name  = gs("enroll_name", sr.enroll_name);  // C.8
+        // C.11 — optional client-minted meeting_id (UUID v4). Empty is the
+        // v1-client fallback; non-empty must validate or we reject at the
+        // wire boundary so a malformed id never reaches UploadSession or
+        // the MeetingIndex.
+        sr.meeting_id   = gs("meeting_id", "");
+        if (!is_valid_meeting_id(sr.meeting_id)) {
+            err.code = static_cast<int>(IpcErrorCode::InvalidParams);
+            err.message = "process.submit: 'meeting_id' must be a canonical "
+                          "lowercase UUID v4 (or absent)";
+            return false;
+        }
         // `speaker_hints` is accepted-and-ignored in C.2 (reserved for v2
         // multi-server). We deliberately do not read it.
 
@@ -2475,7 +2497,7 @@ int main(int argc, char* argv[]) {
 
     auto serialize_job_object = [](const Job& job) -> std::string {
         std::string out;
-        out.reserve(160);
+        out.reserve(200);
         out += "{\"job_id\":";
         out += std::to_string(job.job_id);
         out += ",\"kind\":\"";
@@ -2488,6 +2510,12 @@ int main(int argc, char* argv[]) {
         out += json_escape(job.model_id);
         out += "\",\"error\":\"";
         out += json_escape(job.error);
+        // C.11 — meeting_id emitted unconditionally (empty string for
+        // v1-shaped clients + daemon-internal jobs like model downloads).
+        // The client uses this to reconcile by content key per
+        // docs/V2-STRATEGY.md "Meeting identity".
+        out += "\",\"meeting_id\":\"";
+        out += json_escape(job.meeting_id);
         out += "\"}";
         return out;
     };
@@ -2556,6 +2584,9 @@ int main(int argc, char* argv[]) {
         resp.result["client_id"] = snap->client_id;
         resp.result["model_id"]  = snap->model_id;
         resp.result["error"]     = snap->error;
+        // C.11 — emit unconditionally; matches serialize_job_object so the
+        // job.status object shape is byte-equivalent to a job.list entry.
+        resp.result["meeting_id"] = snap->meeting_id;
 
         log_debug("daemon: job.status job=%ld kind=%s state=%s client=%s",
                   (long)job_id, job_kind_name(snap->kind),

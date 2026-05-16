@@ -91,6 +91,13 @@ struct StreamRequest {
     std::string language = "en";    ///< English-only guard rejects others
     bool        captions_enabled = true;
     int         latency_budget_ms = 500;  ///< [200,2000], drives emit cadence
+    /// Phase C.11 — client-minted UUID v4 identifying the meeting (see
+    /// docs/V2-STRATEGY.md "Meeting identity"). Empty for v1-shaped
+    /// clients. Validated at the wire boundary by the daemon. The
+    /// streaming session carries this through to the postprocess Job
+    /// `process.stream.commit` enqueues — commit itself does not need a
+    /// separate meeting_id arg because the session already knows it.
+    std::string meeting_id;
 };
 
 /// Default / bounds for `latency_budget_ms`.
@@ -198,6 +205,13 @@ private:
     /// committed path for assertions, and over option iii (restructure)
     /// because the smaller surface is safer this late in Phase C.
     bool         committed_ = false;
+
+    /// Phase C.11 — meeting_id this stream belongs to (UUID v4 or empty for
+    /// v1-shaped clients). Captured at create() from the StreamRequest,
+    /// stamped on both the streaming Job (so job.list / job.status echoes
+    /// it back) and the postprocess Job that `commit()` enqueues. Empty is
+    /// the v1 fallback; non-empty is wire-validated before it reaches us.
+    std::string  meeting_id_;
 };
 
 // ---------------------------------------------------------------------------

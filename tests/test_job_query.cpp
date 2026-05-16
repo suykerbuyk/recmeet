@@ -130,12 +130,13 @@ void register_job_query_handlers(IpcServer& server, JobQueue& q) {
                         + " is not owned by this client";
             return false;
         }
-        resp.result["job_id"]    = static_cast<int64_t>(snap->job_id);
-        resp.result["kind"]      = std::string(job_kind_name(snap->kind));
-        resp.result["state"]     = std::string(job_state_name(snap->state));
-        resp.result["client_id"] = snap->client_id;
-        resp.result["model_id"]  = snap->model_id;
-        resp.result["error"]     = snap->error;
+        resp.result["job_id"]     = static_cast<int64_t>(snap->job_id);
+        resp.result["kind"]       = std::string(job_kind_name(snap->kind));
+        resp.result["state"]      = std::string(job_state_name(snap->state));
+        resp.result["client_id"]  = snap->client_id;
+        resp.result["model_id"]   = snap->model_id;
+        resp.result["error"]      = snap->error;
+        resp.result["meeting_id"] = snap->meeting_id;   // C.11
         return true;
     });
 
@@ -157,6 +158,8 @@ void register_job_query_handlers(IpcServer& server, JobQueue& q) {
             arr += json_escape(jobs[i].model_id);
             arr += "\",\"error\":\"";
             arr += json_escape(jobs[i].error);
+            arr += "\",\"meeting_id\":\"";              // C.11
+            arr += json_escape(jobs[i].meeting_id);
             arr += "\"}";
         }
         arr += "]";
@@ -792,6 +795,73 @@ TEST_CASE("C.6 job.list: ascending job_id ordering",
     // unordered_map without preserving the documented order.
     for (size_t i = 1; i < ids.size(); ++i) {
         CHECK(ids[i] > ids[i - 1]);
+    }
+
+    client.close_connection();
+    ::unlink(QUERY_SOCK);
+}
+
+// ---------------------------------------------------------------------------
+// Phase C.11.1 — job.status / job.list responses carry meeting_id.
+// Field is emitted unconditionally; empty string for v1-shaped jobs.
+// ---------------------------------------------------------------------------
+
+TEST_CASE("C.11 — job.status response carries meeting_id "
+          "(populated and empty round-trips)",
+          "[c6][query][c11]") {
+    ::unlink(QUERY_SOCK);
+
+    JobQueue q;
+    JqShutdownGuard jqg(q);
+    IpcServer server(QUERY_SOCK);
+    register_job_query_handlers(server, q);
+    REQUIRE(server.start());
+    ServerGuard sg(server);
+
+    IpcClient client(QUERY_SOCK);
+    REQUIRE(client.connect());
+
+    // Job WITH meeting_id (mirrors what process.submit will do once C.11.4
+    // wires the SubmitRequest field onto the Job at finalize).
+    const std::string id = "12345678-1234-4567-89ab-1234567890ab";
+    Job j;
+    j.meeting_id = id;
+    int64_t with_id = q.enqueue(std::move(j), JobKind::Postprocess,
+                                client.client_id());
+
+    // Job WITHOUT meeting_id (the v1-client fallback).
+    int64_t no_id = enqueue_postprocess_queued(q, client.client_id());
+
+    // job.status on the populated job emits the id.
+    {
+        JsonMap params; params["job_id"] = with_id;
+        IpcResponse resp; IpcError err;
+        REQUIRE(client.call("job.status", params, resp, err, 2000));
+        CHECK(json_val_as_string(resp.result["meeting_id"]) == id);
+    }
+    // job.status on the v1-shaped job emits empty string (not absent).
+    {
+        JsonMap params; params["job_id"] = no_id;
+        IpcResponse resp; IpcError err;
+        REQUIRE(client.call("job.status", params, resp, err, 2000));
+        auto it = resp.result.find("meeting_id");
+        REQUIRE(it != resp.result.end());
+        CHECK(json_val_as_string(it->second).empty());
+    }
+    // job.list emits meeting_id for each entry.
+    {
+        IpcResponse resp; IpcError err;
+        REQUIRE(client.call("job.list", JsonMap{}, resp, err, 2000));
+        auto elems = split_top_array(json_val_as_string(resp.result["jobs"]));
+        REQUIRE(elems.size() == 2);
+        size_t hits = 0;
+        for (const auto& el : elems) {
+            std::string jid = extract_field(el, "job_id");
+            std::string mid = extract_field(el, "meeting_id");
+            if (std::stoll(jid) == with_id) { CHECK(mid == id); ++hits; }
+            else if (std::stoll(jid) == no_id) { CHECK(mid.empty()); ++hits; }
+        }
+        CHECK(hits == 2);
     }
 
     client.close_connection();

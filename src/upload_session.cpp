@@ -349,6 +349,10 @@ UploadSessionManager::create(const std::string& client_id,
         pp_modes_[job_id] = req.mode;
         pp_enroll_names_[job_id] = req.enroll_name;
     }
+    // C.11 — only stash when non-empty so v1 submits leave nothing behind.
+    if (!req.meeting_id.empty()) {
+        pp_meeting_ids_[job_id] = req.meeting_id;
+    }
 
     log_info("[upload] session created: job=%ld client=%s token=%s "
              "dir=%s audio_size=%lld format=%s",
@@ -377,6 +381,7 @@ bool UploadSessionManager::feed_chunk(const std::string& client_id,
     std::string context_inline;
     std::string pp_mode;        // Phase C.8 — captured under the lock
     std::string pp_enroll_name; // Phase C.8 — captured under the lock
+    std::string pp_meeting_id;  // Phase C.11 — captured under the lock
     {
         std::lock_guard<std::mutex> lk(mu_);
         UploadSession* sess = nullptr;
@@ -509,6 +514,8 @@ bool UploadSessionManager::feed_chunk(const std::string& client_id,
             if (mit != pp_modes_.end()) pp_mode = mit->second;
             auto nit = pp_enroll_names_.find(job_id);
             if (nit != pp_enroll_names_.end()) pp_enroll_name = nit->second;
+            auto idit = pp_meeting_ids_.find(job_id);
+            if (idit != pp_meeting_ids_.end()) pp_meeting_id = idit->second;
             // Remove the session BEFORE leaving the lock so the next
             // process.submit from the same client is admitted cleanly.
             sessions_.erase(token_key);
@@ -516,6 +523,7 @@ bool UploadSessionManager::feed_chunk(const std::string& client_id,
             pp_context_overrides_.erase(job_id);
             pp_modes_.erase(job_id);
             pp_enroll_names_.erase(job_id);
+            pp_meeting_ids_.erase(job_id);
             finalize_now = true;
         }
     }
@@ -551,6 +559,12 @@ bool UploadSessionManager::feed_chunk(const std::string& client_id,
             j.cfg.enroll_mode = true;
             j.cfg.enroll_name = pp_enroll_name;
         }
+        // C.11 — stamp the meeting_id captured under the lock. Empty for
+        // v1-shaped clients. The convergence-principle dedup contract in
+        // C.11.4 reads this on the upload finalize path; for C.11.1 the
+        // value just rides on the Job so job.list / job.status echo it
+        // back to the client.
+        j.meeting_id = pp_meeting_id;
 
         bool placed = jobs_.enqueue_reserved(job_id, std::move(j));
         if (!placed) {
@@ -631,6 +645,7 @@ void UploadSessionManager::cancel_session_locked(
     pp_context_overrides_.erase(job_id);
     pp_modes_.erase(job_id);
     pp_enroll_names_.erase(job_id);
+    pp_meeting_ids_.erase(job_id);
 }
 
 int UploadSessionManager::on_client_disconnect(const std::string& client_id) {
@@ -662,6 +677,7 @@ int UploadSessionManager::on_client_disconnect(const std::string& client_id) {
         pp_context_overrides_.erase(job_id);
         pp_modes_.erase(job_id);
         pp_enroll_names_.erase(job_id);
+        pp_meeting_ids_.erase(job_id);
         ++aborted;
     }
     return aborted;

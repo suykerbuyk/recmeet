@@ -247,6 +247,10 @@ StreamingSessionManager::create(const std::string& client_id,
 
     Job job;
     job.kind = JobKind::Streaming;
+    // C.11 — carry meeting_id onto the streaming Job so job.list / job.status
+    // echo it back to the client. Per-session storage below holds the same
+    // value for the postprocess job that commit() eventually enqueues.
+    job.meeting_id = req.meeting_id;
     int64_t job_id = jobs_.enqueue(std::move(job), JobKind::Streaming, client_id);
 
     // --- Open the disk-backed temp WAV (the frame sink).
@@ -294,6 +298,7 @@ StreamingSessionManager::create(const std::string& client_id,
     // parent directory, mirroring C.2's process.submit finalize.
     sess->pp_cfg_ = pp_cfg;
     sess->context_inline_ = req.context;
+    sess->meeting_id_ = req.meeting_id; // C.11 — propagated to commit's pp Job
     StreamingSession* sess_ptr = sess.get();
 
     // --- Start the CaptionEngine (the producer migrates to feed_audio()).
@@ -573,6 +578,10 @@ StreamingSessionManager::commit(const std::string& client_id,
         pp_job.cfg.reprocess_dir = wav_dir.string();
         if (!sess->context_inline_.empty())
             pp_job.cfg.context_inline = sess->context_inline_;
+        // C.11 — carry the meeting_id from the streaming session onto the
+        // postprocess Job so the commit-spawned job is reconcilable by the
+        // same content key as the original process.stream request.
+        pp_job.meeting_id = sess->meeting_id_;
 
         // (f) Place the populated job into the postprocess FIFO. If the
         //     reservation was cancelled meanwhile (e.g. process.cancel

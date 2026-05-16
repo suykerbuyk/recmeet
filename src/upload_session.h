@@ -102,6 +102,15 @@ struct SubmitRequest {
     /// store the voiceprint under. Required when `mode == "enroll"`.
     /// Ignored for `mode == "transcribe"`.
     std::string enroll_name;
+    /// Phase C.11 — client-minted UUID v4 identifying the meeting (per
+    /// docs/V2-STRATEGY.md "Meeting identity and the client-server audio
+    /// contract"). Empty when the client is v1-shaped (pre-C.11) — the
+    /// server treats absence as "fresh allocation, no index binding". When
+    /// non-empty, the daemon's wire handler validates via
+    /// `is_valid_meeting_id` and rejects malformed values at the wire
+    /// boundary. Carried through onto the eventual Job (C.11.4 wires the
+    /// dedup contract).
+    std::string meeting_id;
 };
 
 /// Supported formats. Raw PCM formats are wrapped as WAV on the staging side
@@ -321,6 +330,13 @@ private:
     /// cancel / disconnect) so a closed session leaves nothing behind.
     std::map<int64_t, std::string> pp_modes_;
     std::map<int64_t, std::string> pp_enroll_names_;
+
+    /// Phase C.11 — per-upload meeting_id snapshot. Stashed at create()
+    /// from the SubmitRequest, consumed at finalize where it stamps
+    /// `Job.meeting_id` on the outgoing postprocess job. Empty for
+    /// v1-shaped submits — we skip the map insert so v1 paths leave
+    /// nothing behind. Insert/erase mirror the other side tables.
+    std::map<int64_t, std::string> pp_meeting_ids_;
 };
 
 } // namespace recmeet

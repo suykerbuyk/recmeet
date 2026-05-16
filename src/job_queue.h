@@ -119,6 +119,15 @@ struct Job {
 
     /// Error message when `state == Failed`.
     std::string      error;
+
+    /// Phase C.11 — meeting_id this job belongs to, when known. Threaded
+    /// here from `SubmitRequest::meeting_id` (process.submit) or
+    /// `StreamRequest::meeting_id` (process.stream → process.stream.commit's
+    /// postprocess job inherits via the streaming session's frozen state).
+    /// Empty for v1-shaped clients and for daemon-internal jobs (model
+    /// downloads). The job.list / job.status serializer emits it
+    /// unconditionally so the client can reconcile by content key.
+    std::string      meeting_id;
 };
 
 // ---------------------------------------------------------------------------
