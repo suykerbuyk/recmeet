@@ -327,6 +327,13 @@ target_sources(recmeet_core PRIVATE src/streaming_session.cpp)
 # in recmeet_core; the daemon links it transitively.
 target_sources(recmeet_core PRIVATE src/upload_session.cpp)
 
+# Phase C.11 — in-memory meeting_id -> meeting_dir_path index. Owned by the
+# daemon, populated at startup via rebuild_from_disk(meetings_root), consulted
+# by the upload finalize path (C.11.4) to dedupe known meeting_ids onto their
+# existing directory. Lives in recmeet_core because rebuild_from_disk reaches
+# into pipeline.cpp's load_meeting_id() (context.json reader).
+target_sources(recmeet_core PRIVATE src/meeting_index.cpp)
+
 # Phase C.8 — server-resident per-job diarization cache. Pure stdlib; no
 # sherpa dependency (consumes already-extracted centroids). Lives in
 # recmeet_core so the daemon and pipeline.cpp's writer share the file
@@ -505,6 +512,7 @@ if(RECMEET_BUILD_TESTS)
         tests/test_cancel.cpp
         tests/test_job_query.cpp
         tests/test_enroll.cpp
+        tests/test_meeting_index.cpp
         tests/test_v2_thin_client_e2e.cpp
         tests/test_live_recording.cpp
     )
