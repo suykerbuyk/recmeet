@@ -363,3 +363,83 @@ TEST_CASE("JobQueue: status/finish error path marks the job Failed",
     REQUIRE(st->error == "subprocess crashed");
     REQUIRE_FALSE(q.slot_busy(JobKind::Postprocess));
 }
+
+// ---------------------------------------------------------------------------
+// P3-2 — All three typed slots simultaneously occupied + new submissions of
+// each kind park as Queued. The existing "two postprocess jobs queue serially
+// behind one slot" case (above) covers capacity-1 for the postprocess slot
+// only and uses a worker thread. This case verifies that all three concurrent
+// slots are independent AND that a SECOND job of an occupied kind stays
+// Queued — i.e. each slot is genuinely capacity-1, not just postprocess.
+// Surfaced by the iter-156 audit.
+// ---------------------------------------------------------------------------
+TEST_CASE("JobQueue: all three slots full + new submissions stay Queued",
+          "[job_queue][c7][slot-full]") {
+    JobQueue q;
+
+    // Enqueue one of each kind. Note the model_resolver default returns an
+    // empty list, so the Postprocess job does NOT auto-trigger a download.
+    int64_t pp = q.enqueue(make_pp_job(),  JobKind::Postprocess,    "c1");
+    int64_t st = q.enqueue(Job{},          JobKind::Streaming,      "c1");
+    int64_t dl = q.enqueue(Job{},          JobKind::ModelDownload, "c1");
+
+    // Dequeue each — every slot is concurrently busy.
+    auto a = q.dequeue(JobKind::Postprocess);
+    auto b = q.dequeue(JobKind::Streaming);
+    auto c = q.dequeue(JobKind::ModelDownload);
+    REQUIRE(a.has_value());
+    REQUIRE(b.has_value());
+    REQUIRE(c.has_value());
+    REQUIRE(a->job_id == pp);
+    REQUIRE(b->job_id == st);
+    REQUIRE(c->job_id == dl);
+
+    // All three slots are simultaneously occupied AND each job's state is
+    // Running. (The two-postprocess existing test covers capacity-1 for
+    // the postprocess slot; this case pins concurrency across kinds.)
+    REQUIRE(q.slot_busy(JobKind::Postprocess));
+    REQUIRE(q.slot_busy(JobKind::Streaming));
+    REQUIRE(q.slot_busy(JobKind::ModelDownload));
+    CHECK(q.status(pp)->state == JobState::Running);
+    CHECK(q.status(st)->state == JobState::Running);
+    CHECK(q.status(dl)->state == JobState::Running);
+
+    // Enqueue a SECOND job of two of the kinds — they MUST park as Queued
+    // because each slot is capacity-1. (We don't probe ModelDownload's
+    // capacity because the resolver-driven auto-trigger seam already
+    // exercises that path in the [auto-triggers a ModelDownload] case.)
+    int64_t pp2 = q.enqueue(make_pp_job(), JobKind::Postprocess, "c1");
+    int64_t st2 = q.enqueue(Job{},         JobKind::Streaming,   "c1");
+
+    CHECK(q.status(pp2)->state == JobState::Queued);
+    CHECK(q.status(st2)->state == JobState::Queued);
+    // The slots are still busy with the originals; the queued counts
+    // reflect the parked second submissions.
+    CHECK(q.queued_count(JobKind::Postprocess) == 1);
+    CHECK(q.queued_count(JobKind::Streaming)   == 1);
+
+    // Drain the originals so the slots release; this also confirms the
+    // queued submissions are still in the FIFO and dequeue in order when
+    // we release each slot. (We don't actually run the second jobs here —
+    // just verify they were parked correctly.)
+    q.finish(pp, true);
+    q.finish(st, true);
+    q.finish(dl, true);
+    // After finish, the originals are Done and the slots are free for
+    // the next dequeue to pick the parked second jobs.
+    CHECK(q.status(pp)->state == JobState::Done);
+    CHECK(q.status(st)->state == JobState::Done);
+    CHECK(q.status(dl)->state == JobState::Done);
+
+    auto a2 = q.dequeue(JobKind::Postprocess);
+    auto b2 = q.dequeue(JobKind::Streaming);
+    REQUIRE(a2.has_value());
+    REQUIRE(b2.has_value());
+    CHECK(a2->job_id == pp2);
+    CHECK(b2->job_id == st2);
+
+    // Cleanup: finish the second batch so the slots release before the
+    // JobQueue destructor runs.
+    q.finish(pp2, true);
+    q.finish(st2, true);
+}

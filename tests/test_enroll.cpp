@@ -875,3 +875,104 @@ TEST_CASE("process.fetch on enroll-mode Done job returns empty artifacts",
     CHECK(arts.empty());
     CHECK(e.empty());
 }
+
+// ===========================================================================
+// P3-4 — enroll.finalize with >2 embeddings for the same profile.
+//
+// The existing "two calls for same name yield 2-embedding profile" case
+// (test #11 above) covers the N=2 path. The handler should handle N>2
+// equally — calling enroll.finalize multiple times for the same
+// enroll_name across multiple cached jobs (or multiple target_speakers
+// of the same cached job) should append each cluster's embedding to the
+// SAME on-disk profile. Surfaced by the iter-156 audit.
+// ===========================================================================
+
+TEST_CASE("enroll.finalize: N>2 embeddings for one name produce an N-embedding profile",
+          "[c8][enroll][multi-embedding]") {
+    ::unlink(ENROLL_SOCK);
+    JobQueue q;
+    JqShutdownGuard jqg(q);
+    DiarizationCache cache(/*ttl=*/0);  // disable TTL
+    fs::path db_dir = test_temp_dir("multi_emb_db");
+
+    IpcServer server(ENROLL_SOCK);
+    register_enroll_finalize_handler(server, q, cache, db_dir);
+    REQUIRE(server.start());
+    ServerGuard sg(server);
+
+    IpcClient client(ENROLL_SOCK);
+    REQUIRE(client.connect());
+
+    // Mix the two valid paths for "more embeddings": three SEPARATE
+    // cached jobs (covers the typical "user re-enrolled three times in
+    // separate recordings" flow) plus one same-job different-target
+    // (covers the diarization-cluster-fan-out flow).
+    //
+    // Total expected: 4 embeddings on the profile.
+    constexpr int kSeparateJobs = 3;
+    std::vector<int64_t> job_ids;
+    for (int i = 0; i < kSeparateJobs; ++i) {
+        int64_t jid = stage_done_job(q, client.client_id(),
+                                     test_temp_dir("multi_emb_job"
+                                                   + std::to_string(i)),
+                                     /*enroll_mode=*/true);
+        cache.put(jid, make_synthetic_clusters(1));
+        job_ids.push_back(jid);
+    }
+
+    // Append three times via separate cached jobs, target_speaker=0.
+    for (int64_t jid : job_ids) {
+        JsonMap params;
+        params["job_id"] = jid;
+        params["target_speaker"] = static_cast<int64_t>(0);
+        params["enroll_name"] = std::string("Alice");
+        IpcResponse resp;
+        IpcError err;
+        INFO("job_id=" << jid);
+        REQUIRE(client.call("enroll.finalize", params, resp, err, 2000));
+        CHECK(err.message.empty());
+    }
+    // After 3 separate-job appends, the profile has exactly 3 embeddings.
+    {
+        auto profiles = load_speaker_db(db_dir);
+        REQUIRE(profiles.size() == 1);
+        CHECK(profiles[0].name == "Alice");
+        CHECK(profiles[0].embeddings.size() == 3);
+    }
+
+    // Now append a 4th from a NEW cached job that has multiple clusters,
+    // picking target_speaker=1 (a different cluster than 0). This proves
+    // the handler honors per-call target_speaker for an enroll job whose
+    // diarization produced >1 speaker.
+    int64_t multi_jid = stage_done_job(q, client.client_id(),
+                                       test_temp_dir("multi_emb_multitgt"),
+                                       /*enroll_mode=*/true);
+    cache.put(multi_jid, make_synthetic_clusters(3));
+    {
+        JsonMap params;
+        params["job_id"] = multi_jid;
+        params["target_speaker"] = static_cast<int64_t>(1);
+        params["enroll_name"] = std::string("Alice");
+        IpcResponse resp;
+        IpcError err;
+        REQUIRE(client.call("enroll.finalize", params, resp, err, 2000));
+        CHECK(err.message.empty());
+        CHECK(json_val_as_int(resp.result["embedding_count"]) == 4);
+    }
+    // Final profile has all 4 embeddings under a single "Alice" record.
+    {
+        auto profiles = load_speaker_db(db_dir);
+        REQUIRE(profiles.size() == 1);
+        CHECK(profiles[0].name == "Alice");
+        CHECK(profiles[0].embeddings.size() == 4);
+
+        // Belt + braces: every embedding has the right dimension. Each
+        // synthetic cluster is emb_dim=8 (make_synthetic_clusters default).
+        for (const auto& emb : profiles[0].embeddings) {
+            CHECK(emb.size() == 8);
+        }
+    }
+
+    client.close_connection();
+    ::unlink(ENROLL_SOCK);
+}

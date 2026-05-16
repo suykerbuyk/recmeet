@@ -505,6 +505,8 @@ if(RECMEET_BUILD_TESTS)
         tests/test_cancel.cpp
         tests/test_job_query.cpp
         tests/test_enroll.cpp
+        tests/test_v2_thin_client_e2e.cpp
+        tests/test_live_recording.cpp
     )
     # The test binary exercises both daemon-side surfaces (recmeet_core) and
     # client-side / standalone surfaces (run_recording + recmeet_capture), so

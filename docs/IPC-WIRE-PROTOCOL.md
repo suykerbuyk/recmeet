@@ -9,6 +9,35 @@ artifact download, streaming audio) builds on.
 The transport is a bidirectional byte stream — a Unix domain socket
 (local) or a TCP socket (remote). Framing is identical on both.
 
+## V2 Verb Reference
+
+See [`IPC-VERBS.md`](IPC-VERBS.md) for per-verb request/response shapes,
+error codes, and example flows. This document covers the frame-layer
+spec only.
+
+| Verb                       | Phase   | Frame(s)               | Direction         |
+|----------------------------|---------|------------------------|-------------------|
+| `auth.ok`                  | A.1/4/5 | `0x00`                 | server → client   |
+| `session.init`             | A.6     | `0x00`                 | client → server   |
+| `session.update_credentials` | A.6   | `0x00`                 | client → server   |
+| `session.update_prefs`     | A.6     | `0x00`                 | client → server   |
+| `process.submit`           | C.2/8   | `0x00` + `0x01` frames | client → server   |
+| `process.submit.cancel`    | C.2     | `0x00`                 | client → server   |
+| `process.cancel`           | C.5     | `0x00`                 | client → server   |
+| `process.fetch`            | C.4     | `0x00` + `0x02` frames | both              |
+| `process.stream`           | C.10a   | `0x00` + `0x03` frames | client → server   |
+| `process.stream.cancel`    | C.10a   | `0x00`                 | client → server   |
+| `process.stream.commit`    | C.10b   | `0x00`                 | client → server   |
+| `job.status`               | C.6     | `0x00`                 | client → server   |
+| `job.list`                 | C.6     | `0x00`                 | client → server   |
+| `enroll.finalize`          | C.8     | `0x00`                 | client → server   |
+| `progress.job` (event)     | C.3     | `0x00`                 | server → client   |
+| `state.changed` (event)    | —       | `0x00`                 | server → client   |
+| `caption` (event)          | C.10a/b | `0x00`                 | server → client   |
+| `caption.degraded` (event) | C.10a/b | `0x00`                 | server → client   |
+| `job.complete` (event)     | C.3     | `0x00`                 | server → client   |
+| `error` (event)            | —       | `0x00`                 | server → client   |
+
 ## Frame format
 
 Every frame on the wire begins with a **1-byte frame-type discriminator**.

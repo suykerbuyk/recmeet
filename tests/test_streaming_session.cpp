@@ -750,6 +750,95 @@ TEST_CASE("StreamingSession: 0x03 frames round-trip through IpcServer/IpcClient"
 //     streaming slot and unlinks the temp WAV; the disconnect handler wired
 //     into IpcServer fires on a real client drop.
 // ===========================================================================
+// ===========================================================================
+// P2-3 — RSS does not grow with stream duration.
+//
+// The existing "long stream is disk-backed, not RAM-buffered" case asserts
+// the structural disk-backed property (the WAV grows on disk) but does not
+// measure RSS. This case feeds ~100 MB of PCM in 1 MB chunks and asserts the
+// process's VmRSS grew by less than 10 MB. Linux-only — the test reads
+// /proc/self/status and skips with WARN if it is not available (e.g. other
+// platforms or a sandbox that hides /proc).
+// Surfaced by the iter-156 audit.
+// ===========================================================================
+namespace {
+// Read VmRSS in KiB from /proc/self/status. Returns -1 if /proc is not
+// readable. The VmRSS line is e.g. `VmRSS:\t   12345 kB` — parse the
+// digit run after the colon.
+int64_t read_self_vmrss_kib() {
+    std::ifstream f("/proc/self/status");
+    if (!f) return -1;
+    std::string line;
+    while (std::getline(f, line)) {
+        // Linux uses "VmRSS:" prefix; case is fixed.
+        if (line.rfind("VmRSS:", 0) == 0) {
+            // Skip non-digits, parse the leading integer.
+            size_t i = 6;  // past "VmRSS:"
+            while (i < line.size() && !std::isdigit(static_cast<unsigned char>(line[i])))
+                ++i;
+            int64_t v = 0;
+            while (i < line.size() && std::isdigit(static_cast<unsigned char>(line[i]))) {
+                v = v * 10 + (line[i] - '0');
+                ++i;
+            }
+            return v;
+        }
+    }
+    return -1;
+}
+} // anonymous namespace
+
+TEST_CASE("StreamingSession: RSS does not grow with stream duration",
+          "[streaming-session][c10a][memory-rss]") {
+    const int64_t baseline_kib = read_self_vmrss_kib();
+    if (baseline_kib < 0) {
+        WARN("/proc/self/status not readable — skipping RSS regression test");
+        return;
+    }
+
+    JobQueue q;
+    JqGuard guard(q);
+    auto sink = null_sink();
+    StreamingSessionManager mgr(q, sink, "");
+    fs::path tmp = test_temp_dir("rss");
+
+    StreamRequest req;
+    auto res = mgr.create("client-A", req, tmp);
+    REQUIRE(res.ok);
+
+    // Feed ~100 MB total in 1 MB chunks. 100 MB of 16 kHz mono s16le ==
+    // 100 * 1024 * 1024 bytes = 104,857,600 bytes / 2 bytes/sample / 16,000
+    // samples/sec = ~3276 s of audio (~54 minutes). The test runs in ~1 s
+    // on a warm machine — the disk-backed sink is the bottleneck, not RAM.
+    constexpr size_t CHUNK_BYTES   = 1u << 20;          // 1 MB
+    constexpr int    N_CHUNKS      = 100;                // -> ~100 MB
+    constexpr size_t SAMPLES_PER_CHUNK = CHUNK_BYTES / sizeof(int16_t);
+
+    // Reuse one PCM buffer across feeds — avoids inflating the test
+    // process's allocator just from constructing 100 separate strings.
+    std::string pcm = make_pcm(SAMPLES_PER_CHUNK);
+    REQUIRE(pcm.size() == CHUNK_BYTES);
+
+    for (int i = 0; i < N_CHUNKS; ++i) {
+        REQUIRE(mgr.feed_audio(res.stream_token, pcm));
+    }
+
+    const int64_t after_kib = read_self_vmrss_kib();
+    REQUIRE(after_kib >= 0);
+    const int64_t delta_kib = after_kib - baseline_kib;
+
+    // 10 MB cap is a wide margin. We expect ~1-2 MB of legitimate growth
+    // (sndfile buffering, the temp WAV's mmap'd window, allocator
+    // hysteresis). Anything beyond 10 MB on a 100 MB feed indicates an
+    // accidental in-memory accumulation — the regression the test guards.
+    INFO("VmRSS baseline=" << baseline_kib << " KiB, after=" << after_kib
+         << " KiB, delta=" << delta_kib << " KiB (cap 10240 KiB)");
+    CHECK(delta_kib < 10 * 1024);
+
+    mgr.cancel("client-A", res.stream_token);
+    fs::remove_all(tmp);
+}
+
 TEST_CASE("StreamingSession: process.stream.cancel + disconnect handler over the wire",
           "[streaming-session][streaming-wire]") {
     ::unlink(STREAM_SOCK);

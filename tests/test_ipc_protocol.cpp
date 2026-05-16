@@ -706,3 +706,195 @@ TEST_CASE("C.1: IPC_PROTOCOL_VERSION bumped for the breaking frame change", "[ip
     // version must have moved past the pre-C.1 value of 1.
     CHECK(IPC_PROTOCOL_VERSION >= 2);
 }
+
+// ---------------------------------------------------------------------------
+// C.1 frame-integrity gap (audit iter 156): the FrameReader state machine
+// uses a length prefix to delimit binary frames, so a peer that connects,
+// sends `<type><len>` plus a SHORT payload, then drops can leave the reader
+// in a partial-frame state. The contract is that such a frame must NEVER
+// be surfaced as a complete `Frame` via FrameStatus::Ok — the reader stays
+// at NeedMore, and `in_frame()` reports the mid-frame state so the
+// connection layer (which observes the EOF independently) can close the
+// fd without dispatching the truncated payload.
+//
+// The state machine itself does not see EOF — that is the caller's job —
+// so the assertions here are: (1) after feeding `<type><len><partial>`,
+// next() returns NeedMore on every poll; (2) `in_frame()` is true and the
+// current mode is Binary; (3) the partial payload is held inside the
+// reader's buffer, NOT yielded; (4) feeding ARBITRARILY more partial bytes
+// (still below `expected_len_`) leaves us in the same state — there is no
+// stale-yield bug. Together these make a frame whose connection has gone
+// silent definitively "discardable, never dispatched" once the caller
+// detects EOF.
+// ---------------------------------------------------------------------------
+TEST_CASE("C.1: truncated binary frame stays mid-frame and never yields a Frame",
+          "[ipc][c1][frame-integrity]") {
+    FrameReader reader;
+    Frame f;
+
+    // Hand-build a header declaring a 100-byte payload, then feed only 50
+    // of those payload bytes. The remaining 50 bytes never arrive
+    // (simulating a dropped connection).
+    constexpr uint32_t kDeclaredLen = 100;
+    constexpr size_t   kPartialLen  = 50;
+    std::string wire;
+    wire += static_cast<char>(FrameType::BinaryUpload);
+    wire += static_cast<char>((kDeclaredLen >> 24) & 0xFF);
+    wire += static_cast<char>((kDeclaredLen >> 16) & 0xFF);
+    wire += static_cast<char>((kDeclaredLen >>  8) & 0xFF);
+    wire += static_cast<char>( kDeclaredLen        & 0xFF);
+    wire.append(kPartialLen, 'P');  // 50 bytes of payload only
+
+    reader.feed(wire);
+
+    // (1) next() must report NeedMore, not Ok or any terminal status — the
+    // frame is incomplete, but the reader has done nothing wrong.
+    CHECK(reader.next(f) == FrameStatus::NeedMore);
+
+    // (2) the reader is mid-frame, and specifically in Binary mode (the
+    // length header was consumed cleanly; we are accumulating payload).
+    CHECK(reader.in_frame());
+    CHECK_FALSE(reader.in_ndjson_frame());
+
+    // (3) the partial payload is buffered — `buffered()` reflects the
+    // 50 bytes that have arrived. Note: the 1-byte discriminator and the
+    // 4-byte length header have already been consumed by the state
+    // machine, so the buffered count equals the partial payload size.
+    CHECK(reader.buffered() == kPartialLen);
+
+    // (4) calling next() again on an unchanged buffer is idempotent — it
+    // does NOT yield a half-frame just because we polled twice.
+    Frame f2;
+    CHECK(reader.next(f2) == FrameStatus::NeedMore);
+    CHECK(reader.in_frame());
+
+    // Feed a few more bytes (still below the declared length). The reader
+    // must remain mid-frame and continue to refuse to yield.
+    reader.feed(std::string(10, 'X'));
+    CHECK(reader.next(f2) == FrameStatus::NeedMore);
+    CHECK(reader.in_frame());
+    CHECK(reader.buffered() == kPartialLen + 10);
+
+    // At this point, the connection layer would observe EOF on the socket
+    // and close the fd. The truncated frame is held inside `reader` and is
+    // discarded along with the FrameReader instance — never surfaced as a
+    // completed Frame. The post-EOF cleanup (closing the fd, removing the
+    // reader from the per-connection state) is the connection layer's
+    // responsibility; FrameReader's job here is simply to refuse to yield.
+
+    // Sanity belt-and-braces: completing the frame after the gap closes it
+    // off cleanly, proving the buffered partial wasn't dropped or
+    // corrupted. (This is the recovery path for a slow but non-malicious
+    // peer; truncation-on-EOF is the malicious-or-broken peer path above.)
+    reader.feed(std::string(kDeclaredLen - kPartialLen - 10, 'Q'));
+    Frame done;
+    REQUIRE(reader.next(done) == FrameStatus::Ok);
+    CHECK(done.type == FrameType::BinaryUpload);
+    CHECK(done.payload.size() == kDeclaredLen);
+    CHECK_FALSE(reader.in_frame());
+}
+
+// A truncated frame whose declared length is split across a feed boundary
+// must also stay mid-frame, not yield, and resume correctly when the
+// remainder arrives. Companion case to the truncation test above — they
+// share the [frame-integrity] tag so the entire integrity surface runs as
+// one filter.
+TEST_CASE("C.1: truncated length-prefix bytes also stay mid-frame",
+          "[ipc][c1][frame-integrity]") {
+    FrameReader reader;
+    Frame f;
+
+    // Feed the discriminator + only 2 of the 4 length bytes. The reader
+    // moves into BinaryLen and stays there — it must not guess the length
+    // from partial header data.
+    std::string head;
+    head += static_cast<char>(FrameType::BinaryArtifact);
+    head += static_cast<char>(0x00);
+    head += static_cast<char>(0x00);
+    reader.feed(head);
+
+    CHECK(reader.next(f) == FrameStatus::NeedMore);
+    CHECK(reader.in_frame());
+
+    // Complete the length header (declares 8 bytes) and feed the payload.
+    std::string tail;
+    tail += static_cast<char>(0x00);
+    tail += static_cast<char>(0x08);  // declared len = 8
+    tail.append(8, 'Z');
+    reader.feed(tail);
+
+    REQUIRE(reader.next(f) == FrameStatus::Ok);
+    CHECK(f.type == FrameType::BinaryArtifact);
+    CHECK(f.payload == std::string(8, 'Z'));
+    CHECK_FALSE(reader.in_frame());
+}
+
+// ---------------------------------------------------------------------------
+// P3-1 — Pure-mode streams (no interleave). The existing C.1 tests cover
+// interleaved 0x00 NDJSON + 0x01/0x02/0x03 binary frames but never pin the
+// pure-NDJSON or pure-binary back-to-back case — i.e. confirm the
+// FrameReader does not erroneously slip into the "other mode" between
+// frames of the same discriminator. Surfaced by the iter-156 audit.
+// ---------------------------------------------------------------------------
+TEST_CASE("C.1: pure NDJSON stream (no binary frames) round-trips",
+          "[ipc][c1][frame-modes]") {
+    // Five back-to-back NDJSON frames — feed them all at once into the
+    // reader and assert each is yielded in order with no binary surfacing.
+    std::string wire;
+    wire += frame_ndjson("{\"id\":1}");
+    wire += frame_ndjson("{\"id\":2}");
+    wire += frame_ndjson("{\"id\":3}");
+    wire += frame_ndjson("{\"id\":4}");
+    wire += frame_ndjson("{\"id\":5}");
+
+    FrameReader reader;
+    reader.feed(wire);
+
+    for (int i = 1; i <= 5; ++i) {
+        Frame f;
+        INFO("frame index=" << i);
+        REQUIRE(reader.next(f) == FrameStatus::Ok);
+        CHECK(f.type == FrameType::Ndjson);
+        CHECK(f.payload == std::string("{\"id\":") + std::to_string(i) + "}");
+    }
+    // Reader is back at a clean boundary with no extra frames lurking.
+    Frame trailing;
+    CHECK(reader.next(trailing) == FrameStatus::NeedMore);
+    CHECK_FALSE(reader.in_frame());
+}
+
+TEST_CASE("C.1: pure binary stream (no NDJSON frames) round-trips",
+          "[ipc][c1][frame-modes]") {
+    // Three back-to-back 0x01 BinaryUpload frames — distinct payload sizes
+    // so a misaligned length-prefix read would be observable.
+    std::string p1(16, 'a');
+    std::string p2(64, 'b');
+    std::string p3(128, 'c');
+
+    std::string wire;
+    wire += frame_binary(FrameType::BinaryUpload, p1);
+    wire += frame_binary(FrameType::BinaryUpload, p2);
+    wire += frame_binary(FrameType::BinaryUpload, p3);
+
+    FrameReader reader;
+    reader.feed(wire);
+
+    Frame f1, f2, f3;
+    REQUIRE(reader.next(f1) == FrameStatus::Ok);
+    CHECK(f1.type == FrameType::BinaryUpload);
+    CHECK(f1.payload == p1);
+
+    REQUIRE(reader.next(f2) == FrameStatus::Ok);
+    CHECK(f2.type == FrameType::BinaryUpload);
+    CHECK(f2.payload == p2);
+
+    REQUIRE(reader.next(f3) == FrameStatus::Ok);
+    CHECK(f3.type == FrameType::BinaryUpload);
+    CHECK(f3.payload == p3);
+
+    // Reader is back at a clean boundary; no NDJSON should have surfaced.
+    Frame trailing;
+    CHECK(reader.next(trailing) == FrameStatus::NeedMore);
+    CHECK_FALSE(reader.in_frame());
+    CHECK_FALSE(reader.in_ndjson_frame());
+}

@@ -3,13 +3,71 @@
 This document captures the strategic decisions governing the transition from
 recmeet V1 (the current architecture: monolithic daemon owns capture +
 compute) to recmeet V2 (thin-client architecture: client owns capture, server
-owns compute). The active V2 implementation plan lives at
-`agentctx/tasks/thin-client-recording-server.md`. This document covers
+owns compute). The V2 implementation plan originally lived at
+`agentctx/tasks/thin-client-recording-server.md`; as of iter 156 Phases A,
+B, and C have all landed on `feat/v2-thin-client`. This document covers
 **how the codebase forks, evolves, and stays interoperable**, not what V2
 builds.
 
 The feature roadmap proper lives in `docs/ROADMAP.md`. This document is its
-process companion.
+process companion. For V2 operator-facing topics, see
+`docs/ARCHITECTURE.md`, `docs/IPC-VERBS.md`,
+`docs/IPC-WIRE-PROTOCOL.md`, and `docs/V2-DEPLOYMENT.md`.
+
+---
+
+## Implementation status as of iter 156
+
+V2 Phases A, B, and C have all landed on `feat/v2-thin-client`:
+
+- **Phase A (iter 138-152) — Security foundation.** PSK authentication
+  gate on the TCP listener (`RECMEET_AUTH_TOKEN`); per-fd outbound queue;
+  connection cap; `client_id` minting at accept; `protocol_version`
+  handshake (current value: 3); `session.init` with subprocess credential
+  merge. The daemon fail-stops on TCP bind without a PSK configured.
+- **Phase B (iter 152) — Audio-capture migration to client.** Extracted
+  `recmeet_capture` library with a fan-out subscriber API. The tray now
+  owns capture; the daemon no longer links PipeWire or PulseAudio.
+- **Phase C (iter 155) — Submit/process/fetch + server-side JobQueue +
+  streaming.** Eleven sub-phases (C.1 → C.10b) across twelve commits:
+  framed wire protocol (frame types `0x00` NDJSON, `0x01` binary upload,
+  `0x02` binary artifact, `0x03` streaming PCM); state-machine
+  `FrameReader`; `JobQueue` with three typed slots (postprocess,
+  streaming, model_download — each capacity-1, independent);
+  `process.submit` / `process.fetch` / `process.cancel` /
+  `process.stream` / `process.stream.cancel` /
+  `process.stream.commit` plus `job.status` / `job.list` verbs;
+  `enroll.finalize` two-step dance; `record.start` removal (123 test
+  sites migrated to `process.submit` / `process.stream`).
+  `IPC_PROTOCOL_VERSION` bumped 1 → 3.
+
+The V2 wire protocol is now stable: 14 V2 verbs, 5 V2 events, frame-typed
+upload/download channel. The architectural-proof test
+`tests/test_v2_thin_client_e2e.cpp` (Wave 1 of iter-156 stabilization)
+exercises the real `recmeet-daemon` binary end-to-end over TCP — submit,
+upload, process, fetch — and is wired into CI via `make integration-e2e`.
+
+Operator-facing documentation is now V2-aware: `README.md`,
+`QUICKSTART.md`, `docs/V2-DEPLOYMENT.md`, `docs/ARCHITECTURE.md`,
+`docs/COMPONENT-DIAGRAMS.md`, `docs/IPC-VERBS.md`, and
+`docs/IPC-WIRE-PROTOCOL.md`.
+
+Outstanding before a `v2.0.0` tag:
+
+- **Phase D — Client-side queueing + reconnect.** In-memory submission
+  queue, drain worker with exponential backoff reconnect, persistent
+  `(endpoint, job_id)` tuples in `pending_jobs.json` across tray
+  restarts, server-restart notification, tray UI for queue depth and
+  per-server view, save-for-later WAV persistence across tray restart.
+- **Phase E — Cleanup, schema split, binary slimming, docs polish.**
+  Split `config.yaml` into `daemon.yaml` (server-side keys) and
+  `client.yaml` (client-side keys); strip remaining V1-only code paths;
+  ldd assertions on the slimmed tray binary; final docs sweep.
+- **Minor finding (Phase E candidate or earlier follow-up).** No PSK
+  handshake deadline exists in the `IpcServer` poll loop today — a
+  slowloris-class resource exhaustion vector against the `PendingPsk`
+  slot pool. Surfaced as SUCCEED-with-INFO by the Wave 2 test
+  additions; needs a `psk_deadline_ms` reaper in the poll loop.
 
 ---
 
@@ -272,25 +330,94 @@ places where V2-side work routinely flows back to `v1-maintenance`.
 
 ---
 
-## Validation milestone
+## Deployment story
 
-**Live captioning is the validation test for the maintenance-branch
-model.**
+V2 collapses naturally into three canonical topologies. The full
+operator-facing walk-through (config files, systemd units, PSK
+generation, firewall posture) lives in `docs/V2-DEPLOYMENT.md`; this
+section captures the strategy-level decisions only.
 
-The work to put live captioning into V1 (daemon-captures-audio,
-daemon-runs-streaming-ASR, daemon-broadcasts-captions) and the work to
-put it into V2 (client-captures-audio, optional-stream-to-server,
+### Topology 1 — Single-host, local Unix socket
+
+Daemon and tray run on the same machine. The daemon listens on the
+per-user Unix socket only (TCP disabled). No PSK, no firewall rule,
+no network exposure. This is the closest analog to V1's
+single-binary-set deployment and the default for laptop users who
+record on the same host that processes.
+
+### Topology 2 — Single-host server, remote tray over the LAN / tailnet
+
+Daemon runs on a headless host (home server, NUC, lab box); tray runs
+on the operator's laptop or workstation. The daemon binds TCP on a
+LAN address (or a Tailscale IP) and requires a PSK. Capture happens
+on the tray host; bytes stream to the daemon over the framed wire
+protocol; results flow back the same way. The tailnet case is the
+recommended path because Tailscale provides encryption and identity;
+without it, the PSK is the only auth layer and the operator must take
+responsibility for transport-level confidentiality.
+
+### Topology 3 — Multi-host, multi-user with TLS or VPN
+
+Multiple tray clients connect to one daemon. Wire-level isolation is
+provided by the transport (TLS terminator in front of the daemon, or
+a shared VPN); the daemon's per-client `client_id` minting and
+JobQueue per-client routing handle the rest. True multi-tenant work
+(per-client auth tokens, quotas, isolation) is deferred to v3; in v2
+the PSK is shared across all tray clients of a given daemon.
+
+### PSK lifecycle
+
+The PSK is operator-managed, file-on-disk or env-var, with no
+rotation protocol baked into V2. Rotation is a restart-coordinated
+event: change the secret on the daemon, restart it, push the new
+secret to each tray. Forward-looking work (per-client tokens, OIDC,
+mTLS) is explicitly v3 territory.
+
+### V1 → V2 client compatibility
+
+V2 has **no backwards compatibility for `record.start`** or any other
+V1 verb that moved off the daemon. A V1 tray cannot talk to a V2
+daemon and vice versa. In a mixed-environment migration, V1 hosts
+must stay on `v1-maintenance` and connect to V1 daemons until they
+are upgraded as a unit. The cross-version interop story is at the
+data-at-rest layer (the `~/meetings/` schema; see above), not at the
+IPC layer.
+
+---
+
+## Validation milestones
+
+Two validation milestones gate the maintenance-branch model — one V1-side
+(shipped) and one V2-side (shipped, iter 156 stabilization Wave 1).
+
+### V1 validation: live captioning (shipped iter 135, `v1.5.0`)
+
+Live captioning was the V1 capstone: daemon-captures-audio,
+daemon-runs-streaming-ASR, daemon-broadcasts-captions. The corresponding
+V2 shape (client-captures-audio, optional-stream-to-server,
 server-runs-streaming-ASR, server-routes-captions-to-originating-client)
-share the streaming-ASR engine choice and the model picker but
+shares the streaming-ASR engine choice and the model picker but
 essentially nothing else.
 
-If the V1→V2 port turns out to be a near-rewrite, the maintenance-branch
-model is validated: codepaths really do diverge, backports really are
-rare, and the one-way cherry-pick policy is correctly tuned.
+Outcome: the V1→V2 port is a near-rewrite, as predicted. The
+maintenance-branch model is validated — codepaths really do diverge,
+backports really are rare, and the one-way cherry-pick policy is
+correctly tuned.
 
-If the port turns out to be straightforward, that is also informative —
-revisit the policy and consider whether the `recmeet_ipc` library could
-be extracted as a shared dependency to make routine backports easier.
+### V2 validation: thin-client e2e architectural-proof test (shipped iter 156)
+
+`tests/test_v2_thin_client_e2e.cpp` is the V2 validation test: it stands
+up the real `recmeet-daemon` binary on a loopback TCP listener with a
+PSK, drives a full client-side recording → submit → process → fetch
+round-trip across the framed wire protocol, and asserts on the
+artifacts produced. Seventeen assertions cover the handshake, the
+upload framing, the postprocess JobQueue slot, the artifact-fetch
+return channel, and the final on-disk meeting directory. The test is
+wired into the `test.yml` CI workflow via `make integration-e2e`.
+
+This is the architectural proof that the Phase A + B + C IPC reshape is
+end-to-end correct against the real binary, not just against unit-level
+mocks. Failures of this test gate any future protocol-version bump.
 
 ---
 
@@ -319,17 +446,34 @@ continues. Feature work does not happen on `v1-maintenance` after
 - **MCP server scope in V2.** Is `recmeet-mcp` purely a client-side
   binary that talks to the server via the V2 IPC? Or does the server
   expose its own MCP surface for agent-driven server administration?
-  Decided during V2 Phase A planning.
+  *STILL OPEN — Phase E.* Phase A did not need to settle this; the MCP
+  binary is unchanged on `feat/v2-thin-client`. Decision deferred to
+  the Phase E binary-naming and surface-finalization pass.
 - **Binary name ergonomics.** `recmeet-server-daemon` is verbose;
-  `recmeetd-server` or `recmeet-srv` may read better. Defer until
-  Phase A — the names ship in install scripts and systemd units, so
-  changing them later is mechanical but worth getting right once.
+  `recmeetd-server` or `recmeet-srv` may read better. *STILL OPEN —
+  Phase E.* Phase A through C kept the existing `recmeet-daemon` /
+  `recmeet-tray` names to minimize churn; the rename is mechanical
+  and scheduled for Phase E alongside the schema split.
 - **Shared library extraction.** If `recmeet_ipc` (already a separate
   CMake target as of iter 104) turns out to need parallel maintenance
   on both branches, consider extracting it to a small shared repo or
-  vendoring it across both lines. Revisit after the live-captioning
-  validation milestone.
+  vendoring it across both lines. *STILL OPEN — revisit after `v2.0.0`
+  ships.* The V2-side `recmeet_ipc` is now substantially different
+  from V1's (frame types, JobQueue, FrameReader), so shared-library
+  extraction is less attractive than it looked pre-Phase-C. No action
+  needed unless backport friction becomes a real problem.
 - **Web UI fate.** V1's `recmeet-web` (speaker management) and V2's
   `recmeet-client-web` are likely identical in scope. Worth deciding
   whether they stay separate or share a codebase via a shared static
-  asset directory.
+  asset directory. *STILL OPEN — Phase E or post-2.0.* No urgency
+  while V2's speaker DB lives server-side and the WebUI surface has
+  not yet been re-pointed at the V2 IPC.
+- **PSK handshake deadline.** *NEW, STILL OPEN — Phase E candidate.*
+  Wave 2 of the iter-156 stabilization surfaced (as SUCCEED-with-INFO)
+  the fact that the `IpcServer` poll loop has no per-connection
+  deadline for completing the PSK handshake. A malicious peer that
+  opens a TCP connection and never sends bytes occupies a `PendingPsk`
+  slot indefinitely; with the connection cap, this is a slowloris-class
+  resource exhaustion vector. Fix is a `psk_deadline_ms` reaper in
+  the poll loop. See `docs/IPC-WIRE-PROTOCOL.md` for the handshake
+  shape.

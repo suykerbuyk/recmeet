@@ -26,30 +26,38 @@ source code implementation, not aspirational design.
 
 ## 1. Top-Level Component Interaction
 
-All runtime communication paths between binaries, libraries, and external
-systems. Solid lines are compile-time links; dashed lines are runtime IPC or
-network calls.
+V2 thin-client / recording-server topology. The **client tier** (tray or
+CLI) owns audio capture via `recmeet_capture`; the **server tier** (daemon)
+owns heavy compute via the `JobQueue`. Solid lines are compile-time links;
+dashed lines are runtime IPC, framed binary upload, or network calls.
+
+The daemon does **not** link PipeWire/PulseAudio capture — audio reaches it
+only as framed binary uploads (0x01) or streaming PCM (0x03) over IPC.
 
 ```mermaid
 graph TB
-    subgraph "C++ Binaries"
-        CLI["recmeet<br/>(CLI)"]
-        DAEMON["recmeet-daemon<br/>(IPC server)"]
+    subgraph CLIENT_TIER ["Client Tier (audio capture lives here)"]
+        CLI["recmeet<br/>(CLI — client or standalone)"]
         TRAY["recmeet-tray<br/>(system tray)"]
+    end
+
+    subgraph SERVER_TIER ["Server Tier (heavy compute)"]
+        DAEMON["recmeet-daemon<br/>(IPC server + JobQueue)"]
+    end
+
+    subgraph AUX ["Auxiliary Services"]
         WEB["recmeet-web<br/>(REST API)"]
+        MCP["recmeet-mcp<br/>(Go MCP server)"]
+        AGENT["recmeet-agent<br/>(Go AI agent CLI)"]
     end
 
-    subgraph "Static Libraries"
-        IPC["recmeet_ipc<br/>(config, IPC, util)"]
-        CORE["recmeet_core<br/>(ML pipeline)"]
+    subgraph LIBS ["Static Libraries"]
+        IPC["recmeet_ipc<br/>(framed protocol,<br/>config, util)"]
+        CAPTURE["recmeet_capture<br/>(PipeWire/Pulse,<br/>fan-out subscribers)"]
+        CORE["recmeet_core<br/>(ML pipeline,<br/>JobQueue)"]
     end
 
-    subgraph "Go Binaries"
-        MCP["recmeet-mcp<br/>(MCP server)"]
-        AGENT["recmeet-agent<br/>(AI agent CLI)"]
-    end
-
-    subgraph "Vendored C/C++ Deps"
+    subgraph VENDORED ["Vendored C/C++ Deps"]
         WHISPER["whisper.cpp"]
         LLAMA["llama.cpp"]
         SHERPA["sherpa-onnx"]
@@ -57,9 +65,9 @@ graph TB
         HTTPLIB["cpp-httplib"]
     end
 
-    subgraph "System Libraries"
-        PW["libpipewire"]
-        PA["libpulse /<br/>libpulse-simple"]
+    subgraph SYS ["System Libraries"]
+        PW["libpipewire<br/>(client-side)"]
+        PA["libpulse /<br/>libpulse-simple<br/>(client-side)"]
         SNDFILE["libsndfile"]
         CURL["libcurl"]
         NOTIFY["libnotify"]
@@ -67,13 +75,13 @@ graph TB
         APPIND["ayatana-<br/>appindicator3"]
     end
 
-    subgraph "External Services"
+    subgraph EXT ["External Services"]
         CLOUD["Cloud API<br/>(xAI / OpenAI / Anthropic)"]
         CLAUDE["Anthropic API<br/>(Claude)"]
         BRAVE["Brave Search API"]
     end
 
-    subgraph "Data (Filesystem)"
+    subgraph DATA ["Data (Filesystem)"]
         CONFIG["~/.config/recmeet/<br/>config.yaml"]
         MEETINGS["meetings/<br/>(WAV + notes)"]
         SPEAKERS["~/.local/share/recmeet/<br/>speakers/ (JSON)"]
@@ -81,43 +89,47 @@ graph TB
         LOGS["~/.local/share/recmeet/<br/>logs/"]
     end
 
-    subgraph "IPC Transports"
-        UNIX["Unix socket<br/>$XDG_RUNTIME_DIR/<br/>recmeet/daemon.sock"]
-        TCP["TCP socket<br/>(configurable host:port)"]
+    subgraph TRANSPORT ["IPC Transports (framed wire protocol v3)"]
+        UNIX["Unix socket<br/>$XDG_RUNTIME_DIR/<br/>recmeet/daemon.sock<br/>(auth bypassed)"]
+        TCP["TCP socket<br/>host:port<br/>(PSK auth via<br/>RECMEET_AUTH_TOKEN)"]
     end
 
-    %% Library links
+    %% Library composition
+    CAPTURE --> PW
+    CAPTURE --> PA
+    CAPTURE --> SNDFILE
     CORE -->|"links"| IPC
     CORE --> WHISPER
     CORE -.->|"if RECMEET_USE_LLAMA"| LLAMA
     CORE -.->|"if RECMEET_USE_SHERPA"| SHERPA
     SHERPA --> ONNX
-    CORE --> PW
-    CORE --> PA
     CORE --> SNDFILE
     IPC --> CURL
-    IPC --> PA
     IPC -.->|"if RECMEET_USE_NOTIFY"| NOTIFY
 
-    %% Binary links
+    %% Client-tier binary links (capture lives client-side)
     CLI -->|"links"| CORE
-    DAEMON -->|"links"| CORE
-    WEB -->|"links"| CORE
-    WEB --> HTTPLIB
+    CLI -->|"links"| CAPTURE
     TRAY -->|"links (thin client)"| IPC
+    TRAY -->|"links"| CAPTURE
     TRAY --> GTK
     TRAY --> APPIND
 
-    %% IPC runtime paths
-    CLI -.->|"client mode"| UNIX
-    CLI -.->|"client mode"| TCP
-    TRAY -.->|"always"| UNIX
-    TRAY -.->|"remote"| TCP
+    %% Server-tier binary links (NO capture lib)
+    DAEMON -->|"links"| CORE
+    WEB -->|"links"| CORE
+    WEB --> HTTPLIB
+
+    %% Runtime IPC paths (framed: 0x00/0x01/0x02/0x03)
+    CLI -.->|"client mode<br/>0x00/0x01/0x02/0x03"| UNIX
+    CLI -.->|"client mode<br/>+ PSK auth"| TCP
+    TRAY -.->|"local"| UNIX
+    TRAY -.->|"remote<br/>+ PSK auth"| TCP
     UNIX -.-> DAEMON
     TCP -.-> DAEMON
 
-    %% Subprocess fork/exec
-    DAEMON -.->|"fork/exec<br/>postprocessing"| CLI
+    %% Postprocess subprocess (daemon fork/exec for crash isolation)
+    DAEMON -.->|"fork/exec<br/>postprocess job"| CLI
 
     %% Data access
     CLI --> CONFIG
@@ -144,33 +156,44 @@ graph TB
     AGENT --> MEETINGS
     AGENT --> SPEAKERS
     AGENT --> CONFIG
+
+    style CLIENT_TIER fill:#e8f5e9,stroke:#2e7d32
+    style SERVER_TIER fill:#fff3e0,stroke:#e65100
+    style TRANSPORT fill:#e3f2fd,stroke:#1565c0
 ```
 
 ---
 
 ## 2. Build Topology and Library Dependencies
 
-Exact source file inventory per CMake target and the link dependency graph.
+V2 introduces `recmeet_capture` as a separate static library. The daemon
+binary links **only** `recmeet_ipc + recmeet_core` — it has no PipeWire or
+PulseAudio symbols. Client-tier binaries (CLI, tray) link `recmeet_capture`
+to own the audio path.
 
 ```mermaid
 graph TB
-    subgraph "recmeet_ipc (static lib — no ML deps)"
-        IPC_SRC["json_util.cpp<br/>api_models.cpp<br/>util.cpp<br/>log.cpp<br/>config.cpp<br/>notify.cpp<br/>device_enum.cpp<br/>http_client.cpp<br/>ipc_protocol.cpp<br/>config_json.cpp<br/>ipc_client.cpp<br/>ipc_server.cpp"]
+    subgraph IPC_LIB ["recmeet_ipc (static lib — no ML, no capture)"]
+        IPC_SRC["json_util.cpp<br/>api_models.cpp<br/>util.cpp<br/>log.cpp<br/>config.cpp<br/>notify.cpp<br/>device_enum.cpp<br/>http_client.cpp<br/>ipc_protocol.cpp (framed v3)<br/>config_json.cpp<br/>ipc_client.cpp<br/>ipc_server.cpp<br/>auth.cpp (PSK)"]
     end
 
-    subgraph "recmeet_core (static lib — ML pipeline)"
-        CORE_SRC["audio_capture.cpp<br/>audio_monitor.cpp<br/>audio_file.cpp<br/>audio_mixer.cpp<br/>model_manager.cpp<br/>transcribe.cpp<br/>summarize.cpp<br/>note.cpp<br/>pipeline.cpp<br/>cli.cpp<br/>diarize.cpp<br/>speaker_id.cpp<br/>vad.cpp"]
+    subgraph CAPTURE_LIB ["recmeet_capture (static lib — client-side audio, B.1)"]
+        CAP_SRC["audio_capture.cpp<br/>audio_monitor.cpp<br/>audio_file.cpp<br/>audio_mixer.cpp<br/>capture_fanout.cpp<br/>(subscriber API)"]
     end
 
-    subgraph "Executables"
+    subgraph CORE_LIB ["recmeet_core (static lib — ML + JobQueue, no capture)"]
+        CORE_SRC["model_manager.cpp<br/>transcribe.cpp<br/>summarize.cpp<br/>note.cpp<br/>pipeline.cpp<br/>cli.cpp<br/>diarize.cpp<br/>speaker_id.cpp<br/>vad.cpp<br/>job_queue.cpp<br/>upload_session.cpp<br/>streaming_session.cpp<br/>diarization_cache.cpp"]
+    end
+
+    subgraph BINS ["Executables"]
         BIN_CLI["recmeet<br/>(main.cpp)"]
         BIN_DAEMON["recmeet-daemon<br/>(daemon.cpp)"]
         BIN_WEB["recmeet-web<br/>(web.cpp + httplib.cpp)"]
         BIN_TRAY["recmeet-tray<br/>(tray.cpp)"]
-        BIN_TEST["recmeet_tests<br/>(tests/test_*.cpp × 26)"]
+        BIN_TEST["recmeet_tests<br/>(tests/test_*.cpp)"]
     end
 
-    subgraph "Vendored"
+    subgraph VENDORED ["Vendored"]
         V_WHISPER["whisper.cpp<br/>(submodule)"]
         V_LLAMA["llama.cpp<br/>(submodule, gated)"]
         V_SHERPA["sherpa-onnx v1.12.27<br/>(FetchContent, gated)"]
@@ -179,7 +202,7 @@ graph TB
         V_CATCH["Catch2 v3.8.0<br/>(FetchContent)"]
     end
 
-    subgraph "System (pkg-config)"
+    subgraph SYSTEM ["System (pkg-config)"]
         SYS_PW["libpipewire-0.3"]
         SYS_PA["libpulse"]
         SYS_PAS["libpulse-simple"]
@@ -191,41 +214,62 @@ graph TB
     end
 
     %% recmeet_ipc deps
-    IPC_SRC --> SYS_PA
     IPC_SRC --> SYS_CURL
     IPC_SRC -.->|"RECMEET_USE_NOTIFY"| SYS_NOTIFY
 
-    %% recmeet_core deps
+    %% recmeet_capture deps (client-side only)
+    CAP_SRC --> SYS_PW
+    CAP_SRC --> SYS_PA
+    CAP_SRC --> SYS_PAS
+    CAP_SRC --> SYS_SF
+
+    %% recmeet_core deps (NO PipeWire/Pulse)
     CORE_SRC -->|"PUBLIC link"| IPC_SRC
     CORE_SRC --> V_WHISPER
     CORE_SRC -.->|"RECMEET_USE_LLAMA"| V_LLAMA
     CORE_SRC -.->|"RECMEET_USE_SHERPA"| V_SHERPA
     V_SHERPA --> V_ONNX
-    CORE_SRC --> SYS_PW
-    CORE_SRC --> SYS_PAS
     CORE_SRC --> SYS_SF
 
-    %% Binary links
+    %% Binary links — daemon has NO capture
     BIN_CLI --> CORE_SRC
+    BIN_CLI --> CAP_SRC
     BIN_DAEMON --> CORE_SRC
+    BIN_DAEMON -.->|"NO recmeet_capture"| CAP_SRC
     BIN_WEB --> CORE_SRC
     BIN_WEB --> V_HTTPLIB
     BIN_TRAY -->|"thin client"| IPC_SRC
+    BIN_TRAY --> CAP_SRC
     BIN_TRAY --> SYS_GTK
     BIN_TRAY --> SYS_AI
     BIN_TEST --> CORE_SRC
+    BIN_TEST --> CAP_SRC
     BIN_TEST --> V_CATCH
 
+    linkStyle 14 stroke:#d32f2f,stroke-dasharray:5 5
+
     style BIN_TRAY fill:#e8f5e9,stroke:#2e7d32
-    style IPC_SRC fill:#e3f2fd,stroke:#1565c0
-    style CORE_SRC fill:#fff3e0,stroke:#e65100
+    style BIN_CLI fill:#e8f5e9,stroke:#2e7d32
+    style BIN_DAEMON fill:#fff3e0,stroke:#e65100
+    style IPC_LIB fill:#e3f2fd,stroke:#1565c0
+    style CAPTURE_LIB fill:#e8f5e9,stroke:#2e7d32
+    style CORE_LIB fill:#fff3e0,stroke:#e65100
 ```
+
+The red dashed line indicates a **prohibited** dependency: the daemon must
+never link `recmeet_capture`. Build-system tests guard against accidental
+relinking.
 
 ---
 
 ## 3. Daemon Internals
 
 ### 3a. Daemon Startup Sequence
+
+V2 startup registers the new IPC verb set (no `record.start` / `record.stop`
+/ `sources.list` / `job.context`) and initializes the typed `JobQueue` plus
+the upload and streaming session managers. PSK auth is gated **first** for
+TCP transport; Unix transport bypasses auth.
 
 ```mermaid
 flowchart TD
@@ -234,111 +278,175 @@ flowchart TD
     PID --> FLOCK["open() + flock(LOCK_EX|LOCK_NB)"]
     FLOCK -->|"locked"| ABORT["stderr: 'Another instance running'<br/>return 1"]
     FLOCK -->|"acquired"| INIT["log_init()<br/>whisper_log_set(null)<br/>load_config()<br/>resolve_api_key()<br/>notify_init()"]
-    INIT --> SELF["Resolve g_self_exe<br/>(/proc/self/exe → sibling 'recmeet')"]
-    SELF --> SERVER["IpcServer server(socket_path)"]
-    SERVER --> HANDLERS["Register method handlers:<br/>status.get, sources.list,<br/>config.reload, config.update,<br/>record.start, record.stop,<br/>job.context, speakers.*,<br/>models.list/ensure/update"]
+    INIT --> AUTH_TOK["Resolve RECMEET_AUTH_TOKEN<br/>(required for TCP listen,<br/>optional for Unix)"]
+    AUTH_TOK --> SELF["Resolve g_self_exe<br/>(/proc/self/exe → sibling 'recmeet')"]
+    SELF --> SERVER["IpcServer server(transport)<br/>install PSK auth gate (TCP only)<br/>IPC_PROTOCOL_VERSION = 3"]
+    SERVER --> MANAGERS["Initialize:<br/>JobQueue (typed slots)<br/>UploadSessionManager<br/>StreamingSessionManager<br/>DiarizationCache"]
+    MANAGERS --> HANDLERS["Register V2 method handlers:<br/>auth.ok (PSK challenge)<br/>session.init<br/>session.update_credentials<br/>session.update_prefs<br/>process.submit<br/>process.submit.cancel<br/>process.fetch<br/>process.cancel<br/>process.stream<br/>process.stream.cancel<br/>process.stream.commit<br/>job.status<br/>job.list<br/>enroll.finalize<br/>status.get, config.reload,<br/>config.update, speakers.*,<br/>models.list/ensure/update"]
     HANDLERS --> BIND["server.start()<br/>(bind + listen)"]
     BIND -->|"fail"| EXIT1["return 1"]
-    BIND -->|"ok"| PPWORKER["Spawn g_pp_worker thread<br/>(pp_worker_loop — long-lived)"]
-    PPWORKER --> SIGNALS["Install sigaction:<br/>SIGINT/SIGTERM → stop<br/>SIGHUP → reload config"]
+    BIND -->|"ok"| SLOTS["JobQueue spawns 3 worker threads<br/>(postprocess / streaming /<br/>model_download — each capacity 1)"]
+    SLOTS --> SIGNALS["Install sigaction:<br/>SIGINT/SIGTERM → stop<br/>SIGHUP → reload config"]
     SIGNALS --> RUN["server.run()<br/>(blocks in poll loop)"]
-    RUN --> SHUTDOWN["Shutdown:<br/>request all StopTokens<br/>SIGTERM child if alive<br/>g_queue_shutdown = true<br/>join all workers<br/>unlink pid + socket<br/>log_shutdown()"]
+    RUN --> SHUTDOWN["Shutdown:<br/>JobQueue::shutdown_all()<br/>cancel in-flight jobs<br/>SIGTERM postprocess child<br/>join all slot workers<br/>unlink pid + socket<br/>log_shutdown()"]
 ```
 
-### 3b. Daemon State Machine
+### 3b. JobQueue Per-Slot State Machine
+
+V2 replaces the V1 global `Idle → Recording → Postprocessing` state machine
+with three **independent typed slots** in the `JobQueue`. Each slot is
+capacity-1 and has its own lifecycle; the three slots execute concurrently.
+There is no global daemon state — `state.changed` events project from the
+union of per-slot state.
 
 ```mermaid
 stateDiagram-v2
-    [*] --> Idle
+    [*] --> Queued
 
-    Idle --> Recording : record.start (set g_recording)
-    Idle --> Downloading : models.ensure (set g_downloading)
+    Queued --> WaitingOnDownload : model_download<br/>dependency required
+    Queued --> Running : slot acquired<br/>(no download needed)
+    WaitingOnDownload --> Running : ModelDownload<br/>job completes
 
-    Recording --> RecPP : run_recording() returns
+    Running --> Done : success
+    Running --> Failed : exception<br/>or non-zero exit
+    Running --> Cancelled : process.cancel<br/>or shutdown
 
-    Recording --> Idle : pipeline error (clear g_recording)
+    Done --> [*]
+    Failed --> [*]
+    Cancelled --> [*]
 
-    RecPP --> Postprocessing : rec_worker exits
+    note right of Queued
+        Each typed slot runs this state
+        machine independently:
 
-    Recording --> ConcurrentRecPP : new record.start while PP active
+        - postprocess slot (capacity 1)
+        - streaming slot (capacity 1)
+        - model_download slot (capacity 1)
 
-    Postprocessing --> Idle : subprocess exits (clear g_postprocessing)
+        A submitted job is bound to its
+        client_id; events route via
+        send_to_client(job_id → client_id).
+        Only global events (e.g.,
+        state.changed projection)
+        broadcast() to all clients.
+    end note
 
-    Downloading --> Idle : complete or error (clear g_downloading)
-
-    ConcurrentRecPP --> RecPP : run_recording() returns
-
-    state RecPP {
-        direction LR
-        [*] --> handoff
-        handoff : Atomic handoff under g_state_mu ―\ng_postprocessing = true THEN\ng_recording = false.\nNo transient idle broadcast.
-    }
-
-    state ConcurrentRecPP {
-        direction LR
-        [*] --> overlap
-        overlap : g_recording = true\ng_postprocessing = true\n\nrecord.start guard checks\ng_recording or g_downloading\nbut NOT g_postprocessing\nso overlap is allowed.
-    }
-
-    note right of Recording
-        Worker threads use lock_guard on g_state_mu
-        for all multi-flag transitions.
-        Bare atomic reads are fine without the mutex.
-
-        Reprocess (`--reprocess` or `--reprocess-batch`)
-        traverses the same path: record.start handler
-        receives `reprocess_dir` param, sets g_recording
-        briefly, run_recording() validates paths (no
-        capture), then hands off as above.
-        composite_state_name() projects the live flags
-        as "reprocessing" or "reprocessing+postprocessing"
-        for the on-wire `state.changed` event.
+    note right of WaitingOnDownload
+        Auto-trigger: when dequeue
+        checks DiarizationCache (or
+        model registry) and finds a
+        missing model, the JobQueue
+        auto-enqueues a ModelDownload
+        job and parks the dependent
+        job in WaitingOnDownload.
     end note
 ```
 
-### 3c. Worker Thread Lifecycle
+### 3b'. JobQueue Typed Slots — Concurrent Execution
+
+The three slots run independently. A postprocess job, a streaming session,
+and a model download can all be in `Running` state simultaneously. Each job
+carries a `job_id`; the `send_to_client()` API resolves `job_id → client_id`
+so per-job events route only to the originating client.
+
+```mermaid
+flowchart LR
+    subgraph SUBMIT ["Client Submissions"]
+        S1["client A:<br/>process.submit<br/>(WAV upload via 0x01)"]
+        S2["client B:<br/>process.stream<br/>(live PCM via 0x03)"]
+        S3["client A:<br/>process.submit<br/>(needs missing model)"]
+    end
+
+    subgraph QUEUE ["JobQueue (typed slots, capacity 1 each)"]
+        direction TB
+        SLOT_PP["postprocess slot<br/>━━━━━━━━━━━━<br/>Running: jobA<br/>(transcribe + diarize)"]
+        SLOT_ST["streaming slot<br/>━━━━━━━━━━━━<br/>Running: jobB<br/>(StreamingSession<br/>+ CaptionEngine)"]
+        SLOT_DL["model_download slot<br/>━━━━━━━━━━━━<br/>Running: auto-enqueued<br/>ModelDownload"]
+    end
+
+    subgraph WAIT ["Pending"]
+        JOB_C["jobC<br/>state = WaitingOnDownload<br/>(blocked on ModelDownload)"]
+    end
+
+    subgraph ROUTE ["Per-job event routing"]
+        BIND["job_id → client_id<br/>(JobQueue-owned binding)"]
+        SEND["send_to_client(job_id, event)<br/>routes phase/progress/<br/>job.complete to originator"]
+        BROADCAST["broadcast(state.changed)<br/>global events only"]
+    end
+
+    S1 --> SLOT_PP
+    S2 --> SLOT_ST
+    S3 -.->|"dequeue: cache miss"| AUTO["auto-enqueue<br/>ModelDownload"]
+    AUTO --> SLOT_DL
+    S3 --> JOB_C
+
+    SLOT_DL -.->|"on complete"| UNBLOCK["Promote jobC<br/>WaitingOnDownload → Running"]
+    UNBLOCK --> SLOT_PP
+
+    SLOT_PP --> BIND
+    SLOT_ST --> BIND
+    SLOT_DL --> BIND
+    BIND --> SEND
+    SLOT_PP -.-> BROADCAST
+    SLOT_ST -.-> BROADCAST
+
+    style SLOT_PP fill:#fff3e0,stroke:#e65100
+    style SLOT_ST fill:#e8f5e9,stroke:#2e7d32
+    style SLOT_DL fill:#e3f2fd,stroke:#1565c0
+```
+
+### 3c. JobQueue Slot Worker Lifecycle
+
+Each typed slot runs an identical long-lived worker loop, parameterized by
+the job type it accepts. All slot workers share the `send_to_client()` API
+for per-job-id event routing.
 
 ```mermaid
 flowchart TB
-    subgraph "rec_worker (one-shot per record.start)"
-        RW_START["Spawned from record.start handler"]
-        RW_RUN["run_recording(cfg, g_rec_stop, on_phase)"]
-        RW_PHASE["on_phase callback:<br/>server.post(broadcast phase event)"]
-        RW_OK{Success?}
-        RW_ENQUEUE["Absorb pending context/vocab<br/>Enqueue PostprocessJob<br/>lock(g_state_mu):<br/>  g_postprocessing = true<br/>  g_recording = false<br/>g_queue_cv.notify_one()"]
-        RW_ERR["lock(g_state_mu):<br/>  g_recording = false<br/>server.post(broadcast error state)"]
-
-        RW_START --> RW_RUN
-        RW_RUN --> RW_PHASE
-        RW_RUN --> RW_OK
-        RW_OK -->|"yes"| RW_ENQUEUE
-        RW_OK -->|"exception"| RW_ERR
-    end
-
-    subgraph "pp_worker (long-lived, started at daemon init)"
-        PP_WAIT["wait(g_queue_cv)<br/>until !queue.empty() || shutdown"]
+    subgraph PP_SLOT ["postprocess slot worker (long-lived)"]
+        PP_WAIT["wait on slot CV<br/>until job available || shutdown"]
         PP_SHUT{shutdown?}
-        PP_DEQUEUE["Dequeue PostprocessJob"]
-        PP_FLAG["if !already_flagged:<br/>  g_postprocessing = true<br/>  broadcast state"]
-        PP_FORK["Fork/exec subprocess<br/>(see §11)"]
-        PP_DONE["lock(g_state_mu):<br/>  g_postprocessing = false<br/>broadcast state"]
+        PP_DEQUEUE["Dequeue PostprocessJob<br/>(payload: upload session id<br/>or staged audio path)"]
+        PP_DEP{"model<br/>available?"}
+        PP_PARK["Park in<br/>WaitingOnDownload<br/>(auto-enqueue<br/>ModelDownload)"]
+        PP_RUN["state = Running<br/>send_to_client(job_id,<br/>state.changed)"]
+        PP_FORK["Fork/exec recmeet subprocess<br/>(see §11)"]
+        PP_DONE["state = Done|Failed|Cancelled<br/>send_to_client(job_id,<br/>job.complete | error)"]
 
         PP_WAIT --> PP_SHUT
         PP_SHUT -->|"yes"| PP_EXIT["return"]
         PP_SHUT -->|"no"| PP_DEQUEUE
-        PP_DEQUEUE --> PP_FLAG
-        PP_FLAG --> PP_FORK
-        PP_FORK --> PP_DONE
-        PP_DONE --> PP_WAIT
+        PP_DEQUEUE --> PP_DEP
+        PP_DEP -->|"no"| PP_PARK
+        PP_PARK -.->|"wake on<br/>ModelDownload done"| PP_RUN
+        PP_DEP -->|"yes"| PP_RUN
+        PP_RUN --> PP_FORK --> PP_DONE --> PP_WAIT
     end
 
-    subgraph "dl_worker (one-shot per models.ensure)"
-        DL_START["Spawned from models.ensure handler"]
-        DL_DOWNLOAD["Download models<br/>server.post(broadcast model events)"]
-        DL_DONE["lock(g_state_mu):<br/>  g_downloading = false<br/>broadcast state"]
+    subgraph ST_SLOT ["streaming slot worker (long-lived)"]
+        ST_WAIT["wait on slot CV"]
+        ST_DEQUEUE["Dequeue StreamingJob<br/>(from process.stream)"]
+        ST_SESSION["StreamingSessionManager:<br/>open temp WAV<br/>spin CaptionEngine"]
+        ST_FRAMES["Append 0x03 PCM frames<br/>emit caption events<br/>via send_to_client(job_id)"]
+        ST_COMMIT{"process.stream<br/>.commit?"}
+        ST_FLUSH["Flush temp WAV<br/>enqueue PostprocessJob<br/>onto postprocess slot"]
+        ST_CANCEL["process.stream.cancel:<br/>discard temp, no PP"]
 
-        DL_START --> DL_DOWNLOAD
-        DL_DOWNLOAD --> DL_DONE
+        ST_WAIT --> ST_DEQUEUE --> ST_SESSION --> ST_FRAMES
+        ST_FRAMES --> ST_COMMIT
+        ST_COMMIT -->|"yes"| ST_FLUSH
+        ST_COMMIT -->|"cancel"| ST_CANCEL
+        ST_FLUSH --> ST_WAIT
+        ST_CANCEL --> ST_WAIT
+    end
+
+    subgraph DL_SLOT ["model_download slot worker (long-lived)"]
+        DL_WAIT["wait on slot CV"]
+        DL_DEQUEUE["Dequeue ModelDownloadJob<br/>(submitted or<br/>auto-enqueued)"]
+        DL_DOWNLOAD["Download model<br/>emit progress via<br/>send_to_client(job_id)"]
+        DL_DONE["broadcast(state.changed)<br/>wake any parked jobs"]
+
+        DL_WAIT --> DL_DEQUEUE --> DL_DOWNLOAD --> DL_DONE --> DL_WAIT
     end
 ```
 
@@ -348,9 +456,9 @@ flowchart TB
 flowchart LR
     SIG["Signal received"]
     SIG -->|"SIGHUP"| RELOAD["server.post(lambda:<br/>  load_config()<br/>  store under g_config_mu)"]
-    SIG -->|"SIGINT / SIGTERM"| STOP["g_rec_stop.request()<br/>g_pp_stop.request()<br/>server.stop()<br/>(write 'X' to wakeup pipe)"]
+    SIG -->|"SIGINT / SIGTERM"| STOP["JobQueue::cancel_all()<br/>(signal stop tokens for each slot)<br/>server.stop()<br/>(write 'X' to wakeup pipe)"]
 
-    STOP --> POLL_EXIT["poll() returns →<br/>run() exits →<br/>shutdown sequence"]
+    STOP --> POLL_EXIT["poll() returns →<br/>run() exits →<br/>shutdown sequence<br/>(join all slot workers)"]
 ```
 
 ---
@@ -430,7 +538,12 @@ flowchart TD
 
 ## 5. IPC Client Flow
 
-### 5a. Connection
+### 5a. Connection + PSK Auth Handshake
+
+V2 connection flow. After socket setup, TCP transport requires a PSK auth
+challenge before any other verb is accepted. Unix transport bypasses auth.
+The server enforces this by stamping each client connection with an
+`authenticated` flag; only `auth.ok` is dispatched while unauthenticated.
 
 ```mermaid
 flowchart TD
@@ -440,8 +553,9 @@ flowchart TD
     CONNECTED -->|"no"| TRANSPORT{"addr_.transport?"}
 
     TRANSPORT -->|"Unix"| UNIX["socket(AF_UNIX)<br/>connect(sock_addr)"]
-    UNIX -->|"ok"| FD["fd_ = socket"]
+    UNIX -->|"ok"| UNIX_AUTH["mark fd authenticated<br/>(local trust)"]
     UNIX -->|"fail"| FAIL["return false"]
+    UNIX_AUTH --> FD["fd_ = socket"]
 
     TRANSPORT -->|"TCP"| TCP_SOCK["socket(AF_INET)<br/>set O_NONBLOCK"]
     TCP_SOCK --> TCP_CONN["connect() → EINPROGRESS"]
@@ -450,7 +564,11 @@ flowchart TD
     TCP_POLL -->|"ready"| TCP_CHECK["getsockopt(SO_ERROR)"]
     TCP_CHECK -->|"error"| TCP_FAIL
     TCP_CHECK -->|"0"| TCP_OPTS["Restore blocking mode<br/>TCP_NODELAY<br/>SO_KEEPALIVE 30s/10s/3"]
-    TCP_OPTS --> FD
+    TCP_OPTS --> PSK_SEND["Send auth.ok request<br/>{token: RECMEET_AUTH_TOKEN}<br/>(NDJSON, 0x00 frame)"]
+    PSK_SEND --> PSK_RESP{"daemon response?"}
+    PSK_RESP -->|"ok"| PSK_OK["fd authenticated<br/>(server flips bit)"]
+    PSK_RESP -->|"error /<br/>token mismatch"| PSK_FAIL["close, return false"]
+    PSK_OK --> FD
 
     FD --> OK2["return true"]
 ```
@@ -527,37 +645,97 @@ flowchart TD
     PENDING -->|"no"| DONE
 ```
 
+### 5e. V2 End-to-End Submit Flow (TCP)
+
+End-to-end timeline for the canonical V2 "client uploads a WAV, daemon
+postprocesses, client fetches artifact" flow over TCP. Frame discriminators
+are noted inline (see `docs/IPC-WIRE-PROTOCOL.md` for the wire spec).
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant C as Client<br/>(CLI or tray)
+    participant D as Daemon<br/>(IpcServer + JobQueue)
+    participant Q as postprocess slot
+    participant FS as Filesystem<br/>(meetings/)
+
+    C->>D: TCP connect (3-way handshake)
+    Note over C,D: PSK gate active
+    C->>D: auth.ok {token} <<0x00>>
+    D-->>C: result {authenticated:true} <<0x00>>
+    Note over C,D: All other verbs now accepted
+
+    C->>D: session.init {client_id, prefs} <<0x00>>
+    D-->>C: result {session_id}
+
+    C->>D: process.submit {kind:"postprocess", cfg} <<0x00>>
+    D-->>C: result {job_id, upload_id}
+
+    loop Upload WAV chunks
+        C->>D: binary upload frames <<0x01>><br/>(header: upload_id + offset)
+    end
+    C->>D: process.submit finalize <<0x00>>
+    D->>Q: enqueue PostprocessJob<br/>(bind job_id → client_id)
+    D-->>C: event state.changed (job_id, Running)
+
+    par Daemon processes job
+        Q->>Q: fork/exec subprocess
+        Q-->>C: event phase / progress<br/>(routed via send_to_client(job_id))
+    and Client polls
+        C->>D: job.status {job_id}
+        D-->>C: result {state:"Running", progress:0.42}
+    end
+
+    Q->>FS: write Meeting_*.md, transcript, captions.vtt
+    Q-->>C: event job.complete {job_id, note_path}
+
+    C->>D: process.fetch {job_id, artifact:"note"} <<0x00>>
+    D-->>C: result header <<0x00>>
+    loop Stream artifact
+        D-->>C: binary artifact frames <<0x02>>
+    end
+    D-->>C: end-of-stream marker
+
+    Note over C,D: Errors at any step:<br/>process.cancel cancels the job;<br/>process.submit.cancel cancels<br/>the upload session.
+```
+
 ---
 
 ## 6. IPC Protocol Wire Format
 
+V2 framed protocol (`IPC_PROTOCOL_VERSION = 3`). Every wire frame begins
+with a 1-byte discriminator. See **`docs/IPC-WIRE-PROTOCOL.md`** for the
+authoritative frame-level spec.
+
 ```mermaid
 flowchart LR
-    subgraph "Message Discrimination"
+    subgraph FRAMES ["Frame Discriminators"]
+        F00["0x00 NDJSON<br/>(control: requests,<br/>responses, events, errors)"]
+        F01["0x01 binary upload<br/>(client → daemon:<br/>WAV chunks for<br/>process.submit)"]
+        F02["0x02 binary artifact<br/>(daemon → client:<br/>note / transcript / VTT<br/>for process.fetch)"]
+        F03["0x03 streaming PCM<br/>(client → daemon:<br/>live audio for<br/>process.stream)"]
+    end
+
+    subgraph NDJSON_KINDS ["0x00 NDJSON message kinds"]
         MSG["JSON object"]
         MSG -->|"has 'method' key"| REQ["Request<br/>{id, method, params}"]
         MSG -->|"has 'result' key"| RESP["Response<br/>{id, result}"]
         MSG -->|"has 'error' key"| ERR["Error<br/>{id, error: {code, message}}"]
-        MSG -->|"has 'event' key"| EV["Event<br/>{event, data}"]
+        MSG -->|"has 'event' key"| EV["Event<br/>{event, data,<br/>optional job_id}"]
     end
 
-    subgraph "Value Types (JsonVal)"
+    subgraph TRANSPORT_GRP ["Transport"]
         direction TB
-        V_STR["string"]
-        V_INT["int64_t"]
-        V_DBL["double"]
-        V_BOOL["bool"]
-        V_NULL["null (monostate)"]
+        T_UNIX["Unix socket<br/>$XDG_RUNTIME_DIR/<br/>recmeet/daemon.sock<br/>(auth bypassed)"]
+        T_TCP["TCP socket<br/>host:port<br/>(PSK via auth.ok,<br/>token = RECMEET_AUTH_TOKEN)"]
     end
 
-    subgraph "Transport"
-        direction TB
-        T_UNIX["Unix socket<br/>$XDG_RUNTIME_DIR/<br/>recmeet/daemon.sock"]
-        T_TCP["TCP socket<br/>host:port"]
-        T_NDJSON["Wire: NDJSON<br/>(one JSON object per line)"]
+    subgraph ROUTING ["Event Routing"]
+        SEND["send_to_client(job_id, event)<br/>per-job-id, per-client"]
+        BCAST["broadcast(event)<br/>global events only<br/>(state.changed projection)"]
     end
 
-    subgraph "Address Parsing (parse_ipc_address)"
+    subgraph ADDRS ["Address Parsing (parse_ipc_address)"]
         ADDR["Input string"]
         ADDR -->|"empty"| DEFAULT["Unix: default_socket_path()"]
         ADDR -->|"host:port<br/>(digits after last ':')"| TCP_ADDR["TCP: {host, port}"]
@@ -571,6 +749,12 @@ flowchart LR
 ## 7. Recording Pipeline
 
 `run_recording()` control flow with dual-capture and reprocess branching.
+In V2 this function runs **client-side** (inside the CLI standalone mode
+or invoked by the postprocess subprocess in reprocess mode); it lives in
+`recmeet_core` but is never invoked by the daemon directly for live
+capture. The daemon receives audio only as a finished WAV (via
+`process.submit` + 0x01) or as streaming PCM (via `process.stream` + 0x03)
+and dispatches `run_postprocessing()` from there.
 
 ```mermaid
 flowchart TD
@@ -748,9 +932,10 @@ flowchart TD
     end
 
     %% Note: persistence of context_<ts>.json now happens in the PARENT process
-    %% (daemon::rec_worker or pipeline::run_pipeline) BEFORE run_postprocessing
-    %% is invoked — never inside run_postprocessing. See ARCHITECTURE.md
-    %% "Meeting directory layout" for the rationale.
+    %% (V2: daemon's postprocess slot worker, or pipeline::run_pipeline in
+    %% standalone mode) BEFORE run_postprocessing is invoked — never inside
+    %% run_postprocessing. See ARCHITECTURE.md "Meeting directory layout"
+    %% for the rationale.
 
     SUMM_CHECK{"cfg.no_summary?"}
     CONTEXT --> SUMM_CHECK
@@ -857,7 +1042,7 @@ flowchart TD
     MENU["build_menu()<br/>fetch_provider_models()"]
     SIGNALS["SIGCHLD → reap recmeet-web zombies<br/>SIGTERM/SIGINT → gtk_main_quit"]
     GTK_MAIN["gtk_main()<br/>(blocks in GTK event loop)"]
-    CLEANUP["Send record.stop if active<br/>teardown_ipc_watch()<br/>close IPC connection<br/>stop_web_server()<br/>log_shutdown()"]
+    CLEANUP["recmeet_capture::stop() if active<br/>process.stream.cancel if streaming<br/>teardown_ipc_watch()<br/>close IPC connection<br/>stop_web_server()<br/>log_shutdown()"]
 
     MAIN --> PARSE --> INIT --> INDICATOR --> SOURCES --> CONNECT
     CONNECT --> CONNECT_OK
@@ -919,13 +1104,18 @@ flowchart TD
 
 ### 9c. Recording Start/Stop Flow
 
+In V2 the tray itself owns the audio capture (via `recmeet_capture`); the
+daemon never sees raw audio. The tray records to memory/disk locally, then
+submits the finished WAV via `process.submit` + 0x01 frames. Stop simply
+ends the local capture and triggers the upload.
+
 ```mermaid
 flowchart TD
     subgraph "on_record()"
-        REC_GUARD{"recording ||<br/>downloading?"}
+        REC_GUARD{"capture_active ||<br/>upload_in_flight?"}
         REC_GUARD -->|"yes"| REC_RET["return"]
         REC_GUARD -->|"no"| REC_CONN{"daemon_connected?"}
-        REC_CONN -->|"no"| REC_RETRY["connect_to_daemon()"]
+        REC_CONN -->|"no"| REC_RETRY["connect_to_daemon()<br/>(+ PSK auth if TCP)"]
         REC_RETRY -->|"fail"| REC_NOTIFY["notify('Cannot connect')"]
         REC_RETRY -->|"ok"| REC_KEY
         REC_CONN -->|"yes"| REC_KEY
@@ -937,24 +1127,26 @@ flowchart TD
         REC_KEY_CHECK -->|"no"| REC_BUILD
         REC_SAVE --> REC_BUILD
 
-        REC_BUILD["Build run_cfg from g_tray.cfg<br/>config_to_map() → params"]
-        REC_BUILD --> REC_CALL["ipc.call('record.start',<br/>params, 10s timeout)"]
-        REC_CALL -->|"fail"| REC_ERR_NOTIFY["notify(error)"]
-        REC_CALL -->|"ok"| REC_STATE["update_state(true, pp, false)"]
-        REC_STATE --> REC_CTX["show_context_window()"]
+        REC_BUILD["Build run_cfg from g_tray.cfg"]
+        REC_BUILD --> REC_CAP["recmeet_capture::start()<br/>(local capture begins;<br/>WAV stager subscriber active)"]
+        REC_CAP --> REC_OPT{"captions on?"}
+        REC_OPT -->|"yes"| REC_STREAM["ipc.call('process.stream',<br/>{cfg}) → {job_id}<br/>+ install 0x03 sink subscriber"]
+        REC_OPT -->|"no"| REC_CTX
+        REC_STREAM --> REC_CTX
+        REC_CTX["show_context_window()"]
     end
 
     subgraph "on_stop()"
-        STOP_GUARD{"!recording &&<br/>!postprocessing?"}
+        STOP_GUARD{"!capture_active &&<br/>!upload_in_flight?"}
         STOP_GUARD -->|"yes"| STOP_RET["return"]
-        STOP_GUARD -->|"no"| STOP_CTX{"recording &&<br/>context window?"}
-        STOP_CTX -->|"yes"| STOP_CAPTURE["capture_and_clear_context()<br/>→ {context_inline, vocab}"]
-        STOP_CAPTURE --> STOP_JOB_CTX["ipc.call('job.context',<br/>{context_inline, vocabulary_append})"]
-        STOP_CTX -->|"no"| STOP_TARGET
-        STOP_JOB_CTX --> STOP_TARGET
-
-        STOP_TARGET["params[target] =<br/>recording ? 'recording' : 'postprocessing'"]
-        STOP_TARGET --> STOP_CALL["ipc.call('record.stop',<br/>params, 5s timeout)"]
+        STOP_GUARD -->|"no"| STOP_CAP["recmeet_capture::stop()<br/>finalize WAV stager"]
+        STOP_CAP --> STOP_STREAM{"streaming<br/>session open?"}
+        STOP_STREAM -->|"yes"| STOP_COMMIT["ipc.call('process.stream.commit',<br/>{job_id, cfg, context_inline,<br/>vocabulary_append})<br/>→ daemon flushes temp WAV<br/>and enqueues postprocess"]
+        STOP_STREAM -->|"no"| STOP_SUBMIT["ipc.call('process.submit',<br/>{cfg, context_inline, vocabulary})<br/>→ {job_id, upload_id}"]
+        STOP_SUBMIT --> STOP_UPLOAD["Stream WAV bytes<br/>as 0x01 frames<br/>(header: upload_id + offset)"]
+        STOP_UPLOAD --> STOP_FIN["process.submit finalize<br/>→ daemon enqueues<br/>PostprocessJob"]
+        STOP_COMMIT --> STOP_DONE["Status returns to 'idle';<br/>wait for job.complete event"]
+        STOP_FIN --> STOP_DONE
     end
 ```
 
@@ -1032,15 +1224,17 @@ flowchart TD
         USE_DAEMON --> CLIENT_RECORD
         STANDALONE --> STANDALONE_MAIN
 
-        subgraph CLIENT_RECORD["Client Mode"]
-            CR_CONNECT["IpcClient::connect()"]
-            CR_CB["Set event callback<br/>(phase, progress, state, complete)"]
-            CR_START["call('record.start', params)"]
+        subgraph CLIENT_RECORD["Client Mode (V2 thin client)"]
+            CR_CONNECT["IpcClient::connect()<br/>(PSK auth if TCP)"]
+            CR_CB["Set event callback<br/>(phase, progress, state, complete)<br/>events routed via job_id"]
+            CR_INIT["call('session.init', {prefs})"]
+            CR_CAP["recmeet_capture::start()<br/>(local audio capture)"]
             CR_PRINT["Print 'Recording started.<br/>Press Ctrl+C to stop.'"]
-            CR_SIGINT["Install SIGINT handler<br/>→ call('record.stop')"]
-            CR_WAIT["read_events('job.complete')<br/>(blocks until done)"]
+            CR_SIGINT["Install SIGINT handler<br/>→ recmeet_capture::stop()<br/>→ call('process.submit', cfg)<br/>→ stream 0x01 WAV frames<br/>→ finalize"]
+            CR_WAIT["read_events('job.complete')<br/>(blocks until done;<br/>poll via job.status if desired)"]
+            CR_FETCH["call('process.fetch', job_id)<br/>→ receive 0x02 artifact frames"]
 
-            CR_CONNECT --> CR_CB --> CR_START --> CR_PRINT --> CR_SIGINT --> CR_WAIT
+            CR_CONNECT --> CR_CB --> CR_INIT --> CR_CAP --> CR_PRINT --> CR_SIGINT --> CR_WAIT --> CR_FETCH
         end
 
         subgraph STANDALONE_MAIN["Standalone Mode"]
@@ -1103,7 +1297,7 @@ flowchart TD
 **Hybrid SIGINT model.** Two handlers cooperate:
 
 - `batch_sigint_handler` (installed once at batch entry, standalone-only): sets `g_batch_stop_requested` so the loop breaks after the current iteration's clean shutdown.
-- `batch_daemon_sigint_handler` (re-installed per iteration via `dispatch_one_reprocess` in daemon mode): forwards SIGINT to the daemon as `record.stop` for the current job, then sets `g_batch_stop_requested` so the loop breaks once the daemon reports the job ended.
+- `batch_daemon_sigint_handler` (re-installed per iteration via `dispatch_one_reprocess` in daemon mode): forwards SIGINT to the daemon as `process.cancel {job_id}` for the current job, then sets `g_batch_stop_requested` so the loop breaks once the daemon reports the job ended.
 
 A single Ctrl-C aborts the current meeting's pipeline, lets it shut down cleanly, then exits the loop with code 130. Per-meeting failures (transcription error, OOM, malformed audio) record into the summary but do not abort the batch.
 
@@ -1113,8 +1307,11 @@ A single Ctrl-C aborts the current meeting's pipeline, lets it shut down cleanly
 
 ## 11. Subprocess Postprocessing
 
-The daemon's `pp_worker_loop` fork/exec's the `recmeet` binary as a child
-process for crash isolation. Communication is via NDJSON on stdout/stderr pipes.
+The daemon's **postprocess slot worker** fork/exec's the `recmeet` binary
+as a child process for crash isolation. Communication is via NDJSON on
+stdout/stderr pipes. The input WAV is the one staged on disk by the
+upload session (`process.submit` + 0x01) or by the streaming session
+(`process.stream.commit`).
 
 ### 11a. Fork/Exec Flow
 
@@ -1142,7 +1339,7 @@ flowchart TD
         C_SIG --> C_DUP --> C_CLOSE --> C_EXEC --> C_FAIL
     end
 
-    subgraph PARENT["Parent (pp_worker thread)"]
+    subgraph PARENT["Parent (postprocess slot worker)"]
         P_CLOSE["Close write ends of both pipes"]
         P_PID["g_pp_child_pid.store(child_pid)"]
         P_POLL["Poll loop<br/>(see §11b)"]
@@ -1251,11 +1448,11 @@ When `--reprocess-batch` is the entry point (see §10b), each dispatched job car
 ```mermaid
 flowchart LR
     BATCH_DRIVER["run_reprocess_batch:<br/>cfg.batch_mode = true<br/>per dispatched job"]
-    DAEMON["daemon.cpp record.start<br/>handler stores cfg<br/>(includes batch_mode)"]
+    DAEMON["daemon.cpp process.submit<br/>handler stores cfg<br/>(includes batch_mode)"]
     JSON["write_job_config():<br/>job config JSON<br/>includes 'batch_mode' field"]
     SUBPROC["subprocess_main reads<br/>config_from_json,<br/>cfg.batch_mode set"]
     JOB_COMPLETE["subprocess emits<br/>NDJSON job.complete<br/>{note_path, output_dir,<br/> batch_job: cfg.batch_mode}"]
-    DAEMON_BC["daemon poll loop:<br/>broadcasts job.complete<br/>WITH batch_job field"]
+    DAEMON_BC["daemon poll loop:<br/>send_to_client(job_id,<br/>job.complete) — routed,<br/>NOT broadcast"]
     TRAY["tray.cpp on_job_complete:<br/>if (batch_job) skip notify();<br/>else notify('Note written: …')"]
 
     BATCH_DRIVER --> DAEMON --> JSON --> SUBPROC --> JOB_COMPLETE --> DAEMON_BC --> TRAY
@@ -1267,85 +1464,81 @@ A live single-meeting reprocess or live recording leaves `cfg.batch_mode = false
 
 ---
 
-## 12. Audio Capture Subsystem
+## 12. Audio Capture Subsystem (Client-Side, recmeet_capture)
+
+In V2 audio capture lives **on the client tier** in the `recmeet_capture`
+library (B.1). Both `recmeet-tray` and `recmeet` (CLI) link this lib;
+**the daemon does not**. A single capture instance fans out to multiple
+subscribers via the B.1 `CaptureSubscriber` interface — typically a WAV
+stager (which uploads the finished file via `process.submit` + 0x01) and,
+when live captions are requested, a streaming sink that pushes 0x03 PCM
+frames via `process.stream`.
 
 ```mermaid
 flowchart TD
-    subgraph "Source Selection (run_recording)"
-        SEL_START["Audio source names from Config"]
+    subgraph CLIENT_SCOPE ["Client Tier (tray or CLI)"]
+        SEL_START["Audio source names<br/>(prefs or auto-detect)"]
         SEL_EMPTY{"mic_source<br/>empty?"}
         SEL_EMPTY -->|"yes"| SEL_DETECT["detect_sources(pattern)<br/>→ mic + monitor"]
-        SEL_EMPTY -->|"no"| SEL_USE["Use config values"]
+        SEL_EMPTY -->|"no"| SEL_USE["Use configured values"]
         SEL_DETECT -->|"no mic"| SEL_ERR["throw DeviceError"]
-        SEL_DETECT --> DUAL{"!mic_only &&<br/>monitor found?"}
-        SEL_USE --> DUAL
-    end
+        SEL_DETECT --> CAPTURE_INIT
+        SEL_USE --> CAPTURE_INIT
 
-    DUAL -->|"yes"| DUAL_CAP
-    DUAL -->|"no"| SINGLE_CAP
+        CAPTURE_INIT["recmeet_capture::PipeWireCapture(mic)<br/>+ optional monitor capture<br/>S16LE mono 16 kHz"]
 
-    subgraph DUAL_CAP["Dual Capture"]
-        subgraph MIC_CAP["Mic Capture"]
-            MIC_PW["PipeWireCapture(mic_source)<br/>S16LE mono 16kHz"]
-            MIC_START["mic.start()"]
-            MIC_PW --> MIC_START
+        subgraph FANOUT ["Capture Fan-out (B.1 subscriber API)"]
+            SUB_WAV["WAV stager subscriber<br/>(buffers samples,<br/>writes audio_*.wav)"]
+            SUB_STREAM["Streaming sink subscriber<br/>(optional, when<br/>captions toggle on)"]
+            SUB_MIX["Mixer subscriber<br/>(mic + monitor →<br/>combined int16 stream)"]
         end
 
-        subgraph MON_CAP["Monitor Capture"]
-            MON_CHECK{".monitor suffix?"}
-            MON_CHECK -->|"yes"| MON_PA["PulseMonitorCapture<br/>(pa_simple, own thread)"]
-            MON_CHECK -->|"no"| MON_PW_TRY["try PipeWireCapture<br/>(capture_sink=true)"]
-            MON_PW_TRY -->|"RecmeetError"| MON_PA
-            MON_PW_TRY -->|"ok"| MON_OK["Monitor capturing"]
-            MON_PA --> MON_OK
+        CAPTURE_INIT --> FANOUT
+
+        subgraph DAEMON_PUSH ["Push to daemon via IPC"]
+            SUB_WAV -->|"on stop:<br/>finalize WAV"| UP_SUBMIT["process.submit + 0x01 frames<br/>(WAV bytes)"]
+            SUB_STREAM -->|"every ~20 ms"| UP_STREAM["process.stream + 0x03 frames<br/>(PCM chunks)"]
         end
-
-        STOP_LOOP["while !stop.stop_requested()<br/>  sleep_for(200ms)"]
-        DRAIN_BOTH["mic.stop() + mon.stop()<br/>mic_samples = mic.drain()<br/>mon_samples = mon.drain()"]
-        WRITE_RAW["Write mic.wav + monitor.wav"]
-        VALIDATE["validate_audio(mic.wav) — fatal<br/>validate_audio(monitor.wav) — non-fatal"]
-        MIX_OR_SKIP{"Monitor valid?"}
-        MIX_OR_SKIP -->|"yes"| MIX["mix_audio(mic, mon)<br/>→ averaged int16_t stream"]
-        MIX_OR_SKIP -->|"AudioValidationError"| MIC_FALLBACK["Use mic-only"]
-
-        MIC_START --> STOP_LOOP
-        MON_OK --> STOP_LOOP
-        STOP_LOOP --> DRAIN_BOTH --> WRITE_RAW --> VALIDATE --> MIX_OR_SKIP
-        MIX --> WRITE_OUT
-        MIC_FALLBACK --> WRITE_OUT
-        WRITE_OUT["Write audio_YYYY-MM-DD_HH-MM.wav"]
     end
 
-    subgraph SINGLE_CAP["Single Mic Capture"]
-        S_PW["PipeWireCapture(mic_source)"]
-        S_START["start()"]
-        S_LOOP["while !stop.stop_requested()"]
-        S_DRAIN["stop() → drain()"]
-        S_WRITE["Write audio_YYYY-MM-DD_HH-MM.wav"]
-
-        S_PW --> S_START --> S_LOOP --> S_DRAIN --> S_WRITE
+    subgraph SERVER ["Server Tier (daemon — no capture lib)"]
+        D_UPLOAD["UploadSessionManager<br/>assembles WAV<br/>→ enqueue PostprocessJob"]
+        D_STREAM["StreamingSessionManager<br/>appends to temp WAV<br/>+ CaptionEngine"]
     end
 
-    subgraph "PipeWireCapture Internals (Pimpl)"
+    UP_SUBMIT -.->|"TCP/Unix"| D_UPLOAD
+    UP_STREAM -.->|"TCP/Unix"| D_STREAM
+
+    subgraph PW_INTERNALS ["PipeWireCapture Internals (Pimpl, B.1)"]
         PW_INIT["pw_init(), pw_main_loop_new()<br/>pw_stream_new()"]
-        PW_PROPS["Properties:<br/>S16LE, 16kHz, mono<br/>capture_sink for loopback"]
-        PW_CB["on_process callback (RT thread):<br/>dequeue buffer → memcpy to ring buffer<br/>(atomic flag, no mutex)"]
-        PW_THREAD["pw_main_loop runs in own thread"]
-        PW_STOP["stop(): set atomic flag<br/>pw_main_loop_quit()"]
-        PW_DRAIN["drain(): move ring buffer out<br/>→ vector<int16_t>"]
-
+        PW_PROPS["Properties:<br/>S16LE, 16 kHz, mono<br/>capture_sink for loopback"]
+        PW_CB["on_process callback (RT thread):<br/>dequeue buffer → notify each<br/>subscriber via lock-free path"]
+        PW_THREAD["pw_main_loop on its own thread"]
         PW_INIT --> PW_PROPS --> PW_CB --> PW_THREAD
     end
 
-    subgraph "PulseMonitorCapture Internals"
-        PA_INIT["pa_simple_new(source, record)<br/>S16LE, 16kHz, mono"]
-        PA_THREAD["Capture thread:<br/>pa_simple_read() in loop<br/>mutex-protected vector buffer"]
-        PA_STOP["stop(): set StopToken<br/>join thread"]
-        PA_DRAIN["drain(): move buffer out"]
-
+    subgraph PA_INTERNALS ["PulseMonitorCapture Internals (B.1 fallback)"]
+        PA_INIT["pa_simple_new(source, record)<br/>S16LE, 16 kHz, mono"]
+        PA_THREAD["Capture thread:<br/>pa_simple_read() in loop<br/>publishes to subscribers"]
         PA_INIT --> PA_THREAD
     end
+
+    style CLIENT_SCOPE fill:#e8f5e9,stroke:#2e7d32
+    style SERVER fill:#fff3e0,stroke:#e65100
+    style FANOUT fill:#e3f2fd,stroke:#1565c0
 ```
+
+**Key V2 properties:**
+
+- One physical PipeWire/Pulse capture, many logical consumers. The B.1
+  fan-out runs subscriber callbacks on the RT thread; subscribers are
+  expected to be lock-free (ring-buffer copy + atomic publish).
+- WAV staging and streaming are independent paths; the user can have
+  captions on without recording, or recording without captions.
+- Mixer + validation logic that used to run inside `run_recording()` on
+  the daemon now lives on the client side; the daemon receives a finished
+  WAV (`process.submit`) or a temp WAV assembled from streamed frames
+  (`process.stream` → `process.stream.commit`).
 
 ---
 
@@ -1483,105 +1676,104 @@ flowchart TD
 
 ---
 
-## 14. Live Captioning Pipeline
+## 14. Live Captioning Pipeline (V2 Streaming)
 
-End-to-end flow for the V1 capstone live-captioning feature. Audio
-capture, ASR worker, IPC fan-out, and `.vtt` sidecar persistence all live
-in `recmeet_core`; the tray applet and CLI are display-only consumers
-that render the same IPC events.
+V2 moves audio capture to the client and turns captioning into a routed
+streaming verb. The client opens a `process.stream` session, pushes 0x03
+PCM frames, and the daemon's `StreamingSessionManager` runs a server-side
+`CaptionEngine` that emits `caption` events back to the originator via
+`send_to_client()`. On `process.stream.commit` the temp WAV is flushed and
+a `PostprocessJob` is enqueued onto the postprocess slot for final
+transcription / diarization / note generation.
 
 ```mermaid
 flowchart TD
-    subgraph "Capture (PipeWire RT thread / Pulse capture thread)"
-        ON_PROC["on_process / pa_simple_read<br/>(int16 mono 16 kHz chunks)"]
-        SET_CB{"set_audio_callback<br/>installed?"}
-        BUF["Append to capture<br/>ring buffer (drained at stop)"]
-        PUSH["Invoke callback<br/>(lock-free, non-allocating)"]
+    subgraph CLIENT ["Client Tier (tray / CLI)"]
+        CAP["recmeet_capture<br/>PipeWire/Pulse RT thread<br/>(int16 mono 16 kHz)"]
+        SUB_STREAM["Streaming sink subscriber<br/>(B.1 fan-out)"]
+        OPEN["process.stream <<0x00>><br/>open streaming job<br/>→ {job_id}"]
+        FRAMES["For each ~20 ms chunk:<br/>send 0x03 PCM frame<br/>(header: job_id + seq)"]
+        COMMIT_DEC{"User<br/>action?"}
+        COMMIT["process.stream.commit<br/>→ enqueue postprocess job"]
+        CANCEL["process.stream.cancel<br/>→ discard temp WAV"]
 
-        ON_PROC --> SET_CB
-        SET_CB -->|"yes (captions on)"| PUSH
-        SET_CB -->|"no"| BUF
-        PUSH --> BUF
+        CAP --> SUB_STREAM --> FRAMES
+        OPEN --> FRAMES
+        FRAMES --> COMMIT_DEC
+        COMMIT_DEC -->|"stop + keep"| COMMIT
+        COMMIT_DEC -->|"abandon"| CANCEL
     end
 
-    subgraph "CaptionEngine (recmeet_core)"
-        CB_FN["CaptionEngine::on_audio_chunk<br/>(static, atomic ptr-stable)"]
-        RING["SPSC ring buffer<br/>~32 768 int16 samples<br/>(~2 s @ 16 kHz)"]
-        DROP{"ring full?"}
-        DROP_PATH["drop oldest samples;<br/>set atomic overflow flag"]
-        WORKER["ASR worker thread<br/>(SCHED_BATCH; nice +10 fallback)"]
-        DRAIN["drain ring → recognizer.AcceptWaveform"]
-        DECODE["recognizer.Decode<br/>(streaming Zipformer, int8)"]
-        ENDPOINT{"endpoint detected?"}
-        EMIT_PARTIAL["emit CaptionResult<br/>(is_partial=true)"]
-        EMIT_FINAL["emit CaptionResult<br/>(is_partial=false);<br/>recognizer.Reset"]
-        DEGRADED["emit CaptionDegraded<br/>(BufferOverrun;<br/>rate-limited 1/s)"]
+    subgraph DAEMON ["Server Tier (daemon, streaming slot)"]
+        SSM["StreamingSessionManager<br/>(per job_id)"]
+        TEMP_WAV["Disk-backed temp WAV<br/>(append samples<br/>as they arrive)"]
+        ENGINE["CaptionEngine<br/>(server-side, streaming<br/>Zipformer, int8)"]
+        RING["SPSC ring buffer<br/>~32k samples (~2s)"]
+        WORKER["ASR worker thread<br/>(SCHED_BATCH;<br/>nice +10 fallback)"]
+        DECODE["recognizer.Decode +<br/>endpoint detection"]
+        EMIT_PART["CaptionResult<br/>(is_partial=true)"]
+        EMIT_FIN["CaptionResult<br/>(is_partial=false);<br/>recognizer.Reset"]
+        DEGRADED["CaptionDegraded<br/>(BufferOverrun;<br/>rate-limited 1/s)"]
+        VTT["VttWriter::append<br/>(O_APPEND, finalized<br/>cues only)"]
 
-        PUSH --> CB_FN --> RING
-        RING --> DROP
-        DROP -->|"yes"| DROP_PATH --> RING
-        WORKER --> DRAIN --> DECODE --> ENDPOINT
-        ENDPOINT -->|"no"| EMIT_PARTIAL --> WORKER
-        ENDPOINT -->|"yes"| EMIT_FINAL --> WORKER
-        DROP_PATH -.-> DEGRADED
+        SSM --> TEMP_WAV
+        SSM --> RING
+        RING --> WORKER --> DECODE
+        DECODE -->|"partial"| EMIT_PART
+        DECODE -->|"endpoint"| EMIT_FIN
+        RING -.->|"overflow"| DEGRADED
+        EMIT_FIN --> VTT
     end
 
-    subgraph "Pipeline fan-out (pipeline.cpp)"
-        ADAPTER["CaptionFanoutAdapter<br/>(downstream cb + VttWriter)"]
-        DOWNSTREAM["downstream callback<br/>= daemon's IPC hook"]
-        VTT_TIMER["VttCueTimer<br/>(prev_final_ms watermark)"]
-        VTT_APPEND["VttWriter::append<br/>(O_APPEND, single write)"]
+    subgraph ROUTING ["Per-client routing"]
+        SEND_CAP["send_to_client(job_id,<br/>caption event)"]
+        SEND_DEG["send_to_client(job_id,<br/>caption.degraded)"]
     end
 
-    EMIT_PARTIAL --> ADAPTER
-    EMIT_FINAL --> ADAPTER
-    ADAPTER --> DOWNSTREAM
-    ADAPTER -->|"is_partial=false only"| VTT_TIMER --> VTT_APPEND
-
-    subgraph "Daemon broadcast (daemon.cpp + ipc_server.cpp)"
-        IPC_POST["IpcServer::post<br/>(self-pipe wakeup)"]
-        BROADCAST["broadcast caption / caption.degraded<br/>NDJSON over Unix socket"]
+    subgraph POSTPROCESS ["Postprocess slot (after commit)"]
+        ENQUEUE["JobQueue.enqueue(<br/>PostprocessJob from<br/>temp WAV path)"]
+        PP_RUN["Standard postprocess<br/>(transcribe + diarize +<br/>summarize + note)"]
+        ARTIFACTS["meetings/&lt;dir&gt;/<br/>Meeting_*.md<br/>captions.vtt"]
     end
 
-    DOWNSTREAM --> IPC_POST --> BROADCAST
-    DEGRADED --> IPC_POST
+    FRAMES -.->|"0x03 frames"| SSM
+    EMIT_PART --> SEND_CAP
+    EMIT_FIN --> SEND_CAP
+    DEGRADED --> SEND_DEG
+    SEND_CAP -.->|"NDJSON event"| CLIENT_RX["Client renders<br/>overlay / stderr<br/>(normalize_caption)"]
+    SEND_DEG -.->|"NDJSON event"| CLIENT_RX
 
-    subgraph "Tray (recmeet-tray)"
-        TRAY_RX["IPC client receives<br/>caption event"]
-        NORM_T["normalize_caption()<br/>(ALL-CAPS → human)"]
-        OVERLAY["GtkLabel popup<br/>(replace partial in place;<br/>append finalized)"]
-    end
+    COMMIT --> ENQUEUE --> PP_RUN --> ARTIFACTS
 
-    subgraph "CLI (recmeet)"
-        CLI_RX["IPC client receives<br/>caption event"]
-        NORM_C["normalize_caption()"]
-        STDERR["fprintf(stderr, '[caption] …')<br/>isatty-gated"]
-    end
-
-    BROADCAST -.->|"NDJSON"| TRAY_RX --> NORM_T --> OVERLAY
-    BROADCAST -.->|"NDJSON"| CLI_RX --> NORM_C --> STDERR
-
-    VTT_APPEND --> SIDECAR["~/meetings/&lt;dir&gt;/captions.vtt<br/>WEBVTT, finalized cues only"]
-
-    subgraph "Teardown order (load-bearing)"
-        T1["1. capture.stop()<br/>(RT thread exits)"]
-        T2["2. ActiveCaptionEngine dtor<br/>= unsubscribe + engine.stop()<br/>= worker join + ring drain"]
-        T3["3. capture.drain()<br/>(WAV write)"]
+    subgraph TEARDOWN ["Teardown order (server-side)"]
+        T1["1. process.stream.cancel<br/>or stream-close detected"]
+        T2["2. StreamingSession dtor<br/>= unsubscribe + engine.stop()<br/>= worker join + ring drain"]
+        T3["3. temp WAV finalized<br/>(flush or delete based on<br/>commit vs cancel)"]
         T1 --> T2 --> T3
     end
+
+    style CLIENT fill:#e8f5e9,stroke:#2e7d32
+    style DAEMON fill:#fff3e0,stroke:#e65100
+    style ROUTING fill:#e3f2fd,stroke:#1565c0
 ```
 
-**Key invariants:**
+**Key V2 invariants:**
 
-- The audio callback pointer is atomic; the engine destructor unsubscribes
-  before joining its worker, so the destroyed engine's address can never
-  observe a live capture callback.
+- Audio never reaches the daemon as live PipeWire/Pulse samples; only as
+  0x03 PCM frames over the IPC wire. The `recmeet_core` engine sees an
+  in-memory ring buffer that's filled by the streaming-frame handler, not
+  by a capture callback.
+- Caption events are **routed**, not broadcast. The streaming slot binds
+  `job_id → client_id` at session-open time; `send_to_client()` delivers
+  events to the originator only. Other connected clients do not see
+  captions from a streaming session they didn't open.
+- `process.stream.commit` is what creates the postprocess job. A streaming
+  session without commit is captions-only — no transcript, no note.
+- `process.stream.cancel` (or client disconnect) discards the temp WAV;
+  no postprocess job is created.
 - The VTT writer uses `O_APPEND` with a single `write(2)` per cue (~100 B,
-  well under the FS atomic-write block size). No `fsync`. Crash recovery
-  is "valid up to last fully-flushed cue."
-- Display normalization (`normalize_caption()`) lives at the client
-  render boundary, not in the engine — the IPC payload always carries
-  raw engine output so a downstream consumer can opt out.
+  well under the FS atomic-write block size). Crash recovery is "valid up
+  to last fully-flushed cue."
 - Sherpa-OFF builds compile every component cleanly; `CaptionEngine::start`
-  returns false with the canonical error message and recording continues
-  without captions.
+  returns false with the canonical error message and `process.stream`
+  responds with a typed error.

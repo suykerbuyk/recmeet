@@ -1,0 +1,106 @@
+name: CI
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+    branches: ['**']
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Build + test (ubuntu-latest)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
+      CCACHE_MAXSIZE: 2G
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build pkg-config ccache \
+            libpipewire-0.3-dev libpulse-dev \
+            libcurl4-openssl-dev libnotify-dev \
+            libgtk-3-dev libsndfile1-dev libmpg123-dev
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: 'stable'
+          cache: false
+
+      # The onnxruntime build is ~20 minutes from scratch; cache the
+      # vendored install so steady-state CI does not pay that cost.
+      # Key includes the build script hash so changes to the script
+      # (e.g. version bump) invalidate the cache.
+      - name: Restore onnxruntime cache
+        id: cache-onnxruntime
+        uses: actions/cache@v4
+        with:
+          path: vendor/onnxruntime-local
+          key: onnxruntime-${{ runner.os }}-${{ hashFiles('scripts/build-onnxruntime.sh') }}
+
+      - name: Build onnxruntime (cache miss)
+        if: steps.cache-onnxruntime.outputs.cache-hit != 'true'
+        run: ./scripts/build-onnxruntime.sh
+
+      # whisper.cpp / sherpa-onnx models for the full-stack and e2e
+      # suites. Auto-downloaded by `recmeet --download-models` on
+      # cache miss; cached forever once populated.
+      - name: Restore model cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.local/share/recmeet/models
+          key: recmeet-models-base-v1
+
+      # ccache shrinks repeat rebuilds from ~5 min to ~30 sec.
+      - name: Restore ccache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: ccache-${{ runner.os }}-${{ github.sha }}
+          restore-keys: |
+            ccache-${{ runner.os }}-
+
+      - name: Configure ccache
+        run: |
+          echo "/usr/lib/ccache" >> $GITHUB_PATH
+          ccache --version
+          ccache --zero-stats
+
+      - name: Build (with tests)
+        run: make build RECMEET_BUILD_TESTS=ON
+
+      - name: ccache statistics
+        run: ccache --show-stats
+
+      - name: Unit tests (C++ + Go)
+        run: make test
+
+      - name: Integration tests (C++)
+        run: make integration-cxx
+
+      - name: Integration tests (Go)
+        run: make integration-go
+
+      - name: V2 thin-client e2e (TCP)
+        run: make integration-e2e
+
+      - name: Full-stack pipeline
+        run: make full-stack
+
+      - name: Surface failing logs (on failure)
+        if: failure()
+        run: |
+          echo "::group::recmeet daemon logs"
+          find ~/.local/share/recmeet/logs -type f -printf '\n=== %p ===\n' -exec tail -200 {} \; 2>/dev/null || echo "(no logs)"
+          echo "::endgroup::"

@@ -32,11 +32,34 @@ Drop an audio file (WAV, FLAC, MP3) into a designated folder and have it automat
 - How to handle partial writes (large files being copied in)? `IN_CLOSE_WRITE` handles this for local writes, but NFS/CIFS may need a settle-time heuristic.
 - Should processed files be moved to a `done/` subfolder, deleted, or left in place with a sidecar marker?
 
-## Phase 2: Network Daemon
+## Phase 2: Network Daemon — DELIVERED (as V2 Phases A + B + C)
 
-> **Status (2026-05): superseded by active task `agentctx/tasks/thin-client-recording-server.md`.** That task replaces the original "daemon-captures, clients-watch" framing with a thin-client / heavy-server architecture: audio capture moves to the client (tray), the daemon becomes stateless w.r.t. capture and owns compute (transcribe, diarize, identify, summarize). Wire protocol extends with length-prefixed binary frames for bulk audio upload + result download on the same connection. Phasing: A (security foundation: PSK + caps + identity + session handshake) → B (audio capture migration to client) → C (submit/process/fetch IPC + server-side job queue) → D (client-side queueing + reconnect with `(endpoint, job_id)` persistence) → E (cleanup + config schema split + binary slimming).
+> **Status (2026-05, iter 156): Phases A, B, and C of the thin-client /
+> heavy-server reshape have all landed on `feat/v2-thin-client`
+> (iterations 138-155).** Audio capture has moved to the client (tray);
+> the daemon is stateless w.r.t. capture and owns compute (transcribe,
+> diarize, identify, summarize); the wire protocol now carries
+> length-prefixed binary frames (`0x00` NDJSON, `0x01` upload,
+> `0x02` artifact, `0x03` streaming PCM) on the same socket as the
+> NDJSON control channel. The `record.start` verb has been removed in
+> favor of `process.submit` / `process.stream`. `IPC_PROTOCOL_VERSION`
+> is 3.
 >
-> The Phase 2 sketch below predates the task and is preserved as historical context for the original network-daemon framing. New work should reference the task plan, not this section.
+> Phase A (security foundation: PSK + caps + identity + session
+> handshake), Phase B (audio capture migration to client), and Phase
+> C (submit/process/fetch IPC + server-side `JobQueue`) are all
+> complete. Phase D (client-side queueing + reconnect) and Phase E
+> (cleanup + schema split + binary slim + docs polish) remain — see
+> their dedicated sections below.
+>
+> For operator-facing detail see `docs/V2-DEPLOYMENT.md`,
+> `docs/ARCHITECTURE.md`, `docs/IPC-VERBS.md`,
+> `docs/IPC-WIRE-PROTOCOL.md`, and the strategic framing in
+> `docs/V2-STRATEGY.md`.
+>
+> The Phase 2 sketch below predates the V2 task and is preserved as
+> historical context for the original network-daemon framing. New
+> work references the V2 docs above, not this section.
 
 ### What it enables
 
@@ -263,6 +286,20 @@ watchdog kill. Detailed plan: `agentctx/tasks/postprocess-memory-containment.md`
 
 ## Phase 3: Multi-Client Session Management
 
+> **Status (2026-05, iter 156): foundation laid in V2 Phase C.** The
+> server-side `JobQueue` (three typed slots: postprocess, streaming,
+> model_download, each capacity-1, independent) plus per-client
+> `client_id` minting and `send_to_client` routing implement the
+> queue-shaped half of this phase out of the box: each client sees
+> only its own job completions, jobs are owned by the originating
+> `client_id`, and concurrent submissions from multiple clients
+> serialize through the typed slot rather than competing for a
+> singleton state variable. The remaining V3-shaped work
+> (per-client auth tokens, per-client quotas, admin role
+> distinction, true cross-session isolation) is deferred to v3.
+> The Phase 3 sketch below is preserved as the historical record
+> of the original framing.
+
 ### What it enables
 
 Multiple users on the network can each start independent recordings through their own tray clients, with the daemon managing concurrent sessions. Each client sees only its own session's progress, while an admin view shows all active work.
@@ -293,6 +330,131 @@ Multiple users on the network can each start independent recordings through thei
 - Is true concurrency (multiple simultaneous recordings) worth the complexity, or is a job queue sufficient? A queue is simpler and avoids hardware contention.
 - Should sessions survive daemon restarts? Persisting session state adds significant complexity.
 - How should monitor-source conflicts be handled when two sessions want the same audio?
+
+## V2 Phase D: Client-Side Queueing and Reconnect — PLANNED
+
+**Status: next on `feat/v2-thin-client` after the iter-156 stabilization
+waves complete.** Phase D makes the V2 tray robust against transient
+server unavailability — server restarts, network blips, daemon upgrades
+— without dropping work in flight or forcing the operator to remember
+what was queued.
+
+### What it enables
+
+The tray accepts recordings whether or not the daemon is reachable.
+Submissions buffer locally, drain in the background once the connection
+comes back, survive a tray restart, and present visible queue state in
+the tray UI. Operators can record across server restarts without losing
+WAVs and without having to re-issue submit calls by hand.
+
+### Technical delta
+
+- **In-memory submission queue.** A FIFO of pending `process.submit`
+  payloads (each tagged with a stable client-side submission UUID).
+  Drains in order against the current daemon endpoint.
+- **Drain worker with exponential backoff reconnect.** Background
+  thread reattempts the active connection on failure with capped
+  exponential backoff; when up, drains the queue head-first.
+- **Persistent `pending_jobs.json`.** `(endpoint, job_id,
+  submission_uuid, audio_path)` tuples written to disk under
+  `~/.local/share/recmeet-v2/client/pending_jobs.json` after a
+  successful submit; reloaded on tray startup so the tray re-attaches
+  to in-flight server-side jobs by `job_id` rather than re-submitting.
+- **Save-for-later WAV persistence across tray restart.** Captured
+  audio that has not yet been submitted (or has been queued behind a
+  prior submission) is staged under the client staging directory and
+  picked up on restart.
+- **Server-restart notification.** Tray observes connection drops and
+  posts a desktop notification (via dbus) so the operator knows when
+  a daemon-side restart happened mid-recording.
+- **Tray UI for queue depth + per-server view.** Status menu shows
+  pending submission count, currently-uploading item, and (in
+  multi-server configs) per-endpoint state.
+
+### Test surface
+
+Budget approximately 17 new tests covering: queue ordering, reconnect
+backoff curve, `pending_jobs.json` round-trip, job-id reattachment
+after restart, save-for-later staging, notification emission on drop,
+and queue-depth UI signals.
+
+## V2 Phase E: Cleanup, Schema Split, Binary Slim, Docs Polish — PLANNED
+
+**Status: final V2 pre-tag work.** Phase E covers the items deferred
+from earlier phases so that `v2.0.0` ships with a clean operator
+surface.
+
+### What it covers
+
+- **Config schema split.** Today's single `config.yaml` becomes
+  `daemon.yaml` (server-side keys: listen address/port, PSK,
+  connection caps, model paths, watchdog config) and `client.yaml`
+  (client-side keys: server endpoint, PSK, capture device, staging
+  dir, queue policy). Migration tool reads a V1 / single-file config
+  and emits the pair.
+- **Binary slimming.** With capture out of the daemon and `record.start`
+  removed, sweep for V1-only code paths still linked into either
+  binary. Add an `ldd` assertion on the slimmed tray so PipeWire /
+  PulseAudio / onnxruntime / sherpa / whisper / llama / ggml do not
+  creep back in.
+- **PSK handshake deadline.** Add `psk_deadline_ms` reaping in
+  `IpcServer`'s poll loop. Without it, an unauthenticated peer can
+  open a TCP connection, never send the PSK frame, and occupy a
+  `PendingPsk` slot until the connection cap is exhausted — a
+  slowloris-class resource exhaustion vector surfaced as
+  SUCCEED-with-INFO by the iter-156 Wave 2 tests.
+- **Binary-name finalization.** Decide on the `recmeet-server-daemon`
+  vs `recmeetd-server` vs `recmeet-srv` question deferred from
+  `docs/V2-STRATEGY.md` open-questions list, ship install scripts /
+  systemd units with the chosen names.
+- **MCP scope.** Decide whether `recmeet-mcp` is client-only or
+  splits into client + server halves (also deferred from
+  `V2-STRATEGY.md`).
+- **Docs polish.** Final sweep of `README.md`, `QUICKSTART.md`,
+  `docs/V2-DEPLOYMENT.md`, `docs/ARCHITECTURE.md`,
+  `docs/IPC-VERBS.md`, `docs/IPC-WIRE-PROTOCOL.md`,
+  `docs/COMPONENT-DIAGRAMS.md` for any drift accumulated during
+  Phase D.
+
+## Follow-ups
+
+### WebUI Live Captions — PLANNED (post-V1 follow-up)
+
+**Status: deferred, tracked in the project's task vault as
+`webui-live-captions`.** The V1 live-captioning capstone (iter 135)
+descoped the WebUI client from the original Phase 5 caption-rendering
+work; this task picks it back up. Surfacing live caption events in the
+WebUI is gated on V2 maintenance-branch policy — see
+`docs/V2-STRATEGY.md` "Backport policy" for whether the WebUI work
+lands on `v1-maintenance`, on `main` (V2), or as parallel ports.
+
+### PSK Handshake Deadline — PLANNED (Phase E candidate)
+
+**Status: filed as a Phase E candidate, may pull forward.** Wave 2 of
+the iter-156 V2 stabilization added a test that surfaces (as
+SUCCEED-with-INFO) the absence of a per-connection handshake deadline
+in the `IpcServer` poll loop. A peer that opens a TCP socket and never
+sends the PSK frame holds a `PendingPsk` slot indefinitely; combined
+with the connection cap, this is a slowloris-class resource exhaustion
+vector. Fix: add a `psk_deadline_ms` reaper that closes connections
+which have not completed the handshake within the configured window.
+
+## Current state (iter 156)
+
+- **V1 capstone** (live captioning, Phase 2b) shipped iter 135. V1
+  `v1.5.0` tag and the `v1-maintenance` branch cut remain pending the
+  V1 live-captions validation pass and any release-blocking polish.
+- **V2 Phases A + B + C** delivered across iterations 138-155 on
+  `feat/v2-thin-client`. The V2 wire protocol is stable
+  (`IPC_PROTOCOL_VERSION = 3`); the architectural-proof test
+  `test_v2_thin_client_e2e.cpp` passes end-to-end against the real
+  daemon binary over TCP.
+- **Iter 156 stabilization** in progress: CI workflow + V2 e2e test
+  (Wave 1, done); operator-facing docs rewrite (Wave 2, done); README
+  + QUICKSTART + V2-DEPLOYMENT (Wave 3, done); P2/P3 test additions
+  (Wave 4, in progress).
+- **`v2.0.0` tag** pending completion of Phase D, Phase E, and the
+  full V2 test sweep that lands with them.
 
 ## Cross-Cutting: Progress and Broadcast Enhancements
 

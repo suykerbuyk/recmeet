@@ -20,9 +20,19 @@ The result: full transcriptions with speaker labels, professionally structured s
 - **Summarizes** via cloud API (xAI/OpenAI/Anthropic — all OpenAI-compatible) or a local GGUF model via llama.cpp — your choice
 - **Outputs** timestamped transcripts, structured summaries, and meeting notes with YAML frontmatter (Obsidian-compatible)
 - **System tray applet** for point-and-click control from swaybar or any system tray
-- **Daemon architecture** — a background daemon owns all pipeline logic; the CLI and tray are thin IPC clients
+- **Thin-client / heavy-compute-server architecture (V2)** — the client (tray or CLI) captures audio locally; a daemon (local Unix socket or remote TCP with PSK auth) runs transcription, diarization, identification, and summarization. Standalone in-process mode (`--no-daemon`) is still fully supported for CLI users who don't want a daemon.
 - **MCP server** for IDE integration — exposes meeting data to Claude Code, Claude Desktop, and other MCP-compatible tools
 - **AI agent CLI** for pre-meeting prep and post-meeting follow-up — searches past meetings, drafts briefings, and generates follow-up communications using Claude
+
+## Architecture at a glance (V2)
+
+recmeet is a **thin-client / heavy-compute-server** system:
+
+- The **client** (tray applet or `recmeet` CLI) owns audio capture via the `recmeet_capture` library — PipeWire/PulseAudio live on the client host, not the daemon.
+- The **daemon** (`recmeet-daemon`) owns the heavy ML pipeline (transcribe, diarize, identify, summarize, stream-asr captions) and routes jobs through a typed `JobQueue` with three concurrency slots.
+- They communicate over **Unix socket** (default — local-only, trusted via kernel peer credentials) or **TCP with PSK auth** (`--listen host:port` + `RECMEET_AUTH_TOKEN` env var — for running the daemon on a separate machine).
+
+The standalone in-process path (`recmeet --no-daemon`) is also still supported — it runs the full pipeline directly, identical to the legacy single-process flow. See `docs/ARCHITECTURE.md` for the full V2 picture and `docs/IPC-VERBS.md` for the IPC verb reference.
 
 ## Quick start
 
@@ -62,23 +72,56 @@ make
 
 ### Run
 
-```bash
-# Quick test — standalone mode, mic only, no summary, no API key needed
-./build/recmeet --no-daemon --mic-only --no-summary --no-diarize --model tiny
+#### Local daemon mode (recommended for desktop use)
 
-# Full pipeline with cloud summarization (standalone)
+```bash
+# Start the daemon (Unix socket — default)
+./build/recmeet-daemon &
+
+# CLI: connects to the running daemon automatically
 export XAI_API_KEY=your-key-here
 ./build/recmeet --model base
 
-# Or use the daemon for persistent background operation
-./build/recmeet-daemon &              # start the daemon
-./build/recmeet --model base          # CLI auto-detects daemon and uses it
-./build/recmeet --status              # check daemon state
-./build/recmeet --stop                # stop a recording in progress
-
-# System tray applet (connects to daemon automatically)
+# Or use the system tray applet (also a daemon client)
 ./build/recmeet-tray
 
+# Daemon-control commands
+./build/recmeet --status              # query daemon state
+./build/recmeet --stop                # cancel a job in progress
+```
+
+#### Standalone mode (no daemon)
+
+```bash
+# Smoke test — no daemon, no API key, mic only
+./build/recmeet --no-daemon --mic-only --no-summary --no-diarize --model tiny
+
+# Full pipeline in-process
+export XAI_API_KEY=your-key-here
+./build/recmeet --no-daemon --model base
+```
+
+`--no-daemon` runs the entire pipeline in the CLI process, exactly as the legacy single-process build did. Use it when you don't want a daemon at all, or for one-off CLI work on a host where the daemon isn't installed.
+
+#### Remote daemon (V2 client/server over TCP)
+
+Run the daemon on one machine, drive it from another. The TCP listener **requires** PSK authentication via `RECMEET_AUTH_TOKEN`; the daemon fails to start without it.
+
+```bash
+# Server host (the box doing the heavy compute):
+export RECMEET_AUTH_TOKEN="$(openssl rand -hex 32)"
+./build/recmeet-daemon --listen 0.0.0.0:29991
+
+# Client host (your laptop):
+export RECMEET_AUTH_TOKEN="<same token as above>"
+./build/recmeet --daemon-addr server.lan:29991 --mic-only --model base
+```
+
+Do **not** expose the daemon TCP port directly to the public internet. The PSK gate is a fail-stop, not an encryption layer; put TLS (stunnel, an SSH tunnel, or a reverse proxy) in front if the traffic crosses untrusted networks. Unix-socket listeners bypass the PSK check because they're already gated by filesystem permissions and kernel peer credentials.
+
+#### Other handy commands
+
+```bash
 # Full pipeline with local LLM (no API key, no network)
 ./build/recmeet --model base \
     --llm-model ~/.local/share/recmeet/models/llama/Qwen2.5-7B-Instruct-Q4_K_M.gguf
@@ -86,11 +129,11 @@ export XAI_API_KEY=your-key-here
 # Reprocess an old recording with speaker diarization
 ./build/recmeet --reprocess meetings/2026-02-21_17-34/ --num-speakers 2
 
-# List available audio sources
+# List available audio sources (on the client host — the client owns capture)
 ./build/recmeet --list-sources
 ```
 
-See [QUICKSTART.md](QUICKSTART.md) for a step-by-step installation and usage guide.
+See [QUICKSTART.md](QUICKSTART.md) for a step-by-step installation and usage guide, including the full standalone / local-daemon / remote-server walkthroughs.
 
 ## How it works
 
@@ -99,7 +142,7 @@ Record ──► Transcribe ──► Diarize ──► Identify ──► Summa
 (PipeWire)  (whisper.cpp)  (sherpa-onnx) (voiceprint DB) (API/llama.cpp) (Markdown)
 ```
 
-1. **Record**: PipeWire captures the mic via `pw_stream`; PulseAudio's `pa_simple` captures the speaker monitor (`.monitor` sources are a PulseAudio abstraction that PipeWire doesn't reliably handle, especially over Bluetooth). Both streams are mixed in-process into a single WAV.
+1. **Record**: The **client** (tray or CLI) captures audio via the `recmeet_capture` library — PipeWire `pw_stream` for the mic and PulseAudio `pa_simple` for the speaker monitor (`.monitor` sources are a PulseAudio abstraction that PipeWire doesn't reliably handle, especially over Bluetooth). Both streams are mixed client-side into a single WAV; in daemon mode the WAV is then handed off to the daemon via `process.submit` (or live-streamed PCM via `process.stream` for captions). The daemon itself no longer links PipeWire or PulseAudio — only the client does.
 
 2. **Transcribe**: whisper.cpp runs locally on CPU, producing timestamped segments. Models are GGUF format, auto-downloaded from Hugging Face on first use (141 MB for `base`, up to 1.5 GB for `large-v3`). Vocabulary hints bias the decoder toward correct spellings of names and domain terms — enrolled speaker names are included automatically.
 
@@ -452,17 +495,21 @@ Options:
 ```
 Usage: recmeet-daemon [OPTIONS]
 
-Run the recmeet daemon (IPC server for CLI and tray clients).
+Run the recmeet daemon (V2 IPC server for CLI and tray clients).
+The daemon owns the heavy ML pipeline; clients own audio capture.
 
 Options:
   --socket PATH        Unix socket path (default: $XDG_RUNTIME_DIR/recmeet/daemon.sock)
-  --listen ADDRESS     Listen address: Unix socket path or host:port for TCP
+  --listen ADDRESS     Listen address: Unix path or host:port for TCP
+                       TCP requires RECMEET_AUTH_TOKEN (PSK auth, fail-stop)
   --log-level LEVEL    Log level: none, error, warn, info, debug (default: info)
   --log-dir DIR        Log file directory
   --log-retention HOURS  Hours of log history to keep (default: 4)
   -h, --help           Show this help
   -v, --version        Show version
 ```
+
+`--socket` and `--listen` are aliases — both accept a Unix path or `host:port`. Use `--listen 0.0.0.0:29991` together with `RECMEET_AUTH_TOKEN=<secret>` to run the daemon as a remote server.
 
 ## Configuration
 
@@ -656,14 +703,15 @@ From there, the project evolved through extensive iteration: doubling test cover
 
 ## Architecture
 
-Four C++ binaries share a common static library. The daemon owns all pipeline logic (audio capture, transcription, diarization, summarization). The CLI and tray are thin IPC clients that communicate via a Unix domain socket using newline-delimited JSON. Two additional Go binaries provide AI-powered tooling.
+Four C++ binaries share a common static library. The **client** binaries (CLI and tray) own audio capture; the **daemon** owns the heavy ML pipeline (transcribe, diarize, identify, summarize, stream-asr captions). They communicate over Unix socket or TCP using a framed wire protocol (NDJSON control frames plus binary upload / artifact / streaming-PCM frames). Two additional Go binaries provide AI-powered tooling.
 
 ```
-recmeet_core  (static library — 23 modules)
+recmeet_core     (static library — pipeline + IPC)
+recmeet_capture  (client-side capture library — PipeWire + PulseAudio)
     |
-    +-- recmeet-daemon  (daemon — pipeline + IPC server)
-    +-- recmeet         (CLI — dual-mode: IPC client or standalone)
-    +-- recmeet-tray    (system tray — IPC client, GTK3 + AppIndicator)
+    +-- recmeet-daemon  (daemon — pipeline + IPC server; does NOT link PipeWire/PulseAudio)
+    +-- recmeet         (CLI — dual-mode: thin daemon client or standalone in-process)
+    +-- recmeet-tray    (system tray — daemon client, GTK3 + AppIndicator)
     +-- recmeet_tests   (Catch2 test suite)
 
 tools/  (Go module — github.com/syketech/recmeet-tools)
@@ -675,25 +723,28 @@ tools/  (Go module — github.com/syketech/recmeet-tools)
 ### Daemon mode (recommended)
 
 ```
-recmeet-daemon              recmeet (CLI)           recmeet-tray
-      |                         |                        |
-  [pipeline]  <── IPC ──>  [thin client]  <── IPC ──>  [thin client]
-  [IPC server]             [auto-detect]              [GTK + g_io_watch]
-      |
-  Unix socket: $XDG_RUNTIME_DIR/recmeet/daemon.sock
+recmeet-tray / recmeet (CLI)                 recmeet-daemon
+        |                                          |
+   [capture]                                   [JobQueue: 3 typed slots]
+   (PipeWire / PulseAudio)  ── IPC ──►   [transcribe | diarize | summarize]
+        |                                          |
+   process.submit / process.stream         stream-asr, voiceprint match
+        |                                          |
+   Transport: Unix socket  (default, local-only)
+              TCP + PSK    (--listen / --daemon-addr, RECMEET_AUTH_TOKEN)
 ```
 
-The CLI auto-detects a running daemon and operates as a client. Use `--no-daemon` to force standalone mode (the CLI runs the full pipeline directly, as in previous versions). The tray connects to the daemon and reconnects automatically with exponential backoff if the daemon restarts.
+The CLI auto-detects a running daemon and operates as a client. Use `--no-daemon` to force standalone in-process mode. The tray connects to the daemon and reconnects automatically with exponential backoff if the daemon restarts. A per-client `session.init` handshake carries credentials and per-session preferences (provider, model, language, etc.) so a single daemon can serve multiple clients with different settings.
 
-### IPC protocol
+### IPC protocol (V2)
 
-- **Transport**: Unix domain socket
-- **Wire format**: Newline-delimited JSON (NDJSON)
-- **Transports**: Unix domain socket (default) or TCP — selected via `--listen`/`--daemon-addr`
-- **Methods**: `record.start`, `record.stop`, `status.get`, `config.update`, `config.reload`, `sources.list`, `models.list`, `models.ensure`, `models.update`
-- **Events** (server push): `phase`, `progress`, `state.changed`, `job.complete`, `model.downloading`
+- **Wire format**: Framed binary protocol — 0x00 NDJSON control, 0x01 binary upload (client→daemon), 0x02 binary artifact (daemon→client), 0x03 streaming PCM (client→daemon, used for live captions). `IPC_PROTOCOL_VERSION = 3`.
+- **Transports**: Unix domain socket (default, local-only, kernel-peer-cred trusted) or TCP (`--listen host:port` + `RECMEET_AUTH_TOKEN`; daemon fail-stops without PSK on TCP).
+- **Core verbs**: `session.init`, `session.update_credentials`, `session.update_prefs`, `process.submit`, `process.fetch`, `process.cancel`, `process.stream` / `process.stream.commit` / `process.stream.cancel`, `process.submit.cancel`, `job.status`, `job.list`, `enroll.finalize`, `auth.ok`, plus the unchanged `status.get`, `config.update`, `config.reload`, `models.list`, `models.ensure`, `models.update`.
+- **Removed in V2** (gone in C.9): `record.start`, `record.stop`, `job.context`, `sources.list` — capture moved to the client, source enumeration is a client-local operation.
+- **Events** (server push): `phase`, `progress`, `state.changed`, `job.complete`, `model.downloading`, `caption` (routed per-client).
 
-See [BUILD.md](BUILD.md) for a detailed build system tutorial.
+See [docs/IPC-VERBS.md](docs/IPC-VERBS.md) for the per-verb reference (request/response shapes, error codes, framing rules) and [docs/IPC-WIRE-PROTOCOL.md](docs/IPC-WIRE-PROTOCOL.md) for the framing-level details. See [BUILD.md](BUILD.md) for a detailed build system tutorial.
 
 ## MCP server
 

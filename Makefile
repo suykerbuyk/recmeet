@@ -66,7 +66,7 @@ endif
 endif
 
 # ── Targets ─────────────────────────────────────────────────────────
-.PHONY: build build-onnxruntime test integration integration-cxx integration-go integration-go-coverage integration-t2-1 benchmark full-stack install uninstall package-deb package-rpm package-arch clean coverage help daemon-start daemon-stop daemon-status ensure-submodules
+.PHONY: build build-onnxruntime test integration integration-cxx integration-go integration-go-coverage integration-t2-1 integration-e2e benchmark full-stack install uninstall package-deb package-rpm package-arch clean coverage help daemon-start daemon-stop daemon-status ensure-submodules
 
 # Idempotent submodule populate. Triggered as a prerequisite of every target
 # that runs CMake, so a fresh `git clone` (without --recurse-submodules) or a
@@ -127,6 +127,19 @@ integration-t2-1: ensure-submodules
 	ninja -C $(BUILD_DIR)
 	systemd-run --user --scope -p MemoryMax=8G -p MemorySwapMax=0 \
 	    ./$(BUILD_DIR)/recmeet_tests "[integration][t2-1]"
+
+# V2 thin-client end-to-end gate: forks the real recmeet-daemon binary on
+# 127.0.0.1:29991, sends process.submit + 0x01 upload over TCP with PSK
+# auth, polls job.list, fetches results, validates artifacts. The single
+# automated proof that the V2 thin-client architecture works as a whole
+# system. Models (whisper base, sherpa diarization, VAD) are pre-fetched
+# via `recmeet --download-models` so the test itself can avoid the
+# network round-trip; subsequent runs hit the local cache.
+integration-e2e: ensure-submodules
+	cmake -B $(BUILD_DIR) -G Ninja $(CMAKE_OPTS) -DRECMEET_BUILD_TESTS=ON
+	ninja -C $(BUILD_DIR)
+	./$(BUILD_DIR)/recmeet --download-models --model base
+	./$(BUILD_DIR)/recmeet_tests "[e2e]"
 
 benchmark: ensure-submodules
 	cmake -B $(BUILD_DIR) -G Ninja $(CMAKE_OPTS) -DRECMEET_BUILD_TESTS=ON
@@ -256,6 +269,7 @@ help:
 	@echo "  make integration-go    Run only the Go-tools integration suite (build-tag opt-in)"
 	@echo "  make integration-go-coverage  Re-run Go integration suite under GOCOVERDIR and report binary coverage"
 	@echo "  make integration-t2-1  T2.3 chunked-diarize gate under MemoryMax=8G cgroup"
+	@echo "  make integration-e2e   V2 thin-client gate: real daemon over TCP + PSK"
 	@echo "  make benchmark     Build + run benchmark tests"
 	@echo "  make full-stack    Build + run end-to-end pipeline tests"
 	@echo "  make install       Build + install to PREFIX (default: ~/.local)"

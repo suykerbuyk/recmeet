@@ -2,6 +2,18 @@
 
 Step-by-step guide to installing, configuring, and using recmeet.
 
+## V2 architecture at a glance
+
+recmeet is a **thin-client / heavy-compute-server** system. The client (tray or CLI) captures audio locally via PipeWire/PulseAudio. The daemon (`recmeet-daemon`) does the heavy ML work — transcription, diarization, speaker identification, summarization, and streaming live captions. Clients talk to the daemon over a Unix socket (default, local-only) or TCP (`--listen` / `--daemon-addr` with PSK auth, for running the daemon on a separate machine).
+
+Three operating modes are supported, in order of increasing setup cost:
+
+1. **Standalone mode** — `recmeet --no-daemon` runs the entire pipeline in the CLI process. No daemon, no IPC, no setup. Same flags as the legacy single-process build.
+2. **Local daemon mode** — start `recmeet-daemon` (or use the systemd user unit) and let the tray / CLI auto-connect to its Unix socket. This is the default for desktop users.
+3. **Remote server mode** — run `recmeet-daemon --listen 0.0.0.0:29991` on a beefy machine, connect from your laptop with `recmeet --daemon-addr server:29991`. Requires a PSK (`RECMEET_AUTH_TOKEN`) and is intended for trusted networks only.
+
+Sections 3–6 walk through each of these flows. For the architecture in detail, see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md); for multi-host deployment recipes, see [docs/V2-DEPLOYMENT.md](docs/V2-DEPLOYMENT.md); for the IPC verb reference, see [docs/IPC-VERBS.md](docs/IPC-VERBS.md).
+
 ## 1. Install dependencies
 
 ### Arch Linux
@@ -51,20 +63,26 @@ This produces four C++ binaries in `build/`:
 | `recmeet-mcp` | MCP server (exposes meeting data to AI tools) |
 | `recmeet-agent` | AI agent CLI (meeting prep + follow-up) |
 
-## 3. First recording (standalone, no setup needed)
+## 3. Mode A — Standalone (no daemon, fastest smoke test)
 
-The simplest way to verify everything works — no daemon, no API key:
+The simplest way to verify everything works — no daemon, no IPC, no API key:
 
 ```bash
 ./build/recmeet --no-daemon --mic-only --no-summary --no-diarize --model tiny
-# Speak into your mic, then press Ctrl+C to stop
+# Speak into your mic, then press Ctrl+C to stop.
 ```
 
-Output appears in `meetings/<timestamp>/`.
+Output appears in `meetings/<timestamp>/`. The `--no-daemon` flag tells the CLI to skip daemon detection and run the entire pipeline (capture + transcribe + diarize + summarize) inside the CLI process. This is the legacy single-process flow and remains fully supported in V2.
 
-## 4. Set up the daemon
+Use standalone mode when:
 
-The daemon is the recommended way to run recmeet. It manages the full pipeline in the background while the CLI and tray act as lightweight clients.
+- You don't want a daemon at all.
+- You're on a host where the daemon isn't installed.
+- You're scripting one-off CLI work and don't want shared state.
+
+## 4. Mode B — Local daemon (recommended for desktop use)
+
+The local daemon is the default desktop experience. It runs in the background, exposes a Unix socket at `$XDG_RUNTIME_DIR/recmeet/daemon.sock`, and serves the tray and CLI as thin clients. The daemon owns the heavy ML pipeline; the client owns audio capture.
 
 ### Start manually
 
@@ -87,7 +105,69 @@ recmeet --status
 # Output: Daemon: running / State: idle
 ```
 
-## 5. Configure summarization
+The CLI auto-detects the running daemon. The first command the client sends after connecting is `session.init`, which carries credentials and per-session preferences (provider, model, language, etc.) — so a single daemon can serve multiple clients with different settings.
+
+## 5. Mode C — Remote daemon (V2 client/server over TCP)
+
+V2 lets you run the daemon on one machine and the client(s) on another. Useful when you have a beefy desktop or server doing the heavy ML work and want to drive it from a laptop. **TCP listeners require PSK auth**; the daemon fail-stops if you start it on a TCP address without `RECMEET_AUTH_TOKEN` set.
+
+### Generate a shared secret
+
+```bash
+openssl rand -hex 32
+# 7c2f9a... (paste into both env vars below)
+```
+
+### Server host
+
+```bash
+export RECMEET_AUTH_TOKEN="7c2f9a..."        # same secret on both sides
+./build/recmeet-daemon --listen 0.0.0.0:29991
+# recmeet-daemon: PSK auth enabled for TCP listener
+# recmeet-daemon listening on 0.0.0.0:29991
+```
+
+To run under systemd, drop the token into an EnvironmentFile readable only by your user:
+
+```bash
+mkdir -p ~/.config/systemd/user/recmeet-daemon.service.d
+cat >~/.config/systemd/user/recmeet-daemon.service.d/listen.conf <<'EOF'
+[Service]
+Environment=RECMEET_AUTH_TOKEN=7c2f9a...
+ExecStart=
+ExecStart=/usr/local/bin/recmeet-daemon --listen 0.0.0.0:29991
+EOF
+systemctl --user daemon-reload
+systemctl --user restart recmeet-daemon.service
+```
+
+### Client host
+
+```bash
+export RECMEET_AUTH_TOKEN="7c2f9a..."        # same secret as the server
+recmeet --daemon-addr server.lan:29991 --mic-only --model base
+```
+
+Or, set the daemon address in your shell environment so every `recmeet` invocation picks it up automatically:
+
+```bash
+export RECMEET_DAEMON_ADDR=server.lan:29991
+```
+
+There is no client-side config-file knob for this today; use either `--daemon-addr` per-invocation or `RECMEET_DAEMON_ADDR` in your shell profile.
+
+Audio capture still happens **on the client host** — the daemon never opens PipeWire or PulseAudio. The raw WAV (or live PCM frames, for streaming captions) is uploaded over the IPC connection.
+
+### Security caveats
+
+- **Do not expose the daemon TCP port to the public internet.** The PSK gate is a fail-stop, not an encryption layer; the framed wire is plaintext NDJSON + binary blobs.
+- For traffic crossing untrusted networks, put TLS in front (stunnel, an SSH `LocalForward`, a reverse proxy, or a WireGuard tunnel).
+- Unix-socket listeners (the default) bypass the PSK check — they're already gated by filesystem permissions and kernel peer credentials.
+- Keep `RECMEET_AUTH_TOKEN` out of shell history; use an EnvironmentFile (mode 0600) or a secret manager.
+
+See [docs/V2-DEPLOYMENT.md](docs/V2-DEPLOYMENT.md) for full multi-host deployment recipes, including TLS-fronted setups and systemd templates.
+
+## 6. Configure summarization
 
 recmeet supports three cloud API providers (xAI, OpenAI, Anthropic) and local LLM summarization. Pick one.
 
@@ -136,7 +216,9 @@ recmeet --llm-model ~/.local/share/recmeet/models/llama/Qwen2.5-7B-Instruct-Q4_K
 recmeet --no-summary
 ```
 
-## 6. Record a meeting
+## 7. Record a meeting
+
+The recording flow looks the same from the user's seat regardless of which mode you're in. Under the hood, daemon-mode clients capture audio locally and hand the WAV (or live PCM stream) to the daemon via `process.submit` / `process.stream`; standalone mode runs the pipeline in-process.
 
 ### Via CLI (with daemon running)
 
@@ -146,7 +228,7 @@ recmeet --model base
 # Phases print as they happen: recording → transcribing → diarizing → summarizing → complete
 ```
 
-The CLI auto-detects the daemon. If the daemon isn't running, it falls back to standalone mode.
+The CLI auto-detects the daemon. If the daemon isn't running, it falls back to standalone mode (unless you pass `--daemon`, which makes daemon presence required).
 
 ### Via tray applet
 
@@ -154,12 +236,19 @@ The CLI auto-detects the daemon. If the daemon isn't running, it falls back to s
 recmeet-tray                          # or: systemctl --user start recmeet-tray.service
 ```
 
-Click the tray icon, select **Record** to start, **Stop Recording** to finish. The tray connects to the daemon and shows status updates in real time.
+Click the tray icon, select **Record** to start, **Stop Recording** to finish. The tray connects to the daemon and shows status updates in real time. The tray is always a client — it does not have a standalone mode.
 
 ### Force standalone mode (no daemon)
 
 ```bash
 recmeet --no-daemon --model base
+```
+
+### Point the CLI at a remote daemon
+
+```bash
+export RECMEET_AUTH_TOKEN="<shared PSK>"
+recmeet --daemon-addr server.lan:29991 --model base
 ```
 
 ### Enable live captions (optional)
@@ -168,6 +257,12 @@ Live captions are an opt-in feature — they consume CPU that some users
 want reserved. Captions display in real time during recording and are
 saved as a `.vtt` sidecar; the post-recording batch transcript remains
 the authoritative record.
+
+In daemon mode, the client streams raw PCM frames (0x03 streaming
+frames) to the daemon via `process.stream`; the daemon's stream-asr
+engine emits routed `caption` events back over the IPC connection. In
+standalone mode, the same engine runs in-process. The UX — toggle the
+tray menu item or pass `--show-captions` — is identical.
 
 **1. First-time setup — download the streaming model**
 
@@ -235,7 +330,7 @@ Sherpa-OFF builds compile but `--show-captions` is a no-op (the engine
 emits a one-shot degraded event and recording continues without
 captions).
 
-## 7. View output
+## 8. View output
 
 Each recording creates a directory under `meetings/`:
 
@@ -254,7 +349,7 @@ The meeting note contains:
 - Summary with action items
 - Full timestamped transcript with speaker labels (enrolled speakers use real names)
 
-## 8. Configuration file
+## 9. Configuration file
 
 All CLI options can be set in `~/.config/recmeet/config.yaml`:
 
@@ -321,7 +416,7 @@ CLI flags override config file values. The daemon reloads config on `SIGHUP`:
 kill -HUP $(pidof recmeet-daemon)
 ```
 
-## 9. Daemon management
+## 10. Daemon management
 
 ### Makefile shortcuts
 
@@ -334,11 +429,23 @@ make daemon-status       # query daemon status
 ### CLI commands
 
 ```bash
-recmeet --status         # show daemon state (idle/recording/postprocessing)
-recmeet --stop           # stop a recording in progress
-recmeet --daemon         # force client mode (fail if no daemon)
-recmeet --no-daemon      # force standalone mode (ignore daemon)
+recmeet --status                      # show daemon state (idle/recording/postprocessing)
+recmeet --stop                        # cancel a job in progress
+recmeet --daemon                      # force client mode (fail if no daemon)
+recmeet --no-daemon                   # force standalone mode (ignore daemon)
+recmeet --daemon-addr host:port       # point at a remote daemon (TCP, requires RECMEET_AUTH_TOKEN)
+recmeet --daemon-addr /path/to/sock   # point at a non-default Unix socket
 ```
+
+### Listen address (daemon side)
+
+```bash
+recmeet-daemon                                       # default: $XDG_RUNTIME_DIR/recmeet/daemon.sock
+recmeet-daemon --listen /tmp/recmeet.sock            # custom Unix path
+RECMEET_AUTH_TOKEN=<secret> recmeet-daemon --listen 0.0.0.0:29991   # TCP (PSK required)
+```
+
+TCP listeners fail-stop without `RECMEET_AUTH_TOKEN`. Unix-socket listeners bypass the PSK check (they're already gated by filesystem permissions and kernel peer credentials).
 
 ### systemd
 
@@ -356,7 +463,7 @@ systemctl --user enable --now recmeet-daemon.socket
 journalctl --user -u recmeet-daemon.service -f
 ```
 
-## 10. Model management
+## 11. Model management
 
 Models (whisper, sherpa-onnx, VAD) are auto-downloaded on first use. You can also manage them explicitly.
 
@@ -380,7 +487,7 @@ Re-downloads all currently cached models to get the latest versions.
 
 The tray auto-downloads models when you select a new whisper model from the menu. Use the **Update Models** menu item to re-download all cached models.
 
-## 11. Speaker identification
+## 12. Speaker identification
 
 recmeet can recognize recurring participants across meetings by matching their voice against enrolled voiceprints. Once enrolled, speakers get their real names in transcripts instead of generic `Speaker_01` labels.
 
@@ -447,7 +554,7 @@ recmeet --speaker-threshold 0.7            # stricter matching
 recmeet --speaker-db /path/to/speakers/    # custom database location
 ```
 
-## 12. Vocabulary hints (transcription accuracy)
+## 13. Vocabulary hints (transcription accuracy)
 
 Whisper can mangle unusual names and domain-specific terms. Vocabulary hints bias the transcription decoder toward correct spellings. Enrolled speaker names are included automatically — no configuration needed for names you've already enrolled.
 
@@ -500,7 +607,7 @@ transcription:
 
 Enrolled speaker names are always included alongside vocabulary hints — you don't need to add them manually. The combined list is passed to whisper's `initial_prompt` parameter, which biases the decoder toward the specified tokens.
 
-## 13. MCP server (IDE integration)
+## 14. MCP server (IDE integration)
 
 The MCP server lets AI tools (Claude Code, Claude Desktop, Cursor) query your meeting data directly.
 
@@ -537,7 +644,7 @@ For Claude Code, add to `~/.claude.json`:
 
 Once configured, ask your AI tool: "What action items came out of last week's meetings?" or "Search my meetings about the auth migration."
 
-## 14. AI agent (meeting prep + follow-up)
+## 15. AI agent (meeting prep + follow-up)
 
 The agent CLI uses Claude to automate pre-meeting research and post-meeting follow-up.
 
@@ -584,7 +691,7 @@ The agent reads the meeting note, classifies action items by assignee, and draft
 --dry-run         # Print prompts without calling the API
 ```
 
-## 15. Common workflows
+## 16. Common workflows
 
 ### Record with specific audio sources
 

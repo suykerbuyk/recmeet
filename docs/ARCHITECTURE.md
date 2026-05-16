@@ -2,36 +2,41 @@
 
 ## Purpose
 
-Recmeet records, transcribes, and summarizes meetings entirely on-device. Audio is captured via PipeWire/PulseAudio, transcribed with whisper.cpp, optionally diarized with sherpa-onnx, identified against enrolled voiceprints, and summarized either locally (llama.cpp) or through a cloud API. Everything runs on the user's machine — no audio or transcript data leaves the system unless the user explicitly configures a cloud summarization provider.
+Recmeet records, transcribes, and summarizes meetings entirely on-device. The system is split into a **thin client** (tray or CLI) that owns local audio capture and a **headless daemon** that owns heavy compute — transcription with whisper.cpp, diarization with sherpa-onnx, voiceprint identification, and summarization (local llama.cpp or a cloud API). The client streams or uploads audio to the daemon over a framed IPC transport; the daemon enqueues postprocess work in a typed-slot `JobQueue`, processes it in a subprocess for memory containment, and emits routed events back to the originating client. Everything runs on the user's machine unless a cloud summarization provider is configured.
 
-The system ships as three cooperating C++ binaries connected by a Unix socket IPC layer, plus a static library that contains all shared logic. Two additional Go binaries provide AI-powered meeting tooling — an MCP server for IDE integration and an agent CLI for automated meeting prep and follow-up.
+Two additional Go binaries provide AI-powered tooling — an MCP server for IDE integration and an agent CLI for automated meeting prep and follow-up. They read meeting artifacts directly from disk and are unaffected by IPC changes.
 
 ## High-Level Architecture
 
 ```mermaid
 graph TD
-    CLI["recmeet<br/>(CLI)"]
-    DAEMON["recmeet-daemon<br/>(IPC server)"]
+    CLI["recmeet<br/>(CLI, client or standalone)"]
     TRAY["recmeet-tray<br/>(system tray)"]
-    CORE["recmeet_core<br/>(static library)"]
-    SOCK["Unix socket<br/>$XDG_RUNTIME_DIR/recmeet/daemon.sock"]
+    DAEMON["recmeet-daemon<br/>(headless compute server)"]
+    LISTEN["Unix socket OR<br/>TCP host:port<br/>(framed wire protocol)"]
+    CAPTURE["recmeet_capture<br/>(PipeWire / PulseAudio,<br/>client-only)"]
+    CORE["recmeet_core<br/>(ML pipeline,<br/>daemon + standalone CLI)"]
+    LIVECAP["recmeet_live_capture<br/>(standalone CLI only)"]
     MCP["recmeet-mcp<br/>(MCP server)"]
     AGENT["recmeet-agent<br/>(AI agent CLI)"]
+    WEB["recmeet-web<br/>(REST + browser UI)"]
     MDATA["meetingdata<br/>(Go library)"]
 
-    CLI -->|standalone| CORE
-    CLI -->|client mode| SOCK
-    TRAY --> SOCK
-    SOCK --> DAEMON
+    TRAY --> CAPTURE
+    TRAY --> LISTEN
+    CLI -->|--no-daemon| LIVECAP
+    LIVECAP --> CAPTURE
+    LIVECAP --> CORE
+    CLI -->|client mode| LISTEN
+    LISTEN --> DAEMON
     DAEMON --> CORE
 
-    CORE --> PW["PipeWire"]
-    CORE --> PA["PulseAudio"]
     CORE --> WHISPER["whisper.cpp"]
     CORE --> LLAMA["llama.cpp"]
     CORE --> SHERPA["sherpa-onnx"]
     CORE --> API["Cloud API<br/>(xAI / OpenAI / Anthropic)"]
 
+    WEB --> CORE
     MCP --> MDATA
     AGENT --> MDATA
     AGENT --> CLAUDE["Anthropic API<br/>(Claude)"]
@@ -41,23 +46,41 @@ graph TD
     MDATA -->|reads| CFG["config.yaml"]
 ```
 
+Key V2 facts the diagram encodes:
+
+- **Audio capture is client-side.** Only the tray, the standalone CLI, and the `recmeet_live_capture` shim link `recmeet_capture` (which holds the PipeWire / PulseAudio surface). The daemon does **not** link PipeWire or PulseAudio — verify with `ldd build/recmeet-daemon | grep -E 'pipewire|pulse'` (expect no hits). See `CMakeLists.txt:251-265` (capture lib) and `CMakeLists.txt:357-361` (daemon target).
+- **Two transports, one wire format.** The daemon's `--listen` flag accepts either a Unix socket path or a `host:port`. TCP listeners require `RECMEET_AUTH_TOKEN` at startup and a PSK handshake per connection; Unix listeners rely on kernel peer credentials.
+- **Standalone CLI still works.** `recmeet --no-daemon` runs `run_recording()` + `run_postprocessing()` in-process via `recmeet_live_capture`. This is unchanged from V1 and is the only path that touches both capture and ML pipeline in the same address space.
+
 ## Build System and Binary Topology
 
-CMake builds one static library (`recmeet_core`) from all shared sources, then links it into three C++ executables. Two additional Go binaries are also built by `make build`.
+CMake builds four static libraries — `recmeet_ipc`, `recmeet_capture`, `recmeet_core`, and `recmeet_live_capture` — and links them into the C++ executables in a deliberately layered way. The split exists so the daemon never has to link audio-stack dependencies and the IPC surface never has to link ML dependencies.
 
-| Target | Language | Source | Extra deps | Feature-gated |
-|---|---|---|---|---|
-| `recmeet` | C++ | `src/main.cpp` | — | — |
-| `recmeet-daemon` | C++ | `src/daemon.cpp` | — | — |
-| `recmeet-tray` | C++ | `src/tray.cpp` | GTK3, ayatana-appindicator3 | `RECMEET_BUILD_TRAY` |
-| `recmeet-mcp` | Go | `tools/cmd/recmeet-mcp/main.go` | mcp-go | — |
-| `recmeet-agent` | Go | `tools/cmd/recmeet-agent/main.go` | anthropic-sdk-go, cobra | — |
+| Library | Source | Holds | Links |
+|---|---|---|---|
+| `recmeet_ipc` | `src/ipc_*`, `src/config*`, `src/session_merge.cpp`, `src/fetch_artifacts.cpp` | Wire protocol, framing, session-credential merge, artifact enumeration | Threads, CURL, (libnotify) |
+| `recmeet_capture` | `src/audio_capture.cpp`, `src/audio_monitor.cpp`, `src/device_enum.cpp`, `src/tray_capture.cpp` | PipeWire + PulseAudio capture, source enumeration, tray's fan-out shim | `recmeet_ipc`, PIPEWIRE, PULSE, PULSE_SIMPLE, SNDFILE |
+| `recmeet_core` | ML pipeline (`pipeline.cpp`, `transcribe.cpp`, `diarize.cpp`, `summarize.cpp`, `note.cpp`, `speaker_id.cpp`, `vad.cpp`, `caption_engine.cpp`), plus C.7 `job_queue.cpp`, C.10a `streaming_session.cpp`, C.2 `upload_session.cpp`, C.8 `diarization_cache.cpp` | Postprocess pipeline, server-side JobQueue, server-side upload + streaming session managers, diarization cache | `recmeet_ipc`, SNDFILE, whisper, (llama), (sherpa) |
+| `recmeet_live_capture` | `src/live_recording.cpp`, `src/reprocess_batch.cpp` | `run_recording()` / `run_pipeline()` for the standalone CLI; batch reprocess driver | `recmeet_core`, `recmeet_capture` |
+
+| Executable | Source | Links | Feature-gated |
+|---|---|---|---|
+| `recmeet` (CLI) | `src/main.cpp` | `recmeet_core`, `recmeet_live_capture` | — |
+| `recmeet-daemon` | `src/daemon.cpp` | `recmeet_core` only (no capture, no PipeWire/Pulse) | — |
+| `recmeet-tray` | `src/tray.cpp` | `recmeet_ipc`, `recmeet_capture`, SNDFILE, GTK3, ayatana-appindicator3 | `RECMEET_BUILD_TRAY` |
+| `recmeet-web` | `src/web.cpp` + cpp-httplib | `recmeet_core` | `RECMEET_BUILD_WEB` |
+| `recmeet-mcp` | `tools/cmd/recmeet-mcp/main.go` | mcp-go | — |
+| `recmeet-agent` | `tools/cmd/recmeet-agent/main.go` | anthropic-sdk-go, cobra | — |
+
+The daemon-side `streaming_session.cpp` lives in `recmeet_core` (not in `recmeet_capture`) because it composes `caption_engine` + `job_queue` and consumes network `0x03` audio frames — it never touches the local audio stack. See `CMakeLists.txt:315-321`.
 
 ### Feature flags (CMake options)
 
 | Flag | Default | Effect |
 |---|---|---|
 | `RECMEET_BUILD_TRAY` | ON | Build `recmeet-tray` |
+| `RECMEET_BUILD_WEB` | ON | Build `recmeet-web` |
+| `RECMEET_BUILD_GO_TOOLS` | ON | Build the Go MCP server + agent CLI |
 | `RECMEET_USE_LLAMA` | ON | Link llama.cpp for local summarization |
 | `RECMEET_USE_SHERPA` | ON | Link sherpa-onnx for diarization + VAD |
 | `RECMEET_USE_NOTIFY` | ON | Link libnotify for desktop notifications |
@@ -77,8 +100,8 @@ CMake builds one static library (`recmeet_core`) from all shared sources, then l
 
 The CLI operates in one of two modes, selected at startup:
 
-1. **Client mode** — sends IPC requests to a running daemon.
-2. **Standalone mode** — runs the full pipeline in-process (original single-binary behavior).
+1. **Client mode** — sends IPC requests to a running daemon over the framed wire protocol (Unix socket or TCP).
+2. **Standalone mode** — runs the full pipeline in-process via `recmeet_live_capture` (`src/live_recording.cpp`). This is the only path that records audio and runs the ML pipeline in the same address space.
 
 ### Mode selection logic
 
@@ -89,50 +112,114 @@ if --status or --stop   → client mode (always)
 else (auto)             → client mode if daemon_running(), otherwise standalone
 ```
 
-In client mode, the CLI sends `record.start` with config overrides, installs a SIGINT handler that sends `record.stop`, and blocks on `read_events("job.complete")` until the daemon reports completion.
+In **client mode**, the CLI:
 
-In standalone mode, the CLI runs `run_pipeline()` directly — model validation, audio capture, transcription, and summarization all happen in the same process.
+1. Opens the IPC connection and, for TCP, sends the PSK auth frame; reads back `auth.ok` and stamps `client_id` + `protocol_version` (must equal `IPC_PROTOCOL_VERSION = 3`).
+2. Sends `session.init` to populate the per-client credential + preference slot.
+3. For a file-based postprocess (e.g. `--reprocess <dir>`): sends `process.submit { mode: "transcribe", audio_size, format, ... }`, receives `{ job_id, upload_token, max_size }`, streams the audio as `0x01` BinaryUpload frames, then polls `job.status` or watches `progress.job` events for the returned `job_id`. When the job reaches `done`, the client sends `process.fetch { job_id }` and receives a metadata NDJSON response followed by one `0x02` BinaryArtifact frame per artifact.
+4. SIGINT cancels the active job via `process.cancel { job_id }` rather than the V1 `record.stop`.
+
+In **standalone mode**, the CLI runs `run_pipeline()` directly — model validation, PipeWire/PulseAudio capture, transcription, diarization, identification, and summarization all happen in this process. The daemon-side path is irrelevant; this is the same code that postprocess subprocesses run when invoked via `recmeet --subprocess-mode <config.json>`.
 
 ## Binary: `recmeet-daemon`
 
 **Source:** `src/daemon.cpp`
 
-A long-running IPC server that owns the recording pipeline. Designed for headless or always-on operation under systemd.
+A long-running compute server. Does **not** capture audio. Designed for headless or always-on operation under systemd. The daemon's whole job is to accept upload / stream / fetch / cancel verbs from one or more authenticated clients and run the postprocess pipeline on their audio.
 
-### State machine
+### Invocation
 
-The daemon tracks state via three independent atomic flags rather than a single enum, so one workload class can begin while another finishes:
+```
+recmeet-daemon --listen <addr> [--log-level ...] [--log-dir ...]
+```
 
-| Flag | Set when | Cleared when |
-|---|---|---|
-| `g_recording` | Live audio capture is running | Capture worker exits |
-| `g_postprocessing` | Postprocess subprocess is alive | Subprocess exits and `waitpid` returns |
-| `g_downloading` | A model download is in progress | Download worker finishes or fails |
+`<addr>` is parsed by `parse_ipc_address()` (`src/ipc_protocol.cpp`) — heuristic: digits-after-last-colon in `1..65535` means TCP `host:port`, anything else is a Unix socket path. The legacy `--socket` flag is a synonym.
 
-`composite_state_name()` (`src/daemon.cpp:101`) projects the live flags into the wire-protocol state string broadcast on `state.changed` events. Possible values include `idle`, `recording`, `postprocessing`, `reprocessing`, `downloading`, `recording+postprocessing`, and `reprocessing+postprocessing`. The `reprocessing` distinction is set when `g_postprocessing` is active for a `--reprocess` or `--reprocess-batch` job (no live capture); a CLI/tray-initiated live recording produces plain `recording` or the composite `recording+postprocessing` if a previous reprocess is still wrapping up.
+**TCP fail-stop.** If `<addr>` parses as TCP and `RECMEET_AUTH_TOKEN` is unset, the daemon refuses to start (`src/daemon.cpp:1485-1496`). There is no warn-and-continue — exposing the compute surface to the network without a PSK is unacceptable.
 
-State transitions guard the multi-flag mutations under `g_state_mu`. The end-of-recording handoff to postprocessing flips both `g_recording=false` and `g_postprocessing=true` atomically inside the lock, with no `state.changed` broadcast emitted between the two writes — clients see exactly one transition. The `record.start` admission guard checks `g_recording || g_downloading` (NOT `g_postprocessing`), so a new live recording can begin while a previous reprocess is still postprocessing — that's the concurrent-jobs case.
+### Job queue (the core concurrency mechanism)
+
+The pre-V2 model of three loose atomics (`g_recording` / `g_postprocessing` / `g_downloading`) guarding a single FIFO is gone. Phase C.7 replaced it with `JobQueue` (`src/job_queue.h:142`), a typed-slot scheduler with three independent capacity-1 slots:
+
+| Slot | Capacity | Drains via | Holds |
+|---|---|---|---|
+| `Postprocess` | 1 | `pp_worker_loop` (single thread that fork+execs `recmeet --subprocess-mode` per job) | One transcribe / diarize / summarize job |
+| `Streaming` | 1 | `stream_worker_loop` + the poll-thread `0x03` frame feed | One live caption + buffered streaming session |
+| `ModelDownload` | 1 | `dl_worker` | One whisper / sherpa / llama model fetch |
+
+The slots are **independent**: a postprocess job, a streaming session, and a model download can all be running simultaneously. Two postprocess submissions queue serially behind the postprocess slot's running marker. The single `JobQueue::mu_` mutex (`src/job_queue.cpp`) is the direct successor of the V1 `g_state_mu` — it now guards every slot's FIFO, every running marker, the job registry, and the cross-slot model-download dependency map.
+
+Each `Job` carries `kind`, `client_id`, `state`, and the payload (`PostprocessInput` + `Config` for postprocess; `model_id` + `force_download` for downloads). Lifecycle states (lowercase on the wire — see `job_state_name()` in `src/job_queue.cpp:29`):
+
+- `queued` — in a slot FIFO, not yet dequeued.
+- `waiting_for_upload` — `process.submit` reserved the `job_id`; `0x01` upload frames have not yet finalized.
+- `waiting_on_download` — dequeued postprocess job whose required model is missing; parked while an auto-enqueued `ModelDownload` runs.
+- `running` — slot's running marker is set; the job is executing.
+- `done` / `failed` / `cancelled` — terminal.
+
+**Auto-download on missing model.** At `dequeue(Postprocess)` time, `JobQueue` consults the wired `ModelResolver` + `ModelCacheChecker`. If a required model is missing it auto-enqueues a `ModelDownload` job into the `model_download` slot, parks the postprocess job in `waiting_on_download`, and records the dependency. The daemon's `JobEventSink` emits a `progress.job` event with `phase: "downloading_model"` for the parked job. When `finish_download(ok)` fires, every parked dependent is re-armed at the front of its slot FIFO; on failure they are failed.
+
+**job_id → client_id binding.** `JobQueue` is the authoritative owner of this binding. `JobQueue::client_for_job(job_id)` is what the daemon's send loop and the C.5 / C.4 / C.6 handlers consult to route `progress.job` / `job.complete` / `caption` / artifact frames to the originating client.
+
+### State broadcast
+
+`state.changed` is the only remaining global broadcast. It carries the composite state name plus the three per-slot booleans `postprocessing` / `streaming` / `downloading` (see `fill_state_fields()` in `src/daemon.cpp:151`). The V1 `recording` boolean is removed in C.9; clients that need to know whether something is in flight read `state` (`"idle"`, `"postprocessing"`, `"streaming"`, or `"downloading"` — priority order) or the per-slot booleans. Per-job updates (`progress.job`, `job.complete`, `caption`) flow via `IpcServer::send_to_client(client_id, event)` instead, falling back to `broadcast()` only when the originator's `client_id` is empty (a defensive path for daemon-internal jobs predating any `session.init`).
 
 ### Worker threads
 
-Heavy work runs on independent worker threads — capture (`g_capture_worker`), postprocess subprocess supervisor (`g_pp_worker`), model downloads (`g_dl_worker`). Each writes results back to the poll thread via `server.post()`, which writes to a self-pipe to wake `poll()` and execute the callback on the main thread. This keeps all IPC I/O and broadcast calls single-threaded; the worker threads never touch the wire directly.
+Three long-lived worker threads drain the slots:
+
+| Thread | Loop | Spawned by |
+|---|---|---|
+| `g_pp_worker` | `pp_worker_loop` — dequeues `Postprocess`, fork+execs `recmeet --subprocess-mode <cfg.json>`, supervises the child with the cgroup-aware kill grace machine (T1C.2) | `main()` |
+| `g_dl_worker` | Drains `ModelDownload`; calls `finish_download()` on completion so parked dependents re-arm | `main()` |
+| `g_stream_worker` | Drains `Streaming` slot's dequeue (sets the slot's running marker — the actual `0x03` frame feed runs on the poll thread) | `main()` |
+
+All three marshal results back to the poll thread via `server.post()` + self-pipe wakeup. The poll thread is the only thread that touches the wire — workers never call `broadcast()` or `send_to_client()` directly.
+
+**Postprocess subprocess isolation.** Each postprocess job runs in a fresh `recmeet --subprocess-mode` child. This is iter-90 hard-won: onnxruntime's heap can corrupt over the lifetime of a long-lived daemon, and the only reliable mitigation is a per-job address space. The parent writes `cfg` to a tmp JSON file (`write_job_config()`), `fork()` + `execv()` the self-binary, watches the child's stdout for `progress.job` lines, and reaps via `waitpid()`. The `merge_creds_for_job()` (`src/session_merge.h:55`) call resolves the per-job `Config` from three sources with precedence `daemon env > session.init credentials > daemon.yaml` so the subprocess sees the per-client view even though it never re-reads the environment.
 
 ### PID locking
 
-The daemon creates `<socket_path>.pid` and holds an `flock(LOCK_EX|LOCK_NB)` for its lifetime, preventing duplicate instances.
+The daemon creates a PID file and holds an `flock(LOCK_EX|LOCK_NB)` for its lifetime, preventing duplicate instances. For Unix socket listeners the PID lives at `<socket_path>.pid`; for TCP listeners it lives at `$XDG_RUNTIME_DIR/recmeet/daemon-tcp.pid` (`src/daemon.cpp:1097-1108`).
 
 ### Signal handling
 
 | Signal | Behavior |
 |---|---|
-| `SIGHUP` | Reload config from disk via `server.post()` |
-| `SIGINT` / `SIGTERM` | Request stop on active recording, then exit the poll loop |
+| `SIGHUP` | Reload `daemon.yaml` from disk via `server.post()` — the merged-config snapshot is recomputed on the next job; uploads / streams already in flight keep the snapshot they were created with |
+| `SIGINT` / `SIGTERM` | Request stop on active postprocess child (`g_pp_stop.request()`), call `server.stop()` to exit the poll loop, then `JobQueue::shutdown()` wakes every blocked `dequeue()` so the worker threads can join |
 
 ## Binary: `recmeet-tray`
 
 **Source:** `src/tray.cpp`
 
-A GTK system tray applet using ayatana-appindicator. The tray is a pure IPC client — it never runs the pipeline directly.
+A GTK system tray applet using ayatana-appindicator. In V2 the tray **owns local audio capture end-to-end** via `recmeet_capture` and submits or streams audio to the daemon over the IPC connection. It is the canonical thin client.
+
+### Local capture lifecycle (`tray_state.capture_state`, `src/tray.cpp:130`)
+
+The tray owns:
+
+- A `PipeWireCapture` (or `PulseMonitorCapture` for monitor sources) instance.
+- A `wav_buffer` of int16 samples protected by `wav_mtx`; `start_capture()` clears it, the capture's audio callback appends on every chunk, `stop_capture()` drains it to a staging WAV under `$XDG_RUNTIME_DIR/recmeet/staging/`.
+- When live captions are enabled, a second fan-out subscriber that pumps the same audio frames to a `process.stream` session on the daemon (stacking the streaming feed on top of the WAV staging feed — both consume from the same capture).
+
+After capture stops the tray is in a `waiting_disposition` state — the operator picks **Submit** (send to daemon via `process.submit` + `0x01` upload frames), **Save** (keep the WAV on disk), or **Discard** (unlink).
+
+### Per-connection session handshake
+
+The tray sends `session.init` exactly once per IPC connection, immediately after connect (or after a reconnect). The handshake populates the daemon's per-client credential slot — `SessionCredentials` (provider API keys: xAI / OpenAI / Anthropic / Brave) and `SessionPreferences` (whisper model, language, vocabulary, output paths, mic/monitor source, llm_model, captions_enabled, summarization backend). Subsequent recordings use whatever the slot holds; updates land via `session.update_credentials` and `session.update_prefs`.
+
+### Job correlation
+
+When the user submits a recording, the tray:
+
+1. Sends `process.submit` and stashes the returned `job_id` + `upload_token`.
+2. Sends one `0x01` BinaryUpload frame containing the staged WAV bytes.
+3. Watches `progress.job` events filtered by `job_id` to drive a tray-notification status string.
+4. On `job.complete` (routed to this client by `JobQueue::client_for_job()`), optionally sends `process.fetch { job_id }` and writes the artifacts under the configured output directory. The tray's "Meeting note ready" desktop notification fires from the `job.complete` data, not from a state-machine transition.
+
+The same `job_id` tracking also drives the cancel path: the tray's "Cancel" item sends `process.cancel { job_id }` regardless of which slot the job currently lives in.
 
 ### GTK + GIO integration
 
@@ -140,99 +227,163 @@ The tray wraps the IPC client's socket fd in a `GIOChannel` watched by the GTK m
 
 ### Reconnection
 
-On disconnect (`G_IO_HUP`), the tray tears down the watch, schedules `try_reconnect()` via `g_timeout_add_seconds`, and uses exponential backoff (1, 2, 4, 8, 16, 30, 30, ...) until the daemon reappears.
+On disconnect (`G_IO_HUP`), the tray tears down the watch, schedules `try_reconnect()` via `g_timeout_add_seconds`, and uses exponential backoff (1, 2, 4, 8, 16, 30, 30, ...) until the daemon reappears. After a successful reconnect it re-sends `session.init` (the daemon's per-client slot is keyed by the freshly-minted `client_id`, so the prior credentials are gone).
 
 ### Menu-driven config
 
-The tray builds a GTK menu with radio groups for mic source, monitor source, whisper model, language, summary provider, and API model. Changes are persisted to `~/.config/recmeet/config.yaml` immediately. When the user selects a whisper model, the tray sends `models.ensure` to trigger a background download.
+The tray builds a GTK menu with radio groups for mic source, monitor source, whisper model, language, summary provider, and API model. Most changes are persisted to `~/.config/recmeet/config.yaml` immediately and pushed to the daemon via `session.update_prefs` so the next `process.submit` sees them. When the user selects a whisper model the tray sends `models.ensure` to enqueue a `ModelDownload` job; the daemon's `progress.job` events drive the in-menu download indicator.
 
 ## IPC Protocol
 
-### Wire format
+`IPC_PROTOCOL_VERSION = 3` (`src/ipc_protocol.h:66`). The version is stamped into every `auth.ok` frame; a mismatch closes the connection. The full wire-format reference lives in [`docs/IPC-WIRE-PROTOCOL.md`](IPC-WIRE-PROTOCOL.md) — this section is the architectural summary.
 
-Newline-delimited JSON (NDJSON) over a Unix stream socket at `$XDG_RUNTIME_DIR/recmeet/daemon.sock` (fallback: `/tmp/recmeet-<uid>/daemon.sock`).
+### Transport
 
-### Message types
+The daemon's `--listen` flag accepts either a Unix socket path (default `$XDG_RUNTIME_DIR/recmeet/daemon.sock`, fallback `/tmp/recmeet-<uid>/daemon.sock`) or a TCP `host:port`. The wire format and verb surface are identical on both transports; only the auth gate differs (TCP requires the PSK handshake; Unix bypasses it).
+
+### Frame format (Phase C.1)
+
+Every frame on the wire begins with a 1-byte type discriminator:
+
+| Discriminator | Name | Body |
+|---|---|---|
+| `0x00` | `Ndjson` | One JSON object followed by `'\n'`. Carries requests, responses, errors, events, and the auth handshake. |
+| `0x01` | `BinaryUpload` | 4-byte big-endian length `N` + `N` payload bytes. Client→daemon. Used by `process.submit` to ship audio. |
+| `0x02` | `BinaryArtifact` | 4-byte big-endian length + payload. Daemon→client. Used by `process.fetch` to ship artifacts. |
+| `0x03` | `StreamAudio` | 4-byte big-endian length + raw PCM. Client→daemon. Used by `process.stream` to feed the streaming caption engine. |
+| `0x04+` | (reserved) | `FrameReader` rejects with `BadDiscriminator` and the connection is closed. |
+
+Default cap on a single binary frame's declared length is **16 MiB** (`kDefaultMaxBinaryFrameBytes` — `src/ipc_protocol.h:213`). A frame whose 4-byte length header exceeds the cap is rejected before any payload bytes are buffered, so a hostile peer cannot make the reader allocate.
+
+The receiving side runs a per-connection `FrameReader` state machine (`src/ipc_protocol.h:248`) that buffers across partial reads and transparently interleaves a fully-received NDJSON request between two binary frames of an in-flight upload or stream.
+
+### NDJSON message types (inside an `0x00` frame)
 
 | Direction | Type | Discriminant field | Structure |
 |---|---|---|---|
 | client → server | Request | `"method"` | `{"id": N, "method": "...", "params": {...}}` |
 | server → client | Response | `"result"` | `{"id": N, "result": {...}}` |
 | server → client | Error | `"error"` | `{"id": N, "error": {"code": N, "message": "..."}}` |
-| server → client | Event | `"event"` | `{"event": "...", "data": {...}}` |
+| server → client | Event | `"event"` | `{"event": "...", "data": {...}, "client_id"?: "..."}` |
+| client → server | Auth | `"type":"auth.token"` | `{"type":"auth.token","token":"..."}` (TCP only) |
+| server → client | Auth ack | `"type":"auth.ok"` | `{"type":"auth.ok","client_id":"...","protocol_version":N}` |
+| server → client | Auth reject | `"type":"auth.error"` | `{"type":"auth.error","reason":"invalid_token"\|"auth_required"}` |
 
-### JSON value types
+Values inside `params` / `result` / `data` are `string | int64 | double | bool | null`. Nested objects and arrays are stored as raw JSON strings in the flat `JsonMap` and re-parsed on receive (the `process.fetch { artifacts: [...] }` and `job.list { jobs: [...] }` arrays use this).
 
-Values are `string | int64 | double | bool | null`. Nested objects/arrays are stored as raw JSON strings in the flat `JsonMap`.
+### Authentication (Phase A.1 + A.5)
 
-### Methods
+TCP connections start in `PendingPsk`. The client's first frame must be `{"type":"auth.token","token":"..."}`; on match the server emits `{"type":"auth.ok","client_id":"<id>","protocol_version":3}`, mints a fresh server-side `client_id` (format `c-<counter>-<6 hex>`, `src/ipc_server.h:333`), records the `client_id → fd` reverse map, and flips `auth_state` to `Authed`. The PSK comes from `RECMEET_AUTH_TOKEN` and is constant-time-compared so the daemon never leaks the prefix length. The token itself is never logged.
 
-| Method | Params | Result | Notes |
+Unix-socket connections skip the PSK gate (kernel peer credentials are sufficient for local trust) but still receive a server-issued `client_id` and `auth.ok` so the rest of the protocol is uniform.
+
+### Verbs (V2 surface)
+
+Every verb except `status.get` / `config.reload` / `models.list` / `models.ensure` / `models.update` / the `speakers.*` family is new in V2. The V1 verbs `record.start`, `record.stop`, `job.context`, `sources.list`, and `config.update` were **removed in C.9 / A.6** — a stray request returns `MethodNotFound`.
+
+**Session handshake** (Phase A.6):
+
+| Verb | Params | Result | Purpose |
 |---|---|---|---|
-| `status.get` | — | `{state}` | Returns current daemon state name |
-| `sources.list` | — | `{sources, count}` | JSON array of audio sources |
-| `config.reload` | — | `{ok}` | Re-read config from disk |
-| `config.update` | config key/values | `{ok}` | Merge into running config |
-| `record.start` | config overrides | `{ok}` | Idle → Recording; error if busy |
-| `record.stop` | — | `{ok}` | Signal stop; error if not recording |
-| `models.list` | — | `{models}` | JSON array of cached model info |
-| `models.ensure` | `{whisper_model?}` | `{ok}` | Download missing models; Idle → Downloading |
-| `models.update` | — | `{ok}` | Re-download all cached models |
+| `session.init` | `{credentials: {...}, preferences: {...}}` | `{ok}` | Populate the per-`client_id` session slot with `SessionCredentials` + `SessionPreferences`. Sent exactly once per connection. |
+| `session.update_credentials` | `{credentials: {...}}` | `{ok}` | Partial credential refresh (e.g. tray rotates an API key). |
+| `session.update_prefs` | `{preferences: {...}}` | `{ok}` | Partial preference refresh (whisper_model, language, output_dir, etc.). |
 
-### Events (server → all clients)
+**Batch postprocess** (Phase C.2 + C.4 + C.5):
 
-| Event | Data | When |
-|---|---|---|
-| `state.changed` | `{state, error?}` | Any state transition |
-| `phase` | `{name}` | Pipeline phase change (recording, transcribing, etc.) |
-| `job.complete` | `{note_path, output_dir}` | Recording + postprocessing finished |
-| `model.downloading` | `{model, status, error?}` | Model download progress |
+| Verb | Params | Result | Purpose |
+|---|---|---|---|
+| `process.submit` | `{mode, audio_size, format, sample_rate?, channels?, context?, enroll_name?}` | `{job_id, upload_token, max_size}` | Reserve a postprocess `job_id` and an upload token. Client then sends `0x01` frames totaling `audio_size` bytes. `mode` is `"transcribe"` (default) or `"enroll"` (C.8 — diarize-only, populates the per-job `DiarizationCache`). |
+| `process.submit.cancel` | `{upload_token}` | `{ok}` | Abort an in-flight upload by token. Tears down the staging dir + the `waiting_for_upload` reservation. |
+| `process.fetch` | `{job_id}` | `{job_id, artifacts: [{name,size,content_type}, ...], total_size}` + one `0x02` BinaryArtifact frame per artifact in order | Download the artifacts of a `Done` postprocess job. `JobNotReady` if the job is not in `done`. |
+| `process.cancel` | `{job_id}` | `{ok}` | Unified cancel by `job_id`. Works for any slot — postprocess / streaming / model_download — and any non-terminal state (`queued`, `waiting_*`, `running`). |
+
+**Streaming captions** (Phase C.10a + C.10b):
+
+| Verb | Params | Result | Purpose |
+|---|---|---|---|
+| `process.stream` | `{format?, sample_rate?, channels?, language?, captions_enabled?, latency_budget_ms?, context?}` | `{job_id, stream_token}` | Open a streaming session. Captures-the-config snapshot for the eventual postprocess on `commit`. Client then sends `0x03` PCM frames; the daemon feeds them into a `CaptionEngine` and emits `caption` / `caption.degraded` events routed to this `client_id`. |
+| `process.stream.cancel` | `{stream_token}` | `{ok}` | Discard the streaming session + its buffered audio (unlinks the disk-backed temp WAV) and release the slot. |
+| `process.stream.commit` | `{stream_token}` | `{job_id, ok}` | Flush + close the temp WAV, enqueue a fresh `Postprocess` job from the accumulated audio (transcribe + diarize + summarize), release the streaming slot. The returned `job_id` is the NEW postprocess job; the client watches it via `progress.job` + `process.fetch` exactly like a `process.submit` job. |
+
+**Job introspection** (Phase C.6):
+
+| Verb | Params | Result | Purpose |
+|---|---|---|---|
+| `job.status` | `{job_id}` | `{job_id, kind, state, client_id, model_id, error}` | Single-job snapshot. The registry retains terminal jobs so `done`/`failed`/`cancelled` are fully queryable. |
+| `job.list` | — | `{jobs: [{job_id, kind, state, client_id, model_id, error}, ...], count}` | All jobs owned by the requesting `client_id`, ascending by `job_id`. Server-side scoping; the client cannot list other clients' jobs. |
+
+**Voiceprint enrollment** (Phase C.8):
+
+| Verb | Params | Result | Purpose |
+|---|---|---|---|
+| `enroll.finalize` | `{job_id, target_speaker, enroll_name}` | `{ok}` | Two-step enrollment finalizer. Pulls the centroid for `target_speaker` out of the daemon's `DiarizationCache[job_id]`, appends it to the named speaker profile in the speakers DB. Pairs with `process.submit {mode:"enroll"}` (flow a — fresh audio) or with an existing postprocess job's diarization cache (flow b — re-use). |
+
+**Carry-overs from V1** (still on the wire, refactored but not renamed):
+
+| Verb | Params | Result | Notes |
+|---|---|---|---|
+| `status.get` | — | `{state, postprocessing, streaming, downloading}` | Composite state — see "State broadcast" above. The `recording` boolean is gone in C.9. |
+| `config.reload` | — | `{ok}` | Re-read `daemon.yaml`. Per-request config overrides are NOT supported — they flow via `session.update_*` instead (A.6 removed `config.update`). |
+| `models.list` | — | `{models}` | Cached model inventory. |
+| `models.ensure` | `{whisper_model?}` | `{ok, job_id?}` | Enqueue a `ModelDownload` job for the missing model. Subject to the `[server] allow_client_downloads` policy — `PermissionDenied` if the operator disabled it. |
+| `models.update` | — | `{ok, job_id?}` | Re-download all cached models (the refresh semantic — `force_download = true` on each enqueued job). |
+| `speakers.list` / `speakers.remove` / `speakers.reset` | — | `{...}` | Speaker DB introspection + maintenance (unchanged). |
+
+### Events (server → client, routed via `client_id`)
+
+| Event | Data | When | Routing |
+|---|---|---|---|
+| `state.changed` | `{state, postprocessing, streaming, downloading, error?}` | Any slot's running marker flips | `broadcast()` — genuinely global |
+| `progress.job` | `{job_id, phase, ...}` | Per-job lifecycle (queued → waiting_on_download → running → done; phase strings include `downloading_model`, `transcribing`, `diarizing`, `summarizing`, `uploading`, etc.) | `send_to_client(client_id, ...)` via `JobQueue::client_for_job()`; falls back to `broadcast()` only for daemon-internal jobs |
+| `job.complete` | `{job_id, note_path, output_dir, batch_job, speakers?, enroll_mode?}` | Postprocess subprocess returned cleanly | `send_to_client` for the originator |
+| `caption` | `{job_id, text, is_partial, timestamp_ms}` | `CaptionEngine` produced a result (final or partial) | `send_to_client` for the streaming job's originator |
+| `caption.degraded` | `{job_id, reason, timestamp_ms}` | Streaming buffer overrun or sherpa-OFF build | `send_to_client` |
+| `model.downloading` | `{model, status, error?}` | `ModelDownload` progress / completion | `send_to_client` when the download was auto-triggered for a known job; otherwise `broadcast()` |
 
 ### Error codes
 
 | Code | Name | Meaning |
 |---|---|---|
-| -32600 | InvalidRequest | Malformed JSON |
-| -32601 | MethodNotFound | Unknown method |
-| -32602 | InvalidParams | Bad parameters |
-| -32603 | InternalError | Server-side failure |
-| 1 | AlreadyRecording | — |
-| 2 | NotRecording | `record.stop` when idle |
-| 3 | Busy | State is not Idle |
+| -32600 | `InvalidRequest` | Malformed JSON / unknown frame discriminator |
+| -32601 | `MethodNotFound` | Unknown verb (e.g. a stray V1 `record.start`) |
+| -32602 | `InvalidParams` | Bad / missing parameters; also "unknown job_id" |
+| -32603 | `InternalError` | Server-side failure |
+| 1 | `AlreadyRecording` | Reserved — V2 no longer emits |
+| 2 | `NotRecording` | Reserved — V2 no longer emits |
+| 3 | `Busy` | Slot occupied (rare in V2 — `process.submit` of a second postprocess job queues rather than rejects) |
+| 4 | `PermissionDenied` | Operator policy refused (e.g. `[server] allow_client_downloads=false`); or the caller does not own the target `job_id` |
+| 5 | `JobNotReady` | Verb requires a terminal job state but the job is still in-flight (`process.fetch` on a non-`done` job) |
 
 ### Concurrency model
 
-The IPC server runs a single-threaded `poll()` loop. All socket reads, writes, and broadcasts happen on this thread. Worker threads marshal results back via `server.post()` + self-pipe wakeup, ensuring no concurrent access to client fd state.
-
-### TCP authentication (Phase A.1, V2)
-
-When the daemon listens on TCP (`--listen host:port`), every connection must complete a pre-shared-key handshake before any other request is dispatched. The PSK is read from the `RECMEET_AUTH_TOKEN` environment variable at daemon startup (and again at client connect). The daemon refuses to even bind a TCP listener with an empty PSK — this is fail-stop, not warn-and-continue, because exposing the compute surface to the network without auth is unacceptable. Unix-socket clients bypass the gate entirely; kernel-enforced peer credentials are sufficient for local trust.
-
-The client opens the connection and sends `{"type":"auth.token","token":"..."}\n` as its first frame. On match the server replies `{"type":"auth.ok"}\n` and flips the connection's `auth_state` from `PendingPsk` to `Authed`. On mismatch (or wrong first frame), the server logs the refusal at WARN with the peer address, sends `{"type":"auth.error","reason":"invalid_token"|"auth_required"}\n`, and closes. The token itself is never logged. PSK comparison is constant-time so the daemon does not leak the prefix length of the configured key.
-
-In V2 multi-server work the global PSK is expected to grow into per-server PSKs and a session.init credential channel; the gate's chokepoint (refusing dispatch unless `auth_state == Authed`) is the same in either model.
+The IPC server runs a single-threaded `poll()` loop. All socket reads, frame assembly, NDJSON writes, broadcasts, and `send_to_client` calls happen on this thread. The worker threads (`pp_worker`, `dl_worker`, `stream_worker`) and the postprocess subprocess marshal results back via `server.post()` + a self-pipe wakeup, ensuring no concurrent access to client fd state or the outbound queue. Binary upload frames feed into the per-connection `UploadSession` / `StreamingSession` on this same thread; the upload session writes the staged WAV synchronously inside the frame handler.
 
 ## Recording Pipeline
 
 The pipeline has two phases, split at the point where audio capture completes:
 
-1. **`run_recording()`** — audio capture (blocking on `StopToken`), WAV output, validation, mixing.
-2. **`run_postprocessing()`** — transcription, diarization, speaker identification, summarization, note output.
+1. **`run_recording()`** — audio capture (blocking on `StopToken`), WAV output, validation, mixing. Lives in `recmeet_live_capture` (`src/live_recording.cpp`).
+2. **`run_postprocessing()`** — transcription, diarization, speaker identification, summarization, note output. Lives in `recmeet_core` (`src/pipeline.cpp`).
 
-In standalone mode, `run_pipeline()` calls both sequentially. In daemon mode, the worker thread calls them separately so it can broadcast `state.changed` between phases.
+In V2 these two phases run in different processes depending on the entry path:
+
+- **Standalone CLI (`recmeet --no-daemon`).** `run_pipeline()` calls both sequentially in the same process.
+- **Daemon-mode `process.submit`.** The client owns capture (or the file already exists, e.g. `--reprocess`), uploads the audio via `0x01` frames, and the daemon's `pp_worker_loop` fork+execs `recmeet --subprocess-mode <cfg.json>` for postprocessing only — `run_recording` does not run server-side.
+- **Daemon-mode `process.stream` then `process.stream.commit`.** The client streams `0x03` PCM to the daemon; `StreamingSession` writes it to a disk-backed temp WAV; `commit` hands the WAV off to the same `pp_worker_loop` path as `process.submit`. The server-side "recording" is just the temp-WAV buffering — not the V1 PipeWire-driven capture.
 
 ```mermaid
 flowchart TD
-    subgraph "Phase 1: run_recording()"
-        DETECT["Detect audio sources"]
+    subgraph "Phase 1: run_recording() — CLIENT-SIDE in V2"
+        DETECT["Detect audio sources<br/>(recmeet_capture)"]
         CAPTURE["PipeWire/PulseAudio capture<br/>(mic + optional monitor)"]
-        STOP["StopToken signaled"]
-        DRAIN["Drain buffers → WAV"]
+        STOP["StopToken signaled<br/>or process.stream.commit"]
+        DRAIN["Drain buffers → WAV<br/>(local file or 0x01 / 0x03 frames)"]
         VALIDATE["Validate audio"]
         MIX["Mix mic + monitor"]
     end
 
-    subgraph "Phase 2: run_postprocessing()"
+    subgraph "Phase 2: run_postprocessing() — DAEMON SUBPROCESS in V2"
         LOAD_AUDIO["Load audio file → float[]"]
         VOCAB["Build vocabulary hints<br/>(enrolled names + config)"]
         VAD["VAD segmentation<br/>(sherpa-onnx, optional)"]
@@ -245,7 +396,8 @@ flowchart TD
     end
 
     DETECT --> CAPTURE --> STOP --> DRAIN --> VALIDATE --> MIX
-    MIX --> LOAD_AUDIO --> VOCAB --> VAD --> TRANSCRIBE --> DIARIZE
+    MIX -->|"file path or PCM stream"| LOAD_AUDIO
+    LOAD_AUDIO --> VOCAB --> VAD --> TRANSCRIBE --> DIARIZE
     DIARIZE --> IDENTIFY --> FREE_AUDIO --> SUMMARIZE --> NOTE
 ```
 
@@ -262,7 +414,7 @@ Every recording lives in `meetings/<YYYY-MM-DD_HH-MM>/`. All persisted artifacts
 
 **Legacy-name fallback.** Meetings created before the per-instance naming convention used unsuffixed filenames (`audio.wav`, `context.json`, `speakers.json`). All read paths fall back to the legacy filenames via `find_audio_file()` / `find_context_file()` / `find_speakers_file()` (see `src/util.{h,cpp}`), so old meetings keep loading. Write paths always emit the per-instance form when a canonical timestamp is available; reprocessing a legacy meeting writes new-style files alongside the audio without renaming the audio itself.
 
-**Save site placement.** `context_<ts>.json` is persisted in the **parent process** — `daemon::rec_worker` (after the pending-context drain, outside the `g_context_mu` lock scope) and `pipeline::run_pipeline` (between `run_recording` and `run_postprocessing`) — never inside `run_postprocessing`. The reason is that the daemon path forks a postprocess subprocess for memory containment, and the subprocess always runs with `cfg.reprocess_dir` set to the captured audio directory; an in-postprocess save guarded on `cfg.reprocess_dir.empty()` would be dead code on every daemon path. `speakers_<ts>.json` is still written from inside `run_postprocessing` because it's downstream of diarization (which only runs in postprocessing), and the same subprocess writes it before exit.
+**Save site placement.** `context_<ts>.json` is persisted by the **parent process** before postprocessing — by `pipeline::run_pipeline` (standalone CLI, between `run_recording` and `run_postprocessing`) or by the daemon's `process.submit` / `process.stream.commit` handlers (which fold the `context` request param into the per-job `Config` snapshot and the upload/streaming session writes it into the staging dir before the postprocess subprocess sees it). It is **never** written inside `run_postprocessing`. The reason is that the daemon path always forks a postprocess subprocess with `cfg.reprocess_dir` set to the staging directory; an in-postprocess save guarded on `cfg.reprocess_dir.empty()` would be dead code on every daemon path. `speakers_<ts>.json` is still written from inside `run_postprocessing` because it's downstream of diarization (which only runs in postprocessing), and the same subprocess writes it before exit.
 
 ### Memory scoping strategy
 
@@ -275,90 +427,73 @@ This matters because whisper models (75 MB–1.5 GB) and audio buffers (16-bit, 
 
 ### Reprocess flow
 
-Single-meeting (`--reprocess <dir>`) and batch (`--reprocess-batch <parent>`) share the same per-meeting code path: `run_pipeline` (standalone) or the daemon's `record.start` IPC + postprocess subprocess. The batch driver only adds orchestration and signal plumbing on top.
+Single-meeting (`--reprocess <dir>`) and batch (`--reprocess-batch <parent>`) share the same per-meeting code path: `run_pipeline` (standalone) or the daemon's `process.submit` (`mode: "transcribe"`) verb with the meeting's existing `audio_<ts>.wav` shipped as `0x01` upload frames. The batch driver only adds orchestration and signal plumbing on top.
 
-- **`run_reprocess_batch`** (`src/reprocess_batch.cpp`) classifies immediate `YYYY-MM-DD_HH-MM(_N)?` subdirs into `WillReprocess` / `SkipNoteExists` / `SkipNoAudio` (`classify_batch_entries`), runs `ensure_models_cached_or_fail` once before the loop so a missing whisper/sherpa/VAD/llama model fails fast, locks the dispatch mode (`BatchDispatchMode::Daemon` or `Standalone`) at batch entry, and dispatches each meeting serially via `dispatch_one_reprocess`.
-- **Per-iteration `StopToken` plumbing** — each iteration owns a fresh `StopToken iter_stop`. Before dispatch the driver publishes `&iter_stop` into `g_active_iter_stop` (atomic, release-store); the standalone-mode `batch_sigint_handler` and the daemon-mode `batch_daemon_sigint_handler` (installed per-iteration around the IPC call by `dispatch_one_reprocess_daemon`) read it via acquire-load and trip the token without ever touching a mutex (POSIX async-signal-safety). The handlers also set `g_batch_stop_requested` so the loop's between-iteration check breaks out cleanly. A `SigGuard` RAII helper saves and restores the previous `sigaction` on every exit path.
-- **IPC `batch_job` propagation** — the `record.start` request carries `cfg.batch_mode`; the daemon stores it on the per-job state and stamps it onto the `job.complete` event as `batch_job: <bool>`. The tray (`tray.cpp`) gates its "Meeting note ready" desktop notification on `!batch_job` so a 30-meeting batch produces a single end-of-batch summary notification (emitted by the batch driver itself in the operator's terminal), not one per meeting. Pipeline-error notifications stay unconditional — failures want operator attention regardless of mode.
+- **`run_reprocess_batch`** (`src/reprocess_batch.cpp`, in `recmeet_live_capture`) classifies immediate `YYYY-MM-DD_HH-MM(_N)?` subdirs into `WillReprocess` / `SkipNoteExists` / `SkipNoAudio` (`classify_batch_entries`), runs `ensure_models_cached_or_fail` once before the loop so a missing whisper/sherpa/VAD/llama model fails fast, locks the dispatch mode (`BatchDispatchMode::Daemon` or `Standalone`) at batch entry, and dispatches each meeting serially via `dispatch_one_reprocess`.
+- **Per-iteration `StopToken` plumbing** — each iteration owns a fresh `StopToken iter_stop`. Before dispatch the driver publishes `&iter_stop` into `g_active_iter_stop` (atomic, release-store); the standalone-mode `batch_sigint_handler` and the daemon-mode `batch_daemon_sigint_handler` (installed per-iteration around the IPC call by `dispatch_one_reprocess_daemon`) read it via acquire-load and trip the token without ever touching a mutex (POSIX async-signal-safety). The handlers also set `g_batch_stop_requested` so the loop's between-iteration check breaks out cleanly. A `SigGuard` RAII helper saves and restores the previous `sigaction` on every exit path. The daemon-mode SIGINT path sends `process.cancel { job_id }` for the in-flight `job_id` returned by the most recent `process.submit`.
+- **IPC `batch_job` propagation** — the `process.submit` request carries `cfg.batch_mode` in the per-submit context fields; the daemon stamps `batch_job: <bool>` onto the `job.complete` event for the originator. The tray gates its "Meeting note ready" desktop notification on `!batch_job` so a 30-meeting batch produces a single end-of-batch summary notification (emitted by the batch driver itself in the operator's terminal), not one per meeting. Pipeline-error notifications stay unconditional — failures want operator attention regardless of mode.
 
 ## Live Captioning Architecture
 
-Live captioning runs *during* `run_recording()` — not in postprocessing —
-because its value proposition is real-time text. The architecture mirrors
-the rest of the pipeline (heavy compute behind an opt-in flag, fan-out via
-`broadcast()`, callback-driven state machines) but adds a producer/consumer
-seam between the audio capture thread and a dedicated ASR worker thread.
+V2 splits live captioning across the wire. The **client** owns the capture (PipeWire / PulseAudio via `recmeet_capture`) and pushes raw PCM to the daemon over `0x03` StreamAudio frames. The **daemon** owns the `CaptionEngine` (sherpa-onnx streaming Zipformer + SPSC ring + ASR worker thread), the disk-backed temp WAV that buffers the session for later postprocess, and the emission of `caption` / `caption.degraded` events back to the originating client. Finalizing the session via `process.stream.commit` flushes the WAV, enqueues a normal `Postprocess` job from it, and releases the streaming slot.
 
-**Source:** `src/caption_engine.{h,cpp}`, `src/caption_vtt.{h,cpp}`,
-`src/caption_format.{h,cpp}`, `src/pipeline.cpp` (fan-out adapter +
-RAII teardown), `src/daemon.cpp` (IPC broadcast wiring),
-`src/main.cpp` (CLI flags, model pre-flight), `src/tray.cpp` (overlay).
+**Source:** `src/caption_engine.{h,cpp}`, `src/caption_vtt.{h,cpp}`, `src/caption_format.{h,cpp}`, `src/streaming_session.cpp` (C.10a — daemon-side stream_token → session map, temp WAV, caption-result-to-IPC-event adapter), `src/daemon.cpp` (handler wiring, `0x03` frame routing, `process.stream.commit` postprocess handoff), `src/tray.cpp` (client-side capture fan-out, `process.stream` lifecycle, overlay).
 
-### Component placement
+### Component placement (V2)
 
-| Component | Lives in | Notes |
+| Component | Lives in | Side |
 |---|---|---|
-| `CaptionEngine` (sherpa-onnx streaming Zipformer wrapper, SPSC ring, ASR worker thread) | `recmeet_core` | Producer (`on_audio_chunk`) is lock-free, non-allocating, non-logging |
-| `VttWriter` (append-only WebVTT sidecar persistence) | `recmeet_core` | Pure I/O — no sherpa dependency |
-| `normalize_caption()` (ALL-CAPS → human-readable display normalization) | `recmeet_core` | Pure function; both clients call it at render time |
-| Tray caption overlay (`GtkLabel` popup window) | `recmeet-tray` | Subscribes to `caption` events, calls `normalize_caption()` before display |
-| CLI stderr renderer (`[caption] <text>` lines during recording) | `recmeet` | Same render path as tray, `isatty(STDERR_FILENO)`-gated |
-| Caption model manager (`ensure_caption_model()`, pre-flight prompt) | `recmeet_core` | Curated table of streaming models; same download pattern as whisper/sherpa |
+| `PipeWireCapture` / `PulseMonitorCapture` | `recmeet_capture` | **Client** (tray + standalone CLI) |
+| `CaptionEngine` (sherpa-onnx streaming Zipformer wrapper, SPSC ring, ASR worker thread) | `recmeet_core` | **Daemon** (consumes `0x03` frames in place of the old PipeWire callback) |
+| `StreamingSessionManager` (stream_token → session map, per-session disk-backed temp WAV, JobQueue streaming-slot reservation) | `recmeet_core` (`streaming_session.cpp`) | **Daemon** |
+| `VttWriter` (append-only WebVTT sidecar persistence) | `recmeet_core` | **Daemon** — writes the sidecar into the streaming session's staging dir; the eventual postprocess job copies it into the meeting directory |
+| `normalize_caption()` (ALL-CAPS → human-readable display normalization) | `recmeet_ipc` (via `caption_format.h`) | **Client** — both tray and CLI normalize at render time so the wire stays raw |
+| Tray caption overlay (`GtkLabel` popup) | `recmeet-tray` | **Client** |
+| CLI stderr renderer (`[caption] <text>`) | `recmeet` | **Client** |
+| Caption model manager (`ensure_caption_model()`, pre-flight prompt) | `recmeet_core` | **Daemon** (auto-trigger downloads via `JobKind::ModelDownload`) |
 
-### Data flow
+### Data flow (V2)
 
 ```mermaid
 flowchart LR
-    PW["PipeWire/Pulse RT thread<br/>(on_process)"] -->|"int16 mono 16 kHz<br/>chunks (lock-free)"| CB["set_audio_callback<br/>= CaptionEngine::on_audio_chunk"]
-    CB -->|"push samples<br/>(SPSC ring)"| RING["ring buffer<br/>~2s @ 16 kHz<br/>32 768 samples"]
-    RING -->|"drain"| WORKER["ASR worker thread<br/>(SCHED_BATCH or nice +10)"]
-    WORKER -->|"sherpa-onnx<br/>OnlineRecognizer<br/>greedy_search"| RESULT["CaptionResult<br/>{text, is_partial,<br/>timestamp_ms}"]
-    RESULT --> FANOUT["CaptionFanoutAdapter<br/>(pipeline.cpp)"]
-    FANOUT -->|"every result"| BROADCAST["IpcServer::broadcast<br/>caption / caption.degraded"]
-    FANOUT -->|"is_partial=false only"| VTT["VttWriter::append<br/>(O_APPEND, no fsync)"]
-    BROADCAST -.->|"NDJSON over Unix socket"| TRAY["Tray overlay"]
-    BROADCAST -.->|"NDJSON over Unix socket"| CLI["CLI stderr"]
-    VTT --> SIDECAR["~/meetings/&lt;dir&gt;/<br/>captions.vtt"]
+    PW["Client: PipeWire/Pulse RT thread<br/>(on_process)"] -->|"int16 mono 16 kHz<br/>chunks (lock-free)"| FAN["Client: capture fan-out<br/>(WAV stager + stream pump)"]
+    FAN -->|"0x03 StreamAudio frames<br/>(4-byte BE len + PCM)"| NET["IPC connection<br/>(Unix socket / TCP)"]
+    NET -->|"poll thread reads,<br/>FrameReader assembles"| ROUTE["Daemon: BinaryFrameHandler<br/>routes 0x03 by client_id<br/>→ active StreamingSession"]
+    ROUTE -->|"push samples<br/>(SPSC ring)"| RING["CaptionEngine ring<br/>~2s @ 16 kHz"]
+    RING -->|"drain"| WORKER["Daemon: ASR worker thread<br/>(sherpa-onnx OnlineRecognizer)"]
+    WORKER --> RESULT["CaptionResult<br/>{text, is_partial, timestamp_ms}"]
+    RESULT --> EMIT["server.post(...) →<br/>make_caption_event(job_id, ...)"]
+    EMIT -->|"send_to_client(client_id, ev)"| OUT["Daemon poll thread:<br/>outbound NDJSON frame"]
+    OUT -.->|"caption / caption.degraded"| RENDER["Client renders<br/>(tray overlay / CLI stderr)"]
+    ROUTE -->|"also append PCM"| TMPWAV["StreamingSession temp WAV<br/>(disk-backed)"]
+    WORKER -->|"is_partial=false only"| VTT["VttWriter::append<br/>(staging captions.vtt)"]
 ```
 
-### Teardown ordering (load-bearing)
+### Streaming session lifecycle
 
-The order in which the recording loop tears down is critical because the
-producer (capture thread) and the consumer (engine worker) share an
-in-memory ring through a static function pointer:
+1. **Open.** Client sends `process.stream { format?, sample_rate?, channels?, language?, captions_enabled?, latency_budget_ms?, context? }`. The daemon snapshots the current `Config` (so a `SIGHUP` reload mid-session does not change the eventual postprocess), allocates a `StreamingSession`, reserves a streaming-slot job (which transitions to `running` when the `stream_worker_loop` dequeues), and returns `{ job_id, stream_token }`. The `caption` / `caption.degraded` events that follow carry this `job_id`.
+2. **Feed.** Client sends `0x03` StreamAudio frames; the daemon's `BinaryFrameHandler` looks up the active streaming session by `client_id` and pushes the PCM into the `CaptionEngine`'s SPSC ring AND appends to the on-disk temp WAV. A `0x03` frame from a client with no live session closes the connection (protocol abuse).
+3. **Cancel.** `process.stream.cancel { stream_token }` unlinks the temp WAV, releases the streaming slot, and marks the streaming `Job` as `cancelled`.
+4. **Commit.** `process.stream.commit { stream_token }` flushes the WAV, calls `StreamingSessionManager::commit()` which constructs a fresh `Job { kind: Postprocess, cfg: <snapshotted Config with reprocess_dir = temp_dir>, input: <PostprocessInput from the WAV> }` and enqueues it into the postprocess slot. The streaming slot is released. The response carries the **new** postprocess `job_id`, which the client tracks via `progress.job` + `process.fetch` exactly like a `process.submit` job.
 
-1. **`cap.stop()`** — capture's RT thread exits; `set_audio_callback`'s
-   atomic pointer can no longer fire.
-2. **Engine teardown (RAII)** — `ActiveCaptionEngine` destructor first
-   unsubscribes the callback as a belt-and-braces step, then calls
-   `engine.stop()` which joins the worker thread after it drains the
-   remaining ring contents and emits any pending finals.
-3. **`cap.drain()`** — moves the buffered audio out of the capture for
-   WAV writing.
+### Teardown ordering (load-bearing, daemon side)
 
-Reversing 1 and 2 leaves a window where the destroyed engine's address is
-still in the capture's atomic callback pointer; reversing 2 and 3 means
-the engine could feed the recognizer with samples from a partially-drained
-capture buffer. This sequence is enforced by stack-frame nesting in both
-`run_recording` branches (mic-only and mic+monitor).
+The session destructor must run in the following order because the `0x03` frame handler on the poll thread and the `CaptionEngine`'s ASR worker share the SPSC ring:
 
-### V2 compatibility surface (immutable across V1 → V2)
+1. **Mark the session ineligible** in the `StreamingSessionManager` map so a stray late `0x03` frame is dropped.
+2. **`engine.stop()`** — joins the ASR worker after it drains the ring and emits any pending finals.
+3. **Close + unlink (cancel) or finalize + keep (commit) the temp WAV.**
 
-The following V1 contracts are explicit V2-Phase-A inputs and must not
-change without a V2 migration:
+The client-side capture teardown order (capture stop → engine fan-out unsubscribe → drain) from V1 still applies for the standalone CLI's in-process `CaptionEngine`; the tray-via-daemon path replaces "engine teardown" with "`process.stream.cancel` or `process.stream.commit`".
 
-- **Audio callback API:** `void set_audio_callback(AudioChunkCallback cb,
-  void* userdata)` on `PipeWireCapture` / `PulseMonitorCapture`. Survives
-  the V2 Phase B `recmeet_capture` library extraction unchanged — same
-  signature, same int16-mono-16-kHz samples.
-- **`caption` event payload:** `{job_id, text, is_partial, timestamp_ms}`.
-  `job_id` survives V2 Phase A.4's `client_id`-routing change because per-
-  job filtering is the natural axis. Adding `client_id` later is additive.
-- **`record.start` params:** `captions_enabled` (bool) and `caption_model`
-  (string) become wire-compatible client request fields in V2 Phase B.
-- **`.vtt` sidecar layout:** `~/meetings/<dir>/captions.vtt`, WebVTT,
-  finalized cues only, no cue ids. The `~/meetings/` wire-format-at-rest
-  contract is V1-frozen and additive-only.
+### Wire shape (still stable)
+
+The `caption` and `caption.degraded` event payloads are unchanged from V1:
+
+- `{"event":"caption","data":{"job_id":N,"text":"...","is_partial":true|false,"timestamp_ms":N}}`
+- `{"event":"caption.degraded","data":{"job_id":N,"reason":"...","timestamp_ms":N}}`
+
+What changed is the routing: events now carry the top-level `client_id` field (omitted when empty) and reach the originating client via `send_to_client()` instead of `broadcast()`. The `.vtt` sidecar layout at rest is unchanged (`~/meetings/<dir>/captions.vtt`, WebVTT, finalized cues only, no cue ids).
 
 ### Default model
 
@@ -367,18 +502,22 @@ Apache-2.0, English-only). Resolved by `caption_model_dir(name)` in the
 model manager; empty `name` resolves to this default at use time so a
 future pin change touches one place.
 
-### Limitations (V1)
+### Limitations
 
 - ALL-CAPS, no-punctuation engine output. Display normalization happens
   at the client (tray + CLI), not at the engine — the IPC payload is
   always raw engine text so a downstream consumer can opt out.
 - Partial captions stream over IPC but never land in the `.vtt` sidecar.
 - English-only. `cfg.language` other than empty/`en` disables captions
-  with a warning at recording start.
+  with a warning at session start; `process.stream` accepts the
+  `language` param but a non-English value falls back to the same warning
+  + degraded behavior.
 - Sherpa-OFF builds: `CaptionEngine::start()` returns false with the
-  canonical error message; `record.start {captions_enabled: true}`
-  broadcasts a one-shot `caption.degraded` event and continues recording
-  without captions.
+  canonical error message; `process.stream {captions_enabled: true}`
+  emits a one-shot `caption.degraded` event (routed to the originating
+  client) and the streaming session continues buffering audio without
+  captions — `process.stream.commit` still produces a normal postprocess
+  job from the temp WAV.
 
 ## Diarization
 
@@ -450,7 +589,7 @@ Whisper limits `initial_prompt` to `whisper_n_text_ctx()/2` tokens (typically 22
 
 ### IPC support
 
-The `vocabulary` field flows through the daemon's IPC config system (`config_to_map` / `config_from_map`), so vocabulary hints work for recordings started via the tray or CLI in client mode.
+The `vocabulary` field is part of `SessionPreferences`, so the client pushes it once via `session.init` (and refreshes it via `session.update_prefs`). Per-job overrides ride the `context` parameter on `process.submit` / `process.stream`. Both paths fold into the per-job `Config` snapshot through `merge_creds_for_job()` (`src/session_merge.h:55`) before the postprocess subprocess sees it.
 
 ## Speaker Identification
 
@@ -581,15 +720,15 @@ result.segments = merge_speakers(result.segments, diar, names);
 
 ### Platform (pkg-config)
 
-| Package | Purpose |
-|---|---|
-| `libpipewire-0.3` | Audio capture (primary) |
-| `libpulse`, `libpulse-simple` | Monitor source fallback |
-| `sndfile` | WAV read/write |
-| `libcurl` | HTTP client (API calls, model downloads) |
-| `libnotify` | Desktop notifications (optional) |
-| `gtk+-3.0` | Tray UI (tray only) |
-| `ayatana-appindicator3-0.1` | System tray indicator (tray only) |
+| Package | Purpose | Linked into |
+|---|---|---|
+| `libpipewire-0.3` | Audio capture (primary) | `recmeet_capture` only — i.e. `recmeet-tray`, `recmeet` (via `recmeet_live_capture`). NOT `recmeet-daemon`. |
+| `libpulse`, `libpulse-simple` | Monitor source fallback | `recmeet_capture` only — same scope as PipeWire. |
+| `sndfile` | WAV read/write | `recmeet_capture`, `recmeet_core` |
+| `libcurl` | HTTP client (API calls, model downloads) | `recmeet_ipc` |
+| `libnotify` | Desktop notifications (optional) | `recmeet_ipc` |
+| `gtk+-3.0` | Tray UI | `recmeet-tray` only |
+| `ayatana-appindicator3-0.1` | System tray indicator | `recmeet-tray` only |
 
 ### Runtime (not linked)
 
@@ -598,58 +737,132 @@ result.segments = merge_speakers(result.segments, diar, names);
 | PipeWire (running) | Audio routing |
 | onnxruntime | sherpa-onnx backend (system package preferred) |
 
-## Daemon State Machine
+## JobQueue Slot State Diagrams
+
+V2 has no single global daemon state machine. Each `JobQueue` slot is its own capacity-1 FIFO + running marker, and the three slots are independent. The composite `state.changed` value is just a projection of which slots currently hold a `Running` job (`postprocessing` > `streaming` > `downloading` > `idle`).
+
+### Postprocess slot
 
 ```mermaid
 stateDiagram-v2
-    [*] --> Idle
+    [*] --> Queued : enqueue_reserved()<br/>(after process.submit upload completes)
+    [*] --> WaitingForUpload : process.submit<br/>(reserve_job_id)
 
-    Idle --> Recording : record.start<br/>(compare_exchange Idle→Recording)
-    Idle --> Downloading : models.ensure / models.update<br/>(compare_exchange Idle→Downloading)
+    WaitingForUpload --> Queued : 0x01 upload finalizes
+    WaitingForUpload --> Cancelled : process.submit.cancel<br/>or process.cancel
 
-    Recording --> Postprocessing : StopToken signaled,<br/>run_recording() returns
-    Recording --> Idle : pipeline error<br/>(catch block)
+    Queued --> WaitingOnDownload : dequeue + ModelResolver finds<br/>uncached model (auto-enqueue ModelDownload)
+    Queued --> Running : dequeue + all models cached
+    Queued --> Cancelled : process.cancel
 
-    Postprocessing --> Idle : run_postprocessing() completes<br/>(broadcasts job.complete)
-    Postprocessing --> Idle : pipeline error<br/>(catch block)
+    WaitingOnDownload --> Queued : ModelDownload finished(ok)<br/>(re-armed at FIFO front)
+    WaitingOnDownload --> Failed : ModelDownload finished(error)
+    WaitingOnDownload --> Cancelled : process.cancel
 
-    Downloading --> Idle : downloads complete
-    Downloading --> Idle : download error
+    Running --> Done : subprocess exit 0
+    Running --> Failed : subprocess exit nonzero
+    Running --> Cancelled : process.cancel (g_pp_stop + SIGTERM)
+```
 
-    note right of Recording : g_stop.request()<br/>via record.stop or SIGINT
+### Streaming slot
+
+```mermaid
+stateDiagram-v2
+    [*] --> Queued : process.stream<br/>(reserve_job_id + enqueue_reserved)
+    Queued --> Running : stream_worker dequeues<br/>(StreamingSessionManager owns the session)
+    Running --> Done : process.stream.commit<br/>(temp WAV → enqueue postprocess Job)
+    Running --> Cancelled : process.stream.cancel<br/>or process.cancel
+```
+
+### Model download slot
+
+```mermaid
+stateDiagram-v2
+    [*] --> Queued : auto-enqueue from a parked postprocess job<br/>OR explicit models.ensure / models.update
+    Queued --> Running : dl_worker dequeues
+    Running --> Done : finish_download(ok)<br/>(re-arms every WaitingOnDownload dependent)
+    Running --> Failed : finish_download(error)<br/>(fails every dependent)
+    Running --> Cancelled : process.cancel
 ```
 
 ## Lifecycle Diagrams
 
-### Daemon-mode recording session
+### Daemon-mode batch postprocess (process.submit + process.fetch)
 
 ```mermaid
 sequenceDiagram
-    participant C as CLI / Tray
+    participant C as Client (CLI / Tray)
     participant D as Daemon (poll thread)
-    participant W as Worker thread
+    participant Q as JobQueue
+    participant W as pp_worker / subprocess
 
-    C->>D: record.start {params}
-    D->>D: compare_exchange(Idle→Recording)
-    D->>W: spawn worker
-    D-->>C: {ok: true}
-    D-->>C: event: state.changed {recording}
+    C->>D: process.submit {mode, audio_size, format, ...}
+    D->>Q: reserve_job_id(Postprocess, client_id)
+    D-->>C: {job_id, upload_token, max_size}
+    Note over C,D: status = waiting_for_upload
 
-    W->>W: run_recording(cfg, stop)
-    Note over W: Audio capture blocks on StopToken
+    loop until total = audio_size
+        C->>D: 0x01 BinaryUpload (chunk)
+        D->>D: UploadSession::write()
+    end
+    D->>Q: enqueue_reserved(job_id, Job{cfg, input})
+    Note over Q: status = queued
 
-    C->>D: record.stop
-    D->>D: g_stop.request()
-    D-->>C: {ok: true}
+    W->>Q: dequeue(Postprocess)
+    alt model missing
+        Q->>Q: auto-enqueue ModelDownload<br/>park as waiting_on_download
+        D-->>C: progress.job {job_id, phase: "downloading_model"}
+        Note over W: dequeue keeps blocking
+        Q->>Q: finish_download(ok) → re-arm
+    end
+    Q-->>W: Job (state = running)
 
-    W->>W: drain + validate + mix
-    W->>D: post(state→Postprocessing)
-    D-->>C: event: state.changed {postprocessing}
+    W->>W: fork + execv recmeet --subprocess-mode cfg.json
+    W-->>D: progress.job lines (transcribing, diarizing, ...)
+    D-->>C: progress.job (routed via client_for_job)
+    W->>D: post(finish, job.complete)
+    D-->>C: job.complete {job_id, note_path, output_dir}
+    D-->>C: state.changed (slot released)
 
-    W->>W: run_postprocessing(cfg, input)
-    W->>D: post(broadcast job.complete)
-    D-->>C: event: job.complete {note_path, output_dir}
-    D-->>C: event: state.changed {idle}
+    C->>D: process.fetch {job_id}
+    D-->>C: {job_id, artifacts: [...], total_size}
+    D-->>C: 0x02 BinaryArtifact (per file, in artifacts[] order)
+```
+
+### Daemon-mode streaming session (process.stream + commit)
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant D as Daemon (poll thread)
+    participant S as StreamingSessionManager
+    participant E as CaptionEngine
+
+    C->>D: process.stream {format, sample_rate, ...}
+    D->>S: create(client_id, request, cfg snapshot)
+    S->>E: engine.start()
+    D-->>C: {job_id, stream_token}
+    D-->>C: state.changed (streaming)
+
+    loop while capturing
+        C->>D: 0x03 StreamAudio frame (PCM)
+        D->>S: route by client_id → session.push(samples)
+        S->>E: SPSC ring push
+        E-->>D: server.post(caption result)
+        D-->>C: event caption {job_id, text, is_partial, timestamp_ms}
+    end
+
+    alt user discards
+        C->>D: process.stream.cancel {stream_token}
+        D->>S: unlink temp WAV, mark Cancelled
+        D-->>C: {ok: true}
+    else user keeps recording
+        C->>D: process.stream.commit {stream_token}
+        D->>S: flush WAV, build PostprocessInput, enqueue Postprocess Job
+        D-->>C: {job_id: <new postprocess job_id>, ok: true}
+        Note over C,D: client now tracks new job_id<br/>via progress.job + process.fetch
+    end
+    D-->>C: state.changed (slot released)
 ```
 
 ### Standalone recording session
@@ -657,11 +870,11 @@ sequenceDiagram
 ```mermaid
 sequenceDiagram
     participant U as User
-    participant CLI as recmeet (standalone)
+    participant CLI as recmeet (standalone, --no-daemon)
 
     U->>CLI: recmeet [options]
     CLI->>CLI: Validate models (interactive prompts)
-    CLI->>CLI: run_pipeline()
+    CLI->>CLI: run_pipeline() (recmeet_live_capture)
     Note over CLI: recording phase
     CLI->>CLI: PipeWire capture running
     U->>CLI: Ctrl+C (SIGINT)
@@ -679,22 +892,28 @@ sequenceDiagram
     participant D as recmeet-daemon
     participant T as recmeet-tray
 
-    S->>D: ExecStart (recmeet-daemon.service)
+    S->>D: ExecStart (recmeet-daemon.service)<br/>--listen <addr>
+    D->>D: parse_ipc_address; if TCP, check RECMEET_AUTH_TOKEN<br/>(fail-stop if unset)
     D->>D: flock(PID file)
-    D->>D: Load config, resolve API key
-    D->>D: Create IpcServer, bind socket
-    D->>D: Install signal handlers
+    D->>D: load_config(); resolve API keys
+    D->>D: Create JobQueue; wire ModelResolver, ModelCacheChecker, JobEventSink
+    D->>D: Create IpcServer; bind socket / TCP listener
+    D->>D: Spawn pp_worker, dl_worker, stream_worker
+    D->>D: Install SIGHUP / SIGINT / SIGTERM handlers
     D->>D: server.run() (poll loop)
 
     S->>T: ExecStart (recmeet-tray.service, After=daemon)
-    T->>T: gtk_init, load config
-    T->>T: Create AppIndicator
-    T->>T: refresh_sources()
-    T->>D: connect (Unix socket)
+    T->>T: gtk_init, load config, init recmeet_capture
+    T->>D: connect (Unix or TCP)
+    opt TCP transport
+        T->>D: {"type":"auth.token","token":"..."}
+        D-->>T: {"type":"auth.ok","client_id":"...","protocol_version":3}
+    end
+    T->>D: session.init {credentials, preferences}
+    D-->>T: {ok: true}
     T->>D: status.get
-    D-->>T: {state: "idle"}
-    T->>T: Sync UI state
-    T->>T: fetch_provider_models() (background thread)
+    D-->>T: {state: "idle", postprocessing: false, ...}
+    T->>T: refresh_sources() (local — recmeet_capture)
     T->>T: gtk_main()
 ```
 
@@ -704,51 +923,53 @@ sequenceDiagram
 sequenceDiagram
     participant S as systemd
     participant D as recmeet-daemon
-    participant W as Worker thread
+    participant Q as JobQueue
+    participant W as Worker threads
 
     S->>D: SIGTERM
-    D->>D: g_stop.request()
+    D->>D: g_pp_stop.request() (poke any live subprocess)
     D->>D: server.stop() (write to self-pipe)
     D->>D: poll loop exits
 
-    alt Worker is active
-        D->>W: join (blocks until worker finishes)
-        W->>W: StopToken causes early exit
-        W-->>D: thread returns
+    D->>Q: shutdown() (wakes every blocked dequeue())
+    Q-->>W: dequeue returns nullopt
+    D->>W: join pp_worker, dl_worker, stream_worker
+
+    alt Postprocess child still alive
+        D->>W: kill_pp_child_with_grace (SIGTERM, 5s; SIGKILL, 30s; MemoryHigh bump)
     end
 
     D->>D: unlink PID file, close fds
-    D->>D: unlink socket
+    D->>D: unlink Unix socket (if applicable)
     D->>D: log_shutdown, notify_cleanup
 ```
 
-### Model download flow
+### Auto-download flow (parked postprocess + model_download slot)
 
 ```mermaid
 sequenceDiagram
-    participant C as CLI / Tray
-    participant D as Daemon (poll thread)
-    participant W as Worker thread
+    participant C as Client
+    participant D as Daemon
+    participant Q as JobQueue
+    participant PP as pp_worker
+    participant DL as dl_worker
 
-    C->>D: models.ensure {whisper_model: "small"}
-    D->>D: compare_exchange(Idle→Downloading)
-    D->>W: spawn worker
-    D-->>C: {ok: true}
+    C->>D: process.submit {mode: "transcribe", ...}
+    D->>Q: reserve + (after upload) enqueue Postprocess job J1
+    PP->>Q: dequeue(Postprocess)
+    Q->>Q: ModelResolver: J1 needs "whisper/small"<br/>ModelCacheChecker: not cached
+    Q->>Q: auto-enqueue ModelDownload M1<br/>park J1 as waiting_on_download
+    Q-->>D: JobEventSink for J1 (parked)
+    D-->>C: progress.job {job_id: J1, phase: "downloading_model"}
+    Note over PP: dequeue(Postprocess) keeps blocking
 
-    W->>D: post(state.changed {downloading})
-    D-->>C: event: state.changed {downloading}
-
-    W->>W: is_whisper_model_cached("small")?
-    alt Not cached
-        W->>D: post(model.downloading {whisper/small, downloading})
-        D-->>C: event: model.downloading {...}
-        W->>W: ensure_whisper_model("small")
-        W->>D: post(model.downloading {whisper/small, complete})
-        D-->>C: event: model.downloading {...}
-    end
-
-    W->>D: post(state→Idle, state.changed {idle})
-    D-->>C: event: state.changed {idle}
+    DL->>Q: dequeue(ModelDownload)
+    Q-->>DL: M1 (state = running)
+    DL->>DL: download whisper/small
+    DL->>Q: finish_download(M1, ok)
+    Q->>Q: re-arm J1 at FRONT of Postprocess FIFO
+    D-->>C: progress.job {job_id: J1, phase: "transcribing"} ... etc.
+    Q-->>PP: J1 (state = running)
 ```
 
 ## Go Tools Module
