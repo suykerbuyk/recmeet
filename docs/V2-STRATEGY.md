@@ -373,6 +373,252 @@ event: change the secret on the daemon, restart it, push the new
 secret to each tray. Forward-looking work (per-client tokens, OIDC,
 mTLS) is explicitly v3 territory.
 
+### Session identity and lifecycle
+
+V2 introduces a **server-issued resumption token** as the first per-client
+persistent credential. The PSK above gates connection; the resume_token
+gates *re-association* with prior server-side state (`client_id`, session
+credentials, session preferences, owned jobs) across a TCP reconnect.
+
+On first connect after PSK auth, the server stamps `auth.ok` with a fresh
+`client_id` (ephemeral, server-minted) and a `resume_token` (32 bytes of
+real entropy via `getrandom(2)`, hex-encoded, constant-time compare on
+lookup). The client persists the token to
+`~/.local/share/recmeet/session.token` (0600). On reconnect, the client
+re-sends both PSK and `resume_token`; the server's lookup table maps the
+token to the prior `client_id` and rebinds owned jobs to the live
+connection. Token-not-found and token-expired both fall through to a
+fresh-connect path with new `client_id` + new `resume_token`.
+
+The token is opaque — no JWT, no claims, no signature. It is a routing
+key whose authority derives entirely from the lookup table on the
+daemon. Rotating the PSK silently invalidates every outstanding
+resume_token on next reconnect (PSK check happens first), giving
+operators a coarse "log everyone out" lever without per-token revocation
+machinery in V2.
+
+#### Garbage collection (two half-lives)
+
+The resume-token map is unbounded otherwise: every disconnect that never
+returns leaks one `(resume_token → client_id → session state → owned
+jobs)` entry, and every job those dead clients owned sits in the
+JobQueue's per-job client binding consuming registry slots and
+event-routing decisions on every emission. V2 specifies two distinct
+half-lives, with different drivers, swept by a single periodic GC
+thread inside the daemon (default cadence 5 min):
+
+| Object | Driver | Default TTL | Knob (`[server]`) |
+|---|---|---|---|
+| Resume-token → session binding (creds, prefs, owned-jobs list) | "Operator closed the laptop, will they come back?" | **24 h** post-last-seen | `resume_token_ttl_hours` |
+| In-flight jobs (`queued`/`running`/`downloading_model`) owned by a disconnected client | "A slot is being held hostage by a job nobody will fetch" | **1 h** post-disconnect — converts to `failed` and frees the slot; the WAV stays on disk for operator forensics | `inflight_orphan_ttl_minutes` |
+| Terminal jobs (`complete`/`failed`/`cancelled`) owned by a disconnected client | "Holding artifacts for the client's eventual fetch on next reconnect" | **24 h** — matches the session TTL and C.8's already-planned 24 h diarization-retention window so the two don't fight | (same as resume_token_ttl_hours) |
+| GC sweep interval | "How often we walk the maps" | 5 min | `gc_interval_minutes` |
+
+Subtlety: completed-job artifacts on disk (transcript, summary,
+frontmatter, sidecar WAV) outlive the registry entry. After the
+terminal-job TTL the operator can still find them via filesystem; what
+they lose is the ability to refetch through the IPC. This is the
+correct tradeoff — the IPC registry is a routing layer, not a
+long-term archive.
+
+#### Operator escape hatch
+
+`recmeet-daemon --evict <resume_token_prefix>` forces immediate eviction
+of a specific session — the revocation lever for suspected token
+compromise without waiting for TTL. Small CLI surface, load-bearing for
+the multi-client deployment story.
+
+#### V3 evolution path
+
+V2's resume_token is opaque-and-server-issued. V3's pre-provisioned
+per-client identities (operator pre-mints `(client_id, secret)` pairs
+out-of-band, daemon loads from `clients.yaml`, replaces the global PSK
+with per-client tokens) is a strictly richer model with the same wire
+shape — the v2-to-v3 upgrade replaces the lookup table with a
+credential verifier, no client-side change beyond shipping new tokens.
+Specifying the resume_token as opaque now (rather than baking in a
+JWT-shaped surface "for future-proofing") keeps the v3 path clean.
+
+### Meeting identity and the client-server audio contract
+
+V2 distinguishes **session identity** (the resume_token above — an IPC
+routing key for connection continuity) from **meeting identity** (a
+content key for a specific recorded conversation). The two are
+orthogonal: one operator session produces many meetings; one meeting
+flows through many sessions over its lifetime (live-streamed under one
+session, batch-reuploaded under a later one, server-side reprocessed
+under a third — see the flow patterns below).
+
+The canonical identity for a meeting is a **client-minted UUID v4
+(`meeting_id`)** stamped at recording start. It lives in the existing
+`context.json` as a new additive field (per the V1↔V2 compatibility
+rules above — V1 ignores unknown fields, so this stays backport-safe)
+and in the V2-specific `.pending` sidecar. The directory naming
+(`~/meetings/{name}_{YYYY-MM-DD}/`) stays unchanged — `meeting_id` is
+the IPC-layer key, not a path component. The server maintains an
+in-memory `meeting_id → meeting_dir_path` index that survives daemon
+restart via lazy rebuild (walk `~/meetings/`, read each `context.json`,
+populate the map — cost amortized against startup).
+
+Why introduce a UUID when `(name, YYYY-MM-DD, HH-MM)` already identifies
+a meeting at rest? Three load-bearing reasons:
+
+1. **Operator-side renames must not break the link.** Meeting subjects
+   are mutable in the tray UI; the directory name is derived from
+   subject and would change with it. The UUID survives renames.
+2. **Multi-host scenarios (bd770i + s76 → same daemon) need a stable
+   key the client can mint without coordinating clocks** to
+   sub-minute precision against the server.
+3. **The v3 inter-daemon voiceprint sync path** (already in the v1
+   out-of-scope list) needs a portable meeting key that doesn't depend
+   on any single daemon's on-disk layout.
+
+#### Convergence principle
+
+The client always retains its own copy of a meeting's audio in
+`~/.local/share/recmeet/staging/`. The server is the long-term source
+of truth and the repository visible to all of the operator's machines.
+The two copies converge by **client-initiated overwrite**: any
+`process.submit` or `process.stream.commit` carrying a `meeting_id`
+the server has already seen overwrites the server's audio atomically
+(write to `*.tmp` + `fsync` + `rename` → no half-state visible to a
+concurrent reader). The client's copy is always authoritative on
+overwrite. This is one well-defined dedup rule rather than a thicket
+of naming conventions, and the laptop-on-an-unreliable-network
+scenario degrades cleanly: keep recording locally, reupload-to-overwrite
+the partial when the network returns.
+
+#### The four flow patterns
+
+Every recorded conversation maps to one of these:
+
+| # | Pattern | Client copy | Server copy | When server copy converges |
+|---|---|---|---|---|
+| 1 | Live-stream → commit | full (B.1 fan-out) | full (streaming accumulator) | at `process.stream.commit` |
+| 2 | Live-stream → disconnect mid-call → batch-upload after | full | partial (cut off at disconnect) | at follow-up `process.submit` (overwrites partial) |
+| 3 | Offline record (intentional or no network) → batch-upload later | full | absent until upload | at `process.submit` (first write) |
+| 4 | Server-side reprocess of resident meeting | full | full (already there from a prior pattern) | no upload needed; `process.reprocess` operates on server-resident audio |
+
+Patterns 2 and 4 are the load-bearing additions the V1 architecture
+couldn't express. Pattern 2 is the laptop-cafe-disconnect case; pattern
+4 is the "rerun this meeting with different summarization settings"
+case. Both reduce to "`meeting_id` is the key; operator intent
+determines whether to upload-and-overwrite or operate-on-server-copy."
+
+#### On-disk layout
+
+**Client** (each tray host):
+
+```
+~/.local/share/recmeet/staging/
+  audio_2026-05-16_14-30.wav
+  audio_2026-05-16_14-30.wav.pending   # sidecar (extended H-D2 schema)
+```
+
+The `.pending` sidecar v2 schema carries everything needed to
+reconstruct a submission across tray restart or machine change:
+
+```json
+{
+  "meeting_id":       "<UUID v4>",
+  "wav_path":         "<absolute path>",
+  "timestamp":        "YYYY-MM-DD_HH-MM",
+  "mic_source":       "<pulse source name>",
+  "captions_enabled": false,
+  "context": {
+    "subject":      "<string>",
+    "participants": ["..."],
+    "notes":        "<string>",
+    "language":     "<bcp47>",
+    "vocabulary":   ["..."]
+  }
+}
+```
+
+**Server** (daemon host) — unchanged from V1 except for the additive
+`meeting_id` field in `context.json`:
+
+```
+~/meetings/{name}_{YYYY-MM-DD}/
+  audio_YYYY-MM-DD_HH-MM.wav   # overwritable on reupload of same meeting_id
+  context.json                 # NEW additive field: meeting_id
+  transcript.txt
+  diarization.json
+  summary.md
+  frontmatter.json
+  speakers.json                # per-meeting speaker mapping
+```
+
+The directory naming preserves the V1↔V2 cross-version reprocess
+contract (the `~/meetings/` schema above). The server-side index
+(`meeting_id → meeting_dir_path`) is V2-only operational state; V1
+doesn't need it because V1 has no `meeting_id` concept.
+
+#### IPC implications
+
+Three verbs carry `meeting_id` in V2:
+
+- **`process.submit { meeting_id, audio_size, format, sample_rate,
+  channels, context, mode, speaker_hints? }`** — extended from C.2.
+  Server uses `meeting_id` as the dedup key: known meeting_id ⇒
+  overwrite path; unknown meeting_id ⇒ allocate new meeting directory
+  using `context.subject` + `timestamp`.
+- **`process.stream { meeting_id, format, sample_rate, channels,
+  context, language, captions_enabled, latency_budget_ms,
+  speaker_hints? }`** — extended from C.10a. The streaming accumulator
+  writes directly into the meeting directory keyed by `meeting_id`;
+  `process.stream.commit` does not need to rename a temp path because
+  the canonical path was the target from frame zero.
+- **`process.reprocess { meeting_id, transcribe?, diarize?, identify?,
+  summarize?, summary_style?, vocabulary?, ... }`** — **new verb,
+  not in the current Phase C plan.** Operates on the server's resident
+  copy of the meeting. Returns a `job_id` for progress monitoring. The
+  per-stage flags let the operator rerun individual pipeline stages
+  without redoing the whole thing (e.g., re-summarize without
+  re-transcribing).
+
+`process.reprocess` is the load-bearing addition that makes pattern 4
+work without re-upload. It is small to spec but materially expands
+client capability — without it, every reprocess scenario requires
+re-uploading the audio, defeating the "server as repository" framing.
+
+#### Voiceprint DB residency
+
+The global voiceprint database (speaker enrollment, cross-meeting
+identification) is daemon-resident. Both bd770i and s76 connecting to
+the same daemon see the same speaker inventory — this is the V2
+multi-host benefit relative to the V1 single-host model. Two separate
+daemons mean two separate voiceprint DBs; cross-daemon voiceprint sync
+stays in v3 (already in the v1 out-of-scope list).
+
+Per-meeting `speakers.json` (under each meeting's directory) is a
+snapshot of which voiceprints matched in that meeting — produced by
+the postprocess job, consumed by `process.reprocess` when the operator
+wants different identification settings.
+
+#### Live captions stay server-side
+
+The streaming-ASR + diarization pipeline is heavy enough that doing it
+client-side would balloon the thin-client back into a thick client. V2
+accepts the ~500 ms client→server→client round-trip as the cost of the
+thin-client model. The B.1 fan-out callback (landed iter 152) means
+the local WAV is always being written in parallel during live
+captioning, so a mid-stream disconnect degrades cleanly to pattern 2
+(keep recording locally, reupload-to-overwrite later) without any
+extra client logic.
+
+#### Disk-space implications
+
+The server's per-meeting `audio_*.wav` slot is overwritten on each
+upload-of-same-`meeting_id`, so the same meeting never duplicates
+server-side. But meetings accumulate: at the 4-hour audio target
+(~460 MB raw PCM per meeting), an active operator producing
+~5 meetings/week consumes ~2.3 GB/week of server storage. V2 ships
+without an automatic retention policy — operators manage `~/meetings/`
+with standard filesystem tools. V3 may add an operator-configurable
+retention policy (e.g., "drop audio after N days, keep
+transcript/summary/frontmatter indefinitely").
+
 ### V1 → V2 client compatibility
 
 V2 has **no backwards compatibility for `record.start`** or any other
