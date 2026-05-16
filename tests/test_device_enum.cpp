@@ -6,8 +6,11 @@
 
 using namespace recmeet;
 
-// These tests require a running PipeWire/PulseAudio server.
-// Tagged [integration] so they can be filtered out in CI.
+// These tests require a running PipeWire/PulseAudio server. They are tagged
+// [integration][device_enum]; the `make integration-cxx` target excludes
+// [device_enum] so CI runners (which are typically headless and lack a PA
+// daemon) skip them. Run with `./build/recmeet_tests "[device_enum]"`
+// explicitly on a workstation to exercise them.
 
 TEST_CASE("list_sources: returns at least one source", "[device_enum][integration]") {
     auto sources = list_sources();

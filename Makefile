@@ -100,7 +100,7 @@ integration: integration-cxx integration-go
 integration-cxx: ensure-submodules
 	cmake -B $(BUILD_DIR) -G Ninja $(CMAKE_OPTS) -DRECMEET_BUILD_TESTS=ON
 	ninja -C $(BUILD_DIR)
-	./$(BUILD_DIR)/recmeet_tests "[integration]~[t2-1]"
+	./$(BUILD_DIR)/recmeet_tests "[integration]~[t2-1]~[device_enum]"
 
 # Go-tools integration: 39 build-tag-gated tests across recmeet-mcp + recmeet-agent.
 # Builds binaries via testutil.BuildBinaryOnce; no shared state with the C++ suite,
