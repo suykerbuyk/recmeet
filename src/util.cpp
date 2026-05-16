@@ -296,4 +296,30 @@ long parse_memory_property_line(const char* line) {
     return (end == eq) ? -1 : v;
 }
 
+bool is_valid_meeting_id(const std::string& s) {
+    if (s.empty()) return true;       // sentinel: "no id assigned"
+    if (s.size() != 36) return false; // UUID canonical text length
+
+    // Hyphens at fixed offsets 8/13/18/23 (the 8-4-4-4-12 layout).
+    if (s[8] != '-' || s[13] != '-' || s[18] != '-' || s[23] != '-')
+        return false;
+
+    auto is_lower_hex = [](char c) {
+        return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
+    };
+    for (size_t i = 0; i < 36; ++i) {
+        if (i == 8 || i == 13 || i == 18 || i == 23) continue;
+        if (!is_lower_hex(s[i])) return false;
+    }
+
+    // Version 4 — offset 14 is the version nibble.
+    if (s[14] != '4') return false;
+
+    // Variant 10xx — offset 19 must be one of {8,9,a,b}.
+    char v = s[19];
+    if (v != '8' && v != '9' && v != 'a' && v != 'b') return false;
+
+    return true;
+}
+
 } // namespace recmeet

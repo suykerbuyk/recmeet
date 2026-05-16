@@ -50,8 +50,9 @@ std::string read_context_file(const fs::path& path) {
 }
 
 void save_meeting_context(const fs::path& out_dir, const std::string& context_inline,
-                          const fs::path& context_file, const std::string& timestamp) {
-    if (context_inline.empty() && context_file.empty()) return;
+                          const fs::path& context_file, const std::string& timestamp,
+                          const std::string& meeting_id) {
+    if (context_inline.empty() && context_file.empty() && meeting_id.empty()) return;
     fs::path path = timestamp.empty()
         ? out_dir / LEGACY_CONTEXT_NAME
         : out_dir / (std::string(CONTEXT_PREFIX) + timestamp + ".json");
@@ -61,12 +62,21 @@ void save_meeting_context(const fs::path& out_dir, const std::string& context_in
         return;
     }
     out << "{\"context\":\"" << json_escape(context_inline)
-        << "\",\"context_file\":\"" << json_escape(context_file.string()) << "\"}";
+        << "\",\"context_file\":\"" << json_escape(context_file.string()) << "\"";
+    // C.11: only emit "meeting_id" when non-empty so v1-written context.json
+    // shape is preserved byte-for-byte on the no-id path.
+    if (!meeting_id.empty()) {
+        out << ",\"meeting_id\":\"" << json_escape(meeting_id) << "\"";
+    }
+    out << "}";
     log_info("Saved %s", path.filename().c_str());
 }
 
-std::string load_meeting_context(const fs::path& out_dir) {
-    fs::path path = find_context_file(out_dir);
+namespace {
+/// Parse a context.json file and extract the named field. Returns empty
+/// string when the file is unreadable, malformed, or the field is absent.
+/// Shared by load_meeting_context and load_meeting_id.
+std::string read_context_field(const fs::path& path, const std::string& field) {
     if (path.empty()) return "";
     std::ifstream in(path);
     if (!in) return "";
@@ -74,15 +84,27 @@ std::string load_meeting_context(const fs::path& out_dir) {
     buf << in.rdbuf();
     std::string json = buf.str();
 
-    // Minimal parse: extract "context" value using IPC parser
     IpcMessage msg;
     std::string wrapped = "{\"id\":0,\"result\":" + json + "}";
     if (parse_ipc_message(wrapped, msg) && msg.type == IpcMessageType::Response) {
-        auto it = msg.response.result.find("context");
+        auto it = msg.response.result.find(field);
         if (it != msg.response.result.end())
             return json_val_as_string(it->second);
     }
     return "";
+}
+} // anonymous namespace
+
+std::string load_meeting_context(const fs::path& out_dir) {
+    return read_context_field(find_context_file(out_dir), "context");
+}
+
+std::string load_meeting_id(const fs::path& out_dir) {
+    std::string id = read_context_field(find_context_file(out_dir), "meeting_id");
+    // Defensive: reject a malformed value rather than poison the MeetingIndex.
+    // is_valid_meeting_id accepts "" — round-trips fine through this check.
+    if (!is_valid_meeting_id(id)) return "";
+    return id;
 }
 
 

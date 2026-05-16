@@ -686,3 +686,64 @@ TEST_CASE("derive_meeting_timestamp: empty when no match anywhere",
 
     CHECK(derive_meeting_timestamp(tmp.path()) == "");
 }
+
+// --- Phase C.11 — is_valid_meeting_id ------------------------------------
+
+TEST_CASE("is_valid_meeting_id: empty string is the 'no id' sentinel",
+          "[meeting-id][c11]") {
+    CHECK(is_valid_meeting_id(""));
+}
+
+TEST_CASE("is_valid_meeting_id: accepts canonical lowercase UUID v4",
+          "[meeting-id][c11]") {
+    // version=4 (offset 14), variant=8/9/a/b (offset 19)
+    CHECK(is_valid_meeting_id("12345678-1234-4567-89ab-1234567890ab"));
+    CHECK(is_valid_meeting_id("abcdef01-2345-4678-9abc-def012345678"));
+    CHECK(is_valid_meeting_id("00000000-0000-4000-8000-000000000000"));
+    CHECK(is_valid_meeting_id("ffffffff-ffff-4fff-bfff-ffffffffffff"));
+}
+
+TEST_CASE("is_valid_meeting_id: rejects wrong length",
+          "[meeting-id][c11]") {
+    CHECK_FALSE(is_valid_meeting_id("12345678-1234-4567-89ab-1234567890a"));   // 35
+    CHECK_FALSE(is_valid_meeting_id("12345678-1234-4567-89ab-1234567890abc")); // 37
+    CHECK_FALSE(is_valid_meeting_id("12345678123445678abe1234567890ab"));      // hyphenless
+}
+
+TEST_CASE("is_valid_meeting_id: rejects misplaced or missing hyphens",
+          "[meeting-id][c11]") {
+    CHECK_FALSE(is_valid_meeting_id("123456781234-4567-89ab-1234567890abxy"));
+    CHECK_FALSE(is_valid_meeting_id("12345678-12344567-89ab-1234567890abxy"));
+    CHECK_FALSE(is_valid_meeting_id("1234567x-1234-4567-89ab-1234567890ab")); // 'x' at hex slot
+}
+
+TEST_CASE("is_valid_meeting_id: rejects uppercase hex (canonical lowercase only)",
+          "[meeting-id][c11]") {
+    CHECK_FALSE(is_valid_meeting_id("12345678-1234-4567-89AB-1234567890ab"));
+    CHECK_FALSE(is_valid_meeting_id("ABCDEF01-2345-4678-9abc-def012345678"));
+}
+
+TEST_CASE("is_valid_meeting_id: rejects wrong version nibble",
+          "[meeting-id][c11]") {
+    // Offset 14 must be '4'. v1/v3/v5 → reject; the wire contract is UUID v4.
+    CHECK_FALSE(is_valid_meeting_id("12345678-1234-1567-89ab-1234567890ab"));
+    CHECK_FALSE(is_valid_meeting_id("12345678-1234-3567-89ab-1234567890ab"));
+    CHECK_FALSE(is_valid_meeting_id("12345678-1234-5567-89ab-1234567890ab"));
+    CHECK_FALSE(is_valid_meeting_id("12345678-1234-0567-89ab-1234567890ab"));
+}
+
+TEST_CASE("is_valid_meeting_id: rejects wrong variant high bits",
+          "[meeting-id][c11]") {
+    // Offset 19 must be one of {8,9,a,b} (RFC 4122 variant 10xx).
+    CHECK_FALSE(is_valid_meeting_id("12345678-1234-4567-09ab-1234567890ab")); // 0xxx
+    CHECK_FALSE(is_valid_meeting_id("12345678-1234-4567-79ab-1234567890ab")); // 0111
+    CHECK_FALSE(is_valid_meeting_id("12345678-1234-4567-c9ab-1234567890ab")); // 110x
+    CHECK_FALSE(is_valid_meeting_id("12345678-1234-4567-f9ab-1234567890ab")); // 111x
+}
+
+TEST_CASE("is_valid_meeting_id: rejects non-hex characters",
+          "[meeting-id][c11]") {
+    CHECK_FALSE(is_valid_meeting_id("g2345678-1234-4567-89ab-1234567890ab"));
+    CHECK_FALSE(is_valid_meeting_id("12345678-1234-4567-89ab-12345678 0ab")); // embedded space
+    CHECK_FALSE(is_valid_meeting_id("12345678-1234-4567-89ab-1234567890a!"));
+}

@@ -181,6 +181,90 @@ TEST_CASE("load_meeting_context: returns empty when context key missing", "[pipe
     fs::remove_all(dir);
 }
 
+// --- Phase C.11 — meeting_id round-trip in context.json -------------------
+
+TEST_CASE("save_meeting_context: omits meeting_id field when empty (v1 shape preserved)",
+          "[pipeline][c11]") {
+    auto dir = tmp_dir();
+    save_meeting_context(dir, "hello", {}, "", /*meeting_id=*/"");
+
+    std::ifstream in(dir / "context.json");
+    std::ostringstream buf; buf << in.rdbuf();
+    // v1 readers must see byte-for-byte the same shape on the no-id path.
+    CHECK(buf.str() == "{\"context\":\"hello\",\"context_file\":\"\"}");
+
+    fs::remove_all(dir);
+}
+
+TEST_CASE("save_meeting_context + load_meeting_id round-trip", "[pipeline][c11]") {
+    auto dir = tmp_dir();
+    const std::string id = "12345678-1234-4567-89ab-1234567890ab"; // valid UUID v4
+
+    save_meeting_context(dir, "ctx body", {}, "", id);
+    CHECK(load_meeting_id(dir) == id);
+    // Context text still loads cleanly alongside.
+    CHECK(load_meeting_context(dir) == "ctx body");
+
+    fs::remove_all(dir);
+}
+
+TEST_CASE("save_meeting_context: persists meeting_id when only id is set "
+          "(no inline context, no context_file)",
+          "[pipeline][c11]") {
+    auto dir = tmp_dir();
+    const std::string id = "abcdef01-2345-4678-9abc-def012345678";
+
+    save_meeting_context(dir, "", {}, "", id);
+    REQUIRE(fs::exists(dir / "context.json"));
+    CHECK(load_meeting_id(dir) == id);
+    CHECK(load_meeting_context(dir).empty());
+
+    fs::remove_all(dir);
+}
+
+TEST_CASE("load_meeting_id: returns empty for v1-written context.json "
+          "(no meeting_id field)",
+          "[pipeline][c11]") {
+    auto dir = tmp_dir();
+    save_meeting_context(dir, "v1 context"); // no id passed
+    CHECK(load_meeting_id(dir).empty());
+    // Context still loads.
+    CHECK(load_meeting_context(dir) == "v1 context");
+    fs::remove_all(dir);
+}
+
+TEST_CASE("load_meeting_id: rejects a malformed stored value rather than poison the index",
+          "[pipeline][c11]") {
+    auto dir = tmp_dir();
+    {
+        std::ofstream out(dir / "context.json");
+        // Wrong layout — not a UUID v4. Must NOT propagate into the index.
+        out << "{\"context\":\"\",\"context_file\":\"\","
+               "\"meeting_id\":\"not-a-real-uuid\"}";
+    }
+    CHECK(load_meeting_id(dir).empty());
+    fs::remove_all(dir);
+}
+
+TEST_CASE("load_meeting_id: returns empty for missing dir", "[pipeline][c11]") {
+    CHECK(load_meeting_id("/nonexistent/dir").empty());
+}
+
+TEST_CASE("save_meeting_context: timestamp + meeting_id together write per-instance file",
+          "[pipeline][c11]") {
+    auto dir = tmp_dir();
+    const std::string id = "00000000-0000-4000-8000-000000000001";
+
+    save_meeting_context(dir, "ctx", {}, "2026-05-16_12-34", id);
+
+    CHECK(fs::exists(dir / "context_2026-05-16_12-34.json"));
+    CHECK_FALSE(fs::exists(dir / "context.json"));
+    CHECK(load_meeting_id(dir) == id);
+    CHECK(load_meeting_context(dir) == "ctx");
+
+    fs::remove_all(dir);
+}
+
 TEST_CASE("run_postprocessing: transcribe minimal WAV with no summary/diarize", "[integration]") {
     ensure_whisper_model("tiny");
 

@@ -71,13 +71,27 @@ std::string read_context_file(const fs::path& path);
 
 /// Save inline context as context_<timestamp>.json in the meeting output directory.
 /// If timestamp is empty, falls back to the legacy filename `context.json`.
+///
+/// Phase C.11: `meeting_id` (when non-empty) is emitted as an additive
+/// `"meeting_id"` field in the JSON. Empty `meeting_id` writes no such field
+/// — v1 readers, which ignore unknown keys, see byte-for-byte the same shape
+/// they always have. Server-side MeetingIndex rebuild reads this field via
+/// `load_meeting_id()` below.
 void save_meeting_context(const fs::path& out_dir, const std::string& context_inline,
                           const fs::path& context_file = {},
-                          const std::string& timestamp = "");
+                          const std::string& timestamp = "",
+                          const std::string& meeting_id = "");
 
 /// Load context string from context.json in a meeting directory.
 /// Returns empty if file doesn't exist.
 std::string load_meeting_context(const fs::path& out_dir);
+
+/// Phase C.11 — read the `meeting_id` field from the meeting's context.json.
+/// Returns empty string when the file is missing, the field is absent
+/// (v1-written context.json), or the stored value fails
+/// `is_valid_meeting_id()`. Used by `MeetingIndex::rebuild_from_disk()` to
+/// repopulate the in-memory index on daemon startup. Side-effect-free.
+std::string load_meeting_id(const fs::path& out_dir);
 
 /// Record audio. Phase: "recording". For --reprocess, resolves paths only.
 ///

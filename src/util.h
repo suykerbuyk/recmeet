@@ -163,6 +163,21 @@ std::pair<std::string, std::string> resolve_meeting_time(
     const fs::path& out_dir, const fs::path& audio_path);
 
 // ---------------------------------------------------------------------------
+// meeting_id validation (Phase C.11)
+// ---------------------------------------------------------------------------
+
+/// Validate a `meeting_id` string. Returns true for an empty string (sentinel
+/// for "no id" — used by v1-written context.json and pre-C.11 IPC requests)
+/// OR a canonical lowercase UUID v4 (36 chars, layout 8-4-4-4-12 hex with
+/// hyphens at offsets 8/13/18/23, version nibble = 4 at offset 14, variant
+/// high bits = 10 at offset 19). Any other input — wrong length, wrong hyphen
+/// positions, uppercase hex, non-hex character, wrong version, wrong variant
+/// — returns false. Server-side check on every C.11 verb; rejecting malformed
+/// IDs at the wire boundary prevents them from poisoning the in-memory
+/// `meeting_id → meeting_dir_path` index.
+bool is_valid_meeting_id(const std::string& s);
+
+// ---------------------------------------------------------------------------
 // systemd property line parser (T1C.2)
 // ---------------------------------------------------------------------------
 
