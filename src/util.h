@@ -62,6 +62,12 @@ fs::path config_dir();
 /// ~/.local/share/recmeet/
 fs::path data_dir();
 
+/// ~/.local/state/recmeet/  (Phase D.5 — XDG state dir; mirrors
+/// `config_dir()` / `data_dir()` with `XDG_STATE_HOME` env var and
+/// `.local/state` fallback. Used for the per-server resume_token store
+/// (`session.tokens.json`).
+fs::path state_dir();
+
 /// ~/.local/share/recmeet/models/
 fs::path models_dir();
 
@@ -126,6 +132,35 @@ constexpr const char* DEFAULT_DEVICE_PATTERN = "";
 
 /// Write text content to a file, throwing RecmeetError on failure.
 void write_text_file(const fs::path& path, const std::string& content);
+
+// ---------------------------------------------------------------------------
+// Atomic file write (Phase D.5)
+// ---------------------------------------------------------------------------
+
+/// Atomically write `bytes` to `path` with the durability contract used by
+/// the C.11.4 staging→meeting WAV relocation primitive (`atomic_relocate`):
+///
+///   1. write to `<path>.tmp`
+///   2. `fsync(file_fd)` so the bytes are durable
+///   3. `rename(<path>.tmp, <path>)` — atomic within a single filesystem
+///   4. `fsync(parent_dir_fd)` so the rename entry is durable
+///
+/// EXDEV cross-filesystem case (e.g. tmpfs `path.tmp` next to ext4 `path` is
+/// not the typical layout for D.5's small JSON files, but EXDEV is handled
+/// transparently because step 1 writes the tmp alongside the final path —
+/// the parent dir is identical so EXDEV cannot occur). If `mode != 0` the
+/// final file is `chmod()`'d to that mode after rename (before the dir
+/// fsync) — used by the resume_token store to enforce 0600 secrecy.
+///
+/// Throws `RecmeetError` on any filesystem failure; the partial `.tmp`
+/// file is removed best-effort on the failure path so the next attempt
+/// starts from a clean directory. Concurrent readers of `path` always
+/// observe either the prior bytes or the new bytes — never a partial
+/// write (this is the invariant the journal + resume_token store inherit
+/// from the C.11.4 atomic-write surface).
+void atomic_write_file(const fs::path& path,
+                       const std::string& bytes,
+                       int mode = 0);
 
 // ---------------------------------------------------------------------------
 // Thread count helper

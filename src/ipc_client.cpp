@@ -69,6 +69,36 @@ struct AuthOkProtocolVersion {
     bool present = false;
     int  value   = 0;
 };
+// Phase D.5 — extract the optional `resume_token` string from the auth.ok
+// frame. Frame shape after C.13 is
+// `{"type":"auth.ok","client_id":"...","protocol_version":N,"resume_token":"..."}`
+// where `resume_token` is OMITTED by the server when the SessionManager
+// resolver hook returned an empty token (legacy / test paths). Per the
+// D.5 architecture-review checklist item #6 the absence MUST be tolerated
+// — return the empty string, never throw. Uses the same micro-parser
+// shape as `extract_client_id_from_auth_ok` above.
+std::string extract_resume_token_from_auth_ok(const std::string& line) {
+    size_t key = line.find("\"resume_token\"");
+    if (key == std::string::npos) return "";
+    size_t colon = line.find(':', key);
+    if (colon == std::string::npos) return "";
+    size_t open = line.find('"', colon);
+    if (open == std::string::npos) return "";
+    std::string out;
+    for (size_t i = open + 1; i < line.size(); ++i) {
+        char c = line[i];
+        if (c == '\\' && i + 1 < line.size()) {
+            char nc = line[i + 1];
+            if (nc == '"' || nc == '\\') { out += nc; ++i; continue; }
+            out += c;
+            continue;
+        }
+        if (c == '"') return out;
+        out += c;
+    }
+    return "";
+}
+
 AuthOkProtocolVersion extract_protocol_version_from_auth_ok(const std::string& line) {
     AuthOkProtocolVersion r;
     size_t key = line.find("\"protocol_version\"");
@@ -196,9 +226,28 @@ bool IpcClient::connect() {
     // return and remains true until the next connect() is attempted —
     // tests inspect it on the failed-connect return value.
     protocol_mismatch_ = false;
+    // Phase D.5: clear any cached resume_token from a prior connection
+    // so a failed handshake cannot leak the token through `resume_token()`.
+    resume_token_.clear();
     if (addr_.transport == IpcTransport::Tcp)
         return connect_tcp();
     return connect_unix();
+}
+
+bool IpcClient::connect(const std::string& psk,
+                        const std::string& resume_token) {
+    // Stash the explicit psk + resume_token for `connect_tcp()` to
+    // consume. They are cleared after consumption (whether the connect
+    // succeeded or failed) so a subsequent zero-arg `connect()` falls
+    // back cleanly to the env-var + no-resume-token path.
+    pending_psk_override_ = psk;
+    pending_psk_set_      = true;
+    pending_resume_token_ = resume_token;
+    bool ok = connect();
+    pending_psk_override_.clear();
+    pending_psk_set_      = false;
+    pending_resume_token_.clear();
+    return ok;
 }
 
 bool IpcClient::connect_unix() {
@@ -283,6 +332,12 @@ bool IpcClient::verify_auth_ok_and_capture(const std::string& reply) {
     client_id_         = parsed_id;
     protocol_version_  = pv.value;
     protocol_mismatch_ = false;
+    // Phase D.5 — capture the optional `resume_token` field if present.
+    // Empty string when absent (legacy / test daemon path); the tray's
+    // persist site (`tray.cpp` connect site) checks empty-vs-non-empty
+    // before writing to `ResumeTokenStore`, so an empty value is a
+    // silent no-op all the way through.
+    resume_token_ = extract_resume_token_from_auth_ok(reply);
     return true;
 }
 
@@ -338,15 +393,35 @@ bool IpcClient::connect_tcp() {
     // read from RECMEET_AUTH_TOKEN at connect time so operators can rotate
     // by relaunching. Per-client config arrives in A.6 (session.init);
     // until then, the env var is the v1 source of truth.
-    const char* token_env = std::getenv("RECMEET_AUTH_TOKEN");
-    std::string token = token_env ? token_env : "";
+    //
+    // Phase D.5: the `connect(psk, resume_token)` overload stashes an
+    // explicit PSK (`pending_psk_set_`) and an optional resume_token
+    // (`pending_resume_token_`). When set, the explicit PSK wins over the
+    // env var; the resume_token is appended to the auth.token request
+    // body as the C.13-additive `resume_token` field (server-side
+    // handler at ipc_server.cpp:146-154 extracts it via
+    // `try_parse_auth_token`).
+    std::string token;
+    if (pending_psk_set_) {
+        token = pending_psk_override_;
+    } else {
+        const char* token_env = std::getenv("RECMEET_AUTH_TOKEN");
+        token = token_env ? token_env : "";
+    }
 
     // Phase C.1: the auth.token frame rides the framed transport like
     // every other NDJSON message — prefix it with the `0x00` discriminator
     // via `frame_ndjson()`.
-    std::string auth_frame = frame_ndjson(
+    std::string auth_body =
         "{\"type\":\"auth.token\",\"token\":\""
-        + json_escape_token(token) + "\"}");
+        + json_escape_token(token) + "\"";
+    if (!pending_resume_token_.empty()) {
+        auth_body += ",\"resume_token\":\"";
+        auth_body += json_escape_token(pending_resume_token_);
+        auth_body += "\"";
+    }
+    auth_body += "}";
+    std::string auth_frame = frame_ndjson(auth_body);
     ssize_t aw = write(fd_, auth_frame.data(), auth_frame.size());
     if (aw < 0) { close(fd_); fd_ = -1; return false; }
 
@@ -399,6 +474,11 @@ void IpcClient::close_connection() {
     // cleared here — it documents the reason this connection was torn
     // down, and the next `connect()` call clears it before retrying.
     protocol_version_ = 0;
+    // Phase D.5: drop the cached resume_token so a post-close
+    // `resume_token()` call returns the empty string. The next connect()
+    // will re-populate from the new auth.ok frame (if any) or leave it
+    // empty for the legacy-server case.
+    resume_token_.clear();
     // Phase C.4: discard any unconsumed `0x02` BinaryArtifact frames
     // received during this connection. A stale stash carried into a
     // reconnect would surface as a phantom artifact for the next fetch.

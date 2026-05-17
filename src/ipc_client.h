@@ -27,6 +27,27 @@ public:
     // Connect to the daemon. Returns true on success.
     bool connect();
 
+    // Phase D.5 — connect with explicit PSK + optional resume_token. When
+    // `resume_token` is non-empty the TCP connect sends it as
+    // `auth.token.resume_token` so the server-side SessionManager
+    // resolves the prior `client_id` and remints (or re-issues) the
+    // token. The server-side handler at ipc_server.cpp:146-154 reads
+    // this optional field; the daemon's auth.ok emission at
+    // ipc_server.cpp:87-111 echoes the resolved token back so the client
+    // can persist it via `ResumeTokenStore::put`.
+    //
+    // When `psk` is empty, the same environment-variable fallback as the
+    // zero-arg `connect()` is used (RECMEET_AUTH_TOKEN) — this overload
+    // is the canonical entry point for the tray's reconnect path where
+    // the resume_token comes from `ResumeTokenStore::get(addr)`.
+    //
+    // Unix-socket clients ignore `psk` (no PSK gate on AF_UNIX) but DO
+    // honor `resume_token` for symmetry (a future test seam that swaps
+    // a Unix-socket server with C.13 wiring will exercise resume there
+    // too).
+    bool connect(const std::string& psk,
+                 const std::string& resume_token = "");
+
     // Whether connected.
     bool connected() const { return fd_ >= 0; }
 
@@ -80,6 +101,16 @@ public:
     // connect failure from a version-rejection failure without parsing
     // log output.
     bool protocol_mismatch() const { return protocol_mismatch_; }
+
+    // Phase D.5 — the server-issued `resume_token` parsed from the
+    // `auth.ok` frame (C.13). Returns the EMPTY STRING (NOT throws) when
+    // the daemon omits the field — legacy / test-path daemons, and any
+    // daemon whose SessionManager resolver hook returned an empty token
+    // — per ipc_server.cpp:104-108 conditional emission and the D.5
+    // architecture-review checklist item #6. Reset on
+    // `close_connection()` to prevent a stale token from being persisted
+    // after a disconnect.
+    const std::string& resume_token() const { return resume_token_; }
 
     // Get the underlying fd (for integration with external event loops).
     int fd() const { return fd_; }
@@ -240,6 +271,26 @@ private:
     // (including the "field missing" case). Surfaced via
     // `protocol_mismatch()`. Cleared on the next successful connect.
     bool protocol_mismatch_ = false;
+
+    // Phase D.5: per-connection resume_token captured from the `auth.ok`
+    // frame (C.13). Empty when the daemon did not emit the field
+    // (legacy / test paths). Cleared on `close_connection()` and on the
+    // start of every new `connect()` attempt so a failed handshake can
+    // never leak a token from a prior connection. Read via
+    // `resume_token()`.
+    std::string resume_token_;
+
+    // Phase D.5: resume_token the caller wants to present on the NEXT
+    // connect. Set by the `connect(psk, resume_token)` overload and
+    // consumed by `connect_tcp()` when constructing the `auth.token`
+    // frame. Cleared after consumption so a subsequent zero-arg
+    // `connect()` does not accidentally replay it.
+    std::string pending_resume_token_;
+
+    // Phase D.5: explicit PSK override (empty → use RECMEET_AUTH_TOKEN
+    // env var, matching the zero-arg `connect()` behavior).
+    std::string pending_psk_override_;
+    bool pending_psk_set_ = false;
 
     // Phase C.4: per-connection FIFO of received `0x02` BinaryArtifact frame
     // payloads. The C.1 path discards binary frames on the client side

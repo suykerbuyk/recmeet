@@ -10,10 +10,12 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fcntl.h>
 #include <fstream>
 #include <sys/stat.h>
 #include <iomanip>
 #include <sstream>
+#include <system_error>
 #include <thread>
 #include <unistd.h>
 
@@ -29,7 +31,124 @@ static fs::path xdg_dir(const char* env_var, const char* fallback_suffix) {
 
 fs::path config_dir() { return xdg_dir("XDG_CONFIG_HOME", ".config"); }
 fs::path data_dir()   { return xdg_dir("XDG_DATA_HOME", ".local/share"); }
+fs::path state_dir()  { return xdg_dir("XDG_STATE_HOME", ".local/state"); }
 fs::path models_dir() { return data_dir() / "models"; }
+
+// ---------------------------------------------------------------------------
+// Phase D.5 — atomic_write_file
+// ---------------------------------------------------------------------------
+//
+// Mirror of the C.11.4 staging→meeting WAV `atomic_relocate` durability
+// tail: write to `<path>.tmp`, `fsync(file_fd)`, `rename(tmp, final)`,
+// `fsync(parent_dir_fd)`. The journal + resume_token store both consume
+// this primitive so the disjointness invariant ("a concurrent reader sees
+// either the prior file or the new file, never a half-written one") is
+// shared between the upload pipeline (C.11.4) and the persistence layer
+// (D.5).
+//
+// EXDEV note: D.5's two callers (`PendingJobsJournal`, `ResumeTokenStore`)
+// always write the `.tmp` next to the final file (same parent directory),
+// so EXDEV cannot arise. The `atomic_relocate` cross-fs fallback in
+// upload_session.cpp:139-219 stays where it is — its src/dst can land on
+// different filesystems (tmpfs staging vs ext4 meetings) and that's the
+// scenario that needs the copy-then-rename dance.
+//
+// `mode != 0` triggers an additional `chmod()` on the final file after
+// the rename and before the dir fsync — used by ResumeTokenStore to
+// enforce 0600 secrecy on the on-disk token cache. The mode is applied
+// post-rename rather than at `open()` time so a partially-written `.tmp`
+// can never become world-readable mid-write.
+void atomic_write_file(const fs::path& path, const std::string& bytes,
+                       int mode) {
+    fs::path tmp = path;
+    tmp += ".tmp";
+
+    std::error_code ec;
+    fs::remove(tmp, ec);  // best-effort: clear stale partial
+
+    // Ensure the parent directory exists. This is a no-op when the caller
+    // already created it (the journal + token store always call
+    // create_directories first) but defensive against fresh installs.
+    if (path.has_parent_path()) {
+        fs::create_directories(path.parent_path(), ec);
+        if (ec) {
+            throw RecmeetError("atomic_write_file: cannot mkdir " +
+                               path.parent_path().string() + ": " +
+                               ec.message());
+        }
+    }
+
+    // O_WRONLY|O_CREAT|O_TRUNC|O_CLOEXEC with 0600 default so the
+    // partial-write window cannot leak token bytes to other users on
+    // shared hosts. Mode 0600 is also the final mode for the token store
+    // (preserved across rename per POSIX). For the journal, the caller
+    // passes mode=0 (no chmod) and the file ends up at the open-time
+    // 0600 mask — operator-visible only, which matches the journal's
+    // sensitivity (job_ids + WAV paths are not secrets but no need to
+    // share them with other host users either).
+    int fd = ::open(tmp.string().c_str(),
+                    O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC,
+                    0600);
+    if (fd < 0) {
+        throw RecmeetError("atomic_write_file: cannot open " + tmp.string() +
+                           ": " + std::strerror(errno));
+    }
+
+    size_t remaining = bytes.size();
+    const char* p = bytes.data();
+    while (remaining > 0) {
+        ssize_t w = ::write(fd, p, remaining);
+        if (w < 0) {
+            if (errno == EINTR) continue;
+            int saved = errno;
+            ::close(fd);
+            fs::remove(tmp, ec);
+            throw RecmeetError("atomic_write_file: write to " + tmp.string() +
+                               " failed: " + std::strerror(saved));
+        }
+        p += w;
+        remaining -= static_cast<size_t>(w);
+    }
+
+    if (::fsync(fd) != 0) {
+        int saved = errno;
+        ::close(fd);
+        fs::remove(tmp, ec);
+        throw RecmeetError("atomic_write_file: fsync of " + tmp.string() +
+                           " failed: " + std::strerror(saved));
+    }
+    ::close(fd);
+
+    fs::rename(tmp, path, ec);
+    if (ec) {
+        std::error_code rm_ec;
+        fs::remove(tmp, rm_ec);
+        throw RecmeetError("atomic_write_file: rename(" + tmp.string() +
+                           " -> " + path.string() + ") failed: " +
+                           ec.message());
+    }
+
+    if (mode != 0) {
+        if (::chmod(path.string().c_str(), static_cast<mode_t>(mode)) != 0) {
+            int saved = errno;
+            throw RecmeetError("atomic_write_file: chmod(" + path.string() +
+                               ") failed: " + std::strerror(saved));
+        }
+    }
+
+    // Final step: fsync the parent directory so the rename entry survives
+    // a crash. Best-effort — a chroot or sandboxed test that cannot
+    // re-open the parent dir read-only would otherwise fail the write,
+    // and the data is already on stable storage via the file fsync above.
+    if (path.has_parent_path()) {
+        int dfd = ::open(path.parent_path().string().c_str(),
+                         O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        if (dfd >= 0) {
+            (void)::fsync(dfd);
+            (void)::close(dfd);
+        }
+    }
+}
 
 fs::path find_audio_file(const fs::path& dir) {
     if (!fs::is_directory(dir)) return {};

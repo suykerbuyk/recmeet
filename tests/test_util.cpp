@@ -3,9 +3,14 @@
 
 #include <catch2/catch_test_macros.hpp>
 #include "util.h"
+#include "uuid.h"
 
+#include <algorithm>
 #include <climits>
+#include <cstdlib>
 #include <fstream>
+#include <random>
+#include <sstream>
 #include <sys/stat.h>
 #include <unistd.h>
 #include <vector>
@@ -746,4 +751,111 @@ TEST_CASE("is_valid_meeting_id: rejects non-hex characters",
     CHECK_FALSE(is_valid_meeting_id("g2345678-1234-4567-89ab-1234567890ab"));
     CHECK_FALSE(is_valid_meeting_id("12345678-1234-4567-89ab-12345678 0ab")); // embedded space
     CHECK_FALSE(is_valid_meeting_id("12345678-1234-4567-89ab-1234567890a!"));
+}
+
+// --- Phase D.5 — state_dir + atomic_write_file + new_uuid_v4 -------------
+
+TEST_CASE("state_dir: returns path ending in recmeet", "[util][d5]") {
+    auto dir = state_dir();
+    CHECK(dir.filename() == "recmeet");
+}
+
+TEST_CASE("state_dir: falls back to ~/.local/state when XDG_STATE_HOME unset",
+          "[util][d5]") {
+    // Stash and clear XDG_STATE_HOME so the fallback path is exercised.
+    const char* prev = std::getenv("XDG_STATE_HOME");
+    std::string saved = prev ? prev : "";
+    bool had_prev = prev != nullptr;
+    unsetenv("XDG_STATE_HOME");
+
+    auto dir = state_dir();
+    CHECK(dir.string().find(".local/state/recmeet") != std::string::npos);
+
+    if (had_prev) setenv("XDG_STATE_HOME", saved.c_str(), 1);
+}
+
+TEST_CASE("state_dir: honors XDG_STATE_HOME when set",
+          "[util][d5]") {
+    const char* prev = std::getenv("XDG_STATE_HOME");
+    std::string saved = prev ? prev : "";
+    bool had_prev = prev != nullptr;
+    setenv("XDG_STATE_HOME", "/tmp/xdg-state-override-d5", 1);
+
+    auto dir = state_dir();
+    CHECK(dir.string() == "/tmp/xdg-state-override-d5/recmeet");
+
+    if (had_prev) setenv("XDG_STATE_HOME", saved.c_str(), 1);
+    else          unsetenv("XDG_STATE_HOME");
+}
+
+TEST_CASE("atomic_write_file: writes bytes; .tmp gone after success",
+          "[util][d5]") {
+    std::random_device rd;
+    std::ostringstream oss;
+    oss << "/tmp/recmeet_atomic_" << ::getpid() << "_" << rd();
+    fs::path scratch = oss.str();
+    fs::create_directories(scratch);
+    fs::path file = scratch / "out.bin";
+    fs::path tmp  = file; tmp += ".tmp";
+
+    std::string body = "hello, world\nnewline-too\n";
+    atomic_write_file(file, body);
+    REQUIRE(fs::exists(file));
+    CHECK_FALSE(fs::exists(tmp));
+    CHECK(fs::file_size(file) == body.size());
+
+    std::ifstream in(file);
+    std::ostringstream rs; rs << in.rdbuf();
+    CHECK(rs.str() == body);
+
+    fs::remove_all(scratch);
+}
+
+TEST_CASE("atomic_write_file: mode=0600 applied post-rename",
+          "[util][d5]") {
+    std::random_device rd;
+    std::ostringstream oss;
+    oss << "/tmp/recmeet_atomic_mode_" << ::getpid() << "_" << rd();
+    fs::path scratch = oss.str();
+    fs::create_directories(scratch);
+    fs::path file = scratch / "secret.json";
+
+    atomic_write_file(file, "{}\n", 0600);
+    REQUIRE(fs::exists(file));
+
+    struct stat st;
+    REQUIRE(::stat(file.string().c_str(), &st) == 0);
+    CHECK((st.st_mode & 07777) == 0600);
+
+    fs::remove_all(scratch);
+}
+
+TEST_CASE("new_uuid_v4: returns canonical lowercase UUID v4",
+          "[util][d5][uuid]") {
+    for (int i = 0; i < 100; ++i) {
+        std::string id = new_uuid_v4();
+        REQUIRE(id.size() == 36);
+        CHECK(is_valid_meeting_id(id));
+        // Defensive — confirm exact layout (regex would pull a dep; the
+        // is_valid_meeting_id check already covers the same predicate
+        // with the same offsets/case rules used at the wire boundary).
+        CHECK(id[8]  == '-');
+        CHECK(id[13] == '-');
+        CHECK(id[18] == '-');
+        CHECK(id[23] == '-');
+        CHECK(id[14] == '4');
+        CHECK((id[19] == '8' || id[19] == '9' ||
+               id[19] == 'a' || id[19] == 'b'));
+    }
+}
+
+TEST_CASE("new_uuid_v4: collisions are vanishingly unlikely",
+          "[util][d5][uuid]") {
+    // Sanity: 100 mints, no duplicates. With 122 random bits the birthday
+    // bound is astronomical; this catches an accidental seed regression.
+    std::vector<std::string> ids;
+    for (int i = 0; i < 100; ++i) ids.push_back(new_uuid_v4());
+    std::sort(ids.begin(), ids.end());
+    auto it = std::unique(ids.begin(), ids.end());
+    CHECK(it == ids.end());
 }

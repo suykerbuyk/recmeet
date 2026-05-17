@@ -71,6 +71,11 @@ recmeet_pkg_check(PULSE         libpulse)
 recmeet_pkg_check(PULSE_SIMPLE  libpulse-simple)
 recmeet_pkg_check(SNDFILE       sndfile)
 recmeet_pkg_check(CURL          libcurl)
+# Phase D.5 — libuuid (util-linux) for the canonical UUID v4 mint used by
+# `recmeet::new_uuid_v4()` (the per-recording `meeting_id` minted at
+# `start_capture`). Available on every supported distro as
+# `util-linux`/`libuuid1`/`uuid` packages.
+recmeet_pkg_check(UUID          uuid)
 if(RECMEET_USE_NOTIFY)
     recmeet_pkg_check(NOTIFY    libnotify)
 endif()
@@ -223,6 +228,16 @@ set(IPC_SOURCES
     # std::filesystem; lives in recmeet_ipc so the IPC layer can resolve
     # the artifact list at request time without dragging in recmeet_core.
     src/fetch_artifacts.cpp
+    # Phase D.5 — persistence-across-tray-restart surfaces. UUID v4 mint
+    # (libuuid), the per-server resume_token store, and the in-flight
+    # pending_jobs journal. All three are pure-stdlib (+libuuid) and
+    # consumed by tray.cpp via recmeet_ipc, so they live here so the
+    # daemon (which also links recmeet_ipc) does not need to drag the
+    # tray-side state into its address space — none of the D.5 classes
+    # are referenced by daemon TUs; -Wl,--gc-sections drops them.
+    src/uuid.cpp
+    src/resume_token_store.cpp
+    src/pending_jobs_journal.cpp
 )
 
 add_library(recmeet_ipc STATIC ${IPC_SOURCES})
@@ -234,6 +249,7 @@ target_include_directories(recmeet_ipc PUBLIC
 target_link_libraries(recmeet_ipc PUBLIC
     Threads::Threads
     PkgConfig::CURL
+    PkgConfig::UUID
 )
 
 if(RECMEET_USE_NOTIFY)
@@ -527,6 +543,11 @@ if(RECMEET_BUILD_TESTS)
         tests/test_session_manager.cpp
         tests/test_session_gc.cpp
         tests/test_session_ipc.cpp
+        # Phase D.5 persistence-across-tray-restart tests (iter-164).
+        tests/test_sidecar_v2.cpp
+        tests/test_pending_jobs_journal.cpp
+        tests/test_resume_token_store.cpp
+        tests/test_tray_resume_recovery.cpp
     )
     # The test binary exercises both daemon-side surfaces (recmeet_core) and
     # client-side / standalone surfaces (run_recording + recmeet_capture), so

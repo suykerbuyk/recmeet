@@ -11,8 +11,11 @@
 #include "log.h"
 #include "notify.h"
 #include "api_models.h"
+#include "pending_jobs_journal.h"
+#include "resume_token_store.h"
 #include "tray_capture.h"
 #include "util.h"
+#include "uuid.h"
 #include "version.h"
 
 #include <libayatana-appindicator/app-indicator.h>
@@ -151,6 +154,14 @@ struct TrayState {
         fs::path wav_path;             // currently-active staging WAV path
         std::string wav_timestamp;     // YYYY-MM-DD_HH-MM for sidecar
         std::string wav_source;        // mic source name used for this recording
+        // Phase D.5 — UUID v4 minted at start_capture, owned for the
+        // entire recording lifecycle. Threaded through to
+        // `process.submit` / `process.stream` params AND into the v2
+        // sidecar on save-for-later. Mint happens EXACTLY ONCE per
+        // recording per D.5 plan checklist item #3; the retry-after-
+        // crash path (H-D3) re-uses the same id so C.11.4's server-side
+        // dedup contract routes the bytes back to the same meeting dir.
+        std::string meeting_id;
         bool waiting_disposition = false;  // capture stopped, awaiting Submit/Discard/Save
 
         // Phase C.10a — live-caption streaming. When captions are enabled
@@ -185,6 +196,25 @@ struct TrayState {
     // `process.cancel { job_id }`. Cleared on job.complete / job.failed
     // / cancel-success.
     int64_t last_pp_job_id = 0;
+
+    // Phase D.5 — persistence layer.
+    //   * `resume_tokens` is the per-server token cache; loaded lazily
+    //     on first `get`/`put`, atomically persisted on every mutation.
+    //   * `pending_jobs` is the submitted-but-incomplete journal. D.5
+    //     only provides the class; D.2 wires the journal write call site
+    //     at submit-return time. On startup we `load()` and dispatch
+    //     `job.status` for each entry (recovery loop below).
+    //   * `pending_resumes` is the in-memory snapshot of `.pending`
+    //     sidecars scanned from staging at startup. Drives the
+    //     `Resume Pending (N)` tray submenu.
+    ResumeTokenStore resume_tokens;
+    PendingJobsJournal pending_jobs;
+    std::vector<tray_capture::PendingSidecarV2> pending_resumes;
+    // Captured on every successful `connect()` so subsequent disconnect
+    // / reconnect / persist cycles all reference the same address key.
+    // Set to `daemon_addr` when non-empty; falls back to
+    // `default_ipc_address()` formatted string otherwise.
+    std::string resume_server_key;
 };
 
 static TrayState g_tray;
@@ -517,7 +547,42 @@ static void teardown_ipc_watch() {
 
 static bool connect_to_daemon() {
     if (g_tray.daemon_connected) return true;
-    if (!g_tray.ipc.connect()) return false;
+
+    // Phase D.5 — pick the canonical address key for the resume_token
+    // store. v1 has one server; multi-server (E.2 + multi-server hook
+    // #1) will iterate `servers: [...]` and store per-entry tokens.
+    if (g_tray.resume_server_key.empty()) {
+        g_tray.resume_server_key =
+            g_tray.daemon_addr.empty() ? std::string("default") : g_tray.daemon_addr;
+    }
+
+    // Load the prior resume_token for this server (if any) and present
+    // it on the next handshake. Empty token → falls back to fresh-mint
+    // path on the server side, indistinguishable from a first-time
+    // connect to the legacy daemon.
+    std::string resume_tok;
+    if (auto cached = g_tray.resume_tokens.get(g_tray.resume_server_key)) {
+        resume_tok = *cached;
+    }
+
+    const char* psk_env = std::getenv("RECMEET_AUTH_TOKEN");
+    std::string psk = psk_env ? psk_env : "";
+    if (!g_tray.ipc.connect(psk, resume_tok)) return false;
+
+    // Persist the server-issued resume_token. Empty value (legacy /
+    // test-path daemon that did not emit the field) is a silent no-op
+    // — `put` skips disk writes when the value matches the cache, and
+    // an absent key remains absent. Architecture-review checklist
+    // item #6: empty resume_token returned by the getter must NOT
+    // throw — see `IpcClient::resume_token()` doc.
+    const std::string& fresh_tok = g_tray.ipc.resume_token();
+    if (!fresh_tok.empty()) {
+        try {
+            g_tray.resume_tokens.put(g_tray.resume_server_key, fresh_tok);
+        } catch (const std::exception& e) {
+            log_warn("[tray] resume_token persist failed: %s", e.what());
+        }
+    }
 
     g_tray.ipc.set_event_callback(handle_ipc_event);
     g_tray.daemon_connected = true;
@@ -739,6 +804,14 @@ static void show_context_window() {
 struct CapturedContext {
     std::string context_inline;
     std::string vocab_additions;
+    // Phase D.5 — structured fields preserved for the sidecar v2 schema's
+    // `context` block. The `context_inline` flatten above stays for
+    // backward compatibility with the daemon's `process.submit` context
+    // field; the structured fields below are used by save-for-later to
+    // pre-fill the resume dialog on tray restart.
+    std::string subject;
+    std::vector<std::string> participants;
+    std::string notes;
 };
 
 static CapturedContext capture_and_clear_context() {
@@ -765,6 +838,26 @@ static CapturedContext capture_and_clear_context() {
     if (!notes.empty()) {
         if (!result.context_inline.empty()) result.context_inline += "\n";
         result.context_inline += notes;
+    }
+
+    // Phase D.5 — preserve the structured fields for the sidecar v2
+    // context block (subject + participants list + notes). Split the
+    // participants entry on commas + trim whitespace; matches the
+    // operator-facing convention from the context dialog tooltip.
+    result.subject = subject;
+    result.notes   = notes;
+    if (!participants.empty()) {
+        size_t i = 0;
+        while (i < participants.size()) {
+            size_t j = participants.find(',', i);
+            if (j == std::string::npos) j = participants.size();
+            std::string p = participants.substr(i, j - i);
+            size_t s = p.find_first_not_of(" \t");
+            size_t e = p.find_last_not_of(" \t");
+            if (s != std::string::npos)
+                result.participants.push_back(p.substr(s, e - s + 1));
+            i = j + 1;
+        }
     }
 
     // Destroy window
@@ -913,6 +1006,12 @@ bool start_capture(const std::string& mic_source, std::string& err_msg) {
     g_tray.capture_state.wav_path      = wav_path;
     g_tray.capture_state.wav_timestamp = ts;
     g_tray.capture_state.wav_source    = mic_source;
+    // Phase D.5 — mint the per-recording meeting_id EXACTLY ONCE, at
+    // start_capture. This id is the stable handle the server-side
+    // C.11.4 dedup contract uses; threading the SAME id through every
+    // submit-retry is what lets a tray-crash mid-upload recover onto
+    // the original meeting directory rather than allocating a fresh one.
+    g_tray.capture_state.meeting_id    = recmeet::new_uuid_v4();
     g_tray.capture_state.waiting_disposition = false;
 
     try {
@@ -1166,6 +1265,13 @@ static void on_record(GtkMenuItem*, gpointer) {
             // the protocol default 500 ms. The daemon clamps/rejects out of
             // [200, 2000] anyway.
             sp["latency_budget_ms"] = static_cast<int64_t>(500);
+            // Phase D.5 — thread the per-recording meeting_id through
+            // to the streaming session too, so a process.stream → batch
+            // fallback (D.3) lands on the same meeting dir as the
+            // batch-submit retry path.
+            if (!g_tray.capture_state.meeting_id.empty()) {
+                sp["meeting_id"] = g_tray.capture_state.meeting_id;
+            }
             IpcResponse sr; IpcError se;
             if (g_tray.ipc.call("process.stream", sp, sr, se, 5000)) {
                 auto tit = sr.result.find("stream_token");
@@ -1228,6 +1334,7 @@ void apply_discard() {
     g_tray.capture_state.wav_path.clear();
     g_tray.capture_state.wav_timestamp.clear();
     g_tray.capture_state.wav_source.clear();
+    g_tray.capture_state.meeting_id.clear();
     g_tray.capture_state.waiting_disposition = false;
 }
 
@@ -1306,6 +1413,16 @@ bool apply_submit_with_context(const CapturedContext& ctx, std::string& err_msg)
         }
         params["context"] = combined;
     }
+    // Phase D.5 — thread the client-minted meeting_id through to the
+    // daemon's process.submit handler. Empty is the legacy / pre-D.5
+    // shape (server-side `is_valid_meeting_id("")` returns true as the
+    // "no id" sentinel) but the post-D.5 tray always has a value here
+    // because `start_capture` mints unconditionally. The same id is
+    // re-used on the H-D3 retry path so C.11.4's atomic-overwrite
+    // contract routes the bytes back to the original meeting dir.
+    if (!g_tray.capture_state.meeting_id.empty()) {
+        params["meeting_id"] = g_tray.capture_state.meeting_id;
+    }
 
     IpcResponse resp;
     IpcError err;
@@ -1368,6 +1485,7 @@ bool apply_submit_with_context(const CapturedContext& ctx, std::string& err_msg)
     g_tray.capture_state.wav_path.clear();
     g_tray.capture_state.wav_timestamp.clear();
     g_tray.capture_state.wav_source.clear();
+    g_tray.capture_state.meeting_id.clear();
     g_tray.capture_state.waiting_disposition = false;
     // The local staging WAV is now redundant (the daemon owns the
     // bytes in its own staging dir). Leave it on disk — the next
@@ -1376,28 +1494,68 @@ bool apply_submit_with_context(const CapturedContext& ctx, std::string& err_msg)
     return true;
 }
 
-// Phase B.3 — leave the WAV in staging and drop a `.pending` sidecar
-// so D.5 can resume the disposition flow after a tray restart. The
-// sidecar shape is intentionally minimal (D.5 will tighten it).
-void apply_save_for_later() {
-    bool ok = tray_capture::write_pending_sidecar(
-        g_tray.capture_state.wav_path,
-        g_tray.capture_state.wav_timestamp,
-        g_tray.capture_state.wav_source,
-        g_tray.cap.captions_enabled_for_recording);
-    if (!ok) {
-        log_warn("[tray] save-for-later: failed to write .pending sidecar for %s",
-                 g_tray.capture_state.wav_path.c_str());
-    } else {
-        log_info("[tray] saved WAV for later: %s",
-                 g_tray.capture_state.wav_path.c_str());
+// Phase D.5 — leave the WAV in staging and drop a `.pending` sidecar v2
+// so the tray-restart recovery path can re-surface the disposition flow
+// with the captured meeting_id + context pre-populated. Atomic-write
+// via `util::atomic_write_file`; on filesystem failure the sidecar is
+// absent and the WAV is treated as orphaned (will be cleaned up by
+// D.6's disk-budget sweep). Accepts an optional captured context — when
+// empty (operator dismissed the dialog without filling fields) the
+// `context` block is written with empty values and the resume dialog
+// will re-prompt.
+void apply_save_for_later(const CapturedContext& ctx) {
+    tray_capture::PendingSidecarV2 payload;
+    payload.meeting_id       = g_tray.capture_state.meeting_id;
+    payload.wav_path         = g_tray.capture_state.wav_path.string();
+    payload.timestamp        = g_tray.capture_state.wav_timestamp;
+    payload.mic_source       = g_tray.capture_state.wav_source;
+    payload.captions_enabled = g_tray.cap.captions_enabled_for_recording;
+    payload.context.subject      = ctx.subject;
+    payload.context.participants = ctx.participants;
+    payload.context.notes        = ctx.notes;
+    payload.context.language     = g_tray.cfg.language;
+    if (!g_tray.cfg.vocabulary.empty()) {
+        // Config carries vocabulary as a single newline-separated string;
+        // sidecar v2 carries it as an array. Split on newlines + commas
+        // to give the resume dialog a clean per-term list.
+        std::string v = g_tray.cfg.vocabulary;
+        std::string acc;
+        for (char c : v) {
+            if (c == '\n' || c == ',') {
+                if (!acc.empty()) payload.context.vocabulary.push_back(acc);
+                acc.clear();
+            } else if (c != '\r') {
+                acc += c;
+            }
+        }
+        if (!acc.empty()) payload.context.vocabulary.push_back(acc);
+    }
+
+    try {
+        tray_capture::write_pending_sidecar_v2(payload);
+        log_info("[tray] saved WAV for later: %s (meeting_id=%s)",
+                 g_tray.capture_state.wav_path.c_str(),
+                 g_tray.capture_state.meeting_id.c_str());
+    } catch (const std::exception& e) {
+        log_warn("[tray] save-for-later: failed to write .pending sidecar "
+                 "for %s: %s",
+                 g_tray.capture_state.wav_path.c_str(), e.what());
     }
     // Clear the active staging fields — the WAV is now "saved",
     // outside the active capture lifecycle.
     g_tray.capture_state.wav_path.clear();
     g_tray.capture_state.wav_timestamp.clear();
     g_tray.capture_state.wav_source.clear();
+    g_tray.capture_state.meeting_id.clear();
     g_tray.capture_state.waiting_disposition = false;
+}
+
+// Backward-compatible overload — the on_stop dispatch path captures the
+// context before applying the disposition, so callers that don't have
+// context handy fall back to an empty `CapturedContext` (resume dialog
+// re-prompts).
+void apply_save_for_later() {
+    apply_save_for_later(CapturedContext{});
 }
 
 }  // namespace tray
@@ -1459,7 +1617,11 @@ static void on_stop(GtkMenuItem*, gpointer) {
                 break;
             case StopDisposition::SaveForLater:
             case StopDisposition::Cancelled:
-                tray::apply_save_for_later();
+                // Phase D.5 — thread the captured context into the
+                // sidecar v2 so the resume dialog can re-present submit
+                // with the operator's subject/participants/notes
+                // pre-populated.
+                tray::apply_save_for_later(captured_ctx);
                 break;
         }
         build_menu();
@@ -2018,6 +2180,183 @@ static GtkWidget* build_source_submenu(const std::string& current_name,
     return submenu;
 }
 
+// ---------------------------------------------------------------------------
+// Phase D.5 — startup resume recovery
+// ---------------------------------------------------------------------------
+
+// Scan the tray's staging directory for `*.pending` sidecars and populate
+// `g_tray.pending_resumes` with the parsed payloads. A malformed sidecar
+// (read returns an empty payload) is skipped silently — its presence is
+// logged but the file is left on disk for forensic inspection. The scan
+// is non-recursive (staging is flat).
+static void rescan_pending_sidecars() {
+    g_tray.pending_resumes.clear();
+    fs::path staging = tray_capture::default_staging_dir();
+    std::error_code ec;
+    if (!fs::is_directory(staging, ec) || ec) return;
+    for (const auto& entry : fs::directory_iterator(staging, ec)) {
+        if (ec) break;
+        if (!entry.is_regular_file()) continue;
+        const auto& p = entry.path();
+        if (p.extension() != ".pending") continue;
+        auto payload = tray_capture::read_pending_sidecar(p);
+        if (payload.meeting_id.empty() && payload.wav_path.empty()) {
+            log_warn("[tray] resume scan: skipping malformed sidecar %s",
+                     p.string().c_str());
+            continue;
+        }
+        g_tray.pending_resumes.push_back(std::move(payload));
+    }
+}
+
+// Apply one resume-submit by index. Re-uses the existing submit pipeline
+// by populating capture_state with the sidecar's recorded values, then
+// invoking `apply_submit_with_context`. On success the sidecar is
+// removed and the menu is rebuilt. On failure the sidecar stays on disk
+// so the operator can retry. Threaded through the GTK main loop — there
+// is no IPC background thread in the tray.
+static void apply_resume_submit(size_t idx) {
+    if (idx >= g_tray.pending_resumes.size()) return;
+    auto p = g_tray.pending_resumes[idx];
+
+    if (g_tray.recording || g_tray.capture_state.waiting_disposition) {
+        notify("Cannot resume", "Stop the current recording first.");
+        return;
+    }
+
+    g_tray.capture_state.wav_path      = fs::path(p.wav_path);
+    g_tray.capture_state.wav_timestamp = p.timestamp;
+    g_tray.capture_state.wav_source    = p.mic_source;
+    g_tray.capture_state.meeting_id    = p.meeting_id;
+    g_tray.cap.captions_enabled_for_recording = p.captions_enabled;
+
+    CapturedContext ctx;
+    if (!p.context.subject.empty())
+        ctx.context_inline += "Subject: " + p.context.subject + "\n";
+    if (!p.context.participants.empty()) {
+        std::string joined;
+        for (size_t i = 0; i < p.context.participants.size(); ++i) {
+            if (i > 0) joined += ", ";
+            joined += p.context.participants[i];
+        }
+        ctx.context_inline += "Participants: " + joined + "\n";
+        ctx.vocab_additions = joined;
+    }
+    if (!p.context.notes.empty()) {
+        if (!ctx.context_inline.empty()) ctx.context_inline += "\n";
+        ctx.context_inline += p.context.notes;
+    }
+    ctx.subject      = p.context.subject;
+    ctx.participants = p.context.participants;
+    ctx.notes        = p.context.notes;
+
+    std::string err;
+    if (!tray::apply_submit_with_context(ctx, err)) {
+        notify("Resume submit failed", err);
+        // Leave the sidecar in place; restore capture_state to idle so
+        // the next recording lifecycle is unaffected.
+        g_tray.capture_state.wav_path.clear();
+        g_tray.capture_state.wav_timestamp.clear();
+        g_tray.capture_state.wav_source.clear();
+        g_tray.capture_state.meeting_id.clear();
+        return;
+    }
+    // Success — remove the sidecar so the next rescan doesn't re-surface
+    // it. apply_submit_with_context already cleared capture_state fields.
+    fs::path sidecar = tray_capture::pending_sidecar_path(fs::path(p.wav_path));
+    std::error_code ec;
+    fs::remove(sidecar, ec);
+    if (ec)
+        log_warn("[tray] resume submit: failed to remove sidecar %s: %s",
+                 sidecar.string().c_str(), ec.message().c_str());
+    rescan_pending_sidecars();
+    build_menu();
+}
+
+// Discard a pending resume — unlink both the sidecar and the staging
+// WAV. Idempotent on missing files.
+static void apply_resume_discard(size_t idx) {
+    if (idx >= g_tray.pending_resumes.size()) return;
+    auto p = g_tray.pending_resumes[idx];
+    fs::path wav(p.wav_path);
+    fs::path sidecar = tray_capture::pending_sidecar_path(wav);
+    std::error_code ec;
+    fs::remove(sidecar, ec);
+    fs::remove(wav, ec);
+    log_info("[tray] resume discard: %s", wav.string().c_str());
+    rescan_pending_sidecars();
+    build_menu();
+}
+
+// GTK menu-item callback. `user_data` carries the index of the entry in
+// `g_tray.pending_resumes` (encoded via GINT_TO_POINTER).
+extern "C" void on_resume_submit(GtkMenuItem*, gpointer ud) {
+    apply_resume_submit(static_cast<size_t>(GPOINTER_TO_INT(ud)));
+}
+extern "C" void on_resume_discard(GtkMenuItem*, gpointer ud) {
+    apply_resume_discard(static_cast<size_t>(GPOINTER_TO_INT(ud)));
+}
+
+// ---------------------------------------------------------------------------
+// Phase D.5 — journal recovery (loaded entries dispatched via job.status)
+// ---------------------------------------------------------------------------
+//
+// On tray startup, every journal entry is resolved via `job.status`:
+//   - `unknown` / `expired-token`: per H-D3 retry by re-submitting with the
+//     SAME `meeting_id` (C.11.4 dedup contract routes the bytes back to
+//     the original meeting directory). Streaming entries fall back to
+//     batch per D.3.
+//   - `complete`: dispatch `process.fetch` to download artifacts; on
+//     success remove the journal entry.
+//   - `running`: monitoring is D.3 territory — leave the entry in place;
+//     D.3 will subscribe to progress.job events.
+//
+// D.5 lands the dispatch shape; the actual `job.status` parsing + retry
+// arms are minimal here (the call site only logs the resolved status
+// and leaves recovery actions to D.2 / D.3). The retry shape is unit-
+// tested in `test_tray_resume_recovery.cpp` against a mock IpcClient.
+static void recover_pending_jobs_on_startup() {
+    auto entries = g_tray.pending_jobs.load();
+    if (entries.empty()) return;
+    log_info("[tray] resume: %zu pending job(s) in journal", entries.size());
+    for (const auto& e : entries) {
+        if (!g_tray.daemon_connected) {
+            log_info("[tray] resume: daemon not connected, deferring %s",
+                     e.job_id.c_str());
+            continue;
+        }
+        JsonMap params;
+        if (!e.job_id.empty()) {
+            // The wire shape accepts int64; the journal stores the id as a
+            // string so the schema does not commit to a particular numeric
+            // representation. Attempt a stoll; on failure skip (the entry
+            // is malformed and the next save will leave it alone).
+            try {
+                params["job_id"] = static_cast<int64_t>(std::stoll(e.job_id));
+            } catch (...) {
+                log_warn("[tray] resume: skipping malformed job_id %s",
+                         e.job_id.c_str());
+                continue;
+            }
+        }
+        IpcResponse resp;
+        IpcError err;
+        if (!g_tray.ipc.call("job.status", params, resp, err, 3000)) {
+            log_warn("[tray] resume: job.status(%s) failed: %s",
+                     e.job_id.c_str(), err.message.c_str());
+            continue;
+        }
+        auto it = resp.result.find("status");
+        std::string status = (it != resp.result.end())
+            ? json_val_as_string(it->second) : "";
+        log_info("[tray] resume: job_id=%s status=%s (meeting_id=%s)",
+                 e.job_id.c_str(), status.c_str(), e.meeting_id.c_str());
+        // D.2/D.3 wire the actual retry/fetch arms; D.5 only surfaces
+        // the resolved status so the operator can see the recovered
+        // entry in the tray status line.
+    }
+}
+
 static void build_menu() {
     auto* menu = gtk_menu_new();
     bool is_idle = !g_tray.recording && !g_tray.postprocessing && !g_tray.downloading;
@@ -2086,6 +2425,47 @@ static void build_menu() {
         g_signal_connect(item, "activate", G_CALLBACK(on_record), nullptr);
         gtk_widget_set_sensitive(item, can_record && g_tray.daemon_connected);
         gtk_menu_shell_append(GTK_MENU_SHELL(menu), item);
+    }
+
+    // --- Phase D.5: Resume Pending submenu ---
+    //
+    // Surfaced whenever there is at least one `.pending` sidecar in
+    // staging. Per-entry submenu carries Submit + Discard actions; the
+    // count in the parent label reflects the in-memory snapshot
+    // (rebuilt by `rescan_pending_sidecars()` after every
+    // submit/discard so the count updates without a tray restart).
+    if (!g_tray.pending_resumes.empty()) {
+        std::string label = "Resume Pending (" +
+            std::to_string(g_tray.pending_resumes.size()) + ")";
+        auto* parent = gtk_menu_item_new_with_label(label.c_str());
+        auto* sub = gtk_menu_new();
+        for (size_t i = 0; i < g_tray.pending_resumes.size(); ++i) {
+            const auto& p = g_tray.pending_resumes[i];
+            std::string entry_label = p.timestamp;
+            if (!p.context.subject.empty())
+                entry_label += " — " + p.context.subject;
+            auto* entry_item = gtk_menu_item_new_with_label(entry_label.c_str());
+            auto* entry_sub  = gtk_menu_new();
+
+            auto* sub_item = gtk_menu_item_new_with_label("Submit");
+            g_signal_connect(sub_item, "activate",
+                             G_CALLBACK(on_resume_submit),
+                             GINT_TO_POINTER(static_cast<int>(i)));
+            gtk_widget_set_sensitive(sub_item, g_tray.daemon_connected);
+            gtk_menu_shell_append(GTK_MENU_SHELL(entry_sub), sub_item);
+
+            auto* disc_item = gtk_menu_item_new_with_label("Discard");
+            g_signal_connect(disc_item, "activate",
+                             G_CALLBACK(on_resume_discard),
+                             GINT_TO_POINTER(static_cast<int>(i)));
+            gtk_menu_shell_append(GTK_MENU_SHELL(entry_sub), disc_item);
+
+            gtk_menu_item_set_submenu(GTK_MENU_ITEM(entry_item), entry_sub);
+            gtk_menu_shell_append(GTK_MENU_SHELL(sub), entry_item);
+        }
+        gtk_menu_item_set_submenu(GTK_MENU_ITEM(parent), sub);
+        gtk_widget_set_sensitive(parent, !g_tray.recording);
+        gtk_menu_shell_append(GTK_MENU_SHELL(menu), parent);
     }
 
     gtk_menu_shell_append(GTK_MENU_SHELL(menu), gtk_separator_menu_item_new());
@@ -2446,6 +2826,25 @@ int main(int argc, char* argv[]) {
     // Connect to daemon (non-blocking — will retry via timer if not running)
     if (!connect_to_daemon())
         g_tray.reconnect_timer = g_timeout_add_seconds(1, try_reconnect, nullptr);
+
+    // Phase D.5 — startup resume recovery.
+    //   1. Scan the staging dir for `.pending` sidecars; populate the
+    //      `Resume Pending (N)` submenu.
+    //   2. Emit a SINGLE dbus notification if N > 0 (architecture-review
+    //      checklist item #7: never per-entry; that path leads to
+    //      notification spam).
+    //   3. Load the journal and dispatch `job.status` per entry. The
+    //      journal recovery loop is best-effort — D.2 writes the
+    //      entries; D.3 wires the actual reconnect-with-jitter; D.5
+    //      only surfaces the resolved status so the operator can see
+    //      the recovered state.
+    rescan_pending_sidecars();
+    if (!g_tray.pending_resumes.empty()) {
+        std::string msg = std::to_string(g_tray.pending_resumes.size()) +
+            " saved recording(s) ready to resume — see tray menu.";
+        notify("recmeet: pending recordings", msg);
+    }
+    recover_pending_jobs_on_startup();
 
     build_menu();
     fetch_provider_models();

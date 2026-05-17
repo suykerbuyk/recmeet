@@ -154,7 +154,7 @@ TEST_CASE("B.3: pending_sidecar_path swaps .wav for .pending",
           fs::path("/tmp/audio_2026-05-13_14-30.pending"));
 }
 
-TEST_CASE("B.3: write_pending_sidecar persists the recording metadata",
+TEST_CASE("B.3 (D.5): write_pending_sidecar_v2 persists the recording metadata",
           "[tray][b3]") {
     auto scratch = make_scratch();
     ScopedDir guard{scratch};
@@ -162,8 +162,13 @@ TEST_CASE("B.3: write_pending_sidecar persists the recording metadata",
     fs::path wav = scratch / "audio_2026-05-13_14-30.wav";
     std::ofstream(wav).close();  // wav file does not need to be a real WAV
 
-    REQUIRE(tray_capture::write_pending_sidecar(
-        wav, "2026-05-13_14-30", "alsa_input.usb-microphone", /*captions_enabled=*/true));
+    tray_capture::PendingSidecarV2 p;
+    p.meeting_id       = "deadbeef-0000-4000-8000-000000000001";
+    p.wav_path         = wav.string();
+    p.timestamp        = "2026-05-13_14-30";
+    p.mic_source       = "alsa_input.usb-microphone";
+    p.captions_enabled = true;
+    REQUIRE_NOTHROW(tray_capture::write_pending_sidecar_v2(p));
 
     fs::path sidecar = tray_capture::pending_sidecar_path(wav);
     REQUIRE(fs::exists(sidecar));
@@ -178,6 +183,8 @@ TEST_CASE("B.3: write_pending_sidecar persists the recording metadata",
           != std::string::npos);
     CHECK(content.find("\"captions_enabled\": true") != std::string::npos);
     CHECK(content.find(wav.string()) != std::string::npos);
+    CHECK(content.find("\"meeting_id\": \"deadbeef-0000-4000-8000-000000000001\"")
+          != std::string::npos);
 }
 
 // ---------------------------------------------------------------------------
