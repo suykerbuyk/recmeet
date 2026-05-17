@@ -508,6 +508,37 @@ void JobQueue::update_progress(int64_t job_id, const std::string& phase,
 }
 
 // ---------------------------------------------------------------------------
+// Phase C.13 — Running-Postprocess pid binding
+// ---------------------------------------------------------------------------
+
+void JobQueue::bind_running_pid(int64_t job_id, pid_t pid) {
+    std::lock_guard<std::mutex> lock(mu_);
+    // Idempotent overwrite — pp_worker_loop is sequential single-capacity, so
+    // a "double bind" without an intervening unbind would indicate a fork
+    // path that re-stamped g_pp_child_pid without the reap-path running.
+    // That is a structural bug; we log_warn so it surfaces.
+    auto it = running_pids_.find(job_id);
+    if (it != running_pids_.end() && it->second != pid) {
+        log_warn("job_queue: bind_running_pid job=%ld replacing pid %d -> %d "
+                 "(unbind path skipped?)",
+                 (long)job_id, (int)it->second, (int)pid);
+    }
+    running_pids_[job_id] = pid;
+}
+
+void JobQueue::unbind_running_pid(int64_t job_id) {
+    std::lock_guard<std::mutex> lock(mu_);
+    running_pids_.erase(job_id);
+}
+
+std::optional<pid_t> JobQueue::pid_for_running_job(int64_t job_id) const {
+    std::lock_guard<std::mutex> lock(mu_);
+    auto it = running_pids_.find(job_id);
+    if (it == running_pids_.end()) return std::nullopt;
+    return it->second;
+}
+
+// ---------------------------------------------------------------------------
 // Queries
 // ---------------------------------------------------------------------------
 

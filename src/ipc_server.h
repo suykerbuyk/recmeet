@@ -14,6 +14,7 @@
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include <utility>   // std::pair (C.13 ResumeTokenResolver return)
 #include <vector>
 
 namespace recmeet {
@@ -290,6 +291,33 @@ public:
     bool set_session_preferences(const std::string& client_id,
                                  const SessionPreferences& prefs);
 
+    // Phase C.13 — resume_token resolver hook. Called from `handle_pending_psk`
+    // immediately after the PSK check passes, with the `resume_token` field
+    // the client supplied on `auth.token` (empty string when the client sent
+    // no field). Returns `(client_id, resume_token_to_echo)`:
+    //   - Resume path: provided token resolved → server-side `client_id` from
+    //     the prior session, same token echoed back so the client knows to
+    //     keep using it. No re-`mint_client_id()` call.
+    //   - Fresh path: provided token empty or unknown/expired → resolver
+    //     calls `mint_client_id()` (public below) + `g_sessions->mint(...)`
+    //     and returns the fresh pair. Client overwrites its persisted token.
+    // When the resolver is unset (tests, pre-C.13 callers) the legacy
+    // fresh-mint-only path runs and `auth.ok` carries no `resume_token`
+    // field (additive — L-2). Sole site that sees the raw resume_token in
+    // ipc_server.cpp; everywhere else, only the public resolver result and
+    // SessionManager's redacted log_prefix are observable.
+    using ResumeTokenResolver = std::function<
+        std::pair<std::string /*client_id*/, std::string /*resume_token*/>(
+            const std::string& provided_resume_token)>;
+    void set_resume_token_resolver(ResumeTokenResolver r);
+
+    // Phase C.13 — exposed (was private at l.339) so the resume_token
+    // resolver (which lives in daemon.cpp) can mint a fresh client_id on
+    // the fresh-token path without a second mechanism. Stateful counter,
+    // thread-safe only for poll-thread callers (which is the only caller
+    // both today and post-C.13).
+    std::string mint_client_id();
+
 private:
     void accept_client();
     void handle_client_data(int fd);
@@ -336,8 +364,6 @@ private:
     // cannot easily forge a routing target from a sequential id alone.
     // Hex chars come from `rand()` seeded once at first use — this is a
     // log-friendly tag, not a security primitive.
-    std::string mint_client_id();
-
     // Phase A.3: reject a new fd because the daemon is at `max_clients_`.
     // Writes a single-line JSON `server_full` error frame to the fd
     // synchronously (this is a doomed fd — do NOT enqueue or arm POLLOUT),
@@ -431,6 +457,11 @@ private:
     // Phase C.10a: optional client-disconnect handler (see
     // ClientDisconnectHandler). Unset → no-op.
     ClientDisconnectHandler client_disconnect_handler_;
+
+    // Phase C.13: optional resume_token resolver (see ResumeTokenResolver).
+    // Unset → handle_pending_psk falls back to the pre-C.13 mint_client_id-
+    // only path and auth.ok carries no resume_token field.
+    ResumeTokenResolver resume_resolver_;
 
     std::mutex post_mu_;
     std::vector<std::function<void()>> posted_;

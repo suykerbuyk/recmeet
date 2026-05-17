@@ -340,6 +340,12 @@ target_sources(recmeet_core PRIVATE src/meeting_index.cpp)
 # format constants. Header-only API into the daemon's enroll.finalize.
 target_sources(recmeet_core PRIVATE src/diarization_cache.cpp)
 
+# Phase C.13 — server-side resume_token store + GC sweep + --evict primitive.
+# Pure stdlib + getrandom(2); no ML or transport dependency. Lives in
+# recmeet_core alongside meeting_index.cpp and diarization_cache.cpp (the
+# other daemon-side stateful registries).
+target_sources(recmeet_core PRIVATE src/session_manager.cpp)
+
 # Phase C.9 — live-recording library. Owns `run_recording()` /
 # `run_pipeline()` and the CaptionEngine-with-capture wrapper, all of which
 # the CLI standalone mode (`recmeet` without `--daemon`) still needs. The

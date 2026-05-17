@@ -43,6 +43,8 @@
 #include <optional>
 #include <queue>
 #include <string>
+
+#include <sys/types.h>   // pid_t (C.13 — pid_for_running_job)
 #include <vector>
 
 namespace recmeet {
@@ -294,6 +296,34 @@ public:
     /// moot once a job finishes). `progress` is clamped to [0, 100].
     void update_progress(int64_t job_id, const std::string& phase, int progress);
 
+    /// Phase C.13 — Running-Postprocess `job_id ↔ pid` binding. The GC sweep
+    /// (orphan-eviction path inside the future SessionManager) needs to
+    /// verify `pid_for_running_job(victim) == g_pp_child_pid.load()` BEFORE
+    /// signaling `kill(g_pp_child_pid, SIGTERM)` so it does not SIGTERM an
+    /// unrelated job that happens to occupy the (single-capacity) Postprocess
+    /// slot at sweep time. The pre-C.13 daemon kept the pid in a file-static
+    /// `std::atomic<pid_t> g_pp_child_pid` only — sufficient for the
+    /// owning-client-initiated `process.cancel` path because the cancel
+    /// request races nothing — but unsafe for a periodic background sweep.
+    ///
+    /// Wiring: `pp_worker_loop` calls `bind_running_pid(job.job_id, pid)`
+    /// immediately after `g_pp_child_pid.store(pid)` (the existing fork-and-
+    /// stamp site at `src/daemon.cpp:460`+). The reap path calls
+    /// `unbind_running_pid(job.job_id)` before `finish()` so the binding
+    /// goes away with the running marker.
+    ///
+    /// Thread-safety: mutex-guarded; lookups and mutations are O(log N) on a
+    /// `std::map` keyed by job_id. The binding is a transient overlay on the
+    /// existing registry — it does NOT extend `Job`'s lifetime semantics,
+    /// and a binding for a job not in the registry is benign (treated as
+    /// "no binding"). Empty by default; only Postprocess Running jobs ever
+    /// populate it. Streaming jobs use `g_streaming->cancel_by_job_id` for
+    /// orchestration (job-id-routed, owns its own engine + WAV teardown);
+    /// ModelDownload has no SIGTERM target.
+    void bind_running_pid(int64_t job_id, pid_t pid);
+    void unbind_running_pid(int64_t job_id);
+    std::optional<pid_t> pid_for_running_job(int64_t job_id) const;
+
     /// Snapshot of a single job by id, or std::nullopt if unknown.
     std::optional<Job> status(int64_t job_id) const;
 
@@ -372,6 +402,12 @@ private:
 
     /// download_job_id -> dependent postprocess job_ids parked on it.
     std::map<int64_t, std::vector<int64_t>> download_deps_;
+
+    /// Phase C.13 — Running-Postprocess job_id → pid binding. Empty by
+    /// default; populated by `bind_running_pid` from `pp_worker_loop` after
+    /// fork, cleared by `unbind_running_pid` in the reap path. Read by the
+    /// future GC sweep via `pid_for_running_job` to gate SIGTERM dispatch.
+    std::map<int64_t, pid_t> running_pids_;
 };
 
 } // namespace recmeet

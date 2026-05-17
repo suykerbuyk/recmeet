@@ -6,6 +6,7 @@
 #include "config_json.h"
 #include "diarization_cache.h"
 #include "fetch_artifacts.h"
+#include "ipc_client.h"   // C.13 — `--evict` CLI dispatch routes through IpcClient
 #include "ipc_protocol.h"
 #include "ipc_server.h"
 #include "job_queue.h"
@@ -18,6 +19,7 @@
 #include "notify.h"
 #include "pipeline.h"
 #include "meeting_index.h"
+#include "session_manager.h"
 #include "streaming_session.h"
 #include "upload_session.h"
 #include "util.h"
@@ -103,6 +105,14 @@ static std::unique_ptr<MeetingIndex> g_meeting_index;
 // cluster's embedding and append to the speakers DB.
 static std::unique_ptr<DiarizationCache> g_diar_cache;
 
+// Phase C.13 — server-side resume_token store. Owns the (in-memory only)
+// `resume_token → ResumeSession{client_id, last_seen_epoch}` map and the
+// `--evict` primitive. ResumeSession deliberately does NOT carry creds /
+// prefs (H-2 from iter-161 review): those live on `ClientState` only and
+// are dropped on disconnect; on resume the client MUST re-send
+// `session.init`. Daemon restart invalidates all tokens (MC-1).
+static std::unique_ptr<SessionManager> g_sessions;
+
 static Config g_config;
 static std::mutex g_config_mu;
 
@@ -111,10 +121,19 @@ static std::mutex g_config_mu;
 // kill-switch survives.
 static StopToken g_pp_stop;
 
+// Phase C.13 — GC sweep thread shutdown signal. Pattern-matched on the
+// worker_loop StopToken precedent above; the sweep thread waits on this
+// condition variable (with a timeout for the sweep cadence) so SIGTERM
+// does not have to wait a full interval.
+static std::mutex             g_gc_mu;
+static std::condition_variable g_gc_cv;
+static bool                   g_gc_shutdown = false;
+
 // Worker threads (C.9 retired g_rec_worker)
 static std::thread g_pp_worker;   // long-lived, drains the postprocess slot
 static std::thread g_dl_worker;   // long-lived, drains the model_download slot
 static std::thread g_stream_worker;  // C.10a — drains the streaming slot
+static std::thread g_gc_worker;       // C.13 — periodic resume_token sweep
 
 // PostprocessJob — pre-C.7 this was a standalone struct; the C.7/C.9 typed
 // JobQueue surfaces postprocess work as `Job`. The alias is kept so the
@@ -212,6 +231,20 @@ static void signal_handler(int sig) {
                     log_info("daemon: config reloaded via SIGHUP");
                 } catch (const std::exception& e) {
                     log_error("daemon: config reload failed: %s", e.what());
+                }
+                // Phase C.13 (C-2 fix) — also reload PSK from RECMEET_AUTH_TOKEN
+                // env so an operator who rotates the env var and SIGHUPs the
+                // daemon actually invalidates the old PSK for every NEW
+                // connection (existing fds are already Authed and unaffected).
+                // Pre-C.13 SIGHUP only reloaded Config, never psk_, so the
+                // documented "PSK rotation" operator lever was a no-op.
+                const char* env_psk = std::getenv("RECMEET_AUTH_TOKEN");
+                if (env_psk) {
+                    g_server->set_psk(env_psk);
+                    log_info("daemon: PSK reloaded from RECMEET_AUTH_TOKEN env "
+                             "via SIGHUP (new value takes effect on next "
+                             "auth.token handshake; existing connections "
+                             "unaffected)");
                 }
             });
         }
@@ -384,6 +417,55 @@ static void kill_pp_child_with_grace(pid_t pid) {
 }
 
 // ---------------------------------------------------------------------------
+// Phase C.13 — GC sweep worker (resume_token TTL eviction)
+// ---------------------------------------------------------------------------
+//
+// SCAFFOLD: the sweep body invokes `g_sessions->sweep_expired()` and logs the
+// count of evicted sessions. The orphan-JOB teardown side of the sweep
+// (Postprocess Queued/Running → cancel + verified-pid SIGTERM; Streaming
+// → cancel_by_job_id; ModelDownload → cancel; pre-cancel WAV archive to
+// ~/meetings/.orphan-<prefix>-<ts>/) is intentionally NOT YET WIRED — that
+// is the substantive implementation pass after the operator reviews the
+// scaffold seams. The shell here keeps the GC thread spawned/joinable/
+// shutdown-clean so the addition is surgical.
+static void gc_worker_loop(IpcServer& /*server*/, int interval_minutes) {
+    log_debug("daemon: gc_worker_loop ENTER (interval=%dm)", interval_minutes);
+    using namespace std::chrono;
+    const auto cadence = minutes(interval_minutes > 0 ? interval_minutes : 5);
+    while (true) {
+        {
+            std::unique_lock<std::mutex> lock(g_gc_mu);
+            g_gc_cv.wait_for(lock, cadence,
+                             []() { return g_gc_shutdown; });
+            if (g_gc_shutdown) {
+                log_debug("daemon: gc_worker_loop EXIT (shutdown)");
+                return;
+            }
+        }
+
+        if (!g_sessions) continue;  // pre-init defensive
+
+        // (1) Drop expired resume_token bindings. Returns the list of
+        // (token, client_id) pairs whose TTL elapsed. SCAFFOLD: orphan-job
+        // teardown of each evicted session is the implementation-pass work.
+        auto evicted = g_sessions->sweep_expired();
+        if (!evicted.empty()) {
+            log_info("daemon: GC sweep evicted %zu session(s); orphan-job "
+                     "teardown deferred to C.13 implementation pass",
+                     evicted.size());
+            // TODO(C.13 impl): for each (token, client_id) in `evicted`,
+            // walk JobQueue jobs owned by client_id; for each non-terminal:
+            //   - Postprocess Queued        → g_jobs->cancel(job_id)
+            //   - Postprocess Running       → cancel + verified-pid SIGTERM
+            //                                 (pid_for_running_job == g_pp_child_pid)
+            //   - Streaming non-terminal    → g_streaming->cancel_by_job_id
+            //   - ModelDownload non-terminal→ g_jobs->cancel(job_id)
+            //   - Pre-cancel: archive WAV to ~/meetings/.orphan-<prefix-8>-<ts>/
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Postprocessing worker loop (long-lived thread, fork/exec subprocess)
 // ---------------------------------------------------------------------------
 
@@ -494,6 +576,13 @@ static void pp_worker_loop(IpcServer& server) {
             close(stdout_pipe[1]);
             close(stderr_pipe[1]);
             g_pp_child_pid.store(pid);
+            // C.13 — publish the job_id ↔ pid binding so the future GC sweep
+            // can verify `pid_for_running_job(victim) == g_pp_child_pid` BEFORE
+            // sending SIGTERM (prevents killing an unrelated job that happens
+            // to have replaced this one in the single-capacity pp slot by the
+            // time the sweep fires). Paired with the unbind() in the reap
+            // path below.
+            g_jobs->bind_running_pid(job.job_id, pid);
             log_info("daemon: subprocess launched (pid=%d, job=%ld, dir=%s)",
                      (int)pid, (long)job.job_id, out_dir_str.c_str());
 
@@ -764,6 +853,11 @@ static void pp_worker_loop(IpcServer& server) {
             int status;
             waitpid(pid, &status, 0);
             g_pp_child_pid.store(-1);
+            // C.13 — clear the pid binding paired with bind_running_pid()
+            // above. After this point, a GC sweep that finds the victim still
+            // in the registry sees pid_for_running_job → nullopt and falls
+            // into the cancel-only path (no SIGTERM dispatch).
+            g_jobs->unbind_running_pid(job.job_id);
             if (WIFEXITED(status))
                 log_info("daemon: subprocess exited (pid=%d, exit=%d, job=%ld)",
                          (int)pid, WEXITSTATUS(status), (long)job.job_id);
@@ -1082,6 +1176,9 @@ static void print_usage() {
         "  --log-level LEVEL   Log level: none, error, warn, info, debug (default: info)\n"
         "  --log-dir DIR       Log file directory\n"
         "  --log-retention N   Log retention in hours (default: 4)\n"
+        "  --evict PREFIX      Operator session-revocation: connect to the running\n"
+        "                      daemon and evict the resume_token matching PREFIX\n"
+        "                      (8+ hex chars). Exits without starting a new daemon.\n"
         "  -h, --help          Show this help\n"
         "  -v, --version       Show version\n"
     );
@@ -1101,6 +1198,13 @@ int main(int argc, char* argv[]) {
     if (const char* env = std::getenv("RECMEET_LOG_LEVEL"))
         log_level_str = env;
 
+    // Phase C.13 — `--evict` is a CLI-mode flag, not a daemon-mode flag:
+    // when present, this invocation acts as a client talking to the live
+    // daemon, dispatches `admin.evict`, prints the result, and exits BEFORE
+    // any pid-lock or listener setup. Parsed here as a separate string so
+    // the early-dispatch branch below can fire without re-walking argv.
+    std::string evict_prefix;
+
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
         if ((arg == "-h" || arg == "--help")) { print_usage(); return 0; }
@@ -1110,8 +1214,47 @@ int main(int argc, char* argv[]) {
         if (arg == "--log-level" && i + 1 < argc) { log_level_str = argv[++i]; continue; }
         if (arg == "--log-dir" && i + 1 < argc) { log_dir = argv[++i]; continue; }
         if (arg == "--log-retention" && i + 1 < argc) { log_retention_hours = std::atoi(argv[++i]); continue; }
+        // Phase C.13 — `--evict <prefix>` forces immediate eviction of a
+        // resume_token by 8+ hex-char prefix. CLI-mode: talks to the live
+        // daemon, NEVER acts as the daemon. See operator workflow guide in
+        // agentctx/tasks/thin-client-recording-server.md C.13 body.
+        if (arg == "--evict" && i + 1 < argc) { evict_prefix = argv[++i]; continue; }
         fprintf(stderr, "Unknown option: %s\n", arg.c_str());
         return 1;
+    }
+
+    // Phase C.13 — `--evict` CLI dispatch. Mirrors the client_status /
+    // client_stop pattern from src/main.cpp:143-176. Runs BEFORE pid-lock
+    // acquire because the live daemon already holds it (this invocation is
+    // not a second daemon — it is a one-shot client). Unix-socket peer-
+    // credential trust gates the verb (the daemon's admin.evict handler
+    // has no special privilege check; the security boundary is the socket
+    // itself per src/ipc_server.cpp:501-513).
+    if (!evict_prefix.empty()) {
+        // Use the same listen address resolution the daemon itself would —
+        // empty `socket_path` means default Unix socket (default_socket_path()).
+        IpcClient client(socket_path);
+        if (!client.connect()) {
+            fprintf(stderr, "Daemon not running (cannot reach %s)\n",
+                    socket_path.empty() ? "default socket" : socket_path.c_str());
+            return 1;
+        }
+        IpcResponse resp;
+        IpcError err;
+        JsonMap params;
+        params["prefix"] = evict_prefix;
+        if (!client.call("admin.evict", params, resp, err)) {
+            fprintf(stderr, "Evict failed: %s\n", err.message.c_str());
+            return 1;
+        }
+        printf("Evicted session\n");
+        printf("  token:     %s\n",
+               json_val_as_string(resp.result["evicted"], "<missing>").c_str());
+        printf("  client_id: %s\n",
+               json_val_as_string(resp.result["client_id"], "<missing>").c_str());
+        printf("  jobs:      %s\n",
+               json_val_as_string(resp.result["owned_jobs_failed"], "[]").c_str());
+        return 0;
     }
 
     // PID file with flock() to prevent duplicate daemons
@@ -1214,6 +1357,19 @@ int main(int argc, char* argv[]) {
                  n, n == 1 ? "" : "s", g_config.output_dir.string().c_str());
     }
 
+    // Phase C.13 — construct the resume_token store. In-memory only (MC-1);
+    // daemon restart invalidates all tokens. TTL is the consolidated knob
+    // `[server] retain_terminal_hours` (M-1) — for the scaffold we hard-code
+    // 24h; config-load mapping is a substantive impl task. Clock seam
+    // (L-3) defaults to std::chrono::system_clock; tests inject a fake.
+    {
+        const int64_t ttl_s = 24 * 3600;  // SCAFFOLD: hard-coded; impl pass reads g_config.retain_terminal_hours
+        g_sessions = std::make_unique<SessionManager>(ttl_s);
+        log_info("daemon: session manager ready (TTL=%lldh, in-memory only — "
+                 "restart invalidates all tokens)",
+                 (long long)(ttl_s / 3600));
+    }
+
     notify_init();
 
     // Resolve path to recmeet binary for subprocess postprocessing
@@ -1232,6 +1388,46 @@ int main(int argc, char* argv[]) {
     // Create server
     IpcServer server(socket_path);
     g_server = &server;
+
+    // Phase C.13 — wire the resume_token resolver. Called from
+    // ipc_server.cpp's handle_pending_psk immediately after the PSK check
+    // passes, with the `resume_token` field the client supplied on
+    // auth.token (empty when the client sent no field). The resolver
+    // owns the "resume an existing session OR mint fresh" decision:
+    //   - Non-empty provided token + resolve() hit → reuse prior
+    //     client_id; echo the SAME token back (client keeps using it).
+    //   - Empty / unknown / expired → mint fresh client_id via the
+    //     IpcServer's mint_client_id() + fresh resume_token via
+    //     SessionManager::mint(). Client overwrites its persisted token.
+    //
+    // Per H-2: creds/prefs are NOT restored here — those live on
+    // ClientState only and were dropped at the prior disconnect. The
+    // resumed client MUST re-send session.init.
+    //
+    // Per L-1: only the 8-char prefix of any resume_token reaches log_*.
+    server.set_resume_token_resolver(
+        [&server](const std::string& provided_token)
+            -> std::pair<std::string, std::string> {
+        if (g_sessions && !provided_token.empty()) {
+            if (auto cid = g_sessions->resolve(provided_token); cid) {
+                log_info("daemon: resume_token RESUME (prefix=%s client=%s)",
+                         SessionManager::log_prefix(provided_token).c_str(),
+                         cid->c_str());
+                return {*cid, provided_token};
+            }
+            log_info("daemon: resume_token unknown/expired (prefix=%s) — "
+                     "falling through to fresh-mint",
+                     SessionManager::log_prefix(provided_token).c_str());
+        }
+        std::string fresh_cid = server.mint_client_id();
+        std::string fresh_token = g_sessions
+            ? g_sessions->mint(fresh_cid)
+            : std::string();
+        log_info("daemon: resume_token FRESH (prefix=%s client=%s)",
+                 SessionManager::log_prefix(fresh_token).c_str(),
+                 fresh_cid.c_str());
+        return {fresh_cid, fresh_token};
+    });
 
     // Phase C.7 — wire the JobQueue auto-download machinery now that the
     // IpcServer exists (the JobEventSink captures it). The ModelResolver
@@ -3282,6 +3478,83 @@ int main(int argc, char* argv[]) {
         return true;
     });
 
+    // --- Phase C.13 — admin.evict (operator session-revocation) ---
+    //
+    // admin.evict { prefix } — forced eviction of a resume_token by prefix.
+    //                          Sole caller today is `recmeet-daemon --evict`
+    //                          (a separate CLI invocation routed through the
+    //                          Unix socket; peer-credential trust is the gate
+    //                          — Unix clients bypass PSK at accept time per
+    //                          src/ipc_server.cpp:501-513). TCP-exposed
+    //                          deployments inherit PSK gating automatically
+    //                          (the verb has no special privilege check; the
+    //                          security boundary is the socket itself).
+    //
+    // Request:  { "prefix": "<8+ hex chars>" }
+    // Response: { "evicted":          "<full 64-char token>",
+    //             "client_id":        "<owner_id>",
+    //             "owned_jobs_failed": [<job_ids>] }
+    //
+    // Validation (H-4):
+    //   - prefix < 8 hex chars   → InvalidParams "prefix too short"
+    //   - 0 matches              → InvalidParams "no matching session"
+    //   - > 1 match              → InvalidParams "ambiguous prefix"
+    //   - exact-one              → evict + return full token + client_id
+    //
+    // SCAFFOLD: the eviction primitive on SessionManager is live (drops the
+    // resume_token → ResumeSession binding); the owned-jobs-fail teardown
+    // (which shares the same code path as the GC sweep — see
+    // gc_worker_loop's TODO block) is deferred to the C.13 implementation
+    // pass. owned_jobs_failed returns an empty array for now.
+    server.on("admin.evict",
+              [](const IpcRequest& req, IpcResponse& resp, IpcError& err) {
+        if (!g_sessions) {
+            err.code = static_cast<int>(IpcErrorCode::InternalError);
+            err.message = "admin.evict: session manager unavailable";
+            return false;
+        }
+        auto it = req.params.find("prefix");
+        if (it == req.params.end()) {
+            err.code = static_cast<int>(IpcErrorCode::InvalidParams);
+            err.message = "admin.evict: missing 'prefix'";
+            return false;
+        }
+        std::string prefix = json_val_as_string(it->second);
+        EvictResult r = g_sessions->evict_by_prefix(prefix);
+        switch (r.kind) {
+        case EvictResult::Kind::PrefixTooShort:
+            err.code = static_cast<int>(IpcErrorCode::InvalidParams);
+            err.message = "admin.evict: prefix too short (min 8 hex chars)";
+            return false;
+        case EvictResult::Kind::NoMatch:
+            err.code = static_cast<int>(IpcErrorCode::InvalidParams);
+            err.message = "admin.evict: no matching session for prefix "
+                        + SessionManager::log_prefix(prefix);
+            return false;
+        case EvictResult::Kind::Ambiguous:
+            err.code = static_cast<int>(IpcErrorCode::InvalidParams);
+            err.message = "admin.evict: ambiguous prefix " + prefix
+                        + " — please specify more chars";
+            return false;
+        case EvictResult::Kind::Evicted:
+            resp.result["evicted"]   = r.token;
+            resp.result["client_id"] = r.client_id;
+            // SCAFFOLD: owned-jobs teardown wiring is shared with the GC
+            // sweep and lives in the C.13 implementation pass. Empty array
+            // here keeps the wire shape stable; a future impl writes the
+            // actual evicted job_ids.
+            resp.result["owned_jobs_failed"] = std::string("[]");
+            log_info("daemon: admin.evict OK (prefix=%s client=%s)",
+                     SessionManager::log_prefix(r.token).c_str(),
+                     r.client_id.c_str());
+            return true;
+        }
+        // Unreachable.
+        err.code = static_cast<int>(IpcErrorCode::InternalError);
+        err.message = "admin.evict: unexpected EvictResult kind";
+        return false;
+    });
+
     // --- Start server ---
 
     if (!server.start()) {
@@ -3300,6 +3573,11 @@ int main(int argc, char* argv[]) {
     // slot so its "running" marker is authoritative; the session lifetime
     // itself belongs to g_streaming.
     g_stream_worker = std::thread([&server]() { stream_worker_loop(server); });
+    // Phase C.13 — GC sweep worker. SCAFFOLD: spawns thread + wakes
+    // periodically + invokes g_sessions->sweep_expired(); orphan-job
+    // teardown deferred to the C.13 implementation pass. Hard-coded 5-min
+    // cadence; impl pass reads g_config.gc_interval_minutes.
+    g_gc_worker = std::thread([&server]() { gc_worker_loop(server, 5); });
 
     // Signal handlers
     struct sigaction sa{};
@@ -3335,6 +3613,16 @@ int main(int argc, char* argv[]) {
     // CaptionEngine, closes + unlinks the temp WAV).
     if (g_stream_worker.joinable()) g_stream_worker.join();
     g_streaming.reset();
+    // Phase C.13 — signal + join the GC sweep thread. The sweep loop waits
+    // on g_gc_cv with a per-cadence timeout; setting g_gc_shutdown lets it
+    // exit immediately rather than wait the full interval.
+    {
+        std::lock_guard<std::mutex> lock(g_gc_mu);
+        g_gc_shutdown = true;
+    }
+    g_gc_cv.notify_all();
+    if (g_gc_worker.joinable()) g_gc_worker.join();
+    g_sessions.reset();
     g_server = nullptr;
 
     // Clean up PID file

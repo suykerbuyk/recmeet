@@ -84,9 +84,10 @@ std::string make_auth_error_frame(const std::string& reason) {
 // Phase C.1: emitted as a complete `0x00` NDJSON wire frame via
 // `frame_ndjson()`. The client's auth-handshake reader (which runs before
 // the steady-state FrameReader path) strips the same `0x00` prefix.
-std::string make_auth_ok_frame(const std::string& client_id, int protocol_version) {
+std::string make_auth_ok_frame(const std::string& client_id, int protocol_version,
+                               const std::string& resume_token = "") {
     std::string json;
-    json.reserve(64 + client_id.size());
+    json.reserve(64 + client_id.size() + resume_token.size());
     json += "{\"type\":\"auth.ok\",\"client_id\":\"";
     json += json_escape(client_id);
     json += "\"";
@@ -94,27 +95,30 @@ std::string make_auth_ok_frame(const std::string& client_id, int protocol_versio
         json += ",\"protocol_version\":";
         json += std::to_string(protocol_version);
     }
+    // C.13 — additive field per L-2 (no IPC_PROTOCOL_VERSION bump; v1 clients
+    // ignore unknown keys). Emitted only when the resolver hook returned a
+    // non-empty token (resume succeeded OR fresh mint produced one); empty
+    // means "no resume_token mechanism wired" (legacy / test path) — field
+    // omitted entirely to preserve byte-equivalence with the pre-C.13 frame
+    // on that fallback path.
+    if (!resume_token.empty()) {
+        json += ",\"resume_token\":\"";
+        json += json_escape(resume_token);
+        json += "\"";
+    }
     json += "}";
     return frame_ndjson(json);
 }
 
-// Lightweight extractor for `{"type":"auth.token","token":"..."}`. Avoids
-// pulling the full IpcMessage parser into the auth path — auth frames are
-// not requests/responses/events and do not carry an id. Returns true when
-// `line` looks like a well-formed auth.token frame and `out` is populated.
-bool try_parse_auth_token(const std::string& line, std::string& out) {
-    // Find "type":"auth.token"
-    if (line.find("\"type\":\"auth.token\"") == std::string::npos
-        && line.find("\"type\": \"auth.token\"") == std::string::npos)
-        return false;
-
-    // Find "token": followed by a quoted string. Tolerate optional whitespace
-    // and conservative escape handling (\\, \"). Daemon-side validation only
-    // accepts the value if extraction succeeds; on any malformed shape the
-    // caller treats this as a reject and closes.
-    size_t key = line.find("\"token\"");
-    if (key == std::string::npos) return false;
-    size_t colon = line.find(':', key);
+// Lightweight extractor for a quoted JSON string value following a key.
+// Tolerates optional whitespace and conservative escape handling (\\, \").
+// Returns true on a clean extraction; `out` cleared and populated.
+bool try_extract_json_string(const std::string& line, const std::string& key,
+                             std::string& out) {
+    const std::string needle = "\"" + key + "\"";
+    size_t k = line.find(needle);
+    if (k == std::string::npos) return false;
+    size_t colon = line.find(':', k);
     if (colon == std::string::npos) return false;
     size_t open = line.find('"', colon);
     if (open == std::string::npos) return false;
@@ -124,7 +128,6 @@ bool try_parse_auth_token(const std::string& line, std::string& out) {
         if (c == '\\' && i + 1 < line.size()) {
             char nc = line[i + 1];
             if (nc == '"' || nc == '\\') { out += nc; ++i; continue; }
-            // Other escape sequences are not expected for token values; pass through.
             out += c;
             continue;
         }
@@ -132,6 +135,24 @@ bool try_parse_auth_token(const std::string& line, std::string& out) {
         out += c;
     }
     return false;
+}
+
+// Lightweight extractor for `{"type":"auth.token","token":"...","resume_token":"..."}`.
+// `resume_token` is C.13's additive optional field — extraction returns true
+// when the frame is well-formed (regardless of resume_token presence); the
+// out-param is cleared when the field is absent or unextractable. Daemon-side
+// validation only accepts `token` if extraction succeeds; on any malformed
+// `token` shape the caller treats this as a reject and closes.
+bool try_parse_auth_token(const std::string& line, std::string& out_token,
+                          std::string& out_resume_token) {
+    out_resume_token.clear();
+    if (line.find("\"type\":\"auth.token\"") == std::string::npos
+        && line.find("\"type\": \"auth.token\"") == std::string::npos)
+        return false;
+    if (!try_extract_json_string(line, "token", out_token)) return false;
+    // resume_token is optional — silently succeed when absent or malformed.
+    (void)try_extract_json_string(line, "resume_token", out_resume_token);
+    return true;
 }
 
 } // anonymous namespace
@@ -574,8 +595,8 @@ void IpcServer::reject_full(int fd) {
 }
 
 bool IpcServer::handle_pending_psk(int fd, ClientState& cs, const std::string& line) {
-    std::string token;
-    if (!try_parse_auth_token(line, token)) {
+    std::string psk_token, resume_token;
+    if (!try_parse_auth_token(line, psk_token, resume_token)) {
         // First TCP frame was not auth.token — protocol violation.
         log_warn("ipc_server: TCP auth refused (peer=%s, reason=auth_required)",
                  cs.peer_addr.c_str());
@@ -589,7 +610,7 @@ bool IpcServer::handle_pending_psk(int fd, ClientState& cs, const std::string& l
         return false;
     }
 
-    if (!ct_equals(token, psk_)) {
+    if (!ct_equals(psk_token, psk_)) {
         // Mismatched PSK. Log the peer + reason but never the token itself.
         log_warn("ipc_server: TCP auth refused (peer=%s, reason=invalid_token)",
                  cs.peer_addr.c_str());
@@ -601,20 +622,37 @@ bool IpcServer::handle_pending_psk(int fd, ClientState& cs, const std::string& l
     }
 
     cs.auth_state = AuthState::Authed;
-    // Phase A.4: assign server-issued client_id at the moment auth
-    // completes. The reverse-map insert MUST happen before send_to() so
+    // C.13: resume_token resolver. When the daemon has wired the resolver
+    // (set_resume_token_resolver), it owns the "resume an existing session
+    // OR mint fresh" decision and the matching `client_id` + `resume_token`
+    // pair. Pre-C.13 callers (tests with no resolver) fall back to the
+    // legacy fresh-mint path with no token echoed on auth.ok.
+    std::string client_id;
+    std::string echo_token;
+    if (resume_resolver_) {
+        auto pr = resume_resolver_(resume_token);
+        client_id  = std::move(pr.first);
+        echo_token = std::move(pr.second);
+    } else {
+        client_id = mint_client_id();
+    }
+    cs.client_id = client_id;
+    // Phase A.4: the reverse-map insert MUST happen before send_to() so
     // that a Phase C.7 routed event posted in the same tick can resolve
     // the id immediately. Today's call sites all run on the poll thread
     // so the ordering is enforced by the thread, but lock-free design
     // means the assignment+insert pair must read atomically from the
     // caller's perspective.
-    cs.client_id = mint_client_id();
     client_id_to_fd_[cs.client_id] = fd;
     log_info("ipc_server: TCP auth ok (peer=%s, client_id=%s)",
              cs.peer_addr.c_str(), cs.client_id.c_str());
-    send_to(fd, make_auth_ok_frame(cs.client_id, protocol_version_),
+    send_to(fd, make_auth_ok_frame(cs.client_id, protocol_version_, echo_token),
             MessageClass::Response);
     return true;
+}
+
+void IpcServer::set_resume_token_resolver(ResumeTokenResolver r) {
+    resume_resolver_ = std::move(r);
 }
 
 void IpcServer::handle_client_data(int fd) {
