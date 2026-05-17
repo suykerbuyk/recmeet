@@ -38,13 +38,19 @@
 
 #include "ipc_protocol.h"   // IpcErrorCode
 #include "log.h"
+#include "meeting_index.h"
+#include "pipeline.h"       // save_meeting_context
 
 #include <sndfile.h>
+
+#include <fcntl.h>
+#include <unistd.h>
 
 #include <algorithm>
 #include <array>
 #include <cstdio>
 #include <cstring>
+#include <fstream>
 #include <limits>
 #include <random>
 #include <system_error>
@@ -108,6 +114,110 @@ void rm_dir_quiet(const fs::path& p) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Phase C.11.4 — atomic staging→meeting WAV relocation
+// ---------------------------------------------------------------------------
+//
+// Convergence-principle invariant: a concurrent reader of the final audio
+// path must see either the prior file's bytes or the new file's bytes —
+// never a partial write. Implementation: write the new bytes to
+// `<final>.tmp` (full content + `fsync(file_fd)`), then `rename(2)` over
+// `<final>`, then `fsync(dir_fd)` so the rename hits stable storage.
+// `rename(2)` is atomic within a single filesystem.
+//
+// Cross-filesystem fallback. If `/tmp` (staging) and `~/meetings` are on
+// different filesystems (common: tmpfs vs ext4), `rename(2)` returns
+// EXDEV. We detect this via std::filesystem's error_code and fall back to
+// `copy_file` (which is atomic on POSIX: it opens dst with O_EXCL? no —
+// it isn't, so we do the same write-tmp + rename dance on the destination
+// side, just using a buffered copy as the body). This keeps the
+// "concurrent reader sees one or the other, never half" invariant intact
+// because the rename on the destination filesystem is still atomic.
+//
+// Returns std::nullopt on success; an error message string otherwise.
+std::optional<std::string>
+atomic_relocate(const fs::path& src, const fs::path& dst_final) {
+    fs::path dst_tmp = dst_final;
+    dst_tmp += ".tmp";
+
+    std::error_code ec;
+    fs::remove(dst_tmp, ec); // best-effort — clear any stale partial
+
+    // Try same-filesystem rename first. The source already has its bytes
+    // fully flushed (libsndfile sf_close / ofstream close did that before
+    // we arrived). std::filesystem::rename does rename(2) under the hood.
+    fs::rename(src, dst_tmp, ec);
+    if (ec) {
+        // EXDEV is the only fallback we handle; any other error is fatal.
+        if (ec != std::errc::cross_device_link) {
+            return std::string("rename(") + src.string() + " -> " +
+                   dst_tmp.string() + "): " + ec.message();
+        }
+        // Cross-filesystem path: copy bytes onto the destination FS into
+        // <dst>.tmp, then rename to <dst>.
+        ec.clear();
+        std::ifstream in(src, std::ios::binary);
+        if (!in.is_open()) {
+            return std::string("open src ") + src.string() +
+                   " for cross-fs copy failed";
+        }
+        std::ofstream out(dst_tmp, std::ios::binary | std::ios::trunc);
+        if (!out.is_open()) {
+            return std::string("open dst tmp ") + dst_tmp.string() +
+                   " for cross-fs copy failed";
+        }
+        out << in.rdbuf();
+        out.flush();
+        if (!out.good() || !in.good()) {
+            std::error_code rm_ec;
+            fs::remove(dst_tmp, rm_ec);
+            return std::string("cross-fs copy ") + src.string() + " -> " +
+                   dst_tmp.string() + " failed mid-stream";
+        }
+        out.close();
+        in.close();
+        // Remove the source on success — we own the staging copy now.
+        fs::remove(src, ec);
+        if (ec) {
+            log_warn("[upload] atomic_relocate: cross-fs copy succeeded but "
+                     "failed to remove staging src %s: %s",
+                     src.string().c_str(), ec.message().c_str());
+            ec.clear(); // not fatal — the dst is what matters
+        }
+    }
+
+    // Now: bytes live at dst_tmp on the destination filesystem. fsync the
+    // file before the rename so the data is durable before any reader can
+    // possibly see it.
+    {
+        int fd = ::open(dst_tmp.string().c_str(), O_RDONLY | O_CLOEXEC);
+        if (fd >= 0) {
+            (void)::fsync(fd);
+            (void)::close(fd);
+        }
+    }
+
+    fs::rename(dst_tmp, dst_final, ec);
+    if (ec) {
+        std::error_code rm_ec;
+        fs::remove(dst_tmp, rm_ec);
+        return std::string("rename(") + dst_tmp.string() + " -> " +
+               dst_final.string() + "): " + ec.message();
+    }
+
+    // fsync(parent_dir) so the rename entry is durable.
+    {
+        fs::path parent = dst_final.parent_path();
+        int dfd = ::open(parent.string().c_str(),
+                         O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        if (dfd >= 0) {
+            (void)::fsync(dfd);
+            (void)::close(dfd);
+        }
+    }
+    return std::nullopt;
+}
+
 } // anonymous namespace
 
 // ===========================================================================
@@ -139,9 +249,29 @@ UploadSession::~UploadSession() {
 
 UploadSessionManager::UploadSessionManager(JobQueue& jobs,
                                            fs::path staging_root,
-                                           UploadProgressSink progress_sink)
+                                           UploadProgressSink progress_sink,
+                                           MeetingIndex* meeting_index,
+                                           fs::path meetings_root)
     : jobs_(jobs), staging_root_(std::move(staging_root)),
-      progress_sink_(std::move(progress_sink)) {}
+      progress_sink_(std::move(progress_sink)),
+      meeting_index_(meeting_index),
+      meetings_root_(std::move(meetings_root)) {
+    // C.11.4 — the dedup contract requires BOTH a MeetingIndex AND a
+    // meetings_root. A half-wired manager (one set, the other not) is a
+    // configuration bug; log it once at startup so it surfaces immediately
+    // rather than silently degrading the upload path to legacy behavior.
+    const bool have_idx  = (meeting_index_ != nullptr);
+    const bool have_root = !meetings_root_.empty();
+    if (have_idx != have_root) {
+        log_warn("[upload] manager constructed with partial dedup wiring "
+                 "(meeting_index=%s, meetings_root=%s) — convergence-principle "
+                 "dedup disabled; uploads will use legacy staging-as-meeting-dir",
+                 have_idx ? "set" : "null",
+                 have_root ? meetings_root_.string().c_str() : "empty");
+        meeting_index_ = nullptr;
+        meetings_root_.clear();
+    }
+}
 
 UploadSessionManager::~UploadSessionManager() {
     // Abort every still-active session on daemon shutdown. The map owns the
@@ -382,6 +512,13 @@ bool UploadSessionManager::feed_chunk(const std::string& client_id,
     std::string pp_mode;        // Phase C.8 — captured under the lock
     std::string pp_enroll_name; // Phase C.8 — captured under the lock
     std::string pp_meeting_id;  // Phase C.11 — captured under the lock
+
+    // Phase C.11.4 — resolved by the in-lock dedup block. Equal to the
+    // staging paths on the legacy/unwired path; equal to the real
+    // ~/meetings/{ts}/ path on the dedup-wired path.
+    fs::path    resolved_meeting_dir;
+    fs::path    resolved_audio_path;
+    std::string resolved_timestamp;
     {
         std::lock_guard<std::mutex> lk(mu_);
         UploadSession* sess = nullptr;
@@ -524,6 +661,108 @@ bool UploadSessionManager::feed_chunk(const std::string& client_id,
             pp_modes_.erase(job_id);
             pp_enroll_names_.erase(job_id);
             pp_meeting_ids_.erase(job_id);
+
+            // ---------------------------------------------------------------
+            // Phase C.11.4 — convergence-principle dedup resolution.
+            //
+            // Decide the target meeting directory while the manager mutex is
+            // still held. Concurrent submits with the same meeting_id (from
+            // different clients — same-client is already barred by the
+            // capacity-1 invariant) serialize through this block and end up
+            // referring to the same dir; the LATER one's bytes win via the
+            // atomic relocate outside the lock (client-authoritative
+            // overwrite, per docs/V2-STRATEGY.md).
+            //
+            // Two-path design:
+            //   - Wired:   meeting_index_ + meetings_root_ both set. Resolve
+            //              an entry in ~/meetings/ keyed by meeting_id (or
+            //              allocate fresh when absent / vanished), bind, set
+            //              the resolved paths. The outside-lock block does
+            //              the atomic relocate + context.json write.
+            //   - Unwired: legacy "staging dir IS the meeting dir" model.
+            //              The outside-lock block sees resolved_meeting_dir
+            //              == staging_dir and skips the relocate entirely.
+            //              Existing tests that pass no MeetingIndex stay on
+            //              this path byte-for-byte.
+            // ---------------------------------------------------------------
+            if (meeting_index_ != nullptr && !meetings_root_.empty()) {
+                std::optional<fs::path> hit;
+                if (!pp_meeting_id.empty()) {
+                    hit = meeting_index_->find(pp_meeting_id);
+                }
+                std::error_code dec;
+                if (hit.has_value() && fs::is_directory(*hit, dec)) {
+                    resolved_meeting_dir = *hit;
+                    resolved_timestamp = derive_meeting_timestamp(*hit);
+                    log_info("[upload] dedup: meeting_id=%s -> existing dir %s "
+                             "(overwrite path)",
+                             pp_meeting_id.c_str(),
+                             resolved_meeting_dir.string().c_str());
+                } else {
+                    if (hit.has_value()) {
+                        // Stale index entry — dir was deleted out from under
+                        // us. Drop the binding before allocating fresh so
+                        // the next submit doesn't keep chasing the ghost.
+                        log_warn("[upload] dedup: meeting_id=%s bound to "
+                                 "vanished dir %s — unbinding and allocating "
+                                 "fresh", pp_meeting_id.c_str(),
+                                 hit->string().c_str());
+                        meeting_index_->unbind(pp_meeting_id);
+                    }
+                    std::error_code mkec;
+                    fs::create_directories(meetings_root_, mkec); // best-effort
+                    try {
+                        OutputDir od = create_output_dir(meetings_root_);
+                        resolved_meeting_dir = od.path;
+                        resolved_timestamp = od.timestamp;
+                    } catch (const std::exception& e) {
+                        // create_output_dir throws on "too many sessions in
+                        // the same minute" — extreme edge case. Fall back to
+                        // staging-as-meeting-dir for this one submit; log
+                        // loudly so operators see it.
+                        log_error("[upload] dedup: create_output_dir(%s) "
+                                  "failed: %s — falling back to staging dir",
+                                  meetings_root_.string().c_str(), e.what());
+                        resolved_meeting_dir = staging_dir;
+                        resolved_audio_path =
+                            fs::path(staging_audio_path_str);
+                    }
+                    if (resolved_meeting_dir != staging_dir &&
+                        !pp_meeting_id.empty()) {
+                        // Bind under the mutex. A concurrent submit landing
+                        // immediately after will find this binding and
+                        // converge on the same dir.
+                        meeting_index_->bind(pp_meeting_id,
+                                             resolved_meeting_dir);
+                        log_info("[upload] dedup: meeting_id=%s -> fresh dir "
+                                 "%s (allocate path, bound)",
+                                 pp_meeting_id.c_str(),
+                                 resolved_meeting_dir.string().c_str());
+                    } else if (resolved_meeting_dir != staging_dir) {
+                        log_info("[upload] dedup: v1-shaped submit (no "
+                                 "meeting_id) -> fresh dir %s (no index "
+                                 "binding)",
+                                 resolved_meeting_dir.string().c_str());
+                    }
+                }
+                if (resolved_audio_path.empty()) {
+                    // Compose the final audio filename matching V1 naming
+                    // (audio_<ts>.<ext>) so V1 readers — including
+                    // find_audio_file() — locate it. Fallback to plain
+                    // "audio.<ext>" when the timestamp couldn't be derived.
+                    std::string ext = staging_extension(sess->req_.format);
+                    std::string fname = resolved_timestamp.empty()
+                        ? (std::string("audio.") + ext)
+                        : (std::string("audio_") + resolved_timestamp +
+                           "." + ext);
+                    resolved_audio_path = resolved_meeting_dir / fname;
+                }
+            } else {
+                // Legacy path: staging IS the meeting dir.
+                resolved_meeting_dir = staging_dir;
+                resolved_audio_path = fs::path(staging_audio_path_str);
+            }
+
             finalize_now = true;
         }
     }
@@ -534,23 +773,78 @@ bool UploadSessionManager::feed_chunk(const std::string& client_id,
         progress_sink_.on_progress(job_id, client_id, bytes_after, audio_size);
 
     if (finalize_now) {
-        // Build the postprocess Job payload. The staging dir is the
-        // `out_dir` the reprocess subprocess scans for audio; the staging
-        // audio file lives inside.
+        // Phase C.11.4 — atomic staging→meeting relocation (dedup-wired
+        // path only). On the legacy path the resolved_* values equal the
+        // staging values and we skip the relocate entirely; the staging
+        // dir stays put and becomes the postprocess out_dir as it did
+        // pre-C.11.4. On the wired path the resolved values point into
+        // `meetings_root_/{ts}/`, and we:
+        //   1. Atomically relocate the staging audio file (write-tmp +
+        //      fsync + rename + fsync(dir); EXDEV handled).
+        //   2. Write context.json with the captured context_inline and
+        //      meeting_id (client-authoritative replace; the on-disk
+        //      file is overwritten with whatever the latest submit
+        //      carried — per V2-STRATEGY.md "Convergence principle").
+        //   3. Remove the staging dir (the audio has moved out).
+        // If the relocate fails we cancel the JobQueue reservation and
+        // return true — the protocol round-trip is complete, but the
+        // subprocess will never run. The client sees the failure via
+        // job.status / progress.job after a brief delay.
+        if (resolved_meeting_dir != staging_dir) {
+            auto err = atomic_relocate(fs::path(staging_audio_path_str),
+                                       resolved_audio_path);
+            if (err.has_value()) {
+                log_error("[upload] finalize: atomic_relocate failed for "
+                          "job=%ld meeting_id=%s: %s — cancelling "
+                          "reservation",
+                          (long)job_id, pp_meeting_id.c_str(),
+                          err->c_str());
+                jobs_.cancel(job_id);
+                rm_dir_quiet(staging_dir);
+                return true;
+            }
+            // Write the context.json for this meeting. Includes meeting_id
+            // when non-empty so a future daemon restart's
+            // rebuild_from_disk re-establishes the binding. The
+            // `resolved_timestamp` drives the canonical filename pattern
+            // (context_<ts>.json), matching what live-recording writes.
+            try {
+                save_meeting_context(resolved_meeting_dir, context_inline,
+                                     /*context_file=*/fs::path{},
+                                     resolved_timestamp, pp_meeting_id);
+            } catch (const std::exception& e) {
+                // Non-fatal: the audio is already in place; the
+                // subprocess can still run. Index rebuild after restart
+                // would lose this binding without context.json — log so
+                // operators notice.
+                log_warn("[upload] finalize: save_meeting_context(%s) "
+                         "failed: %s — index binding will be lost across "
+                         "daemon restart",
+                         resolved_meeting_dir.string().c_str(), e.what());
+            }
+            // The staging dir is now empty of the audio; remove it.
+            rm_dir_quiet(staging_dir);
+        }
+
+        // Build the postprocess Job payload. `input.out_dir` is the dir
+        // the reprocess subprocess scans for audio; with C.11.4 wired
+        // this is the real ~/meetings/{ts}/ path, not the staging dir.
         Job j;
-        j.input.out_dir = staging_dir;
-        j.input.audio_path = fs::path(staging_audio_path_str);
+        j.input.out_dir = resolved_meeting_dir;
+        j.input.audio_path = resolved_audio_path;
         j.cfg = pp_cfg;
         // Per-submit context override (the daemon's pp_worker writes the
-        // job config out and the subprocess picks it up via
-        // `save_meeting_context`; our path is the C.2 sibling, so we set
-        // `context_inline` directly on the cfg).
+        // job config out and the subprocess picks it up via the standard
+        // `cfg.context_inline` channel). Pre-C.11.4 the subprocess wrote
+        // context.json itself via run_pipeline's live-record branch; on
+        // the C.11.4 path we already wrote context.json above (so the
+        // index rebuild survives), and the subprocess reads it back via
+        // load_meeting_context. Both are consistent.
         if (!context_inline.empty()) j.cfg.context_inline = context_inline;
-        // Make sure the postprocess subprocess is steered to *reprocess* the
-        // staging dir, not start a new recording. The reprocess_dir is the
-        // same staging dir; pp_worker_loop already sets this from
-        // input.out_dir, but be explicit.
-        j.cfg.reprocess_dir = staging_dir.string();
+        // Steer the subprocess to *reprocess* the meeting dir, not start
+        // a new recording. pp_worker_loop sets this from input.out_dir
+        // anyway, but be explicit so the contract is visible at the seam.
+        j.cfg.reprocess_dir = resolved_meeting_dir.string();
         // Phase C.8 — enroll mode is carried via the locals captured under
         // the lock above (the side-table entries are already erased by
         // this point). Stamp the outgoing Job.cfg so the subprocess
@@ -560,26 +854,35 @@ bool UploadSessionManager::feed_chunk(const std::string& client_id,
             j.cfg.enroll_name = pp_enroll_name;
         }
         // C.11 — stamp the meeting_id captured under the lock. Empty for
-        // v1-shaped clients. The convergence-principle dedup contract in
-        // C.11.4 reads this on the upload finalize path; for C.11.1 the
-        // value just rides on the Job so job.list / job.status echo it
-        // back to the client.
+        // v1-shaped clients. job.list / job.status echo this back so the
+        // client can reconcile its journal entries by content key.
         j.meeting_id = pp_meeting_id;
 
         bool placed = jobs_.enqueue_reserved(job_id, std::move(j));
         if (!placed) {
-            // Reservation was cancelled between feed and finalize — clean
-            // up the staging dir since pp_worker_loop will never run it.
-            log_warn("[upload] finalize: reservation job=%ld no longer "
-                     "WaitingForUpload — staging dir orphaned, removing",
-                     (long)job_id);
-            rm_dir_quiet(staging_dir);
+            // Reservation was cancelled between feed and finalize. The
+            // audio is in its meeting dir (C.11.4 wired) or staging dir
+            // (legacy); on the wired path we leave it in place — it's
+            // operator data, and a future process.reprocess can pick it
+            // up. On the legacy path we still rm_dir the staging since
+            // it would otherwise be an /tmp orphan no operator can find.
+            if (resolved_meeting_dir == staging_dir) {
+                log_warn("[upload] finalize: reservation job=%ld no longer "
+                         "WaitingForUpload — staging dir orphaned, removing",
+                         (long)job_id);
+                rm_dir_quiet(staging_dir);
+            } else {
+                log_warn("[upload] finalize: reservation job=%ld no longer "
+                         "WaitingForUpload — audio at %s preserved for "
+                         "future reprocess", (long)job_id,
+                         resolved_meeting_dir.string().c_str());
+            }
             return true;  // not a protocol violation; just lost the race.
         }
         log_info("[upload] finalize: job=%ld client=%s audio_size=%lld "
-                 "staging=%s — enqueued for postprocess",
+                 "meeting_dir=%s — enqueued for postprocess",
                  (long)job_id, client_id.c_str(), (long long)audio_size,
-                 staging_dir.string().c_str());
+                 resolved_meeting_dir.string().c_str());
     }
     return true;
 }

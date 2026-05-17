@@ -67,6 +67,8 @@
 
 namespace recmeet {
 
+class MeetingIndex;
+
 // ---------------------------------------------------------------------------
 // Upload-progress sink
 // ---------------------------------------------------------------------------
@@ -196,8 +198,25 @@ public:
     /// to the system temp dir at create()-time. `progress_sink` is invoked
     /// from `feed_chunk()` for the `uploading` phase; empty sink is fine
     /// (tests use a no-op).
+    ///
+    /// Phase C.11.4 — `meeting_index` and `meetings_root` together wire the
+    /// convergence-principle dedup contract (docs/V2-STRATEGY.md "Meeting
+    /// identity and the client-server audio contract"). When BOTH are
+    /// non-null/non-empty, finalize relocates the staging WAV into a real
+    /// meeting directory under `meetings_root` (allocating fresh via
+    /// `create_output_dir` for unknown meeting_id, or overwriting the
+    /// existing dir keyed by `meeting_id` via atomic write-temp + fsync +
+    /// rename + fsync(dir)). When EITHER is absent (e.g. unit tests that
+    /// care only about protocol shape), the manager falls back to the
+    /// legacy "staging dir IS the meeting dir" model — the staging dir
+    /// becomes `Job.input.out_dir` and the postprocess subprocess scans
+    /// it in place. The daemon always wires both; tests opt in by passing
+    /// them. The pointer + path are stored, not copied — both must
+    /// outlive the manager.
     UploadSessionManager(JobQueue& jobs, fs::path staging_root,
-                         UploadProgressSink progress_sink = {});
+                         UploadProgressSink progress_sink = {},
+                         MeetingIndex* meeting_index = nullptr,
+                         fs::path meetings_root = {});
     ~UploadSessionManager();
 
     UploadSessionManager(const UploadSessionManager&) = delete;
@@ -306,6 +325,13 @@ private:
     JobQueue&          jobs_;
     fs::path           staging_root_;
     UploadProgressSink progress_sink_;
+
+    /// Phase C.11.4 — dedup contract dependencies. Null/empty when the
+    /// manager is constructed for tests that don't exercise the
+    /// staging→meeting relocation; non-null/non-empty when the daemon
+    /// wires the convergence-principle path. See the ctor doc.
+    MeetingIndex*      meeting_index_ = nullptr;
+    fs::path           meetings_root_;
 
     /// upload_token -> session. Crypto-random key (anti-forgery for
     /// process.submit.cancel). The map owns sessions; erasing an entry runs

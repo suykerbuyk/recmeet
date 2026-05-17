@@ -76,6 +76,7 @@ namespace recmeet {
 // manager (used by the CaptionEngine callbacks), and the manager is defined
 // after StreamingSession in this header.
 class StreamingSessionManager;
+class MeetingIndex;
 
 // ---------------------------------------------------------------------------
 // process.stream request parameters
@@ -168,6 +169,16 @@ private:
     int          latency_budget_ms_ = kStreamLatencyDefaultMs;
 
     fs::path     wav_path_;
+    /// Phase C.11.4 — the meeting directory the WAV lives in. On the wired
+    /// path this is `meetings_root/{ts}/` (real meeting dir from frame
+    /// zero); on the legacy path (unwired manager) it's the WAV's parent
+    /// (whatever temp dir was used). `commit()` reads this into the
+    /// postprocess Job's `input.out_dir`.
+    fs::path     meeting_dir_;
+    /// Phase C.11.4 — derived timestamp matching the meeting dir name on
+    /// the wired path. Empty on the legacy path. Drives the canonical
+    /// audio + context filename naming.
+    std::string  timestamp_;
     /// Open libsndfile handle (SFM_WRITE), or null. Held as `void*` so the
     /// header does not need to pull in <sndfile.h> — the .cpp casts to
     /// `SNDFILE*` at every use site. The disk-backed temp WAV is the frame
@@ -230,9 +241,25 @@ public:
     /// passed to every session's CaptionEngine; empty is tolerated (the
     /// engine reports a clean error and the session still streams audio to
     /// disk so C.10b's batch fallback has the WAV).
+    ///
+    /// Phase C.11.4 — `meeting_index` and `meetings_root` together wire the
+    /// convergence-principle dedup contract on the streaming path (see
+    /// docs/V2-STRATEGY.md). When BOTH are non-null/non-empty, `create()`
+    /// resolves a real `meetings_root/{ts}/` directory and opens the WAV
+    /// directly there, so the streaming accumulator writes into the
+    /// canonical meeting dir from frame zero (pattern 1 of the four flow
+    /// patterns). On TCP drop mid-stream the partial WAV is preserved (not
+    /// unlinked) when `meeting_id` is set — operator can later re-upload
+    /// the full local copy via `process.submit` to overwrite the partial
+    /// (pattern 2). When EITHER is absent (test fixtures), the manager
+    /// falls back to the legacy temp-WAV-becomes-meeting-dir model. The
+    /// pointer + path are stored, not copied — both must outlive the
+    /// manager.
     StreamingSessionManager(JobQueue& jobs,
                             const StreamingCaptionSink& sink,
-                            std::string caption_model_dir);
+                            std::string caption_model_dir,
+                            MeetingIndex* meeting_index = nullptr,
+                            fs::path meetings_root = {});
     ~StreamingSessionManager();
 
     StreamingSessionManager(const StreamingSessionManager&) = delete;
@@ -389,6 +416,13 @@ private:
     JobQueue&          jobs_;
     StreamingCaptionSink sink_;
     std::string        caption_model_dir_;
+
+    /// Phase C.11.4 — dedup contract dependencies. Null/empty when the
+    /// manager is constructed for tests that don't exercise the
+    /// meeting-dir resolution path; non-null/non-empty when the daemon
+    /// wires the convergence-principle path. See the ctor doc.
+    MeetingIndex*      meeting_index_ = nullptr;
+    fs::path           meetings_root_;
 
     /// stream_token -> session. The token is the wire-facing routing key;
     /// it is crypto-random (see mint_stream_token in the .cpp) so a

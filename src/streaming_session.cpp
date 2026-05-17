@@ -39,8 +39,8 @@
 #include "cli.h"          // caption_language_supported
 #include "ipc_protocol.h" // IpcErrorCode
 #include "log.h"
-#include "pipeline.h"     // resolve_caption_model_dir (not used directly here;
-                          //   the daemon passes the resolved dir in)
+#include "meeting_index.h"
+#include "pipeline.h"     // save_meeting_context, resolve_caption_model_dir
 
 #include <sndfile.h>
 
@@ -48,6 +48,7 @@
 #include <array>
 #include <chrono>
 #include <cstdio>
+#include <optional>
 #include <random>
 #include <system_error>
 #include <vector>
@@ -127,7 +128,18 @@ StreamingSession::~StreamingSession() {
     // BEFORE setting `committed_` (so libsndfile flushes the header) and
     // erases the session from the manager's map; this destructor still runs
     // for the unique_ptr's value, and the flag tells us to skip the unlink.
-    if (!committed_) unlink_quiet(wav_path_);
+    //
+    // Phase C.11.4 — a session with a non-empty `meeting_id_` that lands
+    // here uncommitted (TCP drop mid-stream, or `cancel()`) still has its
+    // WAV preserved: per the convergence-principle, the operator's local
+    // copy can later overwrite the partial via `process.submit` (pattern
+    // 2). For v1-shaped streams (empty meeting_id) the partial is
+    // unreachable — no key to look it up by — so we keep the legacy
+    // unlink. The owning manager's teardown_locked() applies the same
+    // rule so both teardown paths agree.
+    if (!committed_ && meeting_id_.empty()) {
+        unlink_quiet(wav_path_);
+    }
 }
 
 // ===========================================================================
@@ -136,9 +148,29 @@ StreamingSession::~StreamingSession() {
 
 StreamingSessionManager::StreamingSessionManager(JobQueue& jobs,
                                                  const StreamingCaptionSink& sink,
-                                                 std::string caption_model_dir)
+                                                 std::string caption_model_dir,
+                                                 MeetingIndex* meeting_index,
+                                                 fs::path meetings_root)
     : jobs_(jobs), sink_(sink),
-      caption_model_dir_(std::move(caption_model_dir)) {}
+      caption_model_dir_(std::move(caption_model_dir)),
+      meeting_index_(meeting_index),
+      meetings_root_(std::move(meetings_root)) {
+    // C.11.4 — symmetry with UploadSessionManager: half-wired dedup is a
+    // configuration bug, not a soft fallback. Log once and force the
+    // legacy path.
+    const bool have_idx  = (meeting_index_ != nullptr);
+    const bool have_root = !meetings_root_.empty();
+    if (have_idx != have_root) {
+        log_warn("[streaming] manager constructed with partial dedup "
+                 "wiring (meeting_index=%s, meetings_root=%s) — "
+                 "convergence-principle dedup disabled; streams will use "
+                 "legacy temp-WAV-becomes-meeting-dir",
+                 have_idx ? "set" : "null",
+                 have_root ? meetings_root_.string().c_str() : "empty");
+        meeting_index_ = nullptr;
+        meetings_root_.clear();
+    }
+}
 
 StreamingSessionManager::~StreamingSessionManager() {
     // Abort every still-active session on daemon shutdown. The map owns the
@@ -169,7 +201,13 @@ void StreamingSessionManager::teardown_locked(StreamingSession* sess) {
     // but we keep this guard symmetric with the destructor's so a future
     // caller can't accidentally trip a double-teardown that would unlink a
     // committed WAV out from under the postprocess subprocess.
-    if (!sess->committed_) {
+    //
+    // Phase C.11.4 — symmetric with ~StreamingSession: a non-empty
+    // meeting_id_ also suppresses the unlink so the partial WAV survives
+    // a TCP drop / cancel and can be overwritten by a follow-up
+    // process.submit (pattern 2). v1-shaped streams (empty meeting_id)
+    // still unlink as before.
+    if (!sess->committed_ && sess->meeting_id_.empty()) {
         unlink_quiet(sess->wav_path_);
         sess->wav_path_.clear();
     }
@@ -253,12 +291,78 @@ StreamingSessionManager::create(const std::string& client_id,
     job.meeting_id = req.meeting_id;
     int64_t job_id = jobs_.enqueue(std::move(job), JobKind::Streaming, client_id);
 
-    // --- Open the disk-backed temp WAV (the frame sink).
-    fs::path dir = temp_dir.empty() ? fs::temp_directory_path() : temp_dir;
+    // --- Resolve where the WAV will live.
+    //
+    // Phase C.11.4 — when the dedup contract is wired (meeting_index_ +
+    // meetings_root_ both set), open the WAV directly inside the real
+    // meeting directory under ~/meetings/. The streaming accumulator
+    // writes there from frame zero, so commit() does not have to relocate
+    // anything (pattern 1 of the convergence-principle flow patterns; per
+    // V2-STRATEGY.md "the canonical path was the target from frame
+    // zero"). On the unwired path (tests), fall back to the legacy temp
+    // WAV in `temp_dir` / `fs::temp_directory_path()`.
+    fs::path     wav_path;
+    fs::path     resolved_meeting_dir;
+    std::string  resolved_timestamp;
+    bool         using_real_meeting_dir = false;
     std::error_code ec;
-    fs::create_directories(dir, ec);  // best-effort; sf_open reports a hard fail
-    fs::path wav_path = dir / ("recmeet-stream-" + std::to_string(job_id)
-                               + "-" + mint_stream_token().substr(0, 8) + ".wav");
+    if (meeting_index_ != nullptr && !meetings_root_.empty()) {
+        // Resolve target meeting dir under the manager mutex (already
+        // held). Find-or-allocate-and-bind, same dedup contract as the
+        // upload finalize path — concurrent process.stream + process.submit
+        // with the same meeting_id will both land in the same dir; either
+        // the WAV is open (this branch) or the audio is being relocated
+        // (upload branch), and the LATER write wins atomically.
+        std::optional<fs::path> hit;
+        if (!req.meeting_id.empty()) {
+            hit = meeting_index_->find(req.meeting_id);
+        }
+        if (hit.has_value() && fs::is_directory(*hit, ec)) {
+            resolved_meeting_dir = *hit;
+            resolved_timestamp = derive_meeting_timestamp(*hit);
+            log_info("[streaming] dedup: meeting_id=%s -> existing dir %s "
+                     "(stream into existing meeting)",
+                     req.meeting_id.c_str(),
+                     resolved_meeting_dir.string().c_str());
+        } else {
+            if (hit.has_value()) {
+                log_warn("[streaming] dedup: meeting_id=%s bound to vanished "
+                         "dir %s — unbinding and allocating fresh",
+                         req.meeting_id.c_str(), hit->string().c_str());
+                meeting_index_->unbind(req.meeting_id);
+            }
+            std::error_code mkec;
+            fs::create_directories(meetings_root_, mkec);
+            try {
+                OutputDir od = create_output_dir(meetings_root_);
+                resolved_meeting_dir = od.path;
+                resolved_timestamp = od.timestamp;
+            } catch (const std::exception& e) {
+                jobs_.finish(job_id, /*ok=*/false,
+                             std::string("meeting dir allocation failed: ") +
+                             e.what());
+                res.code = static_cast<int>(IpcErrorCode::InternalError);
+                res.error = std::string("process.stream: could not allocate "
+                                        "meeting dir: ") + e.what();
+                return res;
+            }
+            // Bind happens AFTER sf_open succeeds below so an sf_open
+            // failure leaves the index clean (no entry pointing at a dir
+            // we just removed). The window between create_output_dir
+            // and sf_open is microseconds under the mutex; no concurrent
+            // submit can race us during it.
+        }
+        std::string fname = resolved_timestamp.empty()
+            ? std::string("audio.wav")
+            : (std::string("audio_") + resolved_timestamp + ".wav");
+        wav_path = resolved_meeting_dir / fname;
+        using_real_meeting_dir = true;
+    } else {
+        fs::path dir = temp_dir.empty() ? fs::temp_directory_path() : temp_dir;
+        fs::create_directories(dir, ec);  // best-effort; sf_open reports a hard fail
+        wav_path = dir / ("recmeet-stream-" + std::to_string(job_id)
+                          + "-" + mint_stream_token().substr(0, 8) + ".wav");
+    }
 
     SF_INFO info = {};
     info.samplerate = req.sample_rate;
@@ -266,13 +370,53 @@ StreamingSessionManager::create(const std::string& client_id,
     info.format = SF_FORMAT_WAV | SF_FORMAT_PCM_16;
     SNDFILE* wav = sf_open(wav_path.string().c_str(), SFM_WRITE, &info);
     if (!wav) {
+        std::string sf_err = sf_strerror(nullptr);
+        // C.11.4 — clean up the allocated meeting dir on the wired path
+        // so a sf_open failure doesn't leave a stray empty dir under
+        // ~/meetings/. We only do this when we just created the dir
+        // (allocate path); the overwrite path (hit existing dir) must
+        // leave it alone — it has operator data.
+        if (using_real_meeting_dir && fs::exists(resolved_meeting_dir)) {
+            std::error_code is_empty_ec;
+            if (fs::is_empty(resolved_meeting_dir, is_empty_ec) &&
+                !is_empty_ec) {
+                std::error_code rm_ec;
+                fs::remove(resolved_meeting_dir, rm_ec);
+            }
+        }
         // Roll back the JobQueue slot — the job never really started.
         jobs_.finish(job_id, /*ok=*/false,
                      "temp WAV open failed");
         res.code = static_cast<int>(IpcErrorCode::InternalError);
-        res.error = std::string("process.stream: could not open temp WAV: ")
-                  + sf_strerror(nullptr);
+        res.error = std::string("process.stream: could not open temp WAV: ") +
+                    sf_err;
         return res;
+    }
+
+    // C.11.4 (wired path) — WAV is open, bind the index entry + persist
+    // context.json so a future daemon restart can repopulate the binding
+    // via rebuild_from_disk. Both are no-ops on the legacy/unwired path.
+    if (using_real_meeting_dir) {
+        if (!req.meeting_id.empty()) {
+            meeting_index_->bind(req.meeting_id, resolved_meeting_dir);
+            log_info("[streaming] dedup: meeting_id=%s -> fresh dir %s "
+                     "(allocate + bind)",
+                     req.meeting_id.c_str(),
+                     resolved_meeting_dir.string().c_str());
+        } else {
+            log_info("[streaming] dedup: v1-shaped stream (no meeting_id) "
+                     "-> fresh dir %s (no index binding)",
+                     resolved_meeting_dir.string().c_str());
+        }
+        try {
+            save_meeting_context(resolved_meeting_dir, req.context,
+                                 /*context_file=*/fs::path{},
+                                 resolved_timestamp, req.meeting_id);
+        } catch (const std::exception& e) {
+            log_warn("[streaming] create: save_meeting_context(%s) failed: "
+                     "%s — binding will be lost across daemon restart",
+                     resolved_meeting_dir.string().c_str(), e.what());
+        }
     }
 
     // --- Build the session object first so the CaptionEngine callbacks can
@@ -291,6 +435,15 @@ StreamingSessionManager::create(const std::string& client_id,
     sess->wav_path_ = wav_path;
     sess->wav_ = wav;
     sess->bytes_written_ = 0;
+    // Phase C.11.4 — capture the resolved meeting dir + timestamp so
+    // commit() can build the postprocess Job from these instead of
+    // re-deriving the parent path. On the unwired path
+    // resolved_meeting_dir is empty; commit() falls back to
+    // wav_path_.parent_path() so the legacy contract is preserved.
+    if (using_real_meeting_dir) {
+        sess->meeting_dir_ = resolved_meeting_dir;
+        sess->timestamp_ = resolved_timestamp;
+    }
     // Phase C.10b — freeze the per-client postprocess config snapshot the
     // daemon passed in. We do NOT clear `reprocess_dir` here: the daemon
     // already passes a snapshot with whatever reprocess context it wants;
@@ -533,7 +686,16 @@ StreamingSessionManager::commit(const std::string& client_id,
         }
 
         stream_job_id = sess->job_id_;
-        wav_dir = sess->wav_path_.parent_path();
+        // Phase C.11.4 — when the manager was wired with a MeetingIndex +
+        // meetings_root, `meeting_dir_` is the canonical ~/meetings/{ts}/
+        // path we opened the WAV in at create() time. Use it as the
+        // postprocess out_dir directly (pattern 1: "the canonical path
+        // was the target from frame zero"). On the unwired / v1 path
+        // meeting_dir_ is empty; fall back to the WAV's parent so the
+        // legacy temp-WAV-becomes-meeting-dir contract is preserved.
+        wav_dir = sess->meeting_dir_.empty()
+            ? sess->wav_path_.parent_path()
+            : sess->meeting_dir_;
 
         // (a) Stop the CaptionEngine — flush + join its worker thread. Any
         //     final partial-caption tokens fire through the existing sink

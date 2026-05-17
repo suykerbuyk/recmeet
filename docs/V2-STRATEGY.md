@@ -539,7 +539,7 @@ reconstruct a submission across tray restart or machine change:
 `meeting_id` field in `context.json`:
 
 ```
-~/meetings/{name}_{YYYY-MM-DD}/
+~/meetings/{YYYY-MM-DD_HH-MM}/
   audio_YYYY-MM-DD_HH-MM.wav   # overwritable on reupload of same meeting_id
   context.json                 # NEW additive field: meeting_id
   transcript.txt
@@ -549,10 +549,21 @@ reconstruct a submission across tray restart or machine change:
   speakers.json                # per-meeting speaker mapping
 ```
 
-The directory naming preserves the V1↔V2 cross-version reprocess
-contract (the `~/meetings/` schema above). The server-side index
-(`meeting_id → meeting_dir_path`) is V2-only operational state; V1
-doesn't need it because V1 has no `meeting_id` concept.
+**Directory naming is timestamp-only** (`{YYYY-MM-DD_HH-MM}` with a
+`_N` collision suffix when two recordings start within the same minute),
+matching the V1 `create_output_dir()` allocator. Earlier drafts of this
+section sketched a subject-bearing form (`{name}_{YYYY-MM-DD}/`); that
+was rejected during C.11 because meeting subjects are mutable
+(AI-rewritten on reprocess, operator-edited in the tray) and a
+subject-bearing dirname would produce `ls`-indistinguishable duplicates
+whenever the subject changed. The stable identity lives in the
+`meeting_id` index, not the path; the dirname stays timestamp-only and
+human-scannable. V1↔V2 cross-version reprocess remains intact — V1
+already names dirs by timestamp.
+
+The server-side index (`meeting_id → meeting_dir_path`) is V2-only
+operational state; V1 doesn't need it because V1 has no `meeting_id`
+concept.
 
 #### IPC implications
 
@@ -561,8 +572,17 @@ Three verbs carry `meeting_id` in V2:
 - **`process.submit { meeting_id, audio_size, format, sample_rate,
   channels, context, mode, speaker_hints? }`** — extended from C.2.
   Server uses `meeting_id` as the dedup key: known meeting_id ⇒
-  overwrite path; unknown meeting_id ⇒ allocate new meeting directory
-  using `context.subject` + `timestamp`.
+  overwrite path (atomic write-temp + `fsync` + `rename` + `fsync(dir)`
+  into the existing meeting directory); unknown meeting_id ⇒ allocate
+  new meeting directory via `create_output_dir(meetings_root)`
+  (timestamp-only naming, per the on-disk layout above). The dedup
+  lookup, the allocation, and the index bind all happen under the
+  upload manager's mutex so concurrent submits with the same
+  `meeting_id` converge on a single dir before either reaches the
+  postprocess slot. The `context_inline` carried in the request
+  replaces the on-disk `context.json` on overwrite — the
+  client-authoritative rule applies to context metadata as well as
+  audio.
 - **`process.stream { meeting_id, format, sample_rate, channels,
   context, language, captions_enabled, latency_budget_ms,
   speaker_hints? }`** — extended from C.10a. The streaming accumulator

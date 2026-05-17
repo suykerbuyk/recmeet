@@ -25,9 +25,12 @@
 #include "ipc_protocol.h"
 #include "ipc_server.h"
 #include "job_queue.h"
+#include "meeting_index.h"
+#include "pipeline.h"          // load_meeting_id
 #include "upload_session.h"
 #include "util.h"
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -35,6 +38,7 @@
 #include <filesystem>
 #include <fstream>
 #include <mutex>
+#include <random>
 #include <string>
 #include <thread>
 #include <vector>
@@ -935,3 +939,370 @@ TEST_CASE("UploadSession: process.submit.cancel + disconnect handler over the wi
 
     ::unlink(UPLOAD_SOCK);
 }
+
+// ===========================================================================
+// Phase C.11.5 — convergence-principle dedup contract tests
+// ===========================================================================
+//
+// These exercise the upload-finalize migration path landed in C.11.4: the
+// staging WAV is atomically relocated into a real `~/meetings/{ts}/`
+// directory under a dedicated `meetings_root`, the MeetingIndex is bound,
+// and a follow-up submit carrying the same meeting_id overwrites
+// atomically rather than allocating a new dir.
+//
+// Each test wires its own MeetingIndex + meetings_root pair (tmpfs-rooted
+// per-test to keep them isolated). The unwired path (no index, no root) is
+// covered by the existing tests above — we don't repeat that ground.
+
+namespace {
+
+fs::path test_meetings_root(const std::string& tag) {
+    fs::path d = fs::temp_directory_path() / ("recmeet_meetings_root_" + tag);
+    std::error_code ec;
+    fs::remove_all(d, ec);
+    fs::create_directories(d);
+    return d;
+}
+
+// A capturing variant of PpDrainGuard: each dequeued Job is recorded
+// before finish() so tests can assert on the finalized payload's shape
+// (input.out_dir, meeting_id, etc.).
+struct PpCapturingGuard {
+    JobQueue& q;
+    std::thread worker;
+    std::mutex mtx;
+    std::vector<Job> jobs;
+    explicit PpCapturingGuard(JobQueue& q_) : q(q_) {
+        worker = std::thread([this]() {
+            for (;;) {
+                auto dq = q.dequeue(JobKind::Postprocess);
+                if (!dq.has_value()) return;
+                int64_t id = dq->job_id;
+                {
+                    std::lock_guard<std::mutex> lk(mtx);
+                    jobs.push_back(std::move(*dq));
+                }
+                q.finish(id, /*ok=*/true);
+            }
+        });
+    }
+    ~PpCapturingGuard() {
+        q.shutdown();
+        if (worker.joinable()) worker.join();
+    }
+    std::vector<Job> snapshot() {
+        std::lock_guard<std::mutex> lk(mtx);
+        return jobs;
+    }
+};
+
+bool drive_full_upload(UploadSessionManager& mgr, const std::string& client,
+                       int64_t n_bytes) {
+    if (n_bytes % 2 != 0) return false;
+    constexpr size_t kChunkSamples = 800;
+    constexpr size_t kChunkBytes = kChunkSamples * sizeof(int16_t);
+    int64_t sent = 0;
+    int16_t cursor = 0;
+    while (sent < n_bytes) {
+        int64_t remaining = n_bytes - sent;
+        size_t take_bytes = remaining < (int64_t)kChunkBytes
+            ? static_cast<size_t>(remaining) : kChunkBytes;
+        size_t take_samples = take_bytes / sizeof(int16_t);
+        std::string chunk = make_pcm(take_samples, cursor);
+        cursor += static_cast<int16_t>(take_samples);
+        if (!mgr.feed_chunk(client, chunk)) return false;
+        sent += static_cast<int64_t>(take_bytes);
+    }
+    return true;
+}
+
+bool wait_for_jobs(PpCapturingGuard& g, size_t n,
+                   std::chrono::milliseconds timeout =
+                       std::chrono::milliseconds(2000)) {
+    return wait_until([&]() { return g.snapshot().size() >= n; }, timeout);
+}
+
+// Deterministic UUID v4 for reproducible test failures.
+std::string make_uuid_v4(uint32_t seed_a = 0xDEADBEEF,
+                         uint32_t seed_b = 0xCAFEBABE) {
+    std::mt19937 rng(seed_a ^ seed_b);
+    std::array<uint8_t, 16> bytes{};
+    for (auto& b : bytes) b = static_cast<uint8_t>(rng() & 0xFF);
+    bytes[6] = (bytes[6] & 0x0F) | 0x40; // version 4
+    bytes[8] = (bytes[8] & 0x3F) | 0x80; // variant 1
+    static const char* hex = "0123456789abcdef";
+    std::string s;
+    s.reserve(36);
+    for (size_t i = 0; i < 16; ++i) {
+        s.push_back(hex[bytes[i] >> 4]);
+        s.push_back(hex[bytes[i] & 0xF]);
+        if (i == 3 || i == 5 || i == 7 || i == 9) s.push_back('-');
+    }
+    return s;
+}
+
+} // anonymous namespace
+
+// ---------------------------------------------------------------------------
+// C.11.5.1 — Allocate-on-unknown-id.
+// ---------------------------------------------------------------------------
+TEST_CASE("dedup: upload with unknown meeting_id allocates fresh meeting dir "
+          "and binds the index",
+          "[c11][dedup][upload]") {
+    JobQueue q;
+    PpCapturingGuard drain(q);
+    fs::path staging = test_temp_dir("dedup_alloc_staging");
+    fs::path meetings = test_meetings_root("dedup_alloc");
+    MeetingIndex idx;
+    UploadSessionManager mgr(q, staging, null_progress_sink(), &idx, meetings);
+
+    const std::string id = make_uuid_v4(1, 1);
+    REQUIRE(idx.find(id) == std::nullopt);
+
+    SubmitRequest req = default_req(/*audio_size=*/3200);
+    req.meeting_id = id;
+    req.context = "Daily standup";
+    auto cr = mgr.create("client-A", req, Config{}, 1 << 20);
+    REQUIRE(cr.ok);
+
+    REQUIRE(drive_full_upload(mgr, "client-A", 3200));
+    REQUIRE(wait_for_jobs(drain, 1));
+
+    auto bound = idx.find(id);
+    REQUIRE(bound.has_value());
+    CHECK(bound->parent_path() == meetings);
+    CHECK(fs::is_directory(*bound));
+
+    fs::path audio = find_audio_file(*bound);
+    REQUIRE(!audio.empty());
+    CHECK(audio.parent_path() == *bound);
+    CHECK(fs::file_size(audio) > 0);
+
+    CHECK(fs::is_empty(staging));
+
+    CHECK(load_meeting_id(*bound) == id);
+
+    auto jobs = drain.snapshot();
+    REQUIRE(jobs.size() == 1);
+    CHECK(jobs[0].input.out_dir == *bound);
+    CHECK(jobs[0].meeting_id == id);
+}
+
+// ---------------------------------------------------------------------------
+// C.11.5.2 — Overwrite-on-known-id (atomic replace, full-context-replace).
+// ---------------------------------------------------------------------------
+TEST_CASE("dedup: upload with known meeting_id overwrites the existing dir's "
+          "audio atomically",
+          "[c11][dedup][upload]") {
+    JobQueue q;
+    PpCapturingGuard drain(q);
+    fs::path staging = test_temp_dir("dedup_overwrite_staging");
+    fs::path meetings = test_meetings_root("dedup_overwrite");
+    MeetingIndex idx;
+    UploadSessionManager mgr(q, staging, null_progress_sink(), &idx, meetings);
+
+    const std::string id = make_uuid_v4(2, 2);
+
+    SubmitRequest req = default_req(3200);
+    req.meeting_id = id;
+    req.context = "first submit";
+    {
+        auto cr = mgr.create("client-A", req, Config{}, 1 << 20);
+        REQUIRE(cr.ok);
+        REQUIRE(drive_full_upload(mgr, "client-A", 3200));
+        REQUIRE(wait_for_jobs(drain, 1));
+    }
+    auto bound1 = idx.find(id);
+    REQUIRE(bound1.has_value());
+    fs::path audio1 = find_audio_file(*bound1);
+    REQUIRE(!audio1.empty());
+    auto sz1 = fs::file_size(audio1);
+    std::ifstream a1(audio1, std::ios::binary);
+    std::vector<char> a1_bytes(std::istreambuf_iterator<char>(a1), {});
+
+    SubmitRequest req2 = default_req(6400);   // double size
+    req2.meeting_id = id;
+    req2.context = "second submit overwrites";
+    {
+        auto cr = mgr.create("client-A", req2, Config{}, 1 << 20);
+        REQUIRE(cr.ok);
+        REQUIRE(drive_full_upload(mgr, "client-A", 6400));
+        REQUIRE(wait_for_jobs(drain, 2));
+    }
+    auto bound2 = idx.find(id);
+    REQUIRE(bound2.has_value());
+    CHECK(*bound2 == *bound1);              // converged on same dir
+
+    fs::path audio2 = find_audio_file(*bound2);
+    REQUIRE(!audio2.empty());
+    CHECK(audio2 == audio1);                // same canonical filename
+    CHECK(fs::file_size(audio2) > sz1);     // larger payload overwrote
+
+    std::ifstream a2(audio2, std::ios::binary);
+    std::vector<char> a2_bytes(std::istreambuf_iterator<char>(a2), {});
+    CHECK(a2_bytes != a1_bytes);            // bytes differ
+    CHECK(load_meeting_id(*bound2) == id);
+
+    int subdirs = 0;
+    for (auto& e : fs::directory_iterator(meetings))
+        if (e.is_directory()) ++subdirs;
+    CHECK(subdirs == 1);
+}
+
+// ---------------------------------------------------------------------------
+// C.11.5.3 — v1-shaped upload still migrates into real meeting dir,
+// without polluting the index.
+// ---------------------------------------------------------------------------
+TEST_CASE("dedup: v1-shaped upload (empty meeting_id) lands in a real meeting "
+          "dir without an index binding",
+          "[c11][dedup][upload]") {
+    JobQueue q;
+    PpCapturingGuard drain(q);
+    fs::path staging = test_temp_dir("dedup_v1_staging");
+    fs::path meetings = test_meetings_root("dedup_v1");
+    MeetingIndex idx;
+    UploadSessionManager mgr(q, staging, null_progress_sink(), &idx, meetings);
+
+    SubmitRequest req = default_req(3200);
+    // req.meeting_id deliberately left empty
+    auto cr = mgr.create("client-A", req, Config{}, 1 << 20);
+    REQUIRE(cr.ok);
+    REQUIRE(drive_full_upload(mgr, "client-A", 3200));
+    REQUIRE(wait_for_jobs(drain, 1));
+
+    CHECK(idx.size() == 0);
+
+    int subdirs = 0;
+    fs::path the_dir;
+    for (auto& e : fs::directory_iterator(meetings)) {
+        if (e.is_directory()) { ++subdirs; the_dir = e.path(); }
+    }
+    REQUIRE(subdirs == 1);
+    CHECK(fs::is_directory(the_dir));
+    CHECK(!find_audio_file(the_dir).empty());
+
+    CHECK(load_meeting_id(the_dir) == "");   // no meeting_id field
+
+    auto jobs = drain.snapshot();
+    REQUIRE(jobs.size() == 1);
+    CHECK(jobs[0].input.out_dir == the_dir);
+    CHECK(jobs[0].meeting_id == "");
+}
+
+// ---------------------------------------------------------------------------
+// C.11.5.4 — Stale-index recovery + unbind.
+// ---------------------------------------------------------------------------
+TEST_CASE("dedup: bound meeting_id whose dir vanished re-allocates and "
+          "unbinds the stale entry",
+          "[c11][dedup][upload]") {
+    JobQueue q;
+    PpCapturingGuard drain(q);
+    fs::path staging = test_temp_dir("dedup_stale_staging");
+    fs::path meetings = test_meetings_root("dedup_stale");
+    MeetingIndex idx;
+    UploadSessionManager mgr(q, staging, null_progress_sink(), &idx, meetings);
+
+    const std::string id = make_uuid_v4(3, 3);
+
+    fs::path ghost = meetings / "2026-01-01_00-00";
+    idx.bind(id, ghost);
+    REQUIRE(idx.find(id) == ghost);
+    REQUIRE_FALSE(fs::exists(ghost));
+
+    SubmitRequest req = default_req(3200);
+    req.meeting_id = id;
+    auto cr = mgr.create("client-A", req, Config{}, 1 << 20);
+    REQUIRE(cr.ok);
+    REQUIRE(drive_full_upload(mgr, "client-A", 3200));
+    REQUIRE(wait_for_jobs(drain, 1));
+
+    auto bound = idx.find(id);
+    REQUIRE(bound.has_value());
+    CHECK(*bound != ghost);
+    CHECK(fs::is_directory(*bound));
+    CHECK(bound->parent_path() == meetings);
+
+    CHECK_FALSE(fs::exists(ghost));
+}
+
+// ---------------------------------------------------------------------------
+// C.11.5.5 — MeetingIndex::rebuild_from_disk reconstructs bindings.
+// ---------------------------------------------------------------------------
+TEST_CASE("dedup: MeetingIndex::rebuild_from_disk reconstructs bindings from "
+          "context.json",
+          "[c11][dedup][index]") {
+    fs::path meetings = test_meetings_root("dedup_rebuild");
+
+    const std::string id_a = make_uuid_v4(4, 1);
+    const std::string id_b = make_uuid_v4(4, 2);
+
+    fs::path dir_a = meetings / "2026-05-16_10-00";
+    fs::path dir_b = meetings / "2026-05-16_11-30";
+    fs::create_directories(dir_a);
+    fs::create_directories(dir_b);
+    save_meeting_context(dir_a, "ctx a", fs::path{}, "2026-05-16_10-00", id_a);
+    save_meeting_context(dir_b, "ctx b", fs::path{}, "2026-05-16_11-30", id_b);
+
+    // Legacy v1 dir (no meeting_id) — must be skipped silently.
+    fs::path dir_legacy = meetings / "2026-05-16_12-15";
+    fs::create_directories(dir_legacy);
+    save_meeting_context(dir_legacy, "ctx legacy", fs::path{},
+                         "2026-05-16_12-15", /*meeting_id=*/"");
+
+    // Stray non-dir entry — must be skipped.
+    std::ofstream(meetings / "stray.txt") << "noise";
+
+    MeetingIndex idx;
+    std::size_t n = idx.rebuild_from_disk(meetings);
+    CHECK(n == 2);
+    CHECK(idx.size() == 2);
+    REQUIRE(idx.find(id_a) == dir_a);
+    REQUIRE(idx.find(id_b) == dir_b);
+}
+
+// ---------------------------------------------------------------------------
+// C.11.5.6 — Concurrent cross-client submits with same meeting_id converge
+// on one dir.
+// ---------------------------------------------------------------------------
+TEST_CASE("dedup: concurrent cross-client submits with same meeting_id "
+          "converge on one dir",
+          "[c11][dedup][upload][concurrency]") {
+    JobQueue q;
+    PpCapturingGuard drain(q);
+    fs::path staging = test_temp_dir("dedup_concurrent_staging");
+    fs::path meetings = test_meetings_root("dedup_concurrent");
+    MeetingIndex idx;
+    UploadSessionManager mgr(q, staging, null_progress_sink(), &idx, meetings);
+
+    const std::string id = make_uuid_v4(5, 5);
+
+    SubmitRequest req = default_req(3200);
+    req.meeting_id = id;
+    auto cr_a = mgr.create("client-A", req, Config{}, 1 << 20);
+    auto cr_b = mgr.create("client-B", req, Config{}, 1 << 20);
+    REQUIRE(cr_a.ok);
+    REQUIRE(cr_b.ok);
+    CHECK(cr_a.job_id != cr_b.job_id);
+
+    REQUIRE(drive_full_upload(mgr, "client-A", 3200));
+    REQUIRE(drive_full_upload(mgr, "client-B", 3200));
+    REQUIRE(wait_for_jobs(drain, 2));
+
+    int subdirs = 0;
+    fs::path the_dir;
+    for (auto& e : fs::directory_iterator(meetings))
+        if (e.is_directory()) { ++subdirs; the_dir = e.path(); }
+    CHECK(subdirs == 1);
+
+    auto bound = idx.find(id);
+    REQUIRE(bound.has_value());
+    CHECK(*bound == the_dir);
+
+    auto jobs = drain.snapshot();
+    REQUIRE(jobs.size() == 2);
+    CHECK(jobs[0].input.out_dir == the_dir);
+    CHECK(jobs[1].input.out_dir == the_dir);
+    CHECK(jobs[0].meeting_id == id);
+    CHECK(jobs[1].meeting_id == id);
+}
+

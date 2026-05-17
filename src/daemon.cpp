@@ -17,6 +17,7 @@
 #include "model_manager.h"
 #include "notify.h"
 #include "pipeline.h"
+#include "meeting_index.h"
 #include "streaming_session.h"
 #include "upload_session.h"
 #include "util.h"
@@ -81,6 +82,16 @@ static std::unique_ptr<StreamingSessionManager> g_streaming;
 // client_id; holds each upload's per-job staging directory + JobQueue
 // postprocess reservation. Constructed in main() after g_jobs exists.
 static std::unique_ptr<UploadSessionManager> g_uploads;
+
+// Phase C.11.4 — server-side `meeting_id -> meeting_dir_path` index. Owns
+// the dedup state for the convergence-principle audio contract (see
+// docs/V2-STRATEGY.md "Meeting identity and the client-server audio
+// contract"). Constructed at daemon startup BEFORE the IPC listener
+// accepts so the very first `process.submit` / `process.stream` sees a
+// fully-populated index. Repopulated from on-disk `context.json` via
+// `rebuild_from_disk(g_config.output_dir)` once at startup; thereafter
+// updated incrementally by the upload finalize + streaming create paths.
+static std::unique_ptr<MeetingIndex> g_meeting_index;
 
 // Phase C.8 — server-resident per-job diarization cache. Populated by
 // pp_worker_loop on every successful Postprocess job that produced
@@ -1176,6 +1187,19 @@ int main(int argc, char* argv[]) {
                  (long long)g_config.diarization_cache_ttl_secs);
     }
 
+    // Phase C.11.4 — construct the meeting-id index BEFORE the upload /
+    // streaming managers are wired so they can pass it into their
+    // constructors. The startup `rebuild_from_disk` walks
+    // `g_config.output_dir` once, reads each meeting dir's `context.json`,
+    // and repopulates the map. Cost amortizes against startup; no on-disk
+    // index file in v1.
+    {
+        g_meeting_index = std::make_unique<MeetingIndex>();
+        std::size_t n = g_meeting_index->rebuild_from_disk(g_config.output_dir);
+        log_info("daemon: meeting index ready (rebuilt %zu binding%s from %s)",
+                 n, n == 1 ? "" : "s", g_config.output_dir.string().c_str());
+    }
+
     notify_init();
 
     // Resolve path to recmeet binary for subprocess postprocessing
@@ -1345,9 +1369,12 @@ int main(int argc, char* argv[]) {
             model_dir = resolve_caption_model_dir(g_config.caption_model).string();
         }
         g_streaming = std::make_unique<StreamingSessionManager>(
-            *g_jobs, sink, model_dir);
-        log_info("daemon: streaming session manager ready (caption_model_dir=%s)",
-                 model_dir.c_str());
+            *g_jobs, sink, model_dir,
+            g_meeting_index.get(),    // C.11.4 — convergence-principle dedup
+            g_config.output_dir);
+        log_info("daemon: streaming session manager ready (caption_model_dir=%s, "
+                 "meetings_root=%s)",
+                 model_dir.c_str(), g_config.output_dir.string().c_str());
     }
 
     // Phase C.2 — construct the UploadSessionManager. The progress sink
@@ -1398,8 +1425,11 @@ int main(int argc, char* argv[]) {
         // mirrors the streaming-session policy. A future op-tunable knob
         // could expose this via `[server] upload_staging_root`; deferred.
         g_uploads = std::make_unique<UploadSessionManager>(
-            *g_jobs, /*staging_root=*/fs::path{}, std::move(upsink));
-        log_info("daemon: upload session manager ready");
+            *g_jobs, /*staging_root=*/fs::path{}, std::move(upsink),
+            g_meeting_index.get(),    // C.11.4 — convergence-principle dedup
+            g_config.output_dir);
+        log_info("daemon: upload session manager ready (meetings_root=%s)",
+                 g_config.output_dir.string().c_str());
     }
 
     // Phase C.10a — route inbound `0x03` streaming-audio frames into the

@@ -21,7 +21,17 @@ std::optional<fs::path> MeetingIndex::find(const std::string& meeting_id) const 
 void MeetingIndex::bind(const std::string& meeting_id, const fs::path& dir) {
     if (meeting_id.empty()) return; // defensive — empty is the "no id" sentinel
     std::lock_guard<std::mutex> lock(mu_);
-    by_id_[meeting_id] = dir;
+    auto it = by_id_.find(meeting_id);
+    if (it == by_id_.end()) {
+        by_id_.emplace(meeting_id, dir);
+        return;
+    }
+    if (it->second == dir) return; // idempotent — no-op on identical rebind
+    log_warn("MeetingIndex: rebinding meeting_id %s from %s to %s — "
+             "convergence-principle overwrite (last-bind-wins)",
+             meeting_id.c_str(), it->second.string().c_str(),
+             dir.string().c_str());
+    it->second = dir;
 }
 
 bool MeetingIndex::unbind(const std::string& meeting_id) {

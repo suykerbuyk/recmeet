@@ -26,9 +26,12 @@
 #include "ipc_protocol.h"
 #include "ipc_server.h"
 #include "job_queue.h"
+#include "meeting_index.h"
+#include "pipeline.h"          // load_meeting_id
 #include "streaming_session.h"
 #include "util.h"
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -36,6 +39,7 @@
 #include <filesystem>
 #include <fstream>
 #include <mutex>
+#include <random>
 #include <string>
 #include <thread>
 #include <vector>
@@ -937,4 +941,165 @@ TEST_CASE("StreamingSession: process.stream.cancel + disconnect handler over the
 
     fs::remove_all(tmp);
     ::unlink(STREAM_SOCK);
+}
+
+// ===========================================================================
+// Phase C.11.5 — streaming-side convergence-principle dedup contract tests
+// ===========================================================================
+//
+// These exercise the streaming-create migration landed in C.11.4: when the
+// manager is wired with a MeetingIndex + meetings_root, create() opens the
+// WAV directly inside a real ~/meetings/{ts}/ dir (pattern 1: "the
+// canonical path was the target from frame zero"). A cancel on a session
+// with a non-empty meeting_id preserves the partial WAV in-place; v1-
+// shaped streams (empty meeting_id) keep the legacy unlink-on-cancel
+// behavior.
+
+namespace {
+
+fs::path test_meetings_root_stream(const std::string& tag) {
+    fs::path d = fs::temp_directory_path() / ("recmeet_stream_meetings_" + tag);
+    std::error_code ec;
+    fs::remove_all(d, ec);
+    fs::create_directories(d);
+    return d;
+}
+
+std::string stream_uuid_v4(uint32_t a, uint32_t b) {
+    std::mt19937 rng(a ^ b ^ 0x4a4a4a4au);
+    std::array<uint8_t, 16> bytes{};
+    for (auto& byte : bytes) byte = static_cast<uint8_t>(rng() & 0xFF);
+    bytes[6] = (bytes[6] & 0x0F) | 0x40;
+    bytes[8] = (bytes[8] & 0x3F) | 0x80;
+    static const char* hex = "0123456789abcdef";
+    std::string s;
+    s.reserve(36);
+    for (size_t i = 0; i < 16; ++i) {
+        s.push_back(hex[bytes[i] >> 4]);
+        s.push_back(hex[bytes[i] & 0xF]);
+        if (i == 3 || i == 5 || i == 7 || i == 9) s.push_back('-');
+    }
+    return s;
+}
+
+} // anonymous namespace
+
+// ---------------------------------------------------------------------------
+// C.11.5.7 — Wired streaming-create allocates a real meeting dir from frame
+// zero, binds the index, writes context.json.
+// ---------------------------------------------------------------------------
+TEST_CASE("dedup: streaming create with meeting_id opens WAV inside real "
+          "meeting dir and binds the index",
+          "[c11][dedup][streaming]") {
+    JobQueue q;
+    JqGuard guard(q);
+    auto sink = null_sink();
+    fs::path meetings = test_meetings_root_stream("dedup_stream_alloc");
+    MeetingIndex idx;
+    StreamingSessionManager mgr(q, sink, "", &idx, meetings);
+
+    StreamRequest req;
+    req.meeting_id = stream_uuid_v4(11, 1);
+    req.context = "live meeting";
+
+    auto res = mgr.create("client-A", req);
+    REQUIRE(res.ok);
+
+    auto bound = idx.find(req.meeting_id);
+    REQUIRE(bound.has_value());
+    CHECK(bound->parent_path() == meetings);
+    CHECK(fs::is_directory(*bound));
+
+    fs::path audio = find_audio_file(*bound);
+    REQUIRE(!audio.empty());
+    CHECK(audio.parent_path() == *bound);
+
+    CHECK(load_meeting_id(*bound) == req.meeting_id);
+
+    // C.11.4 contract: cancel of a meeting_id-tagged session PRESERVES the
+    // partial WAV in-place (pattern 2 — operator can later overwrite via
+    // process.submit). Clean up the session to let JqGuard's shutdown join.
+    CHECK(mgr.cancel("client-A", res.stream_token));
+    CHECK(fs::exists(audio));
+}
+
+// ---------------------------------------------------------------------------
+// C.11.5.8 — Streaming-create with KNOWN meeting_id reuses the existing
+// meeting dir (convergence: live-stream into a dir that already has audio
+// from a prior session).
+// ---------------------------------------------------------------------------
+TEST_CASE("dedup: streaming create with known meeting_id reuses existing "
+          "meeting dir",
+          "[c11][dedup][streaming]") {
+    JobQueue q;
+    JqGuard guard(q);
+    auto sink = null_sink();
+    fs::path meetings = test_meetings_root_stream("dedup_stream_existing");
+    MeetingIndex idx;
+    StreamingSessionManager mgr(q, sink, "", &idx, meetings);
+
+    const std::string id = stream_uuid_v4(11, 2);
+
+    fs::path existing = meetings / "2026-05-16_09-00";
+    fs::create_directories(existing);
+    save_meeting_context(existing, "previously recorded", fs::path{},
+                         "2026-05-16_09-00", id);
+    idx.bind(id, existing);
+
+    StreamRequest req;
+    req.meeting_id = id;
+    req.context = "now resuming as a live stream";
+
+    auto res = mgr.create("client-A", req);
+    REQUIRE(res.ok);
+
+    auto bound = idx.find(id);
+    REQUIRE(bound.has_value());
+    CHECK(*bound == existing);
+
+    fs::path audio = find_audio_file(existing);
+    REQUIRE(!audio.empty());
+    CHECK(audio.parent_path() == existing);
+
+    int subdirs = 0;
+    for (auto& e : fs::directory_iterator(meetings))
+        if (e.is_directory()) ++subdirs;
+    CHECK(subdirs == 1);
+
+    CHECK(mgr.cancel("client-A", res.stream_token));
+}
+
+// ---------------------------------------------------------------------------
+// C.11.5.9 — v1-shaped streaming (empty meeting_id, wired manager) still
+// allocates fresh — but no index bind, and cancel UNLINKS the partial
+// (unreachable without a meeting_id to look it up by).
+// ---------------------------------------------------------------------------
+TEST_CASE("dedup: streaming create with empty meeting_id allocates fresh dir "
+          "without binding; cancel unlinks the v1 partial",
+          "[c11][dedup][streaming]") {
+    JobQueue q;
+    JqGuard guard(q);
+    auto sink = null_sink();
+    fs::path meetings = test_meetings_root_stream("dedup_stream_v1");
+    MeetingIndex idx;
+    StreamingSessionManager mgr(q, sink, "", &idx, meetings);
+
+    StreamRequest req;
+    // req.meeting_id deliberately empty
+
+    auto res = mgr.create("client-A", req);
+    REQUIRE(res.ok);
+
+    CHECK(idx.size() == 0);
+
+    int subdirs = 0;
+    fs::path the_dir;
+    for (auto& e : fs::directory_iterator(meetings))
+        if (e.is_directory()) { ++subdirs; the_dir = e.path(); }
+    REQUIRE(subdirs == 1);
+    fs::path audio = find_audio_file(the_dir);
+    REQUIRE(!audio.empty());
+
+    CHECK(mgr.cancel("client-A", res.stream_token));
+    CHECK_FALSE(fs::exists(audio));
 }
