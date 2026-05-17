@@ -39,6 +39,19 @@ const char* job_state_name(JobState s) {
     return "unknown";
 }
 
+const char* default_phase_for_state(JobState s) {
+    switch (s) {
+        case JobState::Queued:            return "queued";
+        case JobState::WaitingOnDownload: return "downloading_model";
+        case JobState::WaitingForUpload:  return "uploading";
+        case JobState::Running:           return "running";
+        case JobState::Done:              return "complete";
+        case JobState::Failed:            return "failed";
+        case JobState::Cancelled:         return "cancelled";
+    }
+    return "unknown";
+}
+
 // ---------------------------------------------------------------------------
 // Construction / teardown
 // ---------------------------------------------------------------------------
@@ -458,6 +471,40 @@ bool JobQueue::cancel(int64_t job_id) {
         slots_[i].cv.notify_all();
     fire_pending_events();
     return true;
+}
+
+// ---------------------------------------------------------------------------
+// Phase C.14 — update_progress
+// ---------------------------------------------------------------------------
+
+void JobQueue::update_progress(int64_t job_id, const std::string& phase,
+                               int progress) {
+    std::lock_guard<std::mutex> lock(mu_);
+    auto it = jobs_.find(job_id);
+    if (it == jobs_.end()) {
+        // Silent no-op — the daemon's emission paths fire for every event,
+        // including for jobs that may have been cancelled or evicted from
+        // the registry meanwhile. Logging here would be noisy without value;
+        // an unknown job_id is benign on this path.
+        return;
+    }
+    Job& job = it->second;
+
+    // Lock terminal-state values: once a job is Done/Failed/Cancelled, the
+    // phase is dictated by the state and progress is moot. A late
+    // `progress` event from a subprocess we already gave up on must not
+    // overwrite the verdict.
+    switch (job.state) {
+        case JobState::Done:
+        case JobState::Failed:
+        case JobState::Cancelled:
+            return;
+        default:
+            break;
+    }
+
+    job.phase    = phase;
+    job.progress = progress < 0 ? 0 : (progress > 100 ? 100 : progress);
 }
 
 // ---------------------------------------------------------------------------

@@ -128,7 +128,35 @@ struct Job {
     /// downloads). The job.list / job.status serializer emits it
     /// unconditionally so the client can reconcile by content key.
     std::string      meeting_id;
+
+    /// Phase C.14 — last observed pipeline phase + progress, cached on the
+    /// registry so a D.3 reconnect re-sync can populate the UI immediately
+    /// without waiting for the next `progress.job` / `phase` / `progress`
+    /// event. The daemon's event-emission paths call
+    /// `JobQueue::update_progress` to maintain these fields; the
+    /// `serialize_job_object` paths in daemon.cpp emit `phase` / `progress`
+    /// on the wire for both `job.status` and each `job.list` element. When
+    /// `phase` is empty, the serializer falls back to a state-derived value
+    /// (`default_phase_for_state(state)`) so an idle Queued job still wires
+    /// a meaningful `"phase":"queued"` rather than an empty string. Default
+    /// `progress = 0` is a sentinel for "no progress reported yet" — there
+    /// is no way to distinguish "started but 0%" from "unknown" on the wire,
+    /// but the only consumer (D.3 re-sync UI) treats both as "nothing to
+    /// show yet" which is correct in either case.
+    std::string      phase;
+    int              progress = 0;
 };
+
+/// Phase C.14 — derive the canonical phase string for a job in `state` when
+/// the registry has no cached `Job::phase` value (i.e. the job has emitted
+/// no `phase` / `progress` events yet). Mirrors the wire-side enum from the
+/// task plan: queued / downloading_model / uploading / running / complete /
+/// failed / cancelled. `WaitingForUpload` derives "uploading" rather than
+/// "waiting_for_upload" because the client-facing semantics is "an upload
+/// is in flight"; `Running` derives a generic "running" that any pipeline
+/// event will immediately overwrite once the subprocess emits its first
+/// `phase` event.
+const char* default_phase_for_state(JobState s);
 
 // ---------------------------------------------------------------------------
 // JobQueue
@@ -253,6 +281,18 @@ public:
     /// observe this and stop — C.7 does not own subprocess signalling).
     /// Returns true if the job existed and was cancellable.
     bool cancel(int64_t job_id);
+
+    /// Phase C.14 — cache the most-recently-observed pipeline phase and
+    /// progress percentage on the registry entry for `job_id`. Daemon-side
+    /// event emission sites (the pp_worker_loop `phase` / `progress` handlers
+    /// and the UploadProgressSink) call this so a later `job.list` /
+    /// `job.status` on the SAME job carries the same `phase` / `progress`
+    /// without waiting for a fresh event — the load-bearing requirement for
+    /// D.3 reconnect re-sync to render meaningful UI immediately. Silent
+    /// no-op on unknown job_id and on jobs already in a terminal state
+    /// (Done/Failed/Cancelled — phase is locked by state and percent is
+    /// moot once a job finishes). `progress` is clamped to [0, 100].
+    void update_progress(int64_t job_id, const std::string& phase, int progress);
 
     /// Snapshot of a single job by id, or std::nullopt if unknown.
     std::optional<Job> status(int64_t job_id) const;

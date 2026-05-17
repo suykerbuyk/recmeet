@@ -137,6 +137,12 @@ void register_job_query_handlers(IpcServer& server, JobQueue& q) {
         resp.result["model_id"]   = snap->model_id;
         resp.result["error"]      = snap->error;
         resp.result["meeting_id"] = snap->meeting_id;   // C.11
+        // C.14 — mirror daemon.cpp's job.status handler. Empty cached phase
+        // derives from state; progress emitted unconditionally as int.
+        resp.result["phase"] = snap->phase.empty()
+            ? std::string(default_phase_for_state(snap->state))
+            : snap->phase;
+        resp.result["progress"] = static_cast<int64_t>(snap->progress);
         return true;
     });
 
@@ -160,7 +166,15 @@ void register_job_query_handlers(IpcServer& server, JobQueue& q) {
             arr += json_escape(jobs[i].error);
             arr += "\",\"meeting_id\":\"";              // C.11
             arr += json_escape(jobs[i].meeting_id);
-            arr += "\"}";
+            // C.14 — mirror daemon.cpp's serialize_job_object. Empty cached
+            // phase derives from state; progress always serialized as int.
+            arr += "\",\"phase\":\"";
+            arr += json_escape(jobs[i].phase.empty()
+                                   ? std::string(default_phase_for_state(jobs[i].state))
+                                   : jobs[i].phase);
+            arr += "\",\"progress\":";
+            arr += std::to_string(jobs[i].progress);
+            arr += "}";
         }
         arr += "]";
         resp.result["jobs"]  = arr;

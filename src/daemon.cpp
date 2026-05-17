@@ -638,6 +638,12 @@ static void pp_worker_loop(IpcServer& server) {
                                 last_percent = -1;  // Reset throttle on phase change
                                 std::string name = parse_ndjson_string(line, "name");
                                 last_known_phase = name;  // T1C.1
+                                // C.14 — cache the new phase on the registry
+                                // entry before fanning out the event so a D.3
+                                // reconnect that races the event sees the
+                                // updated phase. progress=0 resets the
+                                // percentage now that we're in a new phase.
+                                g_jobs->update_progress(job.job_id, name, 0);
                                 // Phase C.3: route phase events to the owning
                                 // client. The Job's `client_id` was captured
                                 // when the pp_worker dequeued this job; we
@@ -664,6 +670,14 @@ static void pp_worker_loop(IpcServer& server) {
                             } else if (event == "progress") {
                                 std::string phase = parse_ndjson_string(line, "phase");
                                 int64_t percent = parse_ndjson_int(line, "percent");
+                                // C.14 — always cache the latest phase/percent
+                                // (independent of the throttled wire emission
+                                // below) so a job.status / job.list during the
+                                // throttle window still sees the freshest
+                                // value. The throttle only gates wire traffic;
+                                // the registry cache stays current.
+                                g_jobs->update_progress(job.job_id, phase,
+                                                        static_cast<int>(percent));
                                 // Apply throttle
                                 using clock = std::chrono::steady_clock;
                                 auto now = clock::now();
@@ -1395,6 +1409,19 @@ int main(int argc, char* argv[]) {
                                        const std::string& client_id,
                                        int64_t bytes_received,
                                        int64_t audio_size) {
+            // C.14 — cache phase="uploading" + percentage on the job registry
+            // so a D.3 re-sync mid-upload reports the same value as the
+            // throttled-or-not progress.job event below. audio_size==0 (the
+            // "unknown total" case for streams) maps to progress=0 — no way
+            // to compute a meaningful percentage without a known total.
+            if (g_jobs) {
+                int pct = 0;
+                if (audio_size > 0) {
+                    int64_t computed = (bytes_received * 100) / audio_size;
+                    pct = static_cast<int>(computed > 100 ? 100 : computed);
+                }
+                g_jobs->update_progress(job_id, "uploading", pct);
+            }
             // `feed_chunk` already runs on the poll thread (the binary-frame
             // handler), so we could route inline. We still go through
             // server.post() to keep the dispatch lane uniform with the rest
@@ -2091,6 +2118,201 @@ int main(int argc, char* argv[]) {
         return true;
     });
 
+    // --- Phase C.12 — process.reprocess (re-run pipeline on resident meeting) ---
+    //
+    // process.reprocess { meeting_id, transcribe?=true, diarize?=true,
+    //                     identify?=true, summarize?=true,
+    //                     summary_style?, vocabulary? } -> { job_id }
+    //
+    // Resolves a meeting via the server-resident MeetingIndex (C.11.2) and
+    // enqueues a Postprocess job that re-runs the pipeline against that
+    // meeting's on-disk audio — no client-side audio re-upload required.
+    // Pattern 4 of the convergence-principle flow patterns (V2-STRATEGY.md
+    // "Meeting identity and the client-server audio contract"): the canonical
+    // audio is server-resident; the client only needs to name the meeting.
+    //
+    // Per-stage flags let the operator rerun selected stages without redoing
+    // the whole pipeline. Default (no flags) reruns the full pipeline exactly
+    // as `--reprocess <dir>` does today.
+    //
+    // v1 scope note for `transcribe=false`: accepted on the wire for forward
+    // compatibility but currently ignored — the subprocess always re-runs
+    // transcription. Real skip-transcription support requires either threading
+    // PostprocessInput through write_job_config or a new Config flag honored
+    // by the subprocess's run_recording reprocess-mode path; both deferred to
+    // a follow-up so this handler stays surgical. A client that sends
+    // `transcribe=false` should expect re-transcription cost on this revision.
+    //
+    // Validation chain (narrowest first):
+    //   1. Missing meeting_id                    -> InvalidParams
+    //   2. meeting_id fails is_valid_meeting_id  -> InvalidParams
+    //      (is_valid_meeting_id accepts "" as the v1 "no id" sentinel, so the
+    //       empty-reject in step 1 must precede this format check)
+    //   3. meeting_id not in MeetingIndex        -> InvalidParams (not_found)
+    //   4. Resolved dir vanished from disk       -> InternalError
+    //   5. No audio file in resolved dir         -> InternalError
+    //
+    // Per-stage flag translation (matches the existing Config knobs used by
+    // the subprocess; no new Config schema):
+    //   diarize=false    -> cfg.diarize    = false
+    //   identify=false   -> cfg.speaker_id = false
+    //   summarize=false  -> cfg.no_summary = true
+    //   vocabulary=<s>   -> cfg.vocabulary = s   (replaces the per-session
+    //                                             vocabulary for this job)
+    //   summary_style    -> reserved; accepted, ignored (NoteConfig today
+    //                       carries only `domain` + `tags`, no style field)
+    //
+    // The job's `meeting_id` is stamped from the request so job.list /
+    // job.status reconcile by content key, and so process.cancel / process.fetch
+    // address the resulting job via the C.11 binding.
+    server.on("process.reprocess",
+              [](const IpcRequest& req, IpcResponse& resp, IpcError& err) {
+        if (!g_jobs) {
+            err.code = static_cast<int>(IpcErrorCode::InternalError);
+            err.message = "job queue unavailable";
+            return false;
+        }
+        if (!g_meeting_index) {
+            err.code = static_cast<int>(IpcErrorCode::InternalError);
+            err.message = "meeting index unavailable";
+            return false;
+        }
+
+        // (1) meeting_id required.
+        std::string meeting_id;
+        {
+            auto it = req.params.find("meeting_id");
+            if (it != req.params.end()) meeting_id = json_val_as_string(it->second);
+        }
+        if (meeting_id.empty()) {
+            err.code = static_cast<int>(IpcErrorCode::InvalidParams);
+            err.message = "process.reprocess: missing 'meeting_id'";
+            return false;
+        }
+        // (2) Format validation. `is_valid_meeting_id("")` is true (v1 "no id"
+        // sentinel); the step-1 empty reject ensures we never reach here with
+        // an empty id, so the format check is the real gate.
+        if (!is_valid_meeting_id(meeting_id)) {
+            err.code = static_cast<int>(IpcErrorCode::InvalidParams);
+            err.message = "process.reprocess: 'meeting_id' must be a canonical "
+                          "lowercase UUID v4";
+            return false;
+        }
+
+        // (3) Lookup. A miss is the "client claims it exists but the server
+        // has never seen it" case: typo, wrong server, or a meeting whose dir
+        // was unlinked since startup rebuild. InvalidParams matches the
+        // unknown-job_id precedent on process.fetch / job.status.
+        auto hit = g_meeting_index->find(meeting_id);
+        if (!hit.has_value()) {
+            err.code = static_cast<int>(IpcErrorCode::InvalidParams);
+            err.message = "process.reprocess: unknown meeting_id " + meeting_id;
+            return false;
+        }
+        fs::path meeting_dir = *hit;
+
+        // (4) Dir must still exist on disk. The index is in-memory only; an
+        // operator who `rm -rf`'d a meeting after startup-rebuild would still
+        // have a stale binding here. We do NOT unbind() — that would race
+        // concurrent submits with the same meeting_id — we just refuse.
+        std::error_code ec;
+        if (!fs::is_directory(meeting_dir, ec)) {
+            err.code = static_cast<int>(IpcErrorCode::InternalError);
+            err.message = "process.reprocess: meeting_id " + meeting_id
+                        + " is indexed at " + meeting_dir.string()
+                        + " but the directory no longer exists";
+            return false;
+        }
+
+        // (5) Resolve audio. find_audio_file prefers timestamped audio_*.wav
+        // and falls back to legacy audio.wav — both v1+v2 producer paths
+        // write one. A meeting dir with neither is structurally broken (or
+        // mid-upload, in which case the operator should wait).
+        fs::path audio_path = find_audio_file(meeting_dir);
+        if (audio_path.empty()) {
+            err.code = static_cast<int>(IpcErrorCode::InternalError);
+            err.message = "process.reprocess: no audio file found in "
+                        + meeting_dir.string();
+            return false;
+        }
+
+        // (6) Build cfg from live snapshot + per-stage flag overrides. We
+        // clear reprocess_dir from the snapshot: pp_worker_loop sets it from
+        // job.input.out_dir on every dequeue, so a stale value cannot reach
+        // the subprocess via this path either way — but explicit beats
+        // implicit, and mirrors what process.submit does at the same point.
+        Config cfg;
+        {
+            std::lock_guard<std::mutex> lock(g_config_mu);
+            cfg = g_config;
+        }
+        cfg.reprocess_dir.clear();
+
+        // transcribe is accepted but ignored in v1 (see header note).
+        {
+            auto it = req.params.find("transcribe");
+            if (it != req.params.end()) (void)json_val_as_bool(it->second, true);
+        }
+        // diarize: false -> skip diarization. Note this also disables
+        // identification downstream (speaker_id needs diarization clusters).
+        {
+            auto it = req.params.find("diarize");
+            if (it != req.params.end() && !json_val_as_bool(it->second, true))
+                cfg.diarize = false;
+        }
+        // identify: false -> skip cross-session voiceprint matching even when
+        // diarization runs. Useful for "re-summarize with fresh diarization
+        // but don't relabel known speakers".
+        {
+            auto it = req.params.find("identify");
+            if (it != req.params.end() && !json_val_as_bool(it->second, true))
+                cfg.speaker_id = false;
+        }
+        // summarize: false -> skip summary step. Note inverts: cfg.no_summary
+        // is the daemon-side flag, request carries the positive "summarize".
+        {
+            auto it = req.params.find("summarize");
+            if (it != req.params.end() && !json_val_as_bool(it->second, true))
+                cfg.no_summary = true;
+        }
+        // vocabulary: when present (even empty), REPLACES the per-session
+        // vocabulary. An empty string clears the prompt for this job.
+        {
+            auto it = req.params.find("vocabulary");
+            if (it != req.params.end())
+                cfg.vocabulary = json_val_as_string(it->second);
+        }
+        // summary_style: reserved; consumed defensively so an unknown-param
+        // strict mode (future) does not break clients that send it.
+        {
+            auto it = req.params.find("summary_style");
+            if (it != req.params.end()) (void)json_val_as_string(it->second);
+        }
+
+        // (7) Build the postprocess input. `derive_meeting_timestamp` returns
+        // empty for legacy / non-canonical dirs; downstream code handles
+        // empty (resolve_meeting_time falls back to file mtime).
+        PostprocessInput input;
+        input.out_dir    = meeting_dir;
+        input.audio_path = audio_path;
+        input.timestamp  = derive_meeting_timestamp(meeting_dir);
+
+        Job job;
+        job.input      = std::move(input);
+        job.cfg        = std::move(cfg);
+        job.meeting_id = meeting_id;
+
+        int64_t job_id = g_jobs->enqueue(std::move(job), JobKind::Postprocess,
+                                         req.client_id);
+
+        resp.result["job_id"] = job_id;
+        log_info("daemon: process.reprocess OK (job=%ld client=%s "
+                 "meeting_id=%s dir=%s)",
+                 (long)job_id, req.client_id.c_str(),
+                 meeting_id.c_str(), meeting_dir.string().c_str());
+        return true;
+    });
+
     // --- Phase C.5 — process.cancel (general, job_id-routed) ---
     //
     // process.cancel — unified cancellation surface. Request: { job_id }.
@@ -2527,7 +2749,7 @@ int main(int argc, char* argv[]) {
 
     auto serialize_job_object = [](const Job& job) -> std::string {
         std::string out;
-        out.reserve(200);
+        out.reserve(240);
         out += "{\"job_id\":";
         out += std::to_string(job.job_id);
         out += ",\"kind\":\"";
@@ -2546,7 +2768,18 @@ int main(int argc, char* argv[]) {
         // docs/V2-STRATEGY.md "Meeting identity".
         out += "\",\"meeting_id\":\"";
         out += json_escape(job.meeting_id);
-        out += "\"}";
+        // C.14 — phase + progress, cached by JobQueue::update_progress from
+        // every daemon-side emission site (pp_worker_loop phase / progress
+        // handlers + UploadProgressSink). Empty cached phase falls back to
+        // a state-derived default so a D.3 reconnect re-sync always carries
+        // a meaningful phase string without waiting for the next event.
+        out += "\",\"phase\":\"";
+        out += json_escape(job.phase.empty()
+                               ? std::string(default_phase_for_state(job.state))
+                               : job.phase);
+        out += "\",\"progress\":";
+        out += std::to_string(job.progress);
+        out += "}";
         return out;
     };
 
@@ -2617,10 +2850,22 @@ int main(int argc, char* argv[]) {
         // C.11 — emit unconditionally; matches serialize_job_object so the
         // job.status object shape is byte-equivalent to a job.list entry.
         resp.result["meeting_id"] = snap->meeting_id;
+        // C.14 — phase + progress, same source-of-truth + fallback as
+        // serialize_job_object. Keep the two paths byte-equivalent (a
+        // job.status response and a job.list array element MUST carry the
+        // same field set — D.3 / D.5 re-sync correctness).
+        resp.result["phase"] = snap->phase.empty()
+            ? std::string(default_phase_for_state(snap->state))
+            : snap->phase;
+        resp.result["progress"] = static_cast<int64_t>(snap->progress);
 
-        log_debug("daemon: job.status job=%ld kind=%s state=%s client=%s",
+        log_debug("daemon: job.status job=%ld kind=%s state=%s client=%s "
+                  "phase=%s progress=%d",
                   (long)job_id, job_kind_name(snap->kind),
-                  job_state_name(snap->state), req.client_id.c_str());
+                  job_state_name(snap->state), req.client_id.c_str(),
+                  snap->phase.empty() ? default_phase_for_state(snap->state)
+                                      : snap->phase.c_str(),
+                  snap->progress);
         return true;
     });
 

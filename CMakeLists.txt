@@ -511,8 +511,10 @@ if(RECMEET_BUILD_TESTS)
         tests/test_fetch.cpp
         tests/test_cancel.cpp
         tests/test_job_query.cpp
+        tests/test_job_progress.cpp
         tests/test_enroll.cpp
         tests/test_meeting_index.cpp
+        tests/test_reprocess.cpp
         tests/test_v2_thin_client_e2e.cpp
         tests/test_live_recording.cpp
     )
