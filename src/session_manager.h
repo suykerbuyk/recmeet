@@ -139,6 +139,31 @@ public:
     /// the loggable form without remembering the rule.
     static std::string log_prefix(const std::string& token);
 
+#if defined(RECMEET_TESTING)
+    /// TEST_ONLY: insert a binding with a caller-supplied `token`. Exposed
+    /// only when the consumer translation unit compiles with
+    /// `-DRECMEET_TESTING` (the `recmeet_tests` target — never the daemon).
+    /// The method body is gated by the same macro in `session_manager.cpp`
+    /// and is dead-stripped under `-Wl,--gc-sections` in any binary that
+    /// doesn't reference it. Used by `tests/test_session_manager.cpp` +
+    /// `tests/test_session_ipc.cpp` to construct a deterministic 8-char-
+    /// prefix collision so the `Ambiguous` branch of `evict_by_prefix`
+    /// is exercised non-probabilistically. Production code MUST NOT call
+    /// this.
+    void insert_for_test(const std::string& token,
+                         const std::string& client_id);
+
+    /// TEST_ONLY: read the stored `last_seen_epoch` for `token` without
+    /// going through `resolve()` (which intentionally returns only
+    /// `client_id`). Returns nullopt if the token is unknown. Used by the
+    /// per-handler dispatch-hook test to assert that `bump_last_seen`
+    /// actually advanced the per-session clock; the public surface
+    /// deliberately does not expose this so callers can't infer a
+    /// liveness signal beyond resolve-vs-not-resolved.
+    std::optional<int64_t>
+    last_seen_for_test(const std::string& token) const;
+#endif
+
 private:
     /// C.13 default Clock — `std::chrono::system_clock` epoch seconds.
     static int64_t default_clock();

@@ -523,6 +523,10 @@ if(RECMEET_BUILD_TESTS)
         tests/test_reprocess.cpp
         tests/test_v2_thin_client_e2e.cpp
         tests/test_live_recording.cpp
+        # Phase C.13 substantive behavior tests (iter-162).
+        tests/test_session_manager.cpp
+        tests/test_session_gc.cpp
+        tests/test_session_ipc.cpp
     )
     # The test binary exercises both daemon-side surfaces (recmeet_core) and
     # client-side / standalone surfaces (run_recording + recmeet_capture), so
@@ -533,6 +537,18 @@ if(RECMEET_BUILD_TESTS)
         recmeet_capture
         Catch2::Catch2WithMain
     )
+
+    # Phase C.13 — RECMEET_TESTING gates test-only seams (e.g.
+    # `SessionManager::insert_for_test`) so production translation units
+    # cannot reach them. Applied to BOTH `recmeet_core` (so the seam method
+    # body is emitted in the library and the test link resolves) AND
+    # `recmeet_tests` (so the test TUs see the gated declaration in
+    # `session_manager.h`). The macro is only set when RECMEET_BUILD_TESTS
+    # is ON; a tests-off production build never sees the symbol — and even
+    # when tests ARE built, `recmeet-daemon` (which also links
+    # `recmeet_core`) drops the unused seam under `-Wl,--gc-sections`.
+    target_compile_definitions(recmeet_core  PRIVATE RECMEET_TESTING)
+    target_compile_definitions(recmeet_tests PRIVATE RECMEET_TESTING)
     if(RECMEET_BUILD_WEB)
         target_sources(recmeet_tests PRIVATE tests/test_web.cpp vendor/cpp-httplib/httplib.cpp)
         target_include_directories(recmeet_tests PRIVATE vendor/cpp-httplib)

@@ -637,6 +637,15 @@ bool IpcServer::handle_pending_psk(int fd, ClientState& cs, const std::string& l
         client_id = mint_client_id();
     }
     cs.client_id = client_id;
+    // Phase C.13 (M-4): persist the resume_token the resolver bound to
+    // this connection so the per-handler dispatch hook can stamp
+    // `bump_last_seen(token)` on every inbound request without re-
+    // resolving. `echo_token` is the authoritative server-side value —
+    // on the fresh-mint path it's the just-minted token; on the resume
+    // path it's the same token the client sent (echoed back). Empty
+    // when the resolver isn't wired (pre-C.13 / Unix path); the dispatch
+    // hook skips empty silently.
+    cs.resume_token = echo_token;
     // Phase A.4: the reverse-map insert MUST happen before send_to() so
     // that a Phase C.7 routed event posted in the same tick can resolve
     // the id immediately. Today's call sites all run on the poll thread
@@ -653,6 +662,10 @@ bool IpcServer::handle_pending_psk(int fd, ClientState& cs, const std::string& l
 
 void IpcServer::set_resume_token_resolver(ResumeTokenResolver r) {
     resume_resolver_ = std::move(r);
+}
+
+void IpcServer::set_request_dispatch_hook(RequestDispatchHook h) {
+    request_dispatch_hook_ = std::move(h);
 }
 
 void IpcServer::handle_client_data(int fd) {
@@ -828,6 +841,19 @@ void IpcServer::handle_client_data(int fd) {
         IpcError err;
         resp.id = msg.request.id;
         err.id = msg.request.id;
+
+        // Phase C.13 (M-4) — uniform per-handler last_seen bump. Runs
+        // BEFORE the handler so a slow handler doesn't extend the
+        // perceived liveness window past the request arrival. Skipped
+        // when the connection has no resume_token bound (Unix peer,
+        // pre-C.13 tests). The hook target (daemon-side
+        // SessionManager::bump_last_seen) is a single map mutation under
+        // a mutex; cost is negligible vs the handler body. Server-emitted
+        // events (broadcasts, progress.job, captions) do NOT touch this
+        // code path — they reach send_to() directly — so the bump is
+        // dispatch-only by construction.
+        if (request_dispatch_hook_ && !it->second.resume_token.empty())
+            request_dispatch_hook_(it->second.resume_token);
 
         if (handler_it->second(msg.request, resp, err))
             send_to(fd, frame_ndjson(serialize(resp)), MessageClass::Response);

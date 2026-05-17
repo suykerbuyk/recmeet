@@ -417,17 +417,263 @@ static void kill_pp_child_with_grace(pid_t pid) {
 }
 
 // ---------------------------------------------------------------------------
-// Phase C.13 — GC sweep worker (resume_token TTL eviction)
+// Phase C.13 — orphan-WAV archive helper (M-2)
 // ---------------------------------------------------------------------------
 //
-// SCAFFOLD: the sweep body invokes `g_sessions->sweep_expired()` and logs the
-// count of evicted sessions. The orphan-JOB teardown side of the sweep
-// (Postprocess Queued/Running → cancel + verified-pid SIGTERM; Streaming
-// → cancel_by_job_id; ModelDownload → cancel; pre-cancel WAV archive to
-// ~/meetings/.orphan-<prefix>-<ts>/) is intentionally NOT YET WIRED — that
-// is the substantive implementation pass after the operator reviews the
-// scaffold seams. The shell here keeps the GC thread spawned/joinable/
-// shutdown-clean so the addition is surgical.
+// When the GC sweep or `--evict` reaps a session that owned a non-terminal
+// Postprocess (with a staging WAV) or Streaming (with an in-flight WAV)
+// job, the WAV gets archived to `<meetings_root>/.orphan-<prefix>-<ts>/`
+// BEFORE the per-kind teardown unlinks anything. This preserves operator
+// forensics — the operator can `ls ~/meetings/.orphan-*` to recover
+// audio that was in-flight when its owning session expired. The directory
+// naming intentionally mirrors `--evict` ergonomics: the 8-char token
+// prefix is the same handle the operator typed.
+//
+// The archive uses an atomic rename pattern: same-filesystem rename is one
+// syscall (atomic by construction); cross-filesystem (e.g. /tmp -> ~) falls
+// back to copy + rename + remove-src. fsync of parent directory makes the
+// rename durable across crash. Failures are logged but never crash the
+// daemon — losing the forensic copy is acceptable; losing the GC sweep is
+// not. The function returns `true` when archive was attempted (regardless
+// of outcome — the caller still proceeds with the teardown); it returns
+// `false` when the input path was empty / non-existent and there was
+// nothing to archive.
+//
+// Helper kept ~30 lines + comment inline in daemon.cpp per the C.13 plan;
+// extracted to a separate translation unit only if it grows past that.
+
+namespace {
+
+/// Build the orphan archive dir name: `.orphan-<prefix8>-<YYYY-MM-DD_HH-MM>`.
+/// The prefix is the resume_token's first 8 hex chars (matches `--evict`).
+std::string make_orphan_dir_name(const std::string& token_prefix8) {
+    auto now = std::chrono::system_clock::now();
+    auto tt  = std::chrono::system_clock::to_time_t(now);
+    std::tm tmv{};
+#if defined(_WIN32)
+    localtime_s(&tmv, &tt);
+#else
+    localtime_r(&tt, &tmv);
+#endif
+    char buf[32];
+    std::snprintf(buf, sizeof(buf), "%04d-%02d-%02d_%02d-%02d",
+                  tmv.tm_year + 1900, tmv.tm_mon + 1, tmv.tm_mday,
+                  tmv.tm_hour, tmv.tm_min);
+    return std::string(".orphan-") + token_prefix8 + "-" + buf;
+}
+
+/// Atomic-rename `src_file` into `dst_dir/dst_name`. Returns nullopt on
+/// success, an error message on failure. Mirrors the C.11.4 helper in
+/// upload_session.cpp (write-tmp + fsync + rename + fsync(dir) + EXDEV
+/// fallback). Kept local to daemon.cpp so the orphan-archive path does
+/// not pull a header-level dependency on upload_session internals.
+std::optional<std::string>
+orphan_atomic_rename(const fs::path& src_file,
+                     const fs::path& dst_dir,
+                     const std::string& dst_name) {
+    std::error_code ec;
+    fs::create_directories(dst_dir, ec);
+    if (ec) {
+        return std::string("create_directories(") + dst_dir.string() + "): "
+             + ec.message();
+    }
+    fs::path dst_final = dst_dir / dst_name;
+    fs::path dst_tmp = dst_final;
+    dst_tmp += ".tmp";
+    fs::remove(dst_tmp, ec); ec.clear();  // best-effort
+
+    // Try same-filesystem rename first.
+    fs::rename(src_file, dst_tmp, ec);
+    if (ec) {
+        if (ec != std::errc::cross_device_link) {
+            return std::string("rename: ") + ec.message();
+        }
+        // EXDEV — buffered copy then rename on destination FS.
+        ec.clear();
+        std::ifstream in(src_file, std::ios::binary);
+        if (!in.is_open())
+            return std::string("open src for cross-fs copy failed");
+        std::ofstream out(dst_tmp, std::ios::binary | std::ios::trunc);
+        if (!out.is_open())
+            return std::string("open dst tmp for cross-fs copy failed");
+        out << in.rdbuf();
+        out.flush();
+        if (!out.good() || !in.good()) {
+            std::error_code rm; fs::remove(dst_tmp, rm);
+            return std::string("cross-fs copy failed mid-stream");
+        }
+        out.close(); in.close();
+        fs::remove(src_file, ec);
+        if (ec) {
+            log_warn("daemon: orphan archive cross-fs copy succeeded but "
+                     "could not remove src %s: %s",
+                     src_file.string().c_str(), ec.message().c_str());
+            ec.clear();
+        }
+    }
+
+    // fsync the file before the final rename.
+    {
+        int fd = ::open(dst_tmp.string().c_str(), O_RDONLY | O_CLOEXEC);
+        if (fd >= 0) { (void)::fsync(fd); (void)::close(fd); }
+    }
+    fs::rename(dst_tmp, dst_final, ec);
+    if (ec) {
+        std::error_code rm; fs::remove(dst_tmp, rm);
+        return std::string("rename(tmp->final): ") + ec.message();
+    }
+    // fsync(parent dir) so the rename entry is durable across crash.
+    {
+        int dfd = ::open(dst_dir.string().c_str(),
+                         O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        if (dfd >= 0) { (void)::fsync(dfd); (void)::close(dfd); }
+    }
+    return std::nullopt;
+}
+
+/// Best-effort archive of a single WAV (and optional sibling context.json)
+/// to `<meetings_root>/.orphan-<prefix8>-<ts>/`. The caller passes the
+/// 8-char token prefix and the absolute WAV path; the helper picks the
+/// timestamp suffix, makes the dir, moves the files, and logs the outcome.
+/// Returns true when at least one file was archived; false when there was
+/// nothing to do or every rename failed.
+bool archive_orphan_wav(const fs::path& meetings_root,
+                        const std::string& token_prefix8,
+                        const fs::path& wav_path) {
+    if (wav_path.empty()) return false;
+    std::error_code ec;
+    if (!fs::exists(wav_path, ec)) return false;
+
+    fs::path dst_dir = meetings_root / make_orphan_dir_name(token_prefix8);
+    auto err = orphan_atomic_rename(wav_path, dst_dir, "audio.wav");
+    if (err) {
+        log_warn("daemon: orphan archive failed for wav=%s -> %s: %s",
+                 wav_path.string().c_str(), dst_dir.string().c_str(),
+                 err->c_str());
+        return false;
+    }
+    log_info("daemon: orphan archive ok wav=%s -> %s/audio.wav",
+             wav_path.string().c_str(), dst_dir.string().c_str());
+
+    // Best-effort: also archive a sibling context.json so a future
+    // operator-recovery flow has the metadata. Failure here is non-fatal.
+    fs::path ctx_src = wav_path.parent_path() / "context.json";
+    if (fs::exists(ctx_src, ec)) {
+        auto ctx_err = orphan_atomic_rename(ctx_src, dst_dir, "context.json");
+        if (ctx_err) {
+            log_warn("daemon: orphan archive context.json failed: %s",
+                     ctx_err->c_str());
+        }
+    }
+    return true;
+}
+
+/// Per-evicted-session orphan-job teardown body. Shared by the GC sweep
+/// and by `admin.evict`. Walks the JobQueue for jobs owned by
+/// `client_id`; for each non-terminal job:
+///   - Archive the WAV (Postprocess: input.audio_path; Streaming:
+///     wav_path_for_job) BEFORE cancel — cancel unlinks the WAV.
+///   - Cancel via the JobQueue / streaming-manager path that mirrors
+///     process.cancel ordering.
+///   - For Postprocess Running with a bound pid that matches
+///     g_pp_child_pid, also dispatch SIGTERM. Pid mismatch → cancel-only
+///     (C-1 race guard).
+/// Returns the list of job_ids that were canceled, for the response
+/// payload of `admin.evict` (`owned_jobs_failed`).
+std::vector<int64_t>
+teardown_orphan_jobs(const std::string& token_prefix8,
+                     const std::string& client_id) {
+    std::vector<int64_t> canceled;
+    if (!g_jobs) return canceled;
+
+    fs::path meetings_root;
+    {
+        std::lock_guard<std::mutex> lk(g_config_mu);
+        meetings_root = g_config.output_dir;
+    }
+
+    auto owned = g_jobs->list_by_client(client_id);
+    for (const auto& job : owned) {
+        // Skip terminal — nothing to tear down. Done/Failed/Cancelled
+        // artifacts are retained per the 24h diarization-cache TTL.
+        if (job.state == JobState::Done ||
+            job.state == JobState::Failed ||
+            job.state == JobState::Cancelled) {
+            continue;
+        }
+        switch (job.kind) {
+        case JobKind::Postprocess: {
+            // Archive staging WAV (best-effort; Postprocess jobs always
+            // have an audio_path even on the wired meeting-dir path).
+            archive_orphan_wav(meetings_root, token_prefix8, job.input.audio_path);
+            if (job.state == JobState::WaitingForUpload) {
+                if (g_uploads) g_uploads->cancel_by_job_id(job.job_id);
+                g_jobs->cancel(job.job_id);
+            } else if (job.state == JobState::Running) {
+                // C-1 — cancel FIRST so the Cancelled-state guard sticks,
+                // THEN signal the child IFF the bound pid matches the
+                // current pp_worker child. A mismatch means the slot's
+                // current occupant is a different job that replaced ours
+                // between the sweep snapshot and this teardown — sending
+                // SIGTERM to the wrong job would corrupt unrelated work.
+                g_jobs->cancel(job.job_id);
+                auto bound_pid = g_jobs->pid_for_running_job(job.job_id);
+                pid_t live_pid = g_pp_child_pid.load();
+                if (bound_pid.has_value() && *bound_pid == live_pid && live_pid > 0) {
+                    g_pp_stop.request();
+                    ::kill(live_pid, SIGTERM);
+                    log_info("daemon: GC orphan-teardown pp-running job=%ld "
+                             "client=%s pid=%d cancel+SIGTERM",
+                             (long)job.job_id, client_id.c_str(), (int)live_pid);
+                } else {
+                    log_info("daemon: GC orphan-teardown pp-running job=%ld "
+                             "client=%s — pid mismatch (bound=%d live=%d), "
+                             "cancel-only (C-1 guard)",
+                             (long)job.job_id, client_id.c_str(),
+                             bound_pid.has_value() ? (int)*bound_pid : -1,
+                             (int)live_pid);
+                }
+            } else {
+                // Queued / WaitingOnDownload — lazy FIFO removal at next
+                // pick / finish_download Cancelled-guard.
+                g_jobs->cancel(job.job_id);
+            }
+            canceled.push_back(job.job_id);
+            break;
+        }
+        case JobKind::Streaming: {
+            if (g_streaming) {
+                fs::path wav = g_streaming->wav_path_for_job(job.job_id);
+                archive_orphan_wav(meetings_root, token_prefix8, wav);
+                g_streaming->cancel_by_job_id(job.job_id);
+            }
+            canceled.push_back(job.job_id);
+            break;
+        }
+        case JobKind::ModelDownload:
+            // No WAV; just mark Cancelled. The download worker observes
+            // via finish_download's Cancelled guard and any dependents
+            // fail cleanly through the existing finish_download path.
+            g_jobs->cancel(job.job_id);
+            canceled.push_back(job.job_id);
+            break;
+        case JobKind::_count:
+            break;
+        }
+    }
+    if (!canceled.empty()) {
+        log_info("daemon: GC orphan-teardown evicted-prefix=%s client=%s "
+                 "canceled %zu job(s)",
+                 token_prefix8.c_str(), client_id.c_str(), canceled.size());
+    }
+    return canceled;
+}
+
+} // namespace
+
+// ---------------------------------------------------------------------------
+// Phase C.13 — GC sweep worker (resume_token TTL eviction)
+// ---------------------------------------------------------------------------
 static void gc_worker_loop(IpcServer& /*server*/, int interval_minutes) {
     log_debug("daemon: gc_worker_loop ENTER (interval=%dm)", interval_minutes);
     using namespace std::chrono;
@@ -446,21 +692,18 @@ static void gc_worker_loop(IpcServer& /*server*/, int interval_minutes) {
         if (!g_sessions) continue;  // pre-init defensive
 
         // (1) Drop expired resume_token bindings. Returns the list of
-        // (token, client_id) pairs whose TTL elapsed. SCAFFOLD: orphan-job
-        // teardown of each evicted session is the implementation-pass work.
+        // (token, client_id) pairs whose TTL elapsed.
         auto evicted = g_sessions->sweep_expired();
-        if (!evicted.empty()) {
-            log_info("daemon: GC sweep evicted %zu session(s); orphan-job "
-                     "teardown deferred to C.13 implementation pass",
-                     evicted.size());
-            // TODO(C.13 impl): for each (token, client_id) in `evicted`,
-            // walk JobQueue jobs owned by client_id; for each non-terminal:
-            //   - Postprocess Queued        → g_jobs->cancel(job_id)
-            //   - Postprocess Running       → cancel + verified-pid SIGTERM
-            //                                 (pid_for_running_job == g_pp_child_pid)
-            //   - Streaming non-terminal    → g_streaming->cancel_by_job_id
-            //   - ModelDownload non-terminal→ g_jobs->cancel(job_id)
-            //   - Pre-cancel: archive WAV to ~/meetings/.orphan-<prefix-8>-<ts>/
+        if (evicted.empty()) continue;
+
+        log_info("daemon: GC sweep evicted %zu session(s)", evicted.size());
+
+        // (2) Per evicted (token, client_id): walk owned jobs and tear them
+        // down. Per-kind dispatch + WAV archive lives in
+        // `teardown_orphan_jobs` so admin.evict can reuse it verbatim.
+        for (const auto& [token, client_id] : evicted) {
+            const std::string prefix8 = SessionManager::log_prefix(token);
+            (void)teardown_orphan_jobs(prefix8, client_id);
         }
     }
 }
@@ -1359,15 +1602,17 @@ int main(int argc, char* argv[]) {
 
     // Phase C.13 — construct the resume_token store. In-memory only (MC-1);
     // daemon restart invalidates all tokens. TTL is the consolidated knob
-    // `[server] retain_terminal_hours` (M-1) — for the scaffold we hard-code
-    // 24h; config-load mapping is a substantive impl task. Clock seam
-    // (L-3) defaults to std::chrono::system_clock; tests inject a fake.
+    // `[server] retain_terminal_hours` (M-1); the config loader also
+    // derives `diarization_cache_ttl_secs` from the same value so the two
+    // coupled lifetimes track together. Clock seam (L-3) defaults to
+    // std::chrono::system_clock; tests inject a fake.
     {
-        const int64_t ttl_s = 24 * 3600;  // SCAFFOLD: hard-coded; impl pass reads g_config.retain_terminal_hours
+        const int64_t ttl_s =
+            static_cast<int64_t>(g_config.retain_terminal_hours) * 3600;
         g_sessions = std::make_unique<SessionManager>(ttl_s);
-        log_info("daemon: session manager ready (TTL=%lldh, in-memory only — "
+        log_info("daemon: session manager ready (TTL=%dh, in-memory only — "
                  "restart invalidates all tokens)",
-                 (long long)(ttl_s / 3600));
+                 g_config.retain_terminal_hours);
     }
 
     notify_init();
@@ -1428,6 +1673,20 @@ int main(int argc, char* argv[]) {
                  fresh_cid.c_str());
         return {fresh_cid, fresh_token};
     });
+
+    // Phase C.13 (M-4) — wire the per-handler last_seen bump. The
+    // IpcServer dispatch site stamps this on every inbound IPC request
+    // (skipping outbound events). One-line uniform coverage of every
+    // verb. The token came from the auth.token handshake and is
+    // persisted on ClientState.resume_token; we just forward it to the
+    // session map. Silently no-ops on unknown tokens (which can happen
+    // briefly if a SIGHUP-driven PSK rotation arrives mid-request — the
+    // rotation itself doesn't invalidate the running connection's
+    // resume_token binding, but a daemon-restart scenario would).
+    server.set_request_dispatch_hook(
+        [](const std::string& resume_token) {
+            if (g_sessions) g_sessions->bump_last_seen(resume_token);
+        });
 
     // Phase C.7 — wire the JobQueue auto-download machinery now that the
     // IpcServer exists (the JobEventSink captures it). The ModelResolver
@@ -3536,18 +3795,29 @@ int main(int argc, char* argv[]) {
             err.message = "admin.evict: ambiguous prefix " + prefix
                         + " — please specify more chars";
             return false;
-        case EvictResult::Kind::Evicted:
+        case EvictResult::Kind::Evicted: {
+            // Same teardown path the GC sweep runs (shared body —
+            // single-source-of-truth for the orphan-job + WAV-archive
+            // policy). Returns the list of job_ids that were marked
+            // Cancelled; the response carries that as
+            // `owned_jobs_failed` so the operator sees the blast radius.
+            std::vector<int64_t> canceled = teardown_orphan_jobs(
+                SessionManager::log_prefix(r.token), r.client_id);
             resp.result["evicted"]   = r.token;
             resp.result["client_id"] = r.client_id;
-            // SCAFFOLD: owned-jobs teardown wiring is shared with the GC
-            // sweep and lives in the C.13 implementation pass. Empty array
-            // here keeps the wire shape stable; a future impl writes the
-            // actual evicted job_ids.
-            resp.result["owned_jobs_failed"] = std::string("[]");
-            log_info("daemon: admin.evict OK (prefix=%s client=%s)",
+            std::string arr = "[";
+            for (size_t i = 0; i < canceled.size(); ++i) {
+                if (i > 0) arr += ",";
+                arr += std::to_string(canceled[i]);
+            }
+            arr += "]";
+            resp.result["owned_jobs_failed"] = arr;
+            log_info("daemon: admin.evict OK (prefix=%s client=%s "
+                     "canceled=%zu)",
                      SessionManager::log_prefix(r.token).c_str(),
-                     r.client_id.c_str());
+                     r.client_id.c_str(), canceled.size());
             return true;
+        }
         }
         // Unreachable.
         err.code = static_cast<int>(IpcErrorCode::InternalError);

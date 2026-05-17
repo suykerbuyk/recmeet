@@ -311,6 +311,23 @@ public:
             const std::string& provided_resume_token)>;
     void set_resume_token_resolver(ResumeTokenResolver r);
 
+    // Phase C.13 (M-4) — per-handler dispatch hook for resume_token
+    // last_seen bump. Invoked once per inbound IPC request, AFTER the
+    // request frame is fully parsed and BEFORE the handler runs, with the
+    // resume_token bound to the originating connection. Skipped silently
+    // when the token is empty (Unix clients, pre-C.13 tests, fresh
+    // post-auth state before mint completes). The hook receives just the
+    // token so the daemon-side wiring (`g_sessions->bump_last_seen`) does
+    // not pull SessionManager into the ipc_server translation unit; the
+    // server only knows "here is a string, do whatever the daemon wired
+    // to with it". Server-emitted events (broadcasts, progress.job,
+    // captions) skip this path entirely — they never re-enter the
+    // per-handler dispatch site — so the bump is dispatch-only by
+    // construction.
+    using RequestDispatchHook =
+        std::function<void(const std::string& resume_token)>;
+    void set_request_dispatch_hook(RequestDispatchHook h);
+
     // Phase C.13 — exposed (was private at l.339) so the resume_token
     // resolver (which lives in daemon.cpp) can mint a fresh client_id on
     // the fresh-token path without a second mechanism. Stateful counter,
@@ -406,6 +423,21 @@ private:
         // `client_id_to_fd_` for O(1) routing in `send_to_client()`.
         std::string client_id;
 
+        // Phase C.13 (M-4) — the resume_token the resolver bound to this
+        // connection at auth time (fresh-mint OR validated-resume). Empty
+        // when the resolver is unwired (pre-C.13 tests) or for Unix-socket
+        // clients that bypass the PSK exchange entirely (Unix peer
+        // credentials are the auth gate; no resume_token is minted because
+        // there is nothing to resume across — the tray restarts together
+        // with the daemon for same-host deployments). The per-handler
+        // dispatch site stamps `bump_last_seen(resume_token)` on every
+        // inbound IPC request iff this field is non-empty, which lets
+        // server-emitted events (broadcasts, progress.job, captions) skip
+        // the bump implicitly: those code paths never reach the dispatch
+        // site. Per-handler bump is the single uniform stamp covering
+        // every verb without touching individual handlers.
+        std::string resume_token;
+
         // Phase A.6 per-client session state. Populated by `session.init`
         // / `session.update_credentials` / `session.update_prefs`. Cleared
         // automatically when the ClientState entry is erased in
@@ -457,6 +489,11 @@ private:
     // Phase C.10a: optional client-disconnect handler (see
     // ClientDisconnectHandler). Unset → no-op.
     ClientDisconnectHandler client_disconnect_handler_;
+
+    // Phase C.13 (M-4): per-handler dispatch hook for last_seen bump.
+    // Unset by default; daemon main() wires it to
+    // `g_sessions->bump_last_seen(token)`. Skipped when empty.
+    RequestDispatchHook request_dispatch_hook_;
 
     // Phase C.13: optional resume_token resolver (see ResumeTokenResolver).
     // Unset → handle_pending_psk falls back to the pre-C.13 mint_client_id-

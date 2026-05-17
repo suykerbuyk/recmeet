@@ -210,7 +210,33 @@ struct Config {
     // (useful for tests; not recommended in production — the cache is
     // in-memory only so a long-running daemon would accumulate forever).
     // Wired from `[server] diarization_cache_ttl_secs`.
+    //
+    // Phase C.13 (M-1) consolidates this with the resume_token TTL into a
+    // single operator-facing knob (`retain_terminal_hours`, below). When
+    // `retain_terminal_hours` is non-zero, the config loader derives this
+    // value as `retain_terminal_hours * 3600` so an operator bumping the
+    // unified knob keeps both lifetimes in lock-step. Legacy operators who
+    // set `diarization_cache_ttl_secs` directly still work — see the
+    // precedence rule documented on `retain_terminal_hours` below.
     int64_t diarization_cache_ttl_secs = 86400;
+
+    // Phase C.13 (M-1) — consolidated terminal-state / session retention
+    // knob. Drives BOTH `resume_token_ttl_hours` (the SessionManager TTL
+    // — how long a disconnected client can hold its resume_token before
+    // the GC sweep reaps it) AND `diarization_cache_ttl_secs`
+    // (retain_terminal_hours * 3600 — the C.8 cache lifetime). Default
+    // 24 h. 0 means "never expire" (test / dev only; the resume_token map
+    // is in-memory only so it dies with the daemon either way).
+    //
+    // Wired from `[server] retain_terminal_hours`. **Precedence**: if this
+    // key is present and >= 0 in the YAML, it OVERRIDES any explicit
+    // `[server] diarization_cache_ttl_secs` setting (the unified knob
+    // wins, by design — the M-1 finding was specifically that the two
+    // could drift). When this key is absent, the loader falls back to the
+    // legacy `diarization_cache_ttl_secs` field on disk and derives the
+    // session TTL from the same number. Operators migrating from the old
+    // single-knob setup get identical behavior without editing config.
+    int retain_terminal_hours = 24;
 };
 
 /// Load config. Uses path if provided, otherwise ~/.config/recmeet/config.yaml.

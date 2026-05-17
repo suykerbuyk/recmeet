@@ -329,6 +329,14 @@ public:
     /// already finalized or in a terminal state).
     bool cancel_by_job_id(int64_t job_id);
 
+    /// Phase C.13 (M-2) — return the on-disk WAV path of the live
+    /// streaming session bound to `job_id`, or empty when no live
+    /// session is bound. Used by the GC orphan-eviction path to archive
+    /// the in-flight WAV to `~/meetings/.orphan-<prefix>-<ts>/` BEFORE
+    /// calling `cancel_by_job_id` (which unlinks the WAV). Lookup is
+    /// path-only and does not mutate session state.
+    fs::path wav_path_for_job(int64_t job_id) const;
+
     /// Phase C.10b — `process.stream.commit` result. `ok=false` carries a
     /// human-readable `error` and an `IpcErrorCode`-compatible `code` for
     /// the handler. On success, `postprocess_job_id` is a fresh

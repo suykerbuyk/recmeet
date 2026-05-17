@@ -428,3 +428,69 @@ TEST_CASE("backward compat: legacy api_key in config used as fallback", "[config
 
     fs::remove_all(dir);
 }
+
+// ===========================================================================
+// Phase C.13 (M-1) — `retain_terminal_hours` consolidates two TTLs into one
+// operator-facing knob. The loader derives `diarization_cache_ttl_secs` as
+// `retain_terminal_hours * 3600` AND exposes the same number for the
+// SessionManager's resume_token TTL (daemon.cpp reads it from
+// `cfg.retain_terminal_hours`). These tests pin the precedence rule:
+//   1. retain_terminal_hours present → unified knob wins (overrides legacy).
+//   2. retain_terminal_hours absent + legacy dct set → legacy + derive.
+//   3. Both absent → defaults (24h / 86400s).
+// ===========================================================================
+
+TEST_CASE("load_config: retain_terminal_hours defaults to 24 h with derived "
+          "diarization_cache_ttl_secs",
+          "[config][c13]") {
+    fs::path dir = fs::temp_directory_path() / "recmeet_test_rth_default";
+    fs::remove_all(dir);
+    fs::path path = dir / "config.yaml";
+    fs::create_directories(dir);
+    {
+        std::ofstream out(path);
+        out << "server:\n  max_clients: 16\n";  // unrelated key
+    }
+    Config cfg = load_config(path);
+    CHECK(cfg.retain_terminal_hours == 24);
+    CHECK(cfg.diarization_cache_ttl_secs == 86400);
+    fs::remove_all(dir);
+}
+
+TEST_CASE("load_config: retain_terminal_hours overrides legacy "
+          "diarization_cache_ttl_secs (M-1 precedence)",
+          "[config][c13]") {
+    fs::path dir = fs::temp_directory_path() / "recmeet_test_rth_override";
+    fs::remove_all(dir);
+    fs::path path = dir / "config.yaml";
+    fs::create_directories(dir);
+    {
+        // Both set, conflicting — retain_terminal_hours must win.
+        std::ofstream out(path);
+        out << "server:\n"
+               "  retain_terminal_hours: 48\n"
+               "  diarization_cache_ttl_secs: 3600\n";
+    }
+    Config cfg = load_config(path);
+    CHECK(cfg.retain_terminal_hours == 48);
+    CHECK(cfg.diarization_cache_ttl_secs == 48 * 3600);
+    fs::remove_all(dir);
+}
+
+TEST_CASE("load_config: legacy diarization_cache_ttl_secs derives "
+          "retain_terminal_hours when unified knob absent",
+          "[config][c13]") {
+    fs::path dir = fs::temp_directory_path() / "recmeet_test_rth_legacy";
+    fs::remove_all(dir);
+    fs::path path = dir / "config.yaml";
+    fs::create_directories(dir);
+    {
+        std::ofstream out(path);
+        out << "server:\n  diarization_cache_ttl_secs: 7200\n";
+    }
+    Config cfg = load_config(path);
+    CHECK(cfg.diarization_cache_ttl_secs == 7200);
+    // 7200 / 3600 = 2 hours
+    CHECK(cfg.retain_terminal_hours == 2);
+    fs::remove_all(dir);
+}

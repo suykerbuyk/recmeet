@@ -604,6 +604,14 @@ bool StreamingSessionManager::cancel(const std::string& client_id,
     return true;
 }
 
+fs::path StreamingSessionManager::wav_path_for_job(int64_t job_id) const {
+    std::lock_guard<std::mutex> lk(mu_);
+    for (const auto& [tok, sess] : sessions_) {
+        if (sess->job_id_ == job_id) return sess->wav_path_;
+    }
+    return {};
+}
+
 bool StreamingSessionManager::cancel_by_job_id(int64_t job_id) {
     std::lock_guard<std::mutex> lk(mu_);
     // Phase C.5: `process.cancel` enters here with a job_id (the wire-facing

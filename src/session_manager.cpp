@@ -188,4 +188,32 @@ std::string SessionManager::log_prefix(const std::string& token) {
     return token.substr(0, 8);
 }
 
+#if defined(RECMEET_TESTING)
+// TEST_ONLY symbol. Compiled into `recmeet_core` only when the library was
+// built with `-DRECMEET_TESTING` (see `CMakeLists.txt`, set automatically
+// when `RECMEET_BUILD_TESTS=ON` — never in tarball/production builds).
+// The matching declaration in `session_manager.h` is gated by the same
+// macro so production callers cannot reach it even in test-enabled builds.
+// `-ffunction-sections -fdata-sections` + `-Wl,--gc-sections` (set in
+// `CMakeLists.txt:34-35`) strip this symbol from `recmeet-daemon` because
+// nothing in the production link references it.
+void SessionManager::insert_for_test(const std::string& token,
+                                     const std::string& client_id) {
+    // Direct map mutation under the same mutex as production paths so the
+    // test seam matches mint()'s memory-ordering semantics. The clock used
+    // for `last_seen_epoch` is the same `clock_` the rest of the class
+    // consumes — keeps fake-Clock tests deterministic.
+    std::lock_guard<std::mutex> lock(mu_);
+    sessions_[token] = ResumeSession{client_id, clock_()};
+}
+
+std::optional<int64_t>
+SessionManager::last_seen_for_test(const std::string& token) const {
+    std::lock_guard<std::mutex> lock(mu_);
+    auto it = sessions_.find(token);
+    if (it == sessions_.end()) return std::nullopt;
+    return it->second.last_seen_epoch;
+}
+#endif  // RECMEET_TESTING
+
 } // namespace recmeet

@@ -334,15 +334,67 @@ Config load_config(const fs::path& config_path) {
         // Phase C.8 — `[server] diarization_cache_ttl_secs`. Same warn-and-
         // fallback shape as the [ipc] knobs above: a negative override is
         // a typo, not an opt-out (use 0 explicitly for "never expire").
+        //
+        // C.13 (M-1): explicit `retain_terminal_hours` overrides this legacy
+        // field — see the derive block below. The parse stays so legacy
+        // configs that set only the old key still work, and so a config
+        // that sets BOTH still has a meaningful "the unified knob won"
+        // log line at the override site.
         std::string dct = get_val(entries, "server",
                                   "diarization_cache_ttl_secs", "");
-        if (!dct.empty()) {
+        bool legacy_dct_set = !dct.empty();
+        if (legacy_dct_set) {
             long long v = std::atoll(dct.c_str());
             if (v >= 0) cfg.diarization_cache_ttl_secs = static_cast<int64_t>(v);
-            else
+            else {
                 log_warn("config: invalid [server] diarization_cache_ttl_secs=%s; "
                          "keeping default %lld", dct.c_str(),
                          (long long)cfg.diarization_cache_ttl_secs);
+                legacy_dct_set = false;  // invalid input: defer to unified knob default
+            }
+        }
+
+        // Phase C.13 (M-1) — consolidated `[server] retain_terminal_hours`.
+        // Default 24 h. When explicitly set in YAML it overrides the legacy
+        // `diarization_cache_ttl_secs` value AND drives the SessionManager
+        // TTL (read by daemon main() as `retain_terminal_hours * 3600`).
+        // Precedence:
+        //   1. retain_terminal_hours present + valid → unified knob wins.
+        //   2. retain_terminal_hours absent, legacy dct set → legacy + derive
+        //      retain_terminal_hours from it for the SessionManager TTL.
+        //   3. Both absent → default 24 h.
+        std::string rth = get_val(entries, "server",
+                                  "retain_terminal_hours", "");
+        if (!rth.empty()) {
+            long long v = std::atoll(rth.c_str());
+            if (v >= 0) {
+                cfg.retain_terminal_hours = static_cast<int>(v);
+                // Override the legacy field — the unified knob is now
+                // authoritative. Log only when the operator actually set
+                // both, so a "default + legacy" combo stays silent.
+                int64_t derived = static_cast<int64_t>(v) * 3600;
+                if (legacy_dct_set && cfg.diarization_cache_ttl_secs != derived) {
+                    log_warn("config: [server] retain_terminal_hours=%lld overrides "
+                             "[server] diarization_cache_ttl_secs=%lld "
+                             "(unified knob wins per C.13 M-1)",
+                             (long long)v,
+                             (long long)cfg.diarization_cache_ttl_secs);
+                }
+                cfg.diarization_cache_ttl_secs = derived;
+            } else {
+                log_warn("config: invalid [server] retain_terminal_hours=%s; "
+                         "keeping default %d", rth.c_str(),
+                         cfg.retain_terminal_hours);
+            }
+        } else if (legacy_dct_set) {
+            // Legacy-only config: derive retain_terminal_hours from the
+            // legacy field so the SessionManager TTL stays coupled.
+            // Integer division — round to the nearest hour; sub-hour TTLs
+            // are not an operator-facing scenario.
+            cfg.retain_terminal_hours = static_cast<int>(
+                cfg.diarization_cache_ttl_secs / 3600);
+            if (cfg.retain_terminal_hours <= 0)
+                cfg.retain_terminal_hours = 24;
         }
     }
 
