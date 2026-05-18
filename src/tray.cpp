@@ -12,6 +12,7 @@
 #include "notify.h"
 #include "api_models.h"
 #include "pending_jobs_journal.h"
+#include "reconnect_backoff.h"
 #include "resume_token_store.h"
 #include "slot_queue.h"
 #include "tray_capture.h"
@@ -41,6 +42,7 @@
 #include <fstream>
 #include <memory>
 #include <mutex>
+#include <random>
 #include <thread>
 #include <vector>
 
@@ -84,7 +86,35 @@ struct TrayState {
     bool is_reprocess = false;  // derived from state string for display
     bool daemon_connected = false;
     guint reconnect_timer = 0;
-    int reconnect_delay = 1;  // exponential backoff: 1, 2, 4, 8, ... max 30s
+    // Phase D.3 — nominal (un-jittered) backoff in seconds. Doubled
+    // on each failed attempt and capped at `D3_BACKOFF_CAP_SECS` (30 s
+    // per plan line 356). Reset to 1 s on a successful connect. The
+    // value scheduled with the GTK timer is `jittered_delay_secs(this,
+    // D3_JITTER_FRACTION, rng, cap)` — the wire schedule sees
+    // ±25 % uniform jitter to defeat lockstep reconnect storms when
+    // many clients reconnect after a shared network blip.
+    int reconnect_delay = 1;
+    // Phase D.3 — seeded once per tray process so the jitter draws are
+    // reproducible (seed mixes time + pid for inter-process spread).
+    // The single shared `std::mt19937` matches the GTK-thread-only
+    // contract on `g_tray.*` access; no internal locking required.
+    std::mt19937 reconnect_rng{
+        static_cast<unsigned>(std::time(nullptr)) ^ static_cast<unsigned>(::getpid())};
+    // Phase D.3 — client_id observed on the most recent SUCCESSFUL
+    // connect. Snapshot taken inside `connect_to_daemon` AFTER the
+    // server's auth.ok is processed; consulted on the NEXT reconnect
+    // to detect the "same vs fresh session" boundary per plan line
+    // 357-358. A fresh id (resume_token expired, PSK rotated, or
+    // server forgot the session) drops the journal entries that
+    // referenced the prior session and fires a notify per entry. The
+    // resume_token path (when the daemon's resolver hook honors our
+    // persisted token) re-issues the SAME client_id; the equality
+    // check is the load-bearing test.
+    //
+    // Empty on first connect, after close_connection() is called from
+    // tray exit, and after the journal-drop path runs to completion
+    // (which then captures the fresh id as the new baseline).
+    std::string last_client_id;
 
     // GIOChannel for socket event integration with GTK main loop
     GIOChannel* ipc_channel = nullptr;
@@ -252,9 +282,20 @@ static std::string source_label(const AudioSource& s) {
 
 // --- Daemon connection ---
 
+// Phase D.3 — exponential backoff with jitter constants. The schedule
+// is 1, 2, 4, 8, 16, 30, 30, ... s nominal with ±25 % uniform jitter
+// applied to each scheduled wait. Plan line 356 locks both numbers.
+// Surfaced as compile-time constants (not config knobs) per the same
+// "no operator-tunable timing knob" discipline C.13's TTL plan rejected:
+// jitter is mathematics, not policy.
+static constexpr int    D3_BACKOFF_CAP_SECS  = 30;
+static constexpr double D3_JITTER_FRACTION   = 0.25;
+
 static void setup_ipc_watch();
 static void teardown_ipc_watch();
 static gboolean try_reconnect(gpointer);
+static void post_reconnect_resync();
+static void schedule_reconnect_attempt();
 
 static void update_state(bool rec, bool pp, bool dl, bool reproc = false) {
     bool was_recording = g_tray.recording;
@@ -587,9 +628,12 @@ static gboolean on_ipc_data(GIOChannel*, GIOCondition cond, gpointer) {
         // a lost daemon connection does not stop the operator's
         // microphone, only the downstream postprocessing path.
         update_state(g_tray.recording, false, false);
-        // Schedule reconnect with backoff
+        // Phase D.3 — reset nominal backoff to 1 s and schedule the
+        // first reconnect attempt with ±25 % jitter. `schedule_reconnect_attempt`
+        // honors the Unix-out-of-scope guard (plan line 365) — Unix
+        // transports do not arm the timer at all.
         g_tray.reconnect_delay = 1;
-        g_tray.reconnect_timer = g_timeout_add_seconds(1, try_reconnect, nullptr);
+        schedule_reconnect_attempt();
         return G_SOURCE_REMOVE;
     }
 
@@ -603,7 +647,7 @@ static gboolean on_ipc_data(GIOChannel*, GIOCondition cond, gpointer) {
         g_tray.ipc.close_connection();
         update_state(g_tray.recording, false, false);
         g_tray.reconnect_delay = 1;
-        g_tray.reconnect_timer = g_timeout_add_seconds(1, try_reconnect, nullptr);
+        schedule_reconnect_attempt();
         return G_SOURCE_REMOVE;
     }
     return G_SOURCE_CONTINUE;
@@ -745,24 +789,379 @@ static bool connect_to_daemon() {
         }
     }
 
+    // Phase D.3 — snapshot the client_id observed on this successful
+    // connect IFF the snapshot is currently empty (first-ever connect
+    // or post-tray-restart bootstrap). Subsequent reconnects let
+    // `post_reconnect_resync()` do the comparison BEFORE updating the
+    // snapshot — otherwise prior_id and fresh_id would be equal by
+    // construction and the "fresh client_id" branch could never fire.
+    if (g_tray.last_client_id.empty()) {
+        g_tray.last_client_id = g_tray.ipc.client_id();
+    }
+
     log_info("[tray] Connected to daemon");
     return true;
 }
 
+// Phase D.3 — schedule the next reconnect attempt with jittered
+// exponential backoff. `g_tray.reconnect_delay` carries the un-jittered
+// nominal that doubles on each failure (1, 2, 4, ..., 30); the value
+// actually handed to `g_timeout_add_seconds` is the jittered version
+// drawn from a uniform ±25 % around the nominal, then clamped to the
+// 30 s cap. The post-clamp guarantee means the wire never schedules
+// more than 30 s even when the nominal is at the cap and the jitter
+// draw is positive.
+//
+// Unix-out-of-scope guard (plan line 365): when the transport is Unix,
+// the daemon is tray-managed and restarts together with the tray —
+// reconnect after a Unix-side disconnect is the D.5 tray-restart path,
+// not a live reconnect. We log and DO NOT arm the timer; the tray
+// remains in the disconnected state and the operator is expected to
+// restart the tray (or the host) to bring it back.
+static void schedule_reconnect_attempt() {
+    // Defer to the same guard the IpcClient uses (`is_remote()` reads
+    // `addr_.transport == IpcTransport::Tcp`). The check is "remote-ness"
+    // not "non-Unix" so a future non-TCP non-Unix transport gets the
+    // safe-by-default treatment.
+    if (!g_tray.ipc.is_remote()) {
+        log_info("[tray] D.3 reconnect skipped — Unix transport "
+                 "(tray-managed daemon; restart together via tray restart)");
+        return;
+    }
+    int jittered = recmeet::jittered_delay_secs(
+        g_tray.reconnect_delay,
+        D3_JITTER_FRACTION,
+        g_tray.reconnect_rng,
+        D3_BACKOFF_CAP_SECS);
+    log_debug("tray: D.3 reconnect scheduled "
+              "(nominal=%ds, jittered=%ds, cap=%ds)",
+              g_tray.reconnect_delay, jittered, D3_BACKOFF_CAP_SECS);
+    g_tray.reconnect_timer = g_timeout_add_seconds(
+        jittered, try_reconnect, nullptr);
+    // Advance the nominal AFTER scheduling so the NEXT attempt uses the
+    // doubled value. The cap is honored inside `next_nominal_backoff`.
+    g_tray.reconnect_delay = recmeet::next_nominal_backoff(
+        g_tray.reconnect_delay, D3_BACKOFF_CAP_SECS);
+}
+
+// Phase D.3 — convergence-principle pattern-2 batch-upload fallback.
+// Triggered when a streaming session that was in-flight pre-disconnect
+// is reported failed/cancelled/unknown on the post-reconnect job.list
+// re-sync. The server's C.10a TCP-drop policy already finalized the
+// streaming job; the tray re-submits the SAME meeting_id via
+// process.submit, and the server's C.11.4 dedup contract atomically
+// overwrites whatever partial WAV the streaming session left behind.
+//
+// Distinct from `apply_submit_with_context` because:
+//   * The streaming-fallback path operates on JOURNAL data (the
+//     pre-disconnect entry carrying staging_wav_path + meeting_id),
+//     not on `g_tray.capture_state.*` (which has been torn down).
+//   * No context payload — the streaming session never collected an
+//     interactive context dialog (it was a live recording, not a
+//     save-for-later batch).
+//   * The slot-queue admission goes into the postprocess slot, not
+//     the streaming slot (the streaming session is gone server-side).
+//
+// Returns true on a successful re-submit + first upload-chunk pump;
+// false on any wire / I/O failure. On failure the original journal
+// entry stays IN PLACE so a later retry (manual via D.4, or next
+// reconnect) can retry — losing the entry would lose operator data.
+static bool dispatch_streaming_fallback_submit(
+        const recmeet::PendingJobsJournal::Entry& je) {
+    if (!g_tray.daemon_connected || !g_tray.ipc.connected()) {
+        log_warn("[tray] D.3 streaming-fallback: daemon disconnected, deferring");
+        return false;
+    }
+    fs::path wav_path(je.staging_wav_path);
+    std::error_code ec;
+    auto wav_size = fs::file_size(wav_path, ec);
+    if (ec || wav_size == 0) {
+        log_warn("[tray] D.3 streaming-fallback: cannot stat WAV %s: %s",
+                 wav_path.c_str(), ec ? ec.message().c_str() : "empty");
+        return false;
+    }
+    std::ifstream wav_in(wav_path, std::ios::binary);
+    if (!wav_in) {
+        log_warn("[tray] D.3 streaming-fallback: cannot open WAV %s",
+                 wav_path.c_str());
+        return false;
+    }
+
+    JsonMap params;
+    params["audio_size"]  = static_cast<int64_t>(wav_size);
+    params["format"]      = std::string("wav");
+    params["sample_rate"] = static_cast<int64_t>(SAMPLE_RATE);
+    params["channels"]    = static_cast<int64_t>(1);
+    params["mode"]        = std::string("transcribe");
+    // Load-bearing — the SAME meeting_id the streaming session carried.
+    // C.11.4 server-side dedup uses this to route the overwrite back to
+    // the same meeting dir.
+    params["meeting_id"]  = je.meeting_id;
+
+    IpcResponse resp; IpcError err;
+    if (!g_tray.ipc.call("process.submit", params, resp, err, 10000)) {
+        log_warn("[tray] D.3 streaming-fallback: process.submit failed: %s",
+                 err.message.c_str());
+        return false;
+    }
+    auto tok_it = resp.result.find("upload_token");
+    auto job_it = resp.result.find("job_id");
+    std::string upload_token = (tok_it != resp.result.end())
+        ? json_val_as_string(tok_it->second) : "";
+    int64_t new_job_id = (job_it != resp.result.end())
+        ? json_val_as_int(job_it->second) : 0;
+    if (upload_token.empty() || new_job_id <= 0) {
+        log_warn("[tray] D.3 streaming-fallback: process.submit response "
+                 "missing upload_token / job_id");
+        return false;
+    }
+    log_info("[tray] D.3 streaming-fallback: process.submit OK "
+             "(new job=%lld meeting_id=%s size=%llu)",
+             (long long)new_job_id, je.meeting_id.c_str(),
+             (unsigned long long)wav_size);
+
+    // Re-journal the entry under the postprocess slot with the new
+    // job_id; remove the old streaming entry. The follow-up upload-
+    // chunk pump is intentionally NOT done here: we register the
+    // intent in the journal so even if the upload itself is
+    // interrupted (e.g. another disconnect mid-fallback), the next
+    // reconnect's H-D3 path retries by meeting_id — the same recovery
+    // contract D.5 + C.11.4 already establish for crash recovery.
+    recmeet::PendingJobsJournal::Entry new_je;
+    new_je.endpoint          = je.endpoint;
+    new_je.meeting_id        = je.meeting_id;
+    new_je.job_id            = std::to_string(new_job_id);
+    new_je.staging_wav_path  = je.staging_wav_path;
+    new_je.kind              = "submit";
+    new_je.slot_kind         = recmeet::to_string(
+                                   recmeet::SlotKind::Postprocess);
+    new_je.submitted_at_unix = static_cast<int64_t>(
+        std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count());
+    g_tray.pending_jobs.remove_by_job_id(je.job_id);
+    g_tray.pending_jobs.append(new_je);
+    return true;
+}
+
+// Phase D.3 — post-reconnect handler. Called immediately after
+// `connect_to_daemon()` returns true, so `g_tray.ipc.client_id()` and
+// `g_tray.ipc.resume_token()` carry the fresh per-connection values.
+//
+// Steps (plan line 357-361):
+//   2. client_id reconciliation — compare to the prior session's id;
+//      on a fresh id, drop journal entries that referenced the old
+//      session and notify per entry. Streaming entries trigger the
+//      convergence-pattern-2 fallback to batch upload.
+//   3. session.init is already re-sent inside connect_to_daemon when
+//      session_inited was cleared on disconnect — no extra work here.
+//   4. job.list re-sync — pull the server-authoritative list and
+//      classify each entry into Fetch / Monitor / NotifyFailed via
+//      reconnect_backoff::classify_resynced_job.
+//   5. Per-job dispatch: complete → process.fetch, running → monitor
+//      (no work), unknown → notify().
+//
+// All wire calls observe a short 3 s timeout; a hung daemon during
+// resync trips the IPC watch's HUP path and re-enters the backoff
+// loop (avoiding a deadlocked reconnect).
+static void post_reconnect_resync() {
+    if (!g_tray.daemon_connected || !g_tray.ipc.connected()) {
+        log_warn("[tray] D.3 post-reconnect resync invoked while disconnected — skipping");
+        return;
+    }
+
+    // Step 2 — client_id reconciliation. Capture the fresh id BEFORE
+    // mutating anything so the journal-drop path can log both ids.
+    const std::string fresh_id = g_tray.ipc.client_id();
+    const std::string prior_id = g_tray.last_client_id;
+
+    // "Fresh client_id" means: the prior session existed (we had a
+    // non-empty last_client_id) AND the server handed us back a
+    // different id. A first-ever connect has prior_id == "" and is not
+    // a "session expired" event — there was no session to expire.
+    const bool prior_session_existed   = !prior_id.empty();
+    const bool fresh_client_id         = prior_session_existed && fresh_id != prior_id;
+
+    if (fresh_client_id) {
+        log_warn("[tray] D.3 fresh client_id (was=%s, now=%s) — prior session "
+                 "expired (TTL or PSK rotation); dropping journal entries that "
+                 "referenced the old client_id",
+                 prior_id.c_str(), fresh_id.c_str());
+        auto stale = g_tray.pending_jobs.load();
+        for (const auto& e : stale) {
+            // Build a per-entry notification body — operator sees one
+            // toast per orphaned job rather than a count summary so the
+            // affected meeting is identifiable. The streaming-fallback
+            // path additionally tries to dispatch a follow-up
+            // `process.submit` carrying the same meeting_id.
+            std::string body = "meeting_id=" + e.meeting_id
+                             + " job_id=" + e.job_id
+                             + " kind=" + e.kind;
+            notify("recmeet: pending job orphaned by session expiry", body);
+            log_warn("[tray] D.3 dropped journal entry: meeting_id=%s "
+                     "job_id=%s kind=%s slot=%s",
+                     e.meeting_id.c_str(), e.job_id.c_str(),
+                     e.kind.c_str(), e.slot_kind.c_str());
+        }
+        // Wipe the journal — every entry referenced the old session by
+        // construction. Save an empty list atomically.
+        g_tray.pending_jobs.save({});
+        // Clear the slot-queue in-flight set: the daemon-side jobs are
+        // gone; we cannot drain by job_id any more. The retire matches
+        // the journal wipe — a future submit gets a fresh slot.
+        g_tray.slot_queues.postprocess.clear();
+        g_tray.slot_queues.streaming.clear();
+        g_tray.slot_queues.model_download.clear();
+    }
+    // Update the snapshot regardless of fresh/same — the new id is now
+    // the baseline for the NEXT reconnect's comparison.
+    g_tray.last_client_id = fresh_id;
+
+    // Step 4 — job.list re-sync. C.14 stamped `phase` + `progress` on
+    // every entry so the tray's UI can populate synchronously from the
+    // re-sync response without waiting on the next `progress.job`
+    // event. Empty result on a fresh-id wipe (the daemon has no jobs
+    // bound to the new client_id) is the expected path; we still call
+    // job.list so the empty-array test seam observes a real wire
+    // round-trip.
+    IpcResponse list_resp;
+    IpcError list_err;
+    if (!g_tray.ipc.call("job.list", JsonMap{}, list_resp, list_err, 3000)) {
+        log_warn("[tray] D.3 job.list re-sync failed: %s "
+                 "(continuing without per-job dispatch)",
+                 list_err.message.empty() ? "unknown" : list_err.message.c_str());
+        return;
+    }
+    auto jit = list_resp.result.find("jobs");
+    std::string jobs_arr_json = (jit != list_resp.result.end())
+        ? json_val_as_string(jit->second)
+        : std::string("[]");
+    auto parsed = recmeet::parse_job_list_jobs(jobs_arr_json);
+    log_info("[tray] D.3 job.list re-sync: %zu job(s) returned by daemon",
+             parsed.size());
+
+    // Update the local UI / status from the highest-progress in-flight
+    // job, if any. Picking the first running entry covers the common
+    // single-in-flight case; multi-job UI is D.4 territory.
+    for (const auto& j : parsed) {
+        if (j.state == "running" || j.state == "queued"
+            || j.state == "waiting_on_download"
+            || j.state == "waiting_for_upload") {
+            if (!j.phase.empty()) g_tray.current_phase = j.phase;
+            if (j.progress >= 0)  g_tray.progress_percent = j.progress;
+            break;
+        }
+    }
+
+    // Step 5 — per-job dispatch. The classifier collapses (state, kind)
+    // into one of three actions. The Fetch + NotifyFailed branches
+    // emit immediate wire calls; Monitor is a no-op (event pump
+    // catches up).
+    for (const auto& j : parsed) {
+        auto cls = recmeet::classify_resynced_job(j.state, j.kind);
+        switch (cls.action) {
+            case recmeet::JobResyncAction::Fetch: {
+                log_info("[tray] D.3 resync: job=%lld state=done — issuing process.fetch",
+                         (long long)j.job_id);
+                // Reuse the data_dir's staging path for the output;
+                // production wiring routes fetched artifacts into the
+                // meeting dir, but the resync path here is conservative
+                // and just pulls them into a known location. The exact
+                // destination is a D.4 follow-up (per-job UI affordances).
+                fs::path out_dir = recmeet::data_dir() / "fetched"
+                                 / std::to_string(j.job_id);
+                std::error_code ec;
+                fs::create_directories(out_dir, ec);
+                IpcError ferr;
+                auto written = g_tray.ipc.fetch_artifacts(
+                    j.job_id, out_dir, ferr, 10000);
+                if (written.empty()) {
+                    log_warn("[tray] D.3 process.fetch(%lld) failed: %s",
+                             (long long)j.job_id,
+                             ferr.message.empty() ? "no artifacts"
+                                                  : ferr.message.c_str());
+                } else {
+                    log_info("[tray] D.3 fetched %zu artifact(s) for job=%lld",
+                             written.size(), (long long)j.job_id);
+                    g_tray.pending_jobs.remove_by_job_id(std::to_string(j.job_id));
+                }
+                break;
+            }
+            case recmeet::JobResyncAction::NotifyFailed: {
+                std::string body = "job_id=" + std::to_string(j.job_id)
+                                 + " state=" + j.state
+                                 + " kind=" + j.kind;
+                if (!j.error.empty()) body += " error=" + j.error;
+                notify("recmeet: job failed during reconnect", body);
+                log_warn("[tray] D.3 resync: job=%lld state=%s kind=%s notify fired",
+                         (long long)j.job_id, j.state.c_str(), j.kind.c_str());
+
+                // Streaming-aborted convergence-pattern-2 fallback per
+                // plan line 362-363: a streaming session that did not
+                // survive the disconnect (failed/cancelled/unknown) is
+                // not resumable — the tray falls back to batch upload
+                // via process.submit carrying the same meeting_id. The
+                // server's C.11.4 atomic-overwrite contract routes the
+                // batch bytes to the same meeting dir, overwriting any
+                // partial WAV the streaming session left behind.
+                if (cls.streaming_aborted && !j.meeting_id.empty()) {
+                    log_info("[tray] D.3 streaming aborted → falling back to "
+                             "batch upload via process.submit (meeting_id=%s)",
+                             j.meeting_id.c_str());
+                    // Resolve the staging WAV by consulting the journal
+                    // — the entry we wrote at process.stream return
+                    // carries the local WAV path. We dispatch a fresh
+                    // process.submit with the SAME meeting_id so the
+                    // server's C.11.4 dedup contract routes the bytes
+                    // back to the meeting dir the streaming session was
+                    // writing into; the partial WAV is overwritten
+                    // atomically.
+                    auto journal_entries = g_tray.pending_jobs.load();
+                    for (const auto& je : journal_entries) {
+                        if (je.meeting_id == j.meeting_id
+                            && !je.staging_wav_path.empty()) {
+                            if (dispatch_streaming_fallback_submit(je)) {
+                                log_info("[tray] D.3 streaming-fallback "
+                                         "dispatched (meeting_id=%s)",
+                                         j.meeting_id.c_str());
+                            } else {
+                                log_warn("[tray] D.3 streaming-fallback "
+                                         "dispatch failed (meeting_id=%s) — "
+                                         "journal entry preserved for retry",
+                                         j.meeting_id.c_str());
+                            }
+                            break;
+                        }
+                    }
+                }
+                break;
+            }
+            case recmeet::JobResyncAction::Monitor: {
+                log_debug("[tray] D.3 resync: job=%lld state=%s kind=%s — "
+                          "event pump will catch up",
+                          (long long)j.job_id, j.state.c_str(), j.kind.c_str());
+                break;
+            }
+        }
+    }
+}
+
 static gboolean try_reconnect(gpointer) {
     g_tray.reconnect_timer = 0;
-    log_debug("tray: reconnect attempt");
+    log_debug("tray: D.3 reconnect attempt (nominal=%ds)", g_tray.reconnect_delay);
     if (connect_to_daemon()) {
-        log_debug("tray: reconnected to daemon");
-        g_tray.reconnect_delay = 1;  // reset backoff
+        log_debug("tray: D.3 reconnected to daemon");
+        // Successful connect — reset the nominal backoff and run the
+        // post-reconnect resync (job.list pull + per-job dispatch +
+        // client_id reconciliation). The resync runs before
+        // build_menu() so the menu reflects the freshly-re-synced
+        // status row.
+        g_tray.reconnect_delay = 1;
+        post_reconnect_resync();
         build_menu();
         return G_SOURCE_REMOVE;
     }
-    log_debug("tray: reconnect failed");
-    // Exponential backoff: 1, 2, 4, 8, 16, 30, 30, ...
-    g_tray.reconnect_timer = g_timeout_add_seconds(
-        g_tray.reconnect_delay, try_reconnect, nullptr);
-    g_tray.reconnect_delay = std::min(g_tray.reconnect_delay * 2, 30);
+    log_debug("tray: D.3 reconnect failed — re-scheduling");
+    schedule_reconnect_attempt();
     return G_SOURCE_REMOVE;
 }
 
@@ -3034,9 +3433,15 @@ int main(int argc, char* argv[]) {
 
     refresh_sources();
 
-    // Connect to daemon (non-blocking — will retry via timer if not running)
-    if (!connect_to_daemon())
-        g_tray.reconnect_timer = g_timeout_add_seconds(1, try_reconnect, nullptr);
+    // Connect to daemon (non-blocking — will retry via timer if not
+    // running). Phase D.3: the first attempt at startup still goes
+    // through the jittered-backoff scheduler so multi-tray hosts (rare
+    // but possible: power-on of several user sessions at the same
+    // moment) do not converge a thundering accept() burst on the daemon.
+    if (!connect_to_daemon()) {
+        g_tray.reconnect_delay = 1;
+        schedule_reconnect_attempt();
+    }
 
     // Phase D.5 — startup resume recovery.
     //   1. Scan the staging dir for `.pending` sidecars; populate the

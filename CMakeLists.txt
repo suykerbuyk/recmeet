@@ -238,6 +238,13 @@ set(IPC_SOURCES
     src/uuid.cpp
     src/resume_token_store.cpp
     src/pending_jobs_journal.cpp
+    # Phase D.3 — pure helpers for the tray reconnect path: jittered
+    # exponential backoff + post-reconnect job.list re-sync classifier.
+    # Carved out of tray.cpp so the formulas can be unit-tested without
+    # booting GTK. Lives in recmeet_ipc because the classifier consumes
+    # the IPC `job.list` wire shape and the backoff helpers do not pull
+    # any new deps.
+    src/reconnect_backoff.cpp
 )
 
 add_library(recmeet_ipc STATIC ${IPC_SOURCES})
@@ -550,6 +557,8 @@ if(RECMEET_BUILD_TESTS)
         tests/test_tray_resume_recovery.cpp
         # Phase D.1 + D.2 per-slot queue + drain worker (iter-167).
         tests/test_slot_queue.cpp
+        # Phase D.3 — reconnect-with-backoff + resume_token resync (iter-168).
+        tests/test_reconnect_backoff.cpp
     )
     # The test binary exercises both daemon-side surfaces (recmeet_core) and
     # client-side / standalone surfaces (run_recording + recmeet_capture), so
