@@ -13,6 +13,7 @@
 #include "api_models.h"
 #include "pending_jobs_journal.h"
 #include "resume_token_store.h"
+#include "slot_queue.h"
 #include "tray_capture.h"
 #include "util.h"
 #include "uuid.h"
@@ -32,6 +33,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <ctime>
@@ -189,13 +191,17 @@ struct TrayState {
     // resets on disconnect (handled in close-side code).
     bool session_inited = false;
 
-    // Phase C.9 — the most-recent postprocess job_id the tray dispatched
-    // via `process.submit`. Used by the cancel-postprocess paths
-    // (on_cancel_pp / on_stop's pp branch) which previously called
-    // `record.stop target=postprocessing` — that verb is gone; v2 uses
-    // `process.cancel { job_id }`. Cleared on job.complete / job.failed
-    // / cancel-success.
-    int64_t last_pp_job_id = 0;
+    // Phase D.1 — per-slot-kind submission queues. Three independent
+    // slots (`postprocess`, `streaming`, `model_download`), each
+    // capacity-1-in-flight + arbitrary FIFO backlog. Replaces the
+    // pre-D.1 scalar `last_pp_job_id` (which only tracked the most-
+    // recent postprocess job and could not represent the streaming /
+    // model_download slots at all). Cancel paths read
+    // `slot_queues.postprocess.in_flight()->job_id`; terminal status
+    // (`job.complete` / `job.failed`) feeds the drain worker which
+    // pops `complete_in_flight()` and dispatches the next entry, if
+    // any, from the same slot's backlog.
+    recmeet::SlotQueues slot_queues;
 
     // Phase D.5 — persistence layer.
     //   * `resume_tokens` is the per-server token cache; loaded lazily
@@ -394,6 +400,55 @@ static void caption_overlay_destroy() {
     g_tray.cap.state.clear();
 }
 
+// Phase D.2 — drain worker entry point. Called on terminal status of
+// any tracked in-flight job (`job.complete` with its job_id, or
+// `progress.job` with phase ∈ {failed, cancelled}). Removes the
+// journal entry by job_id and, if the slot has a backlog, dispatches
+// the next entry via `apply_submit_with_context` (postprocess) or a
+// future re-open path (streaming).
+//
+// Today the production tray's UI does not surface a "queue another
+// postprocess submission" affordance, so the backlog path is exercised
+// solely by the `[d2][drain]` test. The path is wired here so the
+// invariant "in_flight is always either empty or a server-side
+// reservation" stays true for D.3+: when D.4 lands the queue-depth
+// indicator the dispatch will start firing for real.
+static void handle_terminal_status(int64_t job_id) {
+    if (job_id <= 0) return;
+    auto drain = recmeet::drain_on_terminal(g_tray.slot_queues, job_id);
+    if (!drain.matched) {
+        log_debug("[tray] D.2 drain: job=%lld not in any slot in-flight set",
+                  (long long)job_id);
+        return;
+    }
+    // Atomic-write journal entry removal — the on-disk file is now
+    // consistent with the in-memory drain transition.
+    g_tray.pending_jobs.remove_by_job_id(std::to_string(job_id));
+    log_info("[tray] D.2 drain: slot=%s job=%lld terminal "
+             "(meeting_id=%s, backlog_depth_after=%zu)",
+             recmeet::to_string(drain.slot),
+             (long long)job_id,
+             drain.meeting_id.c_str(),
+             g_tray.slot_queues.select(drain.slot).backlog_size());
+
+    if (drain.next_to_dispatch.has_value()) {
+        // A backlog entry has been promoted to in-flight; the wire-
+        // side dispatch is the appropriate `process.submit` /
+        // `process.stream` round-trip. The production tray has no UI
+        // path that produces backlog entries today (single-submit
+        // disposition dialog) — the dispatcher seam is reserved for
+        // D.4. The promoted entry sits in `in_flight` already, so a
+        // future re-issue path will see it via the same
+        // `slot_queues.<slot>.in_flight()` accessor used by cancel
+        // and recovery paths.
+        log_warn("[tray] D.2 drain: slot=%s promoted backlog entry to "
+                 "in-flight (meeting_id=%s) — dispatcher not yet wired "
+                 "(D.4 will surface it)",
+                 recmeet::to_string(drain.slot),
+                 drain.next_to_dispatch->meeting_id.c_str());
+    }
+}
+
 static void handle_ipc_event(const IpcEvent& ev) {
     log_debug("tray: event '%s'", ev.event.c_str());
     if (ev.event == "phase") {
@@ -443,8 +498,22 @@ static void handle_ipc_event(const IpcEvent& ev) {
         // flow; it doesn't change the postprocessing indicator.)
         update_state(g_tray.recording, pp, dl, false);
     } else if (ev.event == "job.complete") {
-        std::string note = json_val_as_string(ev.data.at("note_path"));
-        std::string dir = json_val_as_string(ev.data.at("output_dir"));
+        // Phase D.2 — drain the slot queue on terminal success. The
+        // event always carries `job_id` (daemon.cpp:1184); legacy
+        // emit sites that pre-date C.3 may omit `note_path` so we
+        // defend with .find rather than .at on every key.
+        auto jit = ev.data.find("job_id");
+        int64_t jid = (jit != ev.data.end())
+            ? json_val_as_int(jit->second) : 0;
+        handle_terminal_status(jid);
+
+        auto note_it = ev.data.find("note_path");
+        auto dir_it  = ev.data.find("output_dir");
+        std::string note = (note_it != ev.data.end())
+            ? json_val_as_string(note_it->second) : "";
+        std::string dir  = (dir_it != ev.data.end())
+            ? json_val_as_string(dir_it->second) : "";
+        (void)dir;
         // Suppress per-meeting notifications during a reprocess-batch run; the
         // batch driver process emits a single end-of-batch summary instead.
         // Failure notifications above (state.changed with error) keep firing
@@ -456,6 +525,22 @@ static void handle_ipc_event(const IpcEvent& ev) {
         if (!note.empty() && !batch_job)
             notify("Meeting note ready", note);
         // Don't reset state here — the subsequent state.changed event handles it
+    } else if (ev.event == "progress.job") {
+        // Phase D.2 — terminal failures arrive via progress.job with
+        // phase ∈ {failed, cancelled}. Done is redundant with
+        // job.complete (same drain path); keeping it here is harmless
+        // because handle_terminal_status is idempotent on already-
+        // drained jobs (find_slot_by_in_flight_job_id returns
+        // matched=false).
+        auto jit = ev.data.find("job_id");
+        auto pit = ev.data.find("phase");
+        int64_t jid = (jit != ev.data.end())
+            ? json_val_as_int(jit->second) : 0;
+        std::string phase = (pit != ev.data.end())
+            ? json_val_as_string(pit->second) : "";
+        if (phase == "failed" || phase == "cancelled" || phase == "done") {
+            handle_terminal_status(jid);
+        }
     } else if (ev.event == "caption") {
         // Phase 5.1 — only render captions if this recording was started
         // with captions_enabled=true. The flag is captured at record.start.
@@ -1272,13 +1357,74 @@ static void on_record(GtkMenuItem*, gpointer) {
             if (!g_tray.capture_state.meeting_id.empty()) {
                 sp["meeting_id"] = g_tray.capture_state.meeting_id;
             }
+            // Phase D.1 — admit a JobEntry to the streaming slot.
+            // Today the streaming slot is always idle at this point
+            // (only one live recording can be active), so admit lands
+            // in-flight; the backlog path is reserved for future
+            // multi-recording UI work. The admit happens BEFORE the
+            // wire call so a failed `process.stream` round-trip rolls
+            // back via `complete_in_flight()` and the slot stays
+            // consistent.
+            recmeet::JobEntry s_entry;
+            s_entry.meeting_id       = g_tray.capture_state.meeting_id;
+            s_entry.staging_wav_path = g_tray.capture_state.wav_path.string();
+            s_entry.kind             = "stream";
+            bool s_admitted =
+                g_tray.slot_queues.streaming.admit(s_entry);
+            if (!s_admitted) {
+                // Backlog placement — the rare future-path where the
+                // operator queues a second streaming session while one
+                // is in-flight. Not exercised by the production UI
+                // today; the [d1] tests cover the shape.
+                log_info("[tray] D.1 streaming admit deferred to backlog "
+                         "(backlog depth=%zu)",
+                         g_tray.slot_queues.streaming.backlog_size());
+            }
+
             IpcResponse sr; IpcError se;
             if (g_tray.ipc.call("process.stream", sp, sr, se, 5000)) {
                 auto tit = sr.result.find("stream_token");
+                auto jit = sr.result.find("job_id");
                 std::string token = tit != sr.result.end()
                     ? recmeet::json_val_as_string(tit->second) : "";
+                int64_t s_job_id = jit != sr.result.end()
+                    ? recmeet::json_val_as_int(jit->second) : 0;
                 if (!token.empty()) {
                     g_tray.capture_state.stream_token = token;
+                    // Phase D.1 — backfill the in-flight entry's
+                    // job_id (admit ran before the wire response).
+                    if (s_admitted && s_job_id > 0) {
+                        g_tray.slot_queues.streaming
+                            .set_in_flight_job_id(s_job_id);
+                    }
+                    // Phase D.2 — journal write at the streaming-
+                    // session reservation return. The plan body cites
+                    // `process.stream.commit` as the canonical write
+                    // point, but the tray does not call that verb
+                    // today (the daemon's StreamingSession auto-
+                    // commits during teardown). `process.stream`
+                    // return is the equivalent client-observable
+                    // "daemon now holds a reservation we may need to
+                    // recover" boundary, so the journal entry lands
+                    // here. Mid-stream tray crash recovery then
+                    // surfaces the meeting_id; per D.3 the streaming
+                    // resume falls back to batch via the same
+                    // meeting_id (C.10a TCP-drop policy).
+                    if (s_admitted && s_job_id > 0) {
+                        recmeet::PendingJobsJournal::Entry sje;
+                        sje.endpoint          = g_tray.resume_server_key;
+                        sje.meeting_id        = s_entry.meeting_id;
+                        sje.job_id            = std::to_string(s_job_id);
+                        sje.staging_wav_path  = s_entry.staging_wav_path;
+                        sje.kind              = s_entry.kind;
+                        sje.slot_kind         = recmeet::to_string(
+                                                    recmeet::SlotKind::Streaming);
+                        sje.submitted_at_unix = static_cast<int64_t>(
+                            std::chrono::duration_cast<std::chrono::seconds>(
+                                std::chrono::system_clock::now()
+                                    .time_since_epoch()).count());
+                        g_tray.pending_jobs.append(sje);
+                    }
                     {
                         std::lock_guard<std::mutex> lk(
                             g_tray.capture_state.stream_mtx);
@@ -1293,15 +1439,25 @@ static void on_record(GtkMenuItem*, gpointer) {
                     // capture chunking the wire protocol is sized for.
                     g_tray.capture_state.stream_pump_id =
                         g_timeout_add(100, tray_stream_pump, nullptr);
-                    log_info("[tray] live-caption stream opened (token=%s)",
-                             token.c_str());
+                    log_info("[tray] live-caption stream opened (token=%s job=%lld)",
+                             token.c_str(), (long long)s_job_id);
                 } else {
                     log_warn("[tray] process.stream returned no stream_token "
                              "— continuing without live captions");
+                    // Roll back the streaming-slot admission on the
+                    // no-token failure path.
+                    if (s_admitted) {
+                        g_tray.slot_queues.streaming.complete_in_flight();
+                    }
                 }
             } else {
                 log_warn("[tray] process.stream failed (%s) — continuing "
                          "without live captions", se.message.c_str());
+                // Roll back the streaming-slot admission on the wire-
+                // call failure path.
+                if (s_admitted) {
+                    g_tray.slot_queues.streaming.complete_in_flight();
+                }
             }
         }
     }
@@ -1424,10 +1580,43 @@ bool apply_submit_with_context(const CapturedContext& ctx, std::string& err_msg)
         params["meeting_id"] = g_tray.capture_state.meeting_id;
     }
 
+    // Phase D.1 — admit a JobEntry to the postprocess slot BEFORE the
+    // submit round-trip. Today the slot is always idle at this point
+    // (the disposition dialog only opens when the operator stops the
+    // current recording; there is no concurrent postprocess submission
+    // UI), so this admit always promotes the entry to in-flight. The
+    // backlog path is exercised by the [d1] tests below — it becomes
+    // load-bearing once D.4's per-slot UI surfaces a "queue another
+    // submission" affordance.
+    recmeet::JobEntry entry;
+    entry.meeting_id       = g_tray.capture_state.meeting_id;
+    entry.staging_wav_path = wav_path.string();
+    entry.kind             = "submit";
+    bool admitted_in_flight =
+        g_tray.slot_queues.postprocess.admit(entry);
+    if (!admitted_in_flight) {
+        // Backlog placement — defer the submit + upload until the
+        // current in-flight postprocess job terminates. The drain
+        // worker (`handle_terminal_status`, below) will surface this
+        // entry on `job.complete` / `job.failed` and the caller can
+        // re-enter this path. Today the production tray never lands
+        // here; the [d1] backlog test does.
+        log_info("[tray] D.1 postprocess admit deferred to backlog "
+                 "(in_flight job=%lld, backlog depth=%zu)",
+                 (long long)g_tray.slot_queues.postprocess
+                     .in_flight()->job_id,
+                 g_tray.slot_queues.postprocess.backlog_size());
+        return true;
+    }
+
     IpcResponse resp;
     IpcError err;
     if (!g_tray.ipc.call("process.submit", params, resp, err, 10000)) {
         err_msg = err.message.empty() ? "process.submit failed" : err.message;
+        // Admission rolled back — the entry never made it to the wire,
+        // so clearing the slot keeps the drain-worker invariant
+        // (in_flight always represents a server-side reservation).
+        g_tray.slot_queues.postprocess.complete_in_flight();
         return false;
     }
 
@@ -1444,12 +1633,37 @@ bool apply_submit_with_context(const CapturedContext& ctx, std::string& err_msg)
         (job_it != resp.result.end()) ? json_val_as_int(job_it->second) : 0;
     if (upload_token.empty() || job_id <= 0) {
         err_msg = "process.submit response missing upload_token / job_id";
+        g_tray.slot_queues.postprocess.complete_in_flight();
         return false;
     }
     log_info("[tray] process.submit OK (job=%lld token=%s size=%llu)",
              (long long)job_id, upload_token.c_str(),
              (unsigned long long)wav_size);
-    g_tray.last_pp_job_id = job_id;  // for the cancel-postprocess paths
+    // Phase D.1 — backfill the in-flight entry's job_id (admit ran
+    // before we had it) so cancel paths and the drain worker can
+    // resolve by id.
+    g_tray.slot_queues.postprocess.set_in_flight_job_id(job_id);
+
+    // Phase D.2 — write the journal entry immediately on submit return,
+    // BEFORE the chunk upload begins. A mid-upload tray crash leaves a
+    // journal entry with the meeting_id, so the restart path (H-D3) can
+    // retry by re-submitting under the same meeting_id and the server's
+    // C.11.4 dedup contract atomically overwrites whatever partial
+    // bytes the previous run uploaded.
+    {
+        recmeet::PendingJobsJournal::Entry je;
+        je.endpoint          = g_tray.resume_server_key;
+        je.meeting_id        = entry.meeting_id;
+        je.job_id            = std::to_string(job_id);
+        je.staging_wav_path  = entry.staging_wav_path;
+        je.kind              = entry.kind;
+        je.slot_kind         = recmeet::to_string(
+                                   recmeet::SlotKind::Postprocess);
+        je.submitted_at_unix = static_cast<int64_t>(
+            std::chrono::duration_cast<std::chrono::seconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count());
+        g_tray.pending_jobs.append(je);
+    }
 
     // Step 2: stream the file in chunks. 64 KiB is a comfortable
     // trade-off between IPC syscall overhead and tray responsiveness.
@@ -1623,22 +1837,24 @@ static void on_stop(GtkMenuItem*, gpointer) {
     if (g_tray.postprocessing) {
         // Daemon-side postprocess cancel — same as the legacy on_cancel_pp.
         // Phase C.9: `record.stop target=postprocessing` is gone; use
-        // `process.cancel { job_id }` (C.5) against the last job_id we
-        // dispatched via process.submit. If the tray has lost track of
-        // the job_id (e.g. tray restart after the daemon enqueued the
-        // job) the daemon's `job.list` could be queried — but the menu
-        // entry only appears when postprocessing is live AND we own the
-        // job, so an empty `last_pp_job_id` is a programming error.
-        if (g_tray.last_pp_job_id <= 0) {
-            log_warn("[tray] postprocess cancel requested but no last_pp_job_id");
+        // `process.cancel { job_id }` (C.5) against the most-recent
+        // job dispatched via process.submit. Phase D.1: the previous
+        // scalar `last_pp_job_id` retired in favor of the postprocess
+        // slot queue; we read the in-flight entry instead. If the slot
+        // is idle the menu entry should not have been clickable — log
+        // and skip rather than crash.
+        const auto* pp = g_tray.slot_queues.postprocess.in_flight();
+        if (!pp || pp->job_id <= 0) {
+            log_warn("[tray] postprocess cancel requested but no in-flight job");
         } else {
+            int64_t pp_job_id = pp->job_id;
             JsonMap params;
-            params["job_id"] = g_tray.last_pp_job_id;
+            params["job_id"] = pp_job_id;
             IpcResponse resp;
             IpcError err;
             if (!g_tray.ipc.call("process.cancel", params, resp, err, 5000)) {
                 log_error("[tray] process.cancel (job=%lld) failed: %s",
-                          (long long)g_tray.last_pp_job_id, err.message.c_str());
+                          (long long)pp_job_id, err.message.c_str());
             }
         }
     }
@@ -1648,18 +1864,21 @@ static void on_cancel_pp(GtkMenuItem*, gpointer) {
     if (!g_tray.postprocessing) return;
 
     // Phase C.9: `record.stop target=postprocessing` → `process.cancel`.
-    if (g_tray.last_pp_job_id <= 0) {
-        log_warn("[tray] cancel-pp requested but no last_pp_job_id");
+    // Phase D.1: postprocess in-flight tracking lives in the slot queue.
+    const auto* pp = g_tray.slot_queues.postprocess.in_flight();
+    if (!pp || pp->job_id <= 0) {
+        log_warn("[tray] cancel-pp requested but no in-flight job");
         return;
     }
+    int64_t pp_job_id = pp->job_id;
     JsonMap params;
-    params["job_id"] = g_tray.last_pp_job_id;
+    params["job_id"] = pp_job_id;
 
     IpcResponse resp;
     IpcError err;
     if (!g_tray.ipc.call("process.cancel", params, resp, err, 5000)) {
         log_error("[tray] cancel postprocessing (job=%lld) failed: %s",
-                  (long long)g_tray.last_pp_job_id, err.message.c_str());
+                  (long long)pp_job_id, err.message.c_str());
     }
 }
 
@@ -2869,16 +3088,19 @@ int main(int argc, char* argv[]) {
     // Phase C.9: `record.stop` is gone. If a postprocess job is still in
     // flight we cancel it via `process.cancel { job_id }`; the local
     // capture state is torn down by tray destruction (PipeWireCapture
-    // dtor stops the loop). If `recording` is set but `last_pp_job_id`
-    // is unset, the recording is still local-only (no daemon
-    // involvement) and there is nothing on the wire to cancel.
-    if (g_tray.postprocessing && g_tray.last_pp_job_id > 0 &&
-        g_tray.daemon_connected) {
-        IpcResponse resp;
-        IpcError err;
-        JsonMap params;
-        params["job_id"] = g_tray.last_pp_job_id;
-        g_tray.ipc.call("process.cancel", params, resp, err, 2000);
+    // dtor stops the loop). Phase D.1: read the in-flight entry from
+    // the postprocess slot queue (the pre-D.1 `last_pp_job_id` scalar
+    // retired). If the slot is idle the recording is still local-only
+    // and there is nothing on the wire to cancel.
+    if (g_tray.postprocessing && g_tray.daemon_connected) {
+        const auto* pp = g_tray.slot_queues.postprocess.in_flight();
+        if (pp && pp->job_id > 0) {
+            IpcResponse resp;
+            IpcError err;
+            JsonMap params;
+            params["job_id"] = pp->job_id;
+            g_tray.ipc.call("process.cancel", params, resp, err, 2000);
+        }
     }
     teardown_ipc_watch();
     g_tray.ipc.close_connection();

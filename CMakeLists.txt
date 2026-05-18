@@ -548,6 +548,8 @@ if(RECMEET_BUILD_TESTS)
         tests/test_pending_jobs_journal.cpp
         tests/test_resume_token_store.cpp
         tests/test_tray_resume_recovery.cpp
+        # Phase D.1 + D.2 per-slot queue + drain worker (iter-167).
+        tests/test_slot_queue.cpp
     )
     # The test binary exercises both daemon-side surfaces (recmeet_core) and
     # client-side / standalone surfaces (run_recording + recmeet_capture), so
