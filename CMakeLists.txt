@@ -578,6 +578,9 @@ if(RECMEET_BUILD_TESTS)
         tests/test_tray_status.cpp
         # Phase D.6 — disk-budget staging eviction sweep.
         tests/test_staging_sweep.cpp
+        # Phase E.3 + E.4 — binary slimming assertions
+        # (tray excludes ML deps; daemon excludes pulse/gtk).
+        tests/test_binary_slim.cpp
     )
     # The test binary exercises both daemon-side surfaces (recmeet_core) and
     # client-side / standalone surfaces (run_recording + recmeet_capture), so
@@ -600,6 +603,14 @@ if(RECMEET_BUILD_TESTS)
     # `recmeet_core`) drops the unused seam under `-Wl,--gc-sections`.
     target_compile_definitions(recmeet_core  PRIVATE RECMEET_TESTING)
     target_compile_definitions(recmeet_tests PRIVATE RECMEET_TESTING)
+    # Phase E.3 + E.4 — `test_binary_slim.cpp` needs an absolute build-
+    # tree path to invoke `ldd build/recmeet-tray` regardless of where
+    # the test binary is launched from (catch_discover_tests sets
+    # WORKING_DIRECTORY to the binary dir, but `./build` is a relative
+    # path the user might also invoke from). Env override
+    # RECMEET_BUILD_DIR wins if set.
+    target_compile_definitions(recmeet_tests PRIVATE
+        RECMEET_BUILD_DIR_DEFAULT="${CMAKE_BINARY_DIR}")
     if(RECMEET_BUILD_WEB)
         target_sources(recmeet_tests PRIVATE tests/test_web.cpp vendor/cpp-httplib/httplib.cpp)
         target_include_directories(recmeet_tests PRIVATE vendor/cpp-httplib)
