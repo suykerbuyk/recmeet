@@ -398,6 +398,23 @@ Config load_config(const fs::path& config_path) {
         }
     }
 
+    // Phase D.6 — `[client] staging_max_bytes`. Same warn-and-fallback
+    // shape as the [ipc] / [server] knobs above. A zero/negative override
+    // is treated as a typo and falls back to the 500 GiB default rather
+    // than disabling the cap (an unbounded staging dir would lose
+    // operator data through the eviction sweep — conservative default).
+    {
+        std::string smb = get_val(entries, "client", "staging_max_bytes", "");
+        if (!smb.empty()) {
+            long long v = std::atoll(smb.c_str());
+            if (v > 0) cfg.staging_max_bytes = static_cast<size_t>(v);
+            else
+                log_warn("config: invalid [client] staging_max_bytes=%s; "
+                         "keeping default %zu", smb.c_str(),
+                         cfg.staging_max_bytes);
+        }
+    }
+
     return cfg;
 }
 
@@ -584,6 +601,20 @@ void save_config(const Config& cfg, const fs::path& config_path) {
                 out << "  slot.model_download: " << cfg.slot_model_download << "\n";
             if (!cfg.allow_client_downloads)
                 out << "  allow_client_downloads: false\n";
+        }
+    }
+
+    // Phase D.6 — `[client]` section. New YAML namespace introduced for the
+    // first client-side scoped knob (`staging_max_bytes`). Emit the
+    // section + the knob only when it diverges from the 500 GiB default
+    // to keep generated YAML compact for the common case. Phase E.2's
+    // schema split moves this section into a separate client.yaml file.
+    {
+        constexpr size_t default_staging_max_bytes =
+            static_cast<size_t>(500) * 1024 * 1024 * 1024;
+        if (cfg.staging_max_bytes != default_staging_max_bytes) {
+            out << "\nclient:\n"
+                << "  staging_max_bytes: " << cfg.staging_max_bytes << "\n";
         }
     }
 

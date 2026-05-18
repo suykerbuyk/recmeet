@@ -15,6 +15,7 @@
 #include "reconnect_backoff.h"
 #include "resume_token_store.h"
 #include "slot_queue.h"
+#include "staging_sweep.h"
 #include "tray_capture.h"
 #include "tray_status.h"
 #include "util.h"
@@ -44,6 +45,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <unordered_set>
 #include <random>
 #include <thread>
 #include <vector>
@@ -1559,6 +1561,38 @@ gboolean tray_stream_pump(gpointer) {
     return G_SOURCE_CONTINUE;
 }
 
+// Phase D.6 — build the set of staging WAV paths that are PROTECTED
+// from auto-eviction because they are referenced by an in-flight journal
+// entry (D.5 pending_jobs.json). Per-WAV `.pending` sidecar protection
+// is checked inline by `scan_staging_dir`; this helper only handles the
+// journal side. Called by both the synchronous-at-start sweep and the
+// 10 min periodic sweep — kept tiny so both call sites pay the same
+// small load cost on the journal file.
+std::unordered_set<std::string> tray_collect_journal_protected_paths() {
+    std::unordered_set<std::string> out;
+    auto entries = g_tray.pending_jobs.load();
+    for (const auto& e : entries) {
+        if (!e.staging_wav_path.empty()) out.insert(e.staging_wav_path);
+    }
+    return out;
+}
+
+// Phase D.6 — periodic 10 min sweep handler. Registered at tray startup
+// via `g_timeout_add_seconds(D6_PERIODIC_SWEEP_SECS, ...)`. Always returns
+// G_SOURCE_CONTINUE so the timer survives across reconnects / config
+// reloads — the budget cap stays enforced for the lifetime of the tray.
+// Wraps the pure `sweep_staging` helper; logging happens inside.
+gboolean tray_run_periodic_staging_sweep(gpointer) {
+    fs::path staging = tray_capture::default_staging_dir();
+    auto protected_paths = tray_collect_journal_protected_paths();
+    (void)recmeet::sweep_staging(staging, protected_paths,
+                                 g_tray.cfg.staging_max_bytes,
+                                 /*extra_pending_bytes=*/0);
+    return G_SOURCE_CONTINUE;
+}
+
+constexpr int D6_PERIODIC_SWEEP_SECS = 600;  // 10 min per plan line 406
+
 // Resolve the mic source to record from. Priority: explicit
 // g_tray.cfg.mic_source > device_pattern auto-detect > system default.
 // Returns empty string if no source could be resolved; caller emits a
@@ -1605,6 +1639,23 @@ bool start_capture(const std::string& mic_source, std::string& err_msg) {
     if (ec) {
         err_msg = "cannot create staging dir: " + staging.string() + " — " + ec.message();
         return false;
+    }
+
+    // Phase D.6 — synchronous disk-budget sweep at recording-start. The
+    // projected total = current staging usage + expected max recording
+    // size (460 MB; 4h × 16 kHz mono int16). If we are at or near the
+    // configured budget, evict oldest safe-to-evict WAVs BEFORE the new
+    // capture opens its file. Protected entries (journal-referenced
+    // in-flight uploads or .pending sidecar save-for-later) are never
+    // touched; if even unlinking every safe entry leaves us over budget
+    // the sweep logs a warning and the recording proceeds — disk-full
+    // detection on write is the OS's job, not the eviction policy's.
+    {
+        auto protected_paths = tray_collect_journal_protected_paths();
+        (void)recmeet::sweep_staging(
+            staging, protected_paths,
+            g_tray.cfg.staging_max_bytes,
+            recmeet::DEFAULT_MAX_RECORDING_BYTES);
     }
 
     std::string ts = tray_capture::format_timestamp(std::time(nullptr));
@@ -3694,6 +3745,16 @@ int main(int argc, char* argv[]) {
         notify("recmeet: pending recordings", msg);
     }
     recover_pending_jobs_on_startup();
+
+    // Phase D.6 — register the periodic staging-sweep timer. Fires every
+    // 10 min (D6_PERIODIC_SWEEP_SECS) for the lifetime of the tray
+    // process. The synchronous-at-start sweep (in start_capture) covers
+    // the common case where a new recording would push us over budget;
+    // this periodic sweep covers the long-tail case where a sidecar
+    // transitions to "fetched" between recordings and the now-evictable
+    // WAV should not wait for the NEXT recording to be reclaimed.
+    g_timeout_add_seconds(D6_PERIODIC_SWEEP_SECS,
+                          tray_run_periodic_staging_sweep, nullptr);
 
     build_menu();
     fetch_provider_models();

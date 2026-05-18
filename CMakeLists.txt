@@ -251,6 +251,14 @@ set(IPC_SOURCES
     # without booting GTK; lives in recmeet_ipc because it touches no new
     # deps beyond <string>.
     src/tray_status.cpp
+    # Phase D.6 — pure disk-budget eviction sweep over ~/.local/share/recmeet/
+    # staging/. Scan + plan + apply, with sidecar/journal protection.
+    # Carved out of tray.cpp so the eviction policy is unit-tested
+    # without booting GTK. Lives in recmeet_ipc (one layer below
+    # recmeet_capture which owns tray_capture::is_sidecar_protected);
+    # the sidecar check is inlined as a single fs::exists call in
+    # staging_sweep.cpp to keep the dep chain unidirectional.
+    src/staging_sweep.cpp
 )
 
 add_library(recmeet_ipc STATIC ${IPC_SOURCES})
@@ -568,6 +576,8 @@ if(RECMEET_BUILD_TESTS)
         # Phase D.4 — tray status renderer (per-slot rows, per-server row,
         # jitter-aware reconnect countdown, caption-inline) (iter-169).
         tests/test_tray_status.cpp
+        # Phase D.6 — disk-budget staging eviction sweep.
+        tests/test_staging_sweep.cpp
     )
     # The test binary exercises both daemon-side surfaces (recmeet_core) and
     # client-side / standalone surfaces (run_recording + recmeet_capture), so

@@ -494,3 +494,76 @@ TEST_CASE("load_config: legacy diarization_cache_ttl_secs derives "
     CHECK(cfg.retain_terminal_hours == 2);
     fs::remove_all(dir);
 }
+
+// ---------------------------------------------------------------------------
+// Phase D.6 — `[client] staging_max_bytes` round-trip + default + zero-fallback.
+// ---------------------------------------------------------------------------
+
+TEST_CASE("load_config: staging_max_bytes defaults to 500 GiB when absent",
+          "[config][d6]") {
+    fs::path dir = fs::temp_directory_path() / "recmeet_test_d6_default";
+    fs::remove_all(dir);
+    Config cfg = load_config(dir / "config.yaml");
+    constexpr size_t expected = static_cast<size_t>(500) * 1024 * 1024 * 1024;
+    CHECK(cfg.staging_max_bytes == expected);
+    fs::remove_all(dir);
+}
+
+TEST_CASE("save_config + load_config: staging_max_bytes round-trips via [client] section",
+          "[config][d6]") {
+    fs::path dir = fs::temp_directory_path() / "recmeet_test_d6_roundtrip";
+    fs::remove_all(dir);
+    fs::path path = dir / "config.yaml";
+    fs::create_directories(dir);
+
+    Config cfg;
+    cfg.staging_max_bytes = static_cast<size_t>(10) * 1024 * 1024 * 1024;  // 10 GiB
+    save_config(cfg, path);
+
+    std::ifstream in(path);
+    std::ostringstream buf;
+    buf << in.rdbuf();
+    std::string content = buf.str();
+    CHECK(content.find("client:") != std::string::npos);
+    CHECK(content.find("staging_max_bytes: 10737418240") != std::string::npos);
+
+    Config loaded = load_config(path);
+    CHECK(loaded.staging_max_bytes == cfg.staging_max_bytes);
+    fs::remove_all(dir);
+}
+
+TEST_CASE("save_config: staging_max_bytes section omitted at default",
+          "[config][d6]") {
+    fs::path dir = fs::temp_directory_path() / "recmeet_test_d6_omit";
+    fs::remove_all(dir);
+    fs::path path = dir / "config.yaml";
+    fs::create_directories(dir);
+
+    Config cfg;  // default 500 GiB
+    save_config(cfg, path);
+
+    std::ifstream in(path);
+    std::ostringstream buf;
+    buf << in.rdbuf();
+    std::string content = buf.str();
+    // Section should not appear when value equals default — keeps YAML compact
+    CHECK(content.find("client:") == std::string::npos);
+    CHECK(content.find("staging_max_bytes") == std::string::npos);
+    fs::remove_all(dir);
+}
+
+TEST_CASE("load_config: invalid staging_max_bytes falls back to default",
+          "[config][d6]") {
+    fs::path dir = fs::temp_directory_path() / "recmeet_test_d6_invalid";
+    fs::remove_all(dir);
+    fs::path path = dir / "config.yaml";
+    fs::create_directories(dir);
+    {
+        std::ofstream out(path);
+        out << "client:\n  staging_max_bytes: 0\n";  // zero = typo → fallback
+    }
+    Config cfg = load_config(path);
+    constexpr size_t expected = static_cast<size_t>(500) * 1024 * 1024 * 1024;
+    CHECK(cfg.staging_max_bytes == expected);
+    fs::remove_all(dir);
+}

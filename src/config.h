@@ -220,6 +220,34 @@ struct Config {
     // precedence rule documented on `retain_terminal_hours` below.
     int64_t diarization_cache_ttl_secs = 86400;
 
+    // Phase D.6 — client-side staging disk-budget retention.
+    //
+    // The tray-side staging dir (~/.local/share/recmeet/staging/) is the
+    // hop a recording spends between capture and either (a) batch upload
+    // via process.submit + server-side fetch, or (b) save-for-later via
+    // a .pending sidecar. D.6 enforces an operator-configurable hard
+    // cap on its on-disk size — matching the journald MaxUse model.
+    //
+    // Triggers: (1) synchronous check at recording-start (projected
+    // total = current + 460 MB) and (2) periodic 10 min GTK timer.
+    // Eviction: safe-to-evict WAVs (NOT journal-referenced AND NO
+    // .pending sidecar) sorted by mtime ascending, unlinked oldest-first
+    // until total ≤ budget. Protected WAVs (journal OR sidecar) are
+    // never auto-evicted — operator removes via `rm` or by deleting the
+    // sidecar.
+    //
+    // Wired from `[client] staging_max_bytes` in config.yaml. Default
+    // 500 GiB. Phase E.2 owns the Config split into ServerConfig +
+    // ClientConfig; this field migrates with the client side then.
+    // The `[client]` section is introduced here as a new YAML namespace
+    // (mirrors the pattern used for `[ipc]`, `[server]`, etc. — each
+    // landed when the first knob for that section was added). A
+    // zero/negative override is treated as a typo and falls back to
+    // the struct default rather than disabling the cap (defense-in-
+    // depth — an over-large staging dir loses operator data through
+    // the eviction sweep; we err on the conservative side).
+    size_t staging_max_bytes = static_cast<size_t>(500) * 1024 * 1024 * 1024;
+
     // Phase C.13 (M-1) — consolidated terminal-state / session retention
     // knob. Drives BOTH `resume_token_ttl_hours` (the SessionManager TTL
     // — how long a disconnected client can hold its resume_token before
