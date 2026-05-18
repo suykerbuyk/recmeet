@@ -581,6 +581,8 @@ if(RECMEET_BUILD_TESTS)
         # Phase E.3 + E.4 — binary slimming assertions
         # (tray excludes ML deps; daemon excludes pulse/gtk).
         tests/test_binary_slim.cpp
+        # Phase E.4.1 — `recmeet-daemon --check-backends` diagnostic CLI flag.
+        tests/test_check_backends.cpp
     )
     # The test binary exercises both daemon-side surfaces (recmeet_core) and
     # client-side / standalone surfaces (run_recording + recmeet_capture), so

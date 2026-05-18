@@ -1422,6 +1422,11 @@ static void print_usage() {
         "  --evict PREFIX      Operator session-revocation: connect to the running\n"
         "                      daemon and evict the resume_token matching PREFIX\n"
         "                      (8+ hex chars). Exits without starting a new daemon.\n"
+        "  --check-backends    Print the ggml active-backend banner (CPU / Vulkan /\n"
+        "                      HIP / CUDA / Metal) and exit 0, BEFORE opening any\n"
+        "                      socket or starting workers. For operators running\n"
+        "                      under systemd who want a one-shot GPU-vs-CPU answer\n"
+        "                      without parsing journalctl.\n"
         "  -h, --help          Show this help\n"
         "  -v, --version       Show version\n"
     );
@@ -1448,6 +1453,14 @@ int main(int argc, char* argv[]) {
     // the early-dispatch branch below can fire without re-walking argv.
     std::string evict_prefix;
 
+    // Phase E.4.1 — `--check-backends` is a diagnostic-mode flag: emit the
+    // `ggml: active backend:` banner (load_backends + log_backend_summary
+    // from src/backend_info.cpp) to stdout and exit 0 BEFORE any pid-lock,
+    // socket bind, or worker thread. Lets operators answer "is the daemon
+    // using my GPU?" without grepping journalctl. Mirrors the early-exit
+    // pattern of --version and --help.
+    bool check_backends = false;
+
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
         if ((arg == "-h" || arg == "--help")) { print_usage(); return 0; }
@@ -1462,8 +1475,33 @@ int main(int argc, char* argv[]) {
         // daemon, NEVER acts as the daemon. See operator workflow guide in
         // agentctx/tasks/thin-client-recording-server.md C.13 body.
         if (arg == "--evict" && i + 1 < argc) { evict_prefix = argv[++i]; continue; }
+        // Phase E.4.1 — diagnostic, no value.
+        if (arg == "--check-backends") { check_backends = true; continue; }
         fprintf(stderr, "Unknown option: %s\n", arg.c_str());
         return 1;
+    }
+
+    // Phase E.4.1 — `--check-backends` early-exit: discover the runtime
+    // ggml plugins, print the active-backend banner, exit 0. Logger is
+    // intentionally NOT initialized (log_init never called → g_level is
+    // NONE → log_info() inside banner_emit() is a no-op), so the only
+    // surviving sink is backend_info.cpp's `fprintf(stderr, ...)`. We
+    // dup2 stdout over stderr first so the banner lands on stdout per the
+    // operator-facing contract (script-friendly capture: `recmeet-daemon
+    // --check-backends | grep 'active backend'`).
+    if (check_backends) {
+        ::fflush(stderr);
+        if (::dup2(STDOUT_FILENO, STDERR_FILENO) < 0) {
+            // dup2 should never fail on healthy stdio; fall through to
+            // backend_info's default stderr sink rather than abort.
+            fprintf(stderr, "warning: dup2(stdout->stderr) failed: %s\n",
+                    strerror(errno));
+        }
+        load_backends();
+        log_backend_summary();
+        ::fflush(stdout);
+        ::fflush(stderr);
+        return 0;
     }
 
     // Phase C.13 — `--evict` CLI dispatch. Mirrors the client_status /
