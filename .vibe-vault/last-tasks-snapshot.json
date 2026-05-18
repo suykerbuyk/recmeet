@@ -1,8 +1,7 @@
 {
-  "iter_n": 165,
-  "anchor_sha": "654f264ad3e99294e625b32398284a5de8d300a9",
+  "iter_n": 166,
+  "anchor_sha": "ae7addbeb10ad488c8647f4cd39bcef2b1b7a81a",
   "active": [
-    "d5-persistence-across-tray-restart",
     "thin-client-recording-server",
     "webui-live-captions"
   ],
@@ -16,6 +15,7 @@
     "concurrent-recording",
     "cross-distro-packaging",
     "crystalline-petting-sutton",
+    "d5-persistence-across-tray-restart",
     "daemon-stop-token-cancels-postprocessing",
     "debian-build-prerequisites",
     "declarative-moseying-wind",
