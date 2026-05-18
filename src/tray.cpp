@@ -16,6 +16,7 @@
 #include "resume_token_store.h"
 #include "slot_queue.h"
 #include "tray_capture.h"
+#include "tray_status.h"
 #include "util.h"
 #include "uuid.h"
 #include "version.h"
@@ -126,7 +127,19 @@ struct TrayState {
     // Progress tracking
     int progress_percent = -1;
     std::string current_phase;
-    GtkWidget* status_menu_item = nullptr;
+
+    // Phase D.4 — jitter-aware reconnect countdown surfaces. The status
+    // menu row shows "Status: Disconnected — reconnect in <N>s" while
+    // disconnected, using the SAME jittered delay D.3 already chose
+    // (we never re-roll jitter here — we read what schedule_reconnect_attempt
+    // already armed). `reconnect_jittered_secs` is the chosen wait,
+    // `reconnect_scheduled_at` is the wall-clock at which the timer was
+    // armed, and `reconnect_countdown_timer` is the 1 Hz GTK tick that
+    // rebuilds the menu so the count decrements live. Cleared once the
+    // reconnect attempt fires (try_reconnect drops the countdown).
+    int     reconnect_jittered_secs    = 0;
+    time_t  reconnect_scheduled_at     = 0;
+    guint   reconnect_countdown_timer  = 0;
 
     // Cached sources
     std::vector<AudioSource> mics;
@@ -495,29 +508,24 @@ static void handle_ipc_event(const IpcEvent& ev) {
     if (ev.event == "phase") {
         std::string name = json_val_as_string(ev.data.at("name"));
         log_info("[tray] Phase: %s", name.c_str());
-        // Reset progress on phase change and update status label
+        // Reset progress on phase change. The C.14 global fields
+        // `current_phase` / `progress_percent` are the single source of
+        // truth that D.4's per-slot row reads; we never re-derive them.
         g_tray.current_phase = name;
         g_tray.progress_percent = -1;
-        if (g_tray.status_menu_item) {
-            std::string label = "Status: " + name + "...";
-            // Capitalize first letter
-            if (!label.empty() && label.size() > 8)
-                label[8] = static_cast<char>(toupper(static_cast<unsigned char>(label[8])));
-            gtk_menu_item_set_label(GTK_MENU_ITEM(g_tray.status_menu_item), label.c_str());
-        }
+        // Phase D.4 — full menu rebuild so the in-flight slot row
+        // reflects the new phase. Replaces the pre-D.4 in-place mutation
+        // of `status_menu_item` (which only updated the single legacy
+        // status row that the per-slot rows now obsolete).
+        build_menu();
     } else if (ev.event == "progress") {
         std::string phase = json_val_as_string(ev.data.at("phase"));
         int percent = static_cast<int>(json_val_as_int(ev.data.at("percent")));
         g_tray.current_phase = phase;
         g_tray.progress_percent = percent;
-        // Update status label in-place (no full menu rebuild)
-        if (g_tray.status_menu_item) {
-            std::string label = "Status: " + phase + "... " + std::to_string(percent) + "%";
-            // Capitalize first letter of phase
-            if (!label.empty() && label.size() > 8)
-                label[8] = static_cast<char>(toupper(static_cast<unsigned char>(label[8])));
-            gtk_menu_item_set_label(GTK_MENU_ITEM(g_tray.status_menu_item), label.c_str());
-        }
+        // Phase D.4 — full menu rebuild (replaces pre-D.4 in-place
+        // single-status-row mutation).
+        build_menu();
     } else if (ev.event == "state.changed") {
         auto err_it = ev.data.find("error");
         if (err_it != ev.data.end()) {
@@ -593,6 +601,11 @@ static void handle_ipc_event(const IpcEvent& ev) {
         g_tray.cap.state.update(text, is_partial,
                                 g_tray.cfg.caption_normalize_display);
         caption_overlay_show_with_markup();
+        // Phase D.4 — refresh the inline caption row in the tray menu.
+        // We do NOT subscribe to the caption event a second time; we
+        // re-read the same `g_tray.cap.state` buffer the overlay just
+        // updated (via CaptionRenderState::latest_text()).
+        build_menu();
     } else if (ev.event == "caption.degraded") {
         if (!g_tray.cap.captions_enabled_for_recording) return;
         std::string reason = json_val_as_string(ev.data.at("reason"));
@@ -818,6 +831,36 @@ static bool connect_to_daemon() {
 // not a live reconnect. We log and DO NOT arm the timer; the tray
 // remains in the disconnected state and the operator is expected to
 // restart the tray (or the host) to bring it back.
+// Phase D.4 — 1 Hz countdown tick that rebuilds the menu so the
+// "reconnect in <N>s" line decrements live. The tick is armed inside
+// `schedule_reconnect_attempt` (after the jittered delay is captured
+// into `g_tray.reconnect_jittered_secs` / `_scheduled_at`) and cleared
+// inside `try_reconnect` when the attempt actually fires. The render
+// computes the remaining seconds from `_jittered_secs - (now - _at)`
+// so a single global clock tick covers all rebuild paths without
+// re-reading the GTK timer.
+static gboolean on_reconnect_countdown_tick(gpointer) {
+    // If we somehow reconnected between scheduling and the tick (e.g.
+    // an out-of-order build_menu call set daemon_connected=true), drop
+    // the timer — the countdown row is no longer rendered.
+    if (g_tray.daemon_connected || g_tray.reconnect_scheduled_at == 0) {
+        g_tray.reconnect_countdown_timer = 0;
+        return G_SOURCE_REMOVE;
+    }
+    time_t now = std::time(nullptr);
+    int elapsed = static_cast<int>(now - g_tray.reconnect_scheduled_at);
+    if (elapsed >= g_tray.reconnect_jittered_secs) {
+        // Past the scheduled fire; try_reconnect will run shortly via
+        // its own timer. Drop the tick — the countdown row collapses
+        // to the "reconnecting..." form via render_reconnect_status_line.
+        g_tray.reconnect_countdown_timer = 0;
+        build_menu();
+        return G_SOURCE_REMOVE;
+    }
+    build_menu();
+    return G_SOURCE_CONTINUE;
+}
+
 static void schedule_reconnect_attempt() {
     // Defer to the same guard the IpcClient uses (`is_remote()` reads
     // `addr_.transport == IpcTransport::Tcp`). The check is "remote-ness"
@@ -838,6 +881,23 @@ static void schedule_reconnect_attempt() {
               g_tray.reconnect_delay, jittered, D3_BACKOFF_CAP_SECS);
     g_tray.reconnect_timer = g_timeout_add_seconds(
         jittered, try_reconnect, nullptr);
+
+    // Phase D.4 — capture the jittered delay D.3 just chose so the menu
+    // can render a live countdown. We DO NOT re-roll jitter here; we
+    // record what D.3 already armed. Then arm a 1 Hz GTK tick that
+    // rebuilds the menu so the count decrements. The tick is cleared
+    // inside `try_reconnect` when the attempt fires (or here on a
+    // re-schedule — we cancel any prior tick first).
+    if (g_tray.reconnect_countdown_timer) {
+        g_source_remove(g_tray.reconnect_countdown_timer);
+        g_tray.reconnect_countdown_timer = 0;
+    }
+    g_tray.reconnect_jittered_secs = jittered;
+    g_tray.reconnect_scheduled_at = std::time(nullptr);
+    g_tray.reconnect_countdown_timer = g_timeout_add_seconds(
+        1, on_reconnect_countdown_tick, nullptr);
+    build_menu();  // surface the initial "reconnect in <N>s" immediately
+
     // Advance the nominal AFTER scheduling so the NEXT attempt uses the
     // doubled value. The cap is honored inside `next_nominal_backoff`.
     g_tray.reconnect_delay = recmeet::next_nominal_backoff(
@@ -1147,6 +1207,17 @@ static void post_reconnect_resync() {
 
 static gboolean try_reconnect(gpointer) {
     g_tray.reconnect_timer = 0;
+    // Phase D.4 — the attempt is firing; drop the live countdown so the
+    // menu's "reconnect in <N>s" line collapses to "reconnecting..." for
+    // the brief window between attempt-start and either success
+    // (Connected) or failure (re-schedule restarts the countdown).
+    if (g_tray.reconnect_countdown_timer) {
+        g_source_remove(g_tray.reconnect_countdown_timer);
+        g_tray.reconnect_countdown_timer = 0;
+    }
+    g_tray.reconnect_scheduled_at = 0;
+    g_tray.reconnect_jittered_secs = 0;
+
     log_debug("tray: D.3 reconnect attempt (nominal=%ds)", g_tray.reconnect_delay);
     if (connect_to_daemon()) {
         log_debug("tray: D.3 reconnected to daemon");
@@ -2972,35 +3043,128 @@ static void build_menu() {
     bool is_idle = !g_tray.recording && !g_tray.postprocessing && !g_tray.downloading;
     bool can_record = !g_tray.recording && !g_tray.downloading;
 
-    // --- Status label ---
-    std::string status;
-    if (!g_tray.daemon_connected)
-        status = "Status: Disconnected";
-    else if (g_tray.recording && g_tray.postprocessing) {
-        std::string rec_label = g_tray.is_reprocess ? "Reprocessing" : "Recording";
-        status = "Status: " + rec_label + "... (processing previous)";
-    } else if (g_tray.recording) {
-        status = g_tray.is_reprocess ? "Status: Reprocessing..." : "Status: Recording...";
-    } else if (g_tray.postprocessing) {
-        status = "Status: Processing...";
-        if (g_tray.progress_percent >= 0 && !g_tray.current_phase.empty()) {
-            status = "Status: " + g_tray.current_phase + "... "
-                     + std::to_string(g_tray.progress_percent) + "%";
-            // Capitalize first letter of phase
-            if (status.size() > 8)
-                status[8] = static_cast<char>(toupper(static_cast<unsigned char>(status[8])));
+    // --- Phase D.4 — connection state with jitter-aware reconnect
+    //                 countdown.
+    //
+    // Replaces the pre-D.4 single-line "Status: ..." item (and its
+    // `g_tray.status_menu_item` widget pointer that the inline phase /
+    // progress handlers used to mutate). The per-slot rows below now
+    // carry the live phase + progress data; this row's sole job is the
+    // connection state + jitter-aware reconnect countdown the D.3
+    // scheduler already armed.
+    {
+        bool armed = !g_tray.daemon_connected
+                     && g_tray.reconnect_scheduled_at != 0
+                     && g_tray.reconnect_jittered_secs > 0;
+        int remaining = 0;
+        if (armed) {
+            time_t now = std::time(nullptr);
+            int elapsed = static_cast<int>(now - g_tray.reconnect_scheduled_at);
+            remaining = g_tray.reconnect_jittered_secs - elapsed;
+            if (remaining < 0) remaining = 0;
         }
-    } else if (g_tray.downloading) {
-        status = "Status: Downloading";
-        if (!g_tray.download_model.empty())
-            status += " " + g_tray.download_model;
-        status += "...";
-    } else
-        status = "Status: Idle";
-    auto* status_item = gtk_menu_item_new_with_label(status.c_str());
-    gtk_widget_set_sensitive(status_item, FALSE);
-    gtk_menu_shell_append(GTK_MENU_SHELL(menu), status_item);
-    g_tray.status_menu_item = status_item;
+        std::string label = recmeet::render_reconnect_status_line(
+            g_tray.daemon_connected, armed, remaining);
+        auto* item = gtk_menu_item_new_with_label(label.c_str());
+        gtk_widget_set_sensitive(item, FALSE);
+        gtk_menu_shell_append(GTK_MENU_SHELL(menu), item);
+    }
+
+    // --- Phase D.4 — per-server queue depth.
+    //
+    // Multi-server hook #5: the renderer iterates a std::vector<ServerView>
+    // from day one, even though v1 has a length-1 list. We derive the
+    // single entry locally rather than reading `Config::servers` because
+    // the schema split is Phase E.2 (plan lines 416-425); D.4 must not
+    // pre-empt that work.
+    {
+        std::size_t total = g_tray.slot_queues.postprocess.backlog_size()
+                          + g_tray.slot_queues.streaming.backlog_size()
+                          + g_tray.slot_queues.model_download.backlog_size();
+        auto servers = recmeet::derive_single_server_view(
+            g_tray.daemon_addr, total);
+        for (const auto& sv : servers) {
+            std::string label = recmeet::render_server_row(sv);
+            auto* item = gtk_menu_item_new_with_label(label.c_str());
+            gtk_widget_set_sensitive(item, FALSE);
+            gtk_menu_shell_append(GTK_MENU_SHELL(menu), item);
+        }
+    }
+
+    // --- Phase D.4 — three per-slot status rows (postprocess, streaming,
+    //                 model_download), in stable order matching C.7's
+    //                 server-side typed-slot enum order.
+    //
+    // The in-flight view is populated from `slot_queues.<kind>.in_flight()`
+    // (D.1) plus the C.14 globals `current_phase` / `progress_percent`
+    // (which the daemon's `phase` / `progress` events update in place;
+    // we never re-derive them here). When no in-flight entry exists the
+    // row renders "Idle" (or "Idle (N queued)" if the backlog is non-
+    // empty — today's tray cannot reach that state because the UI has
+    // no "queue another submission" affordance, but the renderer handles
+    // every combination for testability).
+    //
+    // For the postprocess slot we also fold the legacy `g_tray.postprocessing`
+    // boolean into the "Working..." fallback so the row stays meaningful
+    // for the brief window between admit and the first phase event. The
+    // streaming row inherits the same fallback when `g_tray.recording` &&
+    // captions are enabled. Model download is gated on `g_tray.downloading`.
+    auto append_slot_row = [&](recmeet::SlotKind kind,
+                               const char* fallback_phase,
+                               bool fallback_active) {
+        const auto& q = g_tray.slot_queues.select(kind);
+        std::optional<recmeet::InFlightView> view;
+        if (q.is_in_flight()) {
+            recmeet::InFlightView v;
+            v.job_id = q.in_flight()->job_id;
+            // C.14 fields — single source of truth. The daemon emits
+            // `phase` / `progress` for whichever job is active; D.4 does
+            // not split this per-slot in v1 (one in-flight job per slot
+            // at most, and typically only one slot active at a time).
+            v.phase = g_tray.current_phase;
+            v.progress_percent = g_tray.progress_percent;
+            view = v;
+        } else if (fallback_active && fallback_phase) {
+            recmeet::InFlightView v;
+            v.phase = fallback_phase;
+            view = v;
+        }
+        std::string label = recmeet::render_slot_row(
+            kind, view, q.backlog_size());
+        auto* item = gtk_menu_item_new_with_label(label.c_str());
+        gtk_widget_set_sensitive(item, FALSE);
+        gtk_menu_shell_append(GTK_MENU_SHELL(menu), item);
+    };
+    append_slot_row(recmeet::SlotKind::Postprocess,
+                    "processing", g_tray.postprocessing);
+    append_slot_row(recmeet::SlotKind::Streaming,
+                    "recording",
+                    g_tray.recording && g_tray.cap.captions_enabled_for_recording);
+    append_slot_row(recmeet::SlotKind::ModelDownload,
+                    g_tray.download_model.empty() ? "downloading"
+                                                  : g_tray.download_model.c_str(),
+                    g_tray.downloading);
+
+    // --- Phase D.4 — streaming caption inline row.
+    //
+    // Shown IN ADDITION to the C.10a overlay (not instead of). We read
+    // the same `g_tray.cap.state` buffer the overlay renders from —
+    // `CaptionRenderState::latest_text()` is a thin accessor over the
+    // most recent line. No duplicate caption-event subscription; the
+    // existing `caption` event handler already triggers `build_menu()`
+    // so this row refreshes alongside the overlay update.
+    //
+    // The row is suppressed entirely when there is no caption text to
+    // show (no streaming session, or pre-first-caption window).
+    if (g_tray.cap.captions_enabled_for_recording) {
+        std::string latest = g_tray.cap.state.latest_text();
+        std::string row = recmeet::render_caption_inline_row(latest);
+        if (!row.empty()) {
+            auto* item = gtk_menu_item_new_with_label(row.c_str());
+            gtk_widget_set_sensitive(item, FALSE);
+            gtk_menu_shell_append(GTK_MENU_SHELL(menu), item);
+        }
+    }
 
     gtk_menu_shell_append(GTK_MENU_SHELL(menu), gtk_separator_menu_item_new());
 

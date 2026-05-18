@@ -115,6 +115,15 @@ public:
     bool degraded_active(TimePoint now) const;
     TimePoint last_update() const { return last_update_; }
 
+    /// Phase D.4 — plain-text accessor over the most recent caption line
+    /// (final OR partial). The tray menu's caption-inline row reads this
+    /// to mirror the overlay's freshest text without subscribing to the
+    /// caption event a second time. Returns empty string when no caption
+    /// has been observed.
+    std::string latest_text() const {
+        return lines_.empty() ? std::string() : lines_.back().text;
+    }
+
 private:
     struct Line {
         std::string text;

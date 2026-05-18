@@ -245,6 +245,12 @@ set(IPC_SOURCES
     # the IPC `job.list` wire shape and the backoff helpers do not pull
     # any new deps.
     src/reconnect_backoff.cpp
+    # Phase D.4 — pure renderer helpers for the tray menu (per-slot row,
+    # per-server row, reconnect countdown line, caption-inline truncation).
+    # Carved out of tray.cpp so the [d4] tests can drive the formatters
+    # without booting GTK; lives in recmeet_ipc because it touches no new
+    # deps beyond <string>.
+    src/tray_status.cpp
 )
 
 add_library(recmeet_ipc STATIC ${IPC_SOURCES})
@@ -559,6 +565,9 @@ if(RECMEET_BUILD_TESTS)
         tests/test_slot_queue.cpp
         # Phase D.3 — reconnect-with-backoff + resume_token resync (iter-168).
         tests/test_reconnect_backoff.cpp
+        # Phase D.4 — tray status renderer (per-slot rows, per-server row,
+        # jitter-aware reconnect countdown, caption-inline) (iter-169).
+        tests/test_tray_status.cpp
     )
     # The test binary exercises both daemon-side surfaces (recmeet_core) and
     # client-side / standalone surfaces (run_recording + recmeet_capture), so
