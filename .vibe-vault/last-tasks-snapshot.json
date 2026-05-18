@@ -1,7 +1,8 @@
 {
-  "iter_n": 162,
-  "anchor_sha": "ef001c062c172bddd66c2175e0d330f4cbd6cee7",
+  "iter_n": 165,
+  "anchor_sha": "654f264ad3e99294e625b32398284a5de8d300a9",
   "active": [
+    "d5-persistence-across-tray-restart",
     "thin-client-recording-server",
     "webui-live-captions"
   ],

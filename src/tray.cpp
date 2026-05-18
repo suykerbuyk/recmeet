@@ -1550,14 +1550,6 @@ void apply_save_for_later(const CapturedContext& ctx) {
     g_tray.capture_state.waiting_disposition = false;
 }
 
-// Backward-compatible overload — the on_stop dispatch path captures the
-// context before applying the disposition, so callers that don't have
-// context handy fall back to an empty `CapturedContext` (resume dialog
-// re-prompts).
-void apply_save_for_later() {
-    apply_save_for_later(CapturedContext{});
-}
-
 }  // namespace tray
 
 static void on_stop(GtkMenuItem*, gpointer) {
