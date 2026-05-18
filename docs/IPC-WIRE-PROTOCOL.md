@@ -17,19 +17,20 @@ spec only.
 
 | Verb                       | Phase   | Frame(s)               | Direction         |
 |----------------------------|---------|------------------------|-------------------|
-| `auth.ok`                  | A.1/4/5 | `0x00`                 | server → client   |
+| `auth.ok`                  | A.1/4/5 + C.13 | `0x00`          | server → client   |
 | `session.init`             | A.6     | `0x00`                 | client → server   |
 | `session.update_credentials` | A.6   | `0x00`                 | client → server   |
 | `session.update_prefs`     | A.6     | `0x00`                 | client → server   |
-| `process.submit`           | C.2/8   | `0x00` + `0x01` frames | client → server   |
+| `process.submit`           | C.2/8/11 | `0x00` + `0x01` frames | client → server  |
 | `process.submit.cancel`    | C.2     | `0x00`                 | client → server   |
 | `process.cancel`           | C.5     | `0x00`                 | client → server   |
 | `process.fetch`            | C.4     | `0x00` + `0x02` frames | both              |
-| `process.stream`           | C.10a   | `0x00` + `0x03` frames | client → server   |
+| `process.stream`           | C.10a + C.11 | `0x00` + `0x03` frames | client → server |
 | `process.stream.cancel`    | C.10a   | `0x00`                 | client → server   |
 | `process.stream.commit`    | C.10b   | `0x00`                 | client → server   |
-| `job.status`               | C.6     | `0x00`                 | client → server   |
-| `job.list`                 | C.6     | `0x00`                 | client → server   |
+| `process.reprocess`        | C.12    | `0x00`                 | client → server   |
+| `job.status`               | C.6 + C.14 | `0x00`              | client → server   |
+| `job.list`                 | C.6 + C.14 | `0x00`              | client → server   |
 | `enroll.finalize`          | C.8     | `0x00`                 | client → server   |
 | `progress.job` (event)     | C.3     | `0x00`                 | server → client   |
 | `state.changed` (event)    | —       | `0x00`                 | server → client   |
@@ -200,22 +201,74 @@ streaming protocol cares about.)
 ## Handshake / version interaction
 
 Phase C.1 is a **breaking** wire change: a pre-C.1 (`protocol_version` 1)
-peer emits raw `{...}\n` with no discriminator byte, which a C.1
-(`protocol_version` 2) peer would misparse — byte 0 (`{`, `0x7B`) is in
-the reserved discriminator range and would trip `BadDiscriminator`.
+peer emits raw `{...}\n` with no discriminator byte, which a C.1+
+peer would misparse — byte 0 (`{`, `0x7B`) is in the reserved
+discriminator range and would trip `BadDiscriminator`.
 
 The Phase A.5 `protocol_version` handshake is what makes the break safe.
-The daemon stamps `IPC_PROTOCOL_VERSION` (now **2**) into the `auth.ok`
-frame. The client parses it in `verify_auth_ok_and_capture()` and closes
-the connection on a mismatch (or a missing field — treated as v0) before
-any non-auth frame is exchanged. So a stale peer fails the handshake
-cleanly instead of misframing live traffic.
+The daemon stamps `IPC_PROTOCOL_VERSION` (now **3** — bumped through C.1,
+C.10a, and C.13 `resume_token` payloads) into the `auth.ok` frame. The
+client parses it in `verify_auth_ok_and_capture()` and closes the
+connection on a mismatch (or a missing field — treated as v0) before any
+non-auth frame is exchanged. So a stale peer fails the handshake cleanly
+instead of misframing live traffic.
 
 The auth handshake itself rides the framed transport: `auth.token`,
 `auth.ok`, and `auth.error` are all `0x00` NDJSON frames. The client's
 connect-time blocking reader (`read_one_line_blocking`) strips the
 `0x00` prefix directly, since it runs before the steady-state
 `FrameReader` path takes over.
+
+### Resume-token re-association (C.13 / Phase D.3)
+
+After a successful first connect the client persists the server-issued
+`resume_token` from `auth.ok` (32-byte hex, 0600 file at
+`~/.local/share/recmeet/session.token`). On every subsequent connect the
+client includes the token alongside the PSK:
+
+```json
+{"type":"auth.token","token":"<psk>","resume_token":"<hex>"}
+```
+
+The server consults its `resume_token → client_id` lookup table. If
+found, `auth.ok` rebinds the prior `client_id` and the daemon
+re-attaches owned in-flight jobs to the new fd — `progress.job` /
+`job.complete` / `caption` events resume routing to this connection
+without any further client action. If not found (TTL expired,
+operator `--evict`, daemon restart, PSK rotated since last seen),
+`auth.ok` mints a fresh `client_id` + fresh `resume_token` and the
+client must re-send `session.init` to repopulate its server-side
+credential + preference slot.
+
+The wire shape of `auth.ok` is identical in both paths; the only
+difference is whether the `client_id` is new or rebound. Both paths
+include `resume_token`. The client cannot tell from the wire whether
+it was rebound or freshly minted — it discovers this by comparing the
+returned `client_id` against its locally cached prior value.
+
+## Job state machine (C.6 / C.14)
+
+Every `Job` flows through a typed slot FIFO with a small set of
+lifecycle states. The states appear on the wire in `progress.job`,
+`job.status`, and `job.list` responses (lowercase, see
+`job_state_name()` in `src/job_queue.cpp:29`):
+
+| State | Reachable from | Meaning |
+|---|---|---|
+| `queued` | (initial) | In the slot FIFO, not yet dequeued. |
+| `waiting_for_upload` | (initial, postprocess only) | `process.submit` reserved a `job_id`; `0x01` upload frames have not yet finalized. |
+| `waiting_on_download` | `queued` | Dequeued postprocess job whose required model is missing; parked while an auto-enqueued `ModelDownload` runs. Server emits `progress.job { phase: "downloading_model" }`. |
+| `running` | `queued` / `waiting_on_download` | Slot running marker set; job is executing. |
+| `done` | `running` | Terminal — success. `process.fetch` is now valid. |
+| `failed` | `running` / `waiting_on_download` | Terminal — error. `error` field on the job carries the diagnostic. |
+| `cancelled` | `queued` / `waiting_*` / `running` | Terminal — operator `process.cancel`. |
+
+The phase strings carried inside `progress.job.phase` are richer than
+the lifecycle state (they name the pipeline stage:
+`downloading_model`, `transcribing`, `diarizing`, `summarizing`,
+`uploading`, etc.). C.14 added `progress` (0.0..1.0) alongside `phase`
+on every `progress.job` event so per-slot UI rows in the tray (Phase
+D.4) can render a continuous bar rather than a category label.
 
 ## Versioning rule
 

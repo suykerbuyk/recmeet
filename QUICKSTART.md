@@ -165,7 +165,7 @@ Audio capture still happens **on the client host** — the daemon never opens Pi
 - Unix-socket listeners (the default) bypass the PSK check — they're already gated by filesystem permissions and kernel peer credentials.
 - Keep `RECMEET_AUTH_TOKEN` out of shell history; use an EnvironmentFile (mode 0600) or a secret manager.
 
-See [docs/V2-DEPLOYMENT.md](docs/V2-DEPLOYMENT.md) for full multi-host deployment recipes, including TLS-fronted setups and systemd templates.
+See [docs/DEPLOYMENT-THIN-CLIENT.md](docs/DEPLOYMENT-THIN-CLIENT.md) for the thin-client deployment playbook: PSK generation and rotation, the Tailscale + MagicDNS pattern (the most-recommended path for distributed teams), nginx/caddy TLS termination in front of the daemon, server sizing (CPU + RAM for whisper.cpp + sherpa-onnx + llama.cpp), and the forward-looking `recmeet-client` / `recmeet-server` package split. See [docs/V2-DEPLOYMENT.md](docs/V2-DEPLOYMENT.md) for the full multi-host deployment reference, including TLS-fronted setups, systemd templates, and the PSK-rotation + per-token revocation (`--evict`) operator workflow.
 
 ## 6. Configure summarization
 
@@ -744,7 +744,7 @@ recmeet --num-speakers 3
 
 **No audio captured** — Verify PipeWire is running: `pw-cli info`. List sources with `recmeet --list-sources` and check that your mic appears.
 
-**Whisper model not found** — Models are auto-downloaded on first use. If behind a proxy, download manually (see [BUILD.md](BUILD.md)).
+**Whisper model not found** — Models are auto-downloaded on first use. If behind a proxy, download manually (see [docs/BUILD.md](docs/BUILD.md)).
 
 **Tray shows "Disconnected"** — The tray reconnects automatically when the daemon starts. Check `systemctl --user status recmeet-daemon.service`.
 

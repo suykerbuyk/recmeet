@@ -4,10 +4,10 @@ This document captures the strategic decisions governing the transition from
 recmeet V1 (the current architecture: monolithic daemon owns capture +
 compute) to recmeet V2 (thin-client architecture: client owns capture, server
 owns compute). The V2 implementation plan originally lived at
-`agentctx/tasks/thin-client-recording-server.md`; as of iter 156 Phases A,
-B, and C have all landed on `feat/v2-thin-client`. This document covers
-**how the codebase forks, evolves, and stays interoperable**, not what V2
-builds.
+`agentctx/tasks/thin-client-recording-server.md`; as of iter 168 Phases A
+through D have all landed on `feat/v2-thin-client`, with Phase E in
+progress. This document covers **how the codebase forks, evolves, and
+stays interoperable**, not what V2 builds.
 
 The feature roadmap proper lives in `docs/ROADMAP.md`. This document is its
 process companion. For V2 operator-facing topics, see
@@ -16,53 +16,110 @@ process companion. For V2 operator-facing topics, see
 
 ---
 
-## Implementation status as of iter 156
+## Implementation status as of iter 168
 
-V2 Phases A, B, and C have all landed on `feat/v2-thin-client`:
+V2 Phases A, B, C, and D have all landed on `feat/v2-thin-client`.
+Phase E is in progress.
 
-- **Phase A (iter 138-152) — Security foundation.** PSK authentication
-  gate on the TCP listener (`RECMEET_AUTH_TOKEN`); per-fd outbound queue;
-  connection cap; `client_id` minting at accept; `protocol_version`
-  handshake (current value: 3); `session.init` with subprocess credential
-  merge. The daemon fail-stops on TCP bind without a PSK configured.
-- **Phase B (iter 152) — Audio-capture migration to client.** Extracted
-  `recmeet_capture` library with a fan-out subscriber API. The tray now
-  owns capture; the daemon no longer links PipeWire or PulseAudio.
-- **Phase C (iter 155) — Submit/process/fetch + server-side JobQueue +
-  streaming.** Eleven sub-phases (C.1 → C.10b) across twelve commits:
-  framed wire protocol (frame types `0x00` NDJSON, `0x01` binary upload,
-  `0x02` binary artifact, `0x03` streaming PCM); state-machine
+- **Phase A (iter 138–152) — Security foundation. COMPLETE.** PSK
+  authentication gate on the TCP listener (`RECMEET_AUTH_TOKEN`);
+  per-fd outbound queue; connection cap; `client_id` minting at
+  accept; `protocol_version` handshake (current value: 3);
+  `session.init` with subprocess credential merge. The daemon
+  fail-stops on TCP bind without a PSK configured.
+- **Phase B (iter 152) — Audio-capture migration to client. COMPLETE.**
+  Extracted `recmeet_capture` library with a fan-out subscriber API.
+  The tray now owns capture; the daemon no longer links PipeWire or
+  PulseAudio.
+- **Phase C (iter 155, closure iter 162) — Submit/process/fetch +
+  server-side JobQueue + streaming + closure. COMPLETE.** Eleven base
+  sub-phases (C.1 → C.10b) plus closure work (C.11 `meeting_id` wire
+  extension; C.12 `process.reprocess` verb; C.13 `resume_token`
+  persistent client identity + GC + `--evict` CLI; C.14 `job.list` /
+  `job.status` payload extension with phase + progress): framed wire
+  protocol (frame types `0x00` NDJSON, `0x01` binary upload, `0x02`
+  binary artifact, `0x03` streaming PCM); state-machine
   `FrameReader`; `JobQueue` with three typed slots (postprocess,
   streaming, model_download — each capacity-1, independent);
   `process.submit` / `process.fetch` / `process.cancel` /
   `process.stream` / `process.stream.cancel` /
-  `process.stream.commit` plus `job.status` / `job.list` verbs;
-  `enroll.finalize` two-step dance; `record.start` removal (123 test
-  sites migrated to `process.submit` / `process.stream`).
-  `IPC_PROTOCOL_VERSION` bumped 1 → 3.
+  `process.stream.commit` / `process.reprocess` plus `job.status` /
+  `job.list` verbs; `enroll.finalize` two-step dance; `record.start`
+  removal (123 test sites migrated to `process.submit` /
+  `process.stream`). `IPC_PROTOCOL_VERSION` bumped 1 → 3.
+- **Phase D (iter 165–168) — Client-side queueing + reconnect +
+  retention. COMPLETE.** Four landing commits closed the phase:
+  - **D.5 (iter 165, persistence)** — sidecar v2 schema (`*.pending`
+    JSON next to staged WAV) carries `meeting_id`, `mic_source`,
+    `captions_enabled`, and the full per-submit `context` block;
+    survives tray restart, machine change, and server restart with no
+    state loss.
+  - **D.1 + D.2 (iter 167, `61a701b`)** — per-slot-kind in-memory
+    queue (postprocess / streaming / model_download) inside the tray
+    plus a drain worker thread that hands one job at a time to the
+    daemon, with the journal write happening before the network round
+    trip so a crashed tray re-enqueues on restart.
+  - **D.3 (iter 168, `58d660d`)** — reconnect with backoff + jitter
+    (full-jitter exponential backoff capped at 30 s) and
+    `resume_token` re-sync on every reconnect, so post-restart the
+    client rebinds to its prior `client_id` and the daemon re-routes
+    progress / completion / artifact events to the right place
+    without re-uploading.
+  - **D.4 (iter 168, `380bbd4` base + `d63b6b2` fix)** — tray UI
+    per-slot rows showing live queue depth, jitter-aware reconnect
+    countdown ("retrying in 7 s"), inline caption surface, and
+    per-slot phase + progress routing (the fix corrected a
+    cross-routing bug where the phase string from one slot was
+    overwriting another).
+  - **D.6 (iter 168, `540b205`)** — server-restart handling on the
+    client side (lost-connection detection drives the reconnect path
+    automatically without losing pending work) plus a disk-budget
+    retention sweep on the staging dir so a long-disconnected
+    operator does not accidentally fill the disk with un-submitted
+    WAVs.
+- **Phase E (in progress) — Cleanup, schema split, binary slimming, docs.**
+  Sub-phase status:
 
-The V2 wire protocol is now stable: 14 V2 verbs, 5 V2 events, frame-typed
-upload/download channel. The architectural-proof test
+  | Sub-phase | Scope | Status |
+  |---|---|---|
+  | E.1 | Verify C.9 removal completeness | COMPLETE (verification-only — C.9 commit `40cf09d` already removed the dead surface) |
+  | E.4.1 | `recmeet-daemon --check-backends` flag for active-backend reporting | COMPLETE |
+  | E.3 | Tray binary slimming (`ldd $(tray)` shows no onnxruntime / sherpa-onnx / whisper / llama / ggml) | COMPLETE |
+  | E.4 | Daemon binary slimming (`ldd $(daemon)` shows no PipeWire / PulseAudio) | COMPLETE |
+  | E.2 | Config schema split — `config.yaml` → `client.yaml` + `daemon.yaml` plus three new fields (`summary_style`, `caption_show_partials`, `caption_overlay_position`) and a one-shot migrator | IN PROGRESS |
+  | E.6 | Backward-compat, web migration, decision-#9 web bundling (`speakers.get_voiceprint` + `web.serve_assets` verbs; embedded asset bundle; legacy-path fallback) | IN PROGRESS |
+  | E.5 | Docs sweep — refresh A/B/C/D wave + new `DEPLOYMENT-THIN-CLIENT.md` + operator-workflow appendix on `V2-DEPLOYMENT.md` | IN PROGRESS (this document update) |
+
+The V2 wire protocol is stable. The architectural-proof test
 `tests/test_v2_thin_client_e2e.cpp` (Wave 1 of iter-156 stabilization)
-exercises the real `recmeet-daemon` binary end-to-end over TCP — submit,
-upload, process, fetch — and is wired into CI via `make integration-e2e`.
+exercises the real `recmeet-daemon` binary end-to-end over TCP —
+submit, upload, process, fetch — and is wired into CI via
+`make integration-e2e`. Phase D added its own per-slot drain-worker
+and reconnect tests on top of that floor.
 
-Operator-facing documentation is now V2-aware: `README.md`,
-`QUICKSTART.md`, `docs/V2-DEPLOYMENT.md`, `docs/ARCHITECTURE.md`,
-`docs/COMPONENT-DIAGRAMS.md`, `docs/IPC-VERBS.md`, and
-`docs/IPC-WIRE-PROTOCOL.md`.
+Operator-facing documentation is V2-aware and Phase-D-aware:
+`README.md`, `QUICKSTART.md`, `docs/V2-DEPLOYMENT.md`,
+`docs/ARCHITECTURE.md`, `docs/COMPONENT-DIAGRAMS.md`,
+`docs/IPC-VERBS.md`, `docs/IPC-WIRE-PROTOCOL.md`, and the new
+`docs/DEPLOYMENT-THIN-CLIENT.md` (Phase E.5).
 
 Outstanding before a `v2.0.0` tag:
 
-- **Phase D — Client-side queueing + reconnect.** In-memory submission
-  queue, drain worker with exponential backoff reconnect, persistent
-  `(endpoint, job_id)` tuples in `pending_jobs.json` across tray
-  restarts, server-restart notification, tray UI for queue depth and
-  per-server view, save-for-later WAV persistence across tray restart.
-- **Phase E — Cleanup, schema split, binary slimming, docs polish.**
-  Split `config.yaml` into `daemon.yaml` (server-side keys) and
-  `client.yaml` (client-side keys); strip remaining V1-only code paths;
-  ldd assertions on the slimmed tray binary; final docs sweep.
+- **Phase E.2 — Config schema split.** Split `config.yaml` into
+  `daemon.yaml` (server-side keys) and `client.yaml` (client-side
+  keys), add the three missing fields the tray already round-trips
+  via session prefs, ship a one-shot migrator. The current monolithic
+  `config.yaml` continues to work during this window — the split is
+  additive with a deprecation warning, not a breaking change.
+- **Phase E.6 — Web migration + decision-#9 bundling.** Migrate the
+  speaker-management web UI off direct filesystem reads onto the V2
+  IPC (`speakers.get_voiceprint`, `web.serve_assets`); bundle the
+  static assets into the binary; preserve legacy `~/.config/recmeet/`
+  paths via a fallback shim.
+- **Phase E.5 — Final docs sweep.** Reflects the final landed state
+  of E.2 + E.6 once those land. The current pass (this document
+  update) covers the Phase D + E partial state and forward-references
+  the in-progress sub-phases.
 - **Minor finding (Phase E candidate or earlier follow-up).** No PSK
   handshake deadline exists in the `IpcServer` poll loop today — a
   slowloris-class resource exhaustion vector against the `PendingPsk`
@@ -249,7 +306,7 @@ namespacing:
 
 | Concern | V1 path | V2 path |
 |---|---|---|
-| Config | `~/.config/recmeet/config.yaml` | `~/.config/recmeet-v2/daemon.yaml` + `client.yaml` |
+| Config | `~/.config/recmeet/config.yaml` | `~/.config/recmeet-v2/daemon.yaml` + `client.yaml` (Phase E.2; the monolithic `config.yaml` still works during the deprecation window) |
 | Unix socket | `/run/user/$UID/recmeet/recmeet.sock` | `/run/user/$UID/recmeet-v2/server.sock` |
 | TCP listen port | configurable (V1 default: off) | configurable (V2 default: off, distinct port number) |
 | systemd units | `recmeet-tray.service` | `recmeet-client-tray.service`, `recmeet-server-daemon.service` |
@@ -379,6 +436,8 @@ V2 introduces a **server-issued resumption token** as the first per-client
 persistent credential. The PSK above gates connection; the resume_token
 gates *re-association* with prior server-side state (`client_id`, session
 credentials, session preferences, owned jobs) across a TCP reconnect.
+Landed in Phase C closure (C.13) and exercised end-to-end by the Phase D.3
+reconnect path (iter 168, `58d660d`).
 
 On first connect after PSK auth, the server stamps `auth.ok` with a fresh
 `client_id` (ephemeral, server-minted) and a `resume_token` (32 bytes of
@@ -388,7 +447,10 @@ lookup). The client persists the token to
 re-sends both PSK and `resume_token`; the server's lookup table maps the
 token to the prior `client_id` and rebinds owned jobs to the live
 connection. Token-not-found and token-expired both fall through to a
-fresh-connect path with new `client_id` + new `resume_token`.
+fresh-connect path with new `client_id` + new `resume_token`. Phase D.3
+adds full-jitter exponential backoff on the client side so a daemon
+restart does not produce a synchronized reconnect storm from multiple
+trays.
 
 The token is opaque — no JWT, no claims, no signature. It is a routing
 key whose authority derives entirely from the lookup table on the
@@ -684,6 +746,21 @@ wired into the `test.yml` CI workflow via `make integration-e2e`.
 This is the architectural proof that the Phase A + B + C IPC reshape is
 end-to-end correct against the real binary, not just against unit-level
 mocks. Failures of this test gate any future protocol-version bump.
+
+### V2 validation: Phase D drain + reconnect (shipped iter 167–168)
+
+Phase D added a per-slot in-memory submission queue and drain worker
+inside the tray, plus a `resume_token`-aware reconnect path with
+full-jitter exponential backoff. The tray tests under `[tray][d.1-d.4]`
+exercise: drain ordering across the three slot kinds, journal-write
+durability across simulated tray crash, reconnect timer wake on connect
+success, per-slot phase/progress routing (the iter-168 `d63b6b2`
+regression caught here), and the disk-budget retention sweep on the
+staging dir.
+
+These tests gate any future Phase D regression — the user-visible
+"submit a recording while the server is down" path runs entirely off
+this code.
 
 ---
 

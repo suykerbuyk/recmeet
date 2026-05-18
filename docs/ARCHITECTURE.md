@@ -225,9 +225,27 @@ The same `job_id` tracking also drives the cancel path: the tray's "Cancel" item
 
 The tray wraps the IPC client's socket fd in a `GIOChannel` watched by the GTK main loop (`g_io_add_watch`). When the daemon pushes an event, `on_ipc_data()` fires, calls `ipc.read_and_dispatch(0)`, and the event callback updates the UI.
 
-### Reconnection
+### Reconnection (Phase D.3)
 
-On disconnect (`G_IO_HUP`), the tray tears down the watch, schedules `try_reconnect()` via `g_timeout_add_seconds`, and uses exponential backoff (1, 2, 4, 8, 16, 30, 30, ...) until the daemon reappears. After a successful reconnect it re-sends `session.init` (the daemon's per-client slot is keyed by the freshly-minted `client_id`, so the prior credentials are gone).
+On disconnect (`G_IO_HUP`), the tray tears down the watch, schedules `try_reconnect()` via `g_timeout_add_seconds`, and uses **full-jitter exponential backoff** (base 1, 2, 4, 8, 16, 30 s with a uniform random factor in `[0.5, 1.5]` applied at each step) so a daemon restart serving multiple trays does not produce a synchronized reconnect storm. The tray UI surfaces the live countdown ("retrying in 7 s") via the per-slot status rows landed in D.4.
+
+After a successful reconnect the tray re-sends the persisted `resume_token` along with the PSK. The daemon's lookup table rebinds the prior `client_id` and re-attaches owned jobs to the live fd — the tray's outstanding `process.submit` / `process.fetch` flows resume mid-stream without re-upload. Token-not-found falls through to a fresh-connect path: the tray re-sends `session.init` with the locally-cached credentials and gets a brand-new `client_id` + `resume_token`. The token lives at `~/.local/share/recmeet/session.token` (mode 0600) and is persisted atomically (`*.tmp` + `fsync` + `rename`).
+
+### Per-slot submission queue + drain worker (Phase D.1 / D.2)
+
+The tray owns an in-memory per-slot-kind queue (one FIFO per `JobKind`: `postprocess`, `streaming`, `model_download`) plus a drain worker thread that hands one job at a time to the daemon. The journal write happens **before** the network round trip, so a crashed or killed tray re-enqueues pending submissions on the next launch without loss. The journal is the sidecar v2 schema (`*.pending` JSON next to each staged WAV) landed in D.5 — it carries `meeting_id`, `mic_source`, `captions_enabled`, and the full per-submit `context` block.
+
+Behavior when the daemon is unreachable:
+
+1. Operator picks **Submit** on a finished recording.
+2. Tray writes `<staging>/audio_<ts>.wav.pending` (atomic write), enqueues the job into the appropriate per-slot queue.
+3. Drain worker observes the queue head and tries to send `process.submit`. If the IPC connection is down (server restart, network partition, laptop closed), the worker stays parked behind the reconnect timer.
+4. When the reconnect succeeds and the `resume_token` rebinds the prior `client_id`, the drain worker wakes and proceeds with the upload. The daemon either rejoins the in-flight job or accepts a fresh `process.submit` (idempotent on `meeting_id`).
+5. On successful `job.complete`, the tray deletes the `.pending` sidecar; on `failed` it leaves the sidecar in place for operator inspection.
+
+### Disk-budget retention sweep (Phase D.6)
+
+The tray runs a periodic sweep over `~/.local/share/recmeet/staging/` to bound disk usage when the server has been unreachable for a long time. Defaults: 8 GB soft cap, drop oldest-first beyond the cap, never delete a `.pending` whose audio is younger than `retention_minimum_hours` (default 24). The sweep also handles server-restart cleanup — orphaned uploads whose job_ids the daemon no longer recognises are re-keyed by `meeting_id` and resubmitted on the next drain pass rather than left as dead weight.
 
 ### Menu-driven config
 

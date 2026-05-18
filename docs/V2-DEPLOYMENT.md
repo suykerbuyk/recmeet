@@ -314,11 +314,21 @@ The daemon does NOT hot-reload `RECMEET_AUTH_TOKEN`. `SIGHUP` reloads `daemon.ya
 4. `systemctl --user restart recmeet-daemon.service` — or `kill -TERM $(cat ~/.local/share/recmeet/runtime/daemon-tcp.pid)` if you are running it directly.
 5. Verify with `journalctl --user -u recmeet-daemon.service | tail -n 20` — look for `daemon: PSK auth enabled for TCP listener`.
 
-Plan rotations during a quiet window. A restart drops every in-flight TCP connection and aborts any non-terminal job — postprocess, streaming, or model download.
+Plan rotations during a quiet window. A restart drops every in-flight TCP connection and aborts any non-terminal job — postprocess, streaming, or model download. Phase D.3 reconnect with `resume_token` mitigates the operator-visible impact: once the daemon comes back, every tray that already shared the new PSK re-attaches its prior `client_id` and the per-slot drain queue (Phase D.1 / D.2) resumes from where it parked. Trays that have not yet been re-keyed see `auth.error: invalid_token` and surface "PSK rotation in progress" in their status row.
 
 ### Revocation
 
-Revocation is the same operation as rotation: there is no per-client revocation today. Restart with a new token and every old client gets `auth.error: invalid_token` on its next connect attempt. Track this limitation if you are considering a multi-tenant deployment.
+Per-token revocation **does** exist as of C.13 — `recmeet-daemon --evict <resume_token_prefix>` removes a specific session from the daemon's lookup table immediately, so the next reconnect from that client falls back to fresh-token issuance. Use this for "this laptop was lost, kill its session without disturbing other clients." Coarse "log everyone out" still requires PSK rotation (which silently invalidates every outstanding `resume_token` on next reconnect, since the PSK check happens before the token lookup).
+
+```bash
+# Find suspect tokens in the journal (prefixes are logged, full tokens never are)
+journalctl --user -u recmeet-daemon.service | grep "client_id=c-" | tail
+
+# Evict a specific session by token prefix (8+ hex chars)
+recmeet-daemon --evict abcd1234
+```
+
+The TTLs on the resume-token map (24 h for the session binding, 1 h for orphaned in-flight jobs, 24 h for terminal jobs awaiting fetch) provide hands-off cleanup; `--evict` is the surgical override.
 
 ### Audit
 
@@ -487,6 +497,8 @@ A Prometheus exporter is on the wishlist; not in V2 scope.
 
 Per-section keys observed by the daemon (see `src/config.cpp`). All sections are optional; missing keys take struct defaults.
 
+> **Forward note (Phase E.2):** the current monolithic `config.yaml` is being split into two files — `daemon.yaml` (server-side keys: `[ipc]`, `[server]`, `[diarization]`, `[transcription]`, `[summary]`, `[api_keys]`, `[vad]`, `[captions]`, `[logging]`, `[web]`, `[notes]`, `[output]`) and `client.yaml` (client-side keys: `[audio]`, `[general]`, plus three new fields the tray already round-trips via session prefs but does not yet persist locally — `summary_style`, `caption_show_partials`, `caption_overlay_position`). The split is additive and ships with a one-shot migrator. The monolithic file continues to work during a deprecation window; both halves take precedence over it when present. No action required from operators until `v2.0.0` ships.
+
 | Section | Keys |
 |---|---|
 | `[audio]` | `device_pattern`, `mic_source`, `monitor_source` |
@@ -570,8 +582,9 @@ This section will be tightened once the v1-maintenance branch is cut and the mig
 ## See also
 
 - [`docs/ARCHITECTURE.md`](ARCHITECTURE.md) — architectural overview (the authoritative document on V2).
+- [`docs/DEPLOYMENT-THIN-CLIENT.md`](DEPLOYMENT-THIN-CLIENT.md) — thin-client deployment recipes (PSK distribution, Tailscale + TLS patterns, server sizing, package split guidance).
 - [`docs/IPC-VERBS.md`](IPC-VERBS.md) — per-verb IPC reference.
-- [`docs/IPC-WIRE-PROTOCOL.md`](IPC-WIRE-PROTOCOL.md) — frame-layer spec.
+- [`docs/IPC-WIRE-PROTOCOL.md`](IPC-WIRE-PROTOCOL.md) — frame-layer spec + job state machine.
 - [`docs/V2-STRATEGY.md`](V2-STRATEGY.md) — strategy doc explaining the V1 → V2 migration plan.
 - [`QUICKSTART.md`](../QUICKSTART.md) — end-user quickstart; links here for past-the-default-install steps.
 - [`README.md`](../README.md) — project overview.

@@ -119,6 +119,8 @@ export RECMEET_AUTH_TOKEN="<same token as above>"
 
 Do **not** expose the daemon TCP port directly to the public internet. The PSK gate is a fail-stop, not an encryption layer; put TLS (stunnel, an SSH tunnel, or a reverse proxy) in front if the traffic crosses untrusted networks. Unix-socket listeners bypass the PSK check because they're already gated by filesystem permissions and kernel peer credentials.
 
+For the full thin-client deployment playbook — PSK generation and rotation, Tailscale/MagicDNS pattern, nginx/caddy TLS termination, server sizing for the ML workload, and future package-split guidance (`recmeet-client` vs `recmeet-server` PKGBUILDs) — see [docs/DEPLOYMENT-THIN-CLIENT.md](docs/DEPLOYMENT-THIN-CLIENT.md). For multi-host topologies and systemd templates, see [docs/V2-DEPLOYMENT.md](docs/V2-DEPLOYMENT.md).
+
 #### Other handy commands
 
 ```bash
@@ -643,7 +645,7 @@ make package-deb        # Debian/Ubuntu (.deb via CPack)
 make package-rpm        # Fedora/RHEL (.rpm via CPack)
 ```
 
-See [BUILD.md](BUILD.md) for packaging details and per-distro build dependencies.
+See [docs/BUILD.md](docs/BUILD.md) for packaging details and per-distro build dependencies.
 
 ### Autostart via systemd
 
@@ -671,7 +673,7 @@ Socket activation is also available — `recmeet-daemon.socket` starts the daemo
 systemctl --user enable --now recmeet-daemon.socket
 ```
 
-The tray service is tied to `graphical-session.target` and restarts automatically on crash. On Sway, your config must activate that target — see [BUILD.md](BUILD.md) for details.
+The tray service is tied to `graphical-session.target` and restarts automatically on crash. On Sway, your config must activate that target — see [docs/BUILD.md](docs/BUILD.md) for details.
 
 ### Postprocessing memory limits
 
@@ -744,7 +746,7 @@ The CLI auto-detects a running daemon and operates as a client. Use `--no-daemon
 - **Removed in V2** (gone in C.9): `record.start`, `record.stop`, `job.context`, `sources.list` — capture moved to the client, source enumeration is a client-local operation.
 - **Events** (server push): `phase`, `progress`, `state.changed`, `job.complete`, `model.downloading`, `caption` (routed per-client).
 
-See [docs/IPC-VERBS.md](docs/IPC-VERBS.md) for the per-verb reference (request/response shapes, error codes, framing rules) and [docs/IPC-WIRE-PROTOCOL.md](docs/IPC-WIRE-PROTOCOL.md) for the framing-level details. See [BUILD.md](BUILD.md) for a detailed build system tutorial.
+See [docs/IPC-VERBS.md](docs/IPC-VERBS.md) for the per-verb reference (request/response shapes, error codes, framing rules) and [docs/IPC-WIRE-PROTOCOL.md](docs/IPC-WIRE-PROTOCOL.md) for the framing-level details. See [docs/BUILD.md](docs/BUILD.md) for a detailed build system tutorial.
 
 ## MCP server
 

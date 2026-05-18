@@ -16,6 +16,7 @@ source code implementation, not aspirational design.
 8. [Postprocessing Pipeline](#8-postprocessing-pipeline)
    - [8a. Chunked Diarization + Stitching](#8a-chunked-diarization--stitching)
 9. [Tray Applet](#9-tray-applet)
+   - [9e. Per-Slot Submission Queue + Drain Worker (Phase D)](#9e-per-slot-submission-queue--drain-worker-phase-d1--d2--d5--d6)
 10. [CLI Mode Selection](#10-cli-mode-selection)
 11. [Subprocess Postprocessing](#11-subprocess-postprocessing)
 12. [Audio Capture Subsystem](#12-audio-capture-subsystem)
@@ -1094,13 +1095,17 @@ flowchart TD
 
     STATE --> US_CTX
 
-    subgraph "Reconnection (exponential backoff)"
+    subgraph "Reconnection (Phase D.3 — full-jitter exponential backoff + resume_token)"
         TRY["try_reconnect()"]
-        TRY --> TRY_CONN["connect_to_daemon()"]
-        TRY_CONN -->|"success"| RESET["delay = 1s<br/>build_menu()"]
-        TRY_CONN -->|"fail"| NEXT["delay = min(delay × 2, 30)<br/>g_timeout_add_seconds(delay,<br/>try_reconnect)"]
+        TRY --> TRY_CONN["connect_to_daemon()<br/>+ PSK + resume_token"]
+        TRY_CONN -->|"success"| RESUME{"server bound<br/>resume_token?"}
+        RESUME -->|"yes"| REBIND["client_id rebound<br/>in-flight jobs re-attached<br/>delay = 1s<br/>build_menu()"]
+        RESUME -->|"no"| FRESH["new client_id minted<br/>re-send session.init<br/>delay = 1s<br/>build_menu()"]
+        TRY_CONN -->|"fail"| NEXT["base = min(base × 2, 30)<br/>delay = base × uniform(0.5, 1.5)<br/>g_timeout_add_seconds(delay,<br/>try_reconnect)"]
     end
 ```
+
+The jitter factor (`uniform(0.5, 1.5)`) prevents synchronized reconnect storms when one daemon serves multiple trays — the iter-168 `58d660d` landing. The countdown the operator sees in the tray status row ("retrying in 7 s") is computed from the same scheduled delay so the UI never lies about when the next attempt will fire.
 
 ### 9c. Recording Start/Stop Flow
 
@@ -1177,6 +1182,72 @@ graph TD
     MENU --> SEP6["─── separator ───"]
     MENU --> QUIT["Quit"]
 ```
+
+### 9e. Per-Slot Submission Queue + Drain Worker (Phase D.1 / D.2 / D.5 / D.6)
+
+V2 Phase D added a client-side submission queue inside the tray so the
+operator can record + submit while the server is unreachable. The queue
+is partitioned by `JobKind` (postprocess, streaming, model_download); a
+single drain worker thread services the heads of all three FIFOs. The
+on-disk journal is the sidecar v2 schema (`*.pending` JSON next to each
+staged WAV) — written **before** the network attempt, so a tray that
+gets killed mid-submit re-enqueues the work on the next launch.
+
+```mermaid
+flowchart TD
+    SUBMIT["operator: Submit"]
+    SUBMIT --> STAGE["recmeet_capture WAV stager<br/>finalizes audio_&lt;ts&gt;.wav<br/>under ~/.local/share/recmeet/staging/"]
+    STAGE --> JOURNAL["write audio_&lt;ts&gt;.wav.pending<br/>(atomic: tmp + fsync + rename)<br/>schema v2: meeting_id, mic_source,<br/>captions_enabled, context block"]
+    JOURNAL --> ENQ["enqueue(JobKind::Postprocess,<br/>{wav_path, meeting_id, ...})"]
+
+    subgraph "Per-slot queues (in-memory + on-disk journal)"
+        QPP["postprocess FIFO"]
+        QST["streaming FIFO"]
+        QDL["model_download FIFO"]
+    end
+
+    ENQ --> QPP
+
+    subgraph "Drain worker (single background thread)"
+        DRAIN["loop: pick non-empty queue"]
+        DRAIN --> ATTEMPT["attempt(job)"]
+        ATTEMPT --> CONN_OK{"IPC up?"}
+        CONN_OK -->|"no"| PARK["park behind reconnect timer<br/>(Phase D.3)"]
+        CONN_OK -->|"yes"| SEND["ipc.call('process.submit', cfg)<br/>+ 0x01 frames"]
+        SEND --> ACK{"daemon ack?"}
+        ACK -->|"ok"| TRACK["stash (endpoint, job_id)<br/>watch progress.job + job.complete"]
+        ACK -->|"fail"| RETRY["leave in queue,<br/>increment attempt counter,<br/>backoff before next try"]
+        TRACK --> COMPLETE{"job.complete<br/>received?"}
+        COMPLETE -->|"yes"| CLEANUP["delete .pending sidecar<br/>delete staging WAV<br/>(unless --keep)"]
+        COMPLETE -->|"failed"| KEEP[".pending stays in place<br/>for operator inspection"]
+        PARK --> DRAIN
+        RETRY --> DRAIN
+        CLEANUP --> DRAIN
+        KEEP --> DRAIN
+    end
+
+    QPP --> DRAIN
+    QST --> DRAIN
+    QDL --> DRAIN
+
+    subgraph "Disk-budget retention sweep (Phase D.6)"
+        SWEEP["periodic: scan staging/"]
+        SWEEP --> BUDGET{"total bytes &gt;<br/>retention_budget_gb?"}
+        BUDGET -->|"yes"| DROP["drop oldest .pending<br/>whose age &gt; retention_minimum_hours"]
+        BUDGET -->|"no"| RESYNC{"orphaned uploads?<br/>(meeting_id not on daemon)"}
+        RESYNC -->|"yes"| RESUBMIT["re-enqueue under fresh job_id<br/>(daemon dedups on meeting_id)"]
+        RESYNC -->|"no"| DONE["sweep idle"]
+    end
+```
+
+The journal-before-network ordering is load-bearing: a tray that
+crashes between writing the sidecar and calling `process.submit`
+re-enqueues on next launch (the sidecar is the ground truth, the
+in-memory queue is rebuilt from the staging directory on startup). The
+disk-budget sweep handles two failure modes — long disconnect filling
+the disk, and stale `job_id`s after a daemon restart that the
+`resume_token` rebind could not recover. Both reduce to "re-key by
+`meeting_id` and either drop or resubmit."
 
 ---
 
