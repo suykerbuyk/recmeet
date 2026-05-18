@@ -34,6 +34,7 @@
 
 #include <cstdint>
 #include <deque>
+#include <map>
 #include <optional>
 #include <string>
 
@@ -272,6 +273,73 @@ inline DrainResult drain_on_terminal(SlotQueues& q, int64_t job_id) {
     }
     r.next_to_dispatch = q.select(slot).complete_in_flight();
     return r;
+}
+
+/// Phase D.4 follow-up — per-slot phase/progress routing helpers.
+///
+/// Pre-fix, the tray tracked `current_phase` + `progress_percent` as a
+/// SINGLE pair of globals shared across all three typed slots. With
+/// concurrent slots (D.1's whole point — e.g. live streaming + previous
+/// recording postprocessing), the single-pair design collapsed all three
+/// per-slot rows onto whichever event arrived last.
+///
+/// These helpers route a phase/progress event to the correct per-slot
+/// map entry by looking up the SlotKind via the D.1 in-flight set
+/// (`slot_queues.find_slot_by_in_flight_job_id`). The lookup is O(1)
+/// — three slot-equality checks — so the cost is constant per event
+/// regardless of journal size; the journal is on-disk persistence and
+/// is NOT touched on the hot path.
+///
+/// Routing is a no-op when the job_id matches no in-flight entry
+/// (terminal-after-drain, foreign client_id). Callers may still pass
+/// the event through to per-job UI bits; only the per-slot row map is
+/// gated on a slot match.
+///
+/// `phase_by_slot` and `progress_by_slot` are mutated in place — the
+/// helpers are designed for test-friendly call from a stub TrayState as
+/// well as from the production GTK callback. Returns true iff a slot
+/// match was found and the map was updated.
+inline bool route_phase_to_slot(const SlotQueues& queues,
+                                int64_t job_id,
+                                const std::string& phase,
+                                std::map<SlotKind, std::string>& phase_by_slot,
+                                std::map<SlotKind, int>& progress_by_slot) {
+    bool found = false;
+    SlotKind slot = queues.find_slot_by_in_flight_job_id(job_id, found);
+    if (!found) return false;
+    phase_by_slot[slot] = phase;
+    // A new phase resets the per-slot progress (mirrors the pre-fix
+    // single-global behavior at handle_ipc_event "phase").
+    progress_by_slot[slot] = -1;
+    return true;
+}
+
+/// As `route_phase_to_slot` but for the `progress` event. Writes both
+/// the phase (which the event carries alongside the percent) and the
+/// percent itself; returns true on slot-match, false otherwise.
+inline bool route_progress_to_slot(const SlotQueues& queues,
+                                   int64_t job_id,
+                                   const std::string& phase,
+                                   int percent,
+                                   std::map<SlotKind, std::string>& phase_by_slot,
+                                   std::map<SlotKind, int>& progress_by_slot) {
+    bool found = false;
+    SlotKind slot = queues.find_slot_by_in_flight_job_id(job_id, found);
+    if (!found) return false;
+    phase_by_slot[slot] = phase;
+    progress_by_slot[slot] = percent;
+    return true;
+}
+
+/// Convert the on-wire slot_kind string ("postprocess", "streaming",
+/// "model_download") to the SlotKind enum. Used by `post_reconnect_resync`
+/// to route each parsed `job.list` entry's phase/progress into the
+/// matching per-slot map. Unknown / empty inputs default to Postprocess
+/// (legacy / defensive — mirrors `classify_resynced_job`'s same default).
+inline SlotKind slot_kind_from_string(const std::string& s) {
+    if (s == "streaming")      return SlotKind::Streaming;
+    if (s == "model_download") return SlotKind::ModelDownload;
+    return SlotKind::Postprocess;
 }
 
 } // namespace recmeet

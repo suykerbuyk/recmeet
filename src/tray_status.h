@@ -15,9 +15,11 @@
 //
 //   2. `render_slot_row` — one row per typed-slot kind (postprocess,
 //      streaming, model_download). Carries the in-flight job's phase +
-//      progress (sourced from C.14 fields `current_phase` /
-//      `progress_percent` — not re-derived) plus a "(N queued)" suffix
-//      when the backlog depth is non-zero.
+//      progress (sourced from the tray's per-slot maps
+//      `current_phase_by_slot` / `progress_percent_by_slot`, keyed by
+//      SlotKind — the D.4-follow-up replacement for the original single
+//      shared pair which collapsed concurrent-slot UI state) plus a
+//      "(N queued)" suffix when the backlog depth is non-zero.
 //
 //   3. `render_server_row` + `derive_single_server_view` — per-server
 //      queue-depth display. The renderer iterates a `std::vector<ServerView>`
@@ -49,19 +51,22 @@ namespace recmeet {
 
 /// View of the in-flight job for one slot, as seen by the tray's
 /// renderer. The tray populates this from `slot_queues.<kind>.in_flight()`
-/// plus the C.14 globals `current_phase` / `progress_percent`. The view
+/// plus the per-slot maps `current_phase_by_slot` /
+/// `progress_percent_by_slot` (D.4 follow-up — the pre-fix design used
+/// a single shared pair of globals; per-slot keys ensure concurrent
+/// in-flight jobs in different slots render their own state). The view
 /// is a value type so tests can construct it directly without depending
-/// on `SlotQueue` internals.
+/// on `SlotQueue` or `TrayState` internals.
 struct InFlightView {
     /// Server-assigned job_id (post-dispatch). 0 → unknown (e.g. the
     /// admit-pre-dispatch window). Not rendered today; reserved for D.6
     /// notifications.
     int64_t job_id = 0;
-    /// C.14 `current_phase` (e.g. "transcribe", "diarize"). Empty when
-    /// the job is admitted but has not yet emitted any phase event.
+    /// Phase string (e.g. "transcribe", "diarize"). Empty when the job
+    /// is admitted but has not yet emitted any phase event.
     std::string phase;
-    /// C.14 `progress_percent`. `-1` → no progress emitted yet; renderer
-    /// shows phase only. `>=0` → renderer appends ` <p>%`.
+    /// Progress percent. `-1` → no progress emitted yet; renderer shows
+    /// phase only. `>=0` → renderer appends ` <p>%`.
     int progress_percent = -1;
 };
 

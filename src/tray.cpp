@@ -41,6 +41,7 @@
 #include <ctime>
 #include <filesystem>
 #include <fstream>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <random>
@@ -124,9 +125,22 @@ struct TrayState {
     // Current model download status (for status label)
     std::string download_model;
 
-    // Progress tracking
-    int progress_percent = -1;
-    std::string current_phase;
+    // Phase D.4 follow-up — per-slot phase + progress, keyed by SlotKind.
+    // Pre-fix D.4 carried a SINGLE pair of globals (`current_phase` +
+    // `progress_percent`) and routed every `phase` / `progress` event
+    // through it. With three concurrent typed slots (D.1) — e.g. live
+    // streaming + previous recording postprocessing (the primary C.7
+    // use case) — the single-pair design caused all three per-slot
+    // rows to mirror whichever event arrived last instead of their own
+    // state. Per-slot maps fix the routing: the `phase` / `progress`
+    // event handler looks up slot_kind via `slot_queues.find_slot_by_in_flight_job_id`
+    // (D.1) and writes into the per-slot entry; `build_menu` reads per
+    // slot when constructing each `InFlightView`. Maps are cleared on
+    // the fresh-client_id branch in `post_reconnect_resync` (same
+    // semantics as the journal-drop + slot_queues-clear that fires
+    // when the prior session expired server-side).
+    std::map<recmeet::SlotKind, std::string> current_phase_by_slot;
+    std::map<recmeet::SlotKind, int>         progress_percent_by_slot;
 
     // Phase D.4 — jitter-aware reconnect countdown surfaces. The status
     // menu row shows "Status: Disconnected — reconnect in <N>s" while
@@ -337,8 +351,12 @@ static void update_state(bool rec, bool pp, bool dl, bool reproc = false) {
     }
 
     if (!rec && !pp && !dl) {
-        g_tray.progress_percent = -1;
-        g_tray.current_phase.clear();
+        // Phase D.4 follow-up — fully-idle clears the per-slot maps so
+        // the next phase event starts from a clean slate. Pre-fix this
+        // zeroed the single `current_phase` / `progress_percent` pair;
+        // the per-slot maps replace them.
+        g_tray.current_phase_by_slot.clear();
+        g_tray.progress_percent_by_slot.clear();
     }
 
     const char* icon = ICON_IDLE;
@@ -508,11 +526,28 @@ static void handle_ipc_event(const IpcEvent& ev) {
     if (ev.event == "phase") {
         std::string name = json_val_as_string(ev.data.at("name"));
         log_info("[tray] Phase: %s", name.c_str());
-        // Reset progress on phase change. The C.14 global fields
-        // `current_phase` / `progress_percent` are the single source of
-        // truth that D.4's per-slot row reads; we never re-derive them.
-        g_tray.current_phase = name;
-        g_tray.progress_percent = -1;
+        // Phase D.4 follow-up — route by SlotKind via the D.1 in-flight
+        // set. Pre-fix wrote into a SINGLE shared pair of globals; this
+        // caused all three per-slot rows to mirror whichever phase
+        // event arrived last. The `phase` / `progress` events carry
+        // `job_id` (daemon.cpp:990); we look up the slot via
+        // `slot_queues.find_slot_by_in_flight_job_id` (D.1) which is
+        // O(1) — three equality checks — so the cost is constant per
+        // event regardless of journal size. A miss (terminal-after-
+        // drain race, or foreign client_id) is silently ignored; the
+        // matching slot row simply does not update.
+        auto jit = ev.data.find("job_id");
+        int64_t jid = (jit != ev.data.end())
+            ? json_val_as_int(jit->second) : 0;
+        bool routed = recmeet::route_phase_to_slot(
+            g_tray.slot_queues, jid, name,
+            g_tray.current_phase_by_slot,
+            g_tray.progress_percent_by_slot);
+        if (!routed) {
+            log_debug("[tray] D.4 phase event: job=%lld not in any slot "
+                      "in-flight set (drained or foreign) — skipping row update",
+                      (long long)jid);
+        }
         // Phase D.4 — full menu rebuild so the in-flight slot row
         // reflects the new phase. Replaces the pre-D.4 in-place mutation
         // of `status_menu_item` (which only updated the single legacy
@@ -521,8 +556,21 @@ static void handle_ipc_event(const IpcEvent& ev) {
     } else if (ev.event == "progress") {
         std::string phase = json_val_as_string(ev.data.at("phase"));
         int percent = static_cast<int>(json_val_as_int(ev.data.at("percent")));
-        g_tray.current_phase = phase;
-        g_tray.progress_percent = percent;
+        // Phase D.4 follow-up — route by SlotKind, same lookup as the
+        // `phase` event above. See the comment block on `phase` for the
+        // rationale; same O(1) cost, same miss semantics.
+        auto jit = ev.data.find("job_id");
+        int64_t jid = (jit != ev.data.end())
+            ? json_val_as_int(jit->second) : 0;
+        bool routed = recmeet::route_progress_to_slot(
+            g_tray.slot_queues, jid, phase, percent,
+            g_tray.current_phase_by_slot,
+            g_tray.progress_percent_by_slot);
+        if (!routed) {
+            log_debug("[tray] D.4 progress event: job=%lld not in any slot "
+                      "in-flight set (drained or foreign) — skipping row update",
+                      (long long)jid);
+        }
         // Phase D.4 — full menu rebuild (replaces pre-D.4 in-place
         // single-status-row mutation).
         build_menu();
@@ -1071,6 +1119,15 @@ static void post_reconnect_resync() {
         g_tray.slot_queues.postprocess.clear();
         g_tray.slot_queues.streaming.clear();
         g_tray.slot_queues.model_download.clear();
+        // Phase D.4 follow-up — the per-slot phase/progress maps
+        // referenced the prior session's jobs; clear them in lock-step
+        // with the journal + slot_queues clear so the next reconnect
+        // starts with empty per-slot rows. Disconnect alone does NOT
+        // clear these maps (D.5 preserves slot_queues across reconnect
+        // when the resume_token still resolves); only a fresh-id wipe
+        // discards the stale per-slot state.
+        g_tray.current_phase_by_slot.clear();
+        g_tray.progress_percent_by_slot.clear();
     }
     // Update the snapshot regardless of fresh/same — the new id is now
     // the baseline for the NEXT reconnect's comparison.
@@ -1099,16 +1156,21 @@ static void post_reconnect_resync() {
     log_info("[tray] D.3 job.list re-sync: %zu job(s) returned by daemon",
              parsed.size());
 
-    // Update the local UI / status from the highest-progress in-flight
-    // job, if any. Picking the first running entry covers the common
-    // single-in-flight case; multi-job UI is D.4 territory.
+    // Phase D.4 follow-up — populate the per-slot phase/progress maps
+    // from EVERY parsed entry that's still in-flight, not just the first.
+    // Pre-fix this only updated the single shared global pair from the
+    // first running entry, collapsing concurrent-slot UI state to one
+    // value. With per-slot routing, each entry's `kind` ("postprocess",
+    // "streaming", "model_download") maps directly to the matching
+    // SlotKind bucket so the per-slot rows survive a reconnect with
+    // multiple in-flight jobs (the primary C.7 concurrent-slot use case).
     for (const auto& j : parsed) {
         if (j.state == "running" || j.state == "queued"
             || j.state == "waiting_on_download"
             || j.state == "waiting_for_upload") {
-            if (!j.phase.empty()) g_tray.current_phase = j.phase;
-            if (j.progress >= 0)  g_tray.progress_percent = j.progress;
-            break;
+            recmeet::SlotKind slot = recmeet::slot_kind_from_string(j.kind);
+            if (!j.phase.empty()) g_tray.current_phase_by_slot[slot] = j.phase;
+            if (j.progress >= 0)  g_tray.progress_percent_by_slot[slot] = j.progress;
         }
     }
 
@@ -3096,13 +3158,14 @@ static void build_menu() {
     //                 server-side typed-slot enum order.
     //
     // The in-flight view is populated from `slot_queues.<kind>.in_flight()`
-    // (D.1) plus the C.14 globals `current_phase` / `progress_percent`
-    // (which the daemon's `phase` / `progress` events update in place;
-    // we never re-derive them here). When no in-flight entry exists the
-    // row renders "Idle" (or "Idle (N queued)" if the backlog is non-
-    // empty — today's tray cannot reach that state because the UI has
-    // no "queue another submission" affordance, but the renderer handles
-    // every combination for testability).
+    // (D.1) plus the per-slot phase + progress maps `current_phase_by_slot`
+    // / `progress_percent_by_slot` (D.4 follow-up — pre-fix this was a
+    // single shared pair of globals which collapsed concurrent slots
+    // onto whichever event landed last). The `handle_ipc_event` "phase"
+    // / "progress" handlers and `post_reconnect_resync` both route into
+    // these maps by SlotKind; this consumer just reads the per-kind
+    // entry (`.find(kind)` → empty/sentinel if absent, e.g. pre-first-
+    // event window).
     //
     // For the postprocess slot we also fold the legacy `g_tray.postprocessing`
     // boolean into the "Working..." fallback so the row stays meaningful
@@ -3117,12 +3180,18 @@ static void build_menu() {
         if (q.is_in_flight()) {
             recmeet::InFlightView v;
             v.job_id = q.in_flight()->job_id;
-            // C.14 fields — single source of truth. The daemon emits
-            // `phase` / `progress` for whichever job is active; D.4 does
-            // not split this per-slot in v1 (one in-flight job per slot
-            // at most, and typically only one slot active at a time).
-            v.phase = g_tray.current_phase;
-            v.progress_percent = g_tray.progress_percent;
+            // Per-slot phase + progress — D.4 follow-up: read the
+            // entry for this slot (NOT the same shared pair three
+            // times). `.find()` returns end() before the first phase
+            // event for the slot, in which case the renderer's
+            // "Working..." fallback applies via empty `v.phase`.
+            auto pit = g_tray.current_phase_by_slot.find(kind);
+            if (pit != g_tray.current_phase_by_slot.end()) {
+                v.phase = pit->second;
+            }
+            auto qit = g_tray.progress_percent_by_slot.find(kind);
+            v.progress_percent = (qit != g_tray.progress_percent_by_slot.end())
+                ? qit->second : -1;
             view = v;
         } else if (fallback_active && fallback_phase) {
             recmeet::InFlightView v;
