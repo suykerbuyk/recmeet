@@ -228,9 +228,7 @@ static gboolean caption_overlay_tick(gpointer) {
     }
     last_degraded_active = now_active;
 
-    // Auto-hide check.
-    if (g_tray.cap.state.tick(now))
-        gtk_widget_hide(g_tray.cap.window);
+    // Window stays shown for the whole recording — see Part B of live-captions-pivot-to-monitor.
 
     return G_SOURCE_CONTINUE;
 }
@@ -275,6 +273,13 @@ static void caption_overlay_create() {
     }
 }
 
+// MUST stay idempotent on an already-shown popup: gtk_widget_show_all on
+// a mapped GTK_WINDOW_POPUP is a no-op for WM placement, which is why
+// this function is safe to call on every caption event without
+// re-triggering Sway/wlroots pointer-placement. The pre-show in
+// on_record_start() relies on this — if a future refactor adds a
+// hide/show cycle here, the placement bug returns silently. See
+// live-captions-pivot-to-monitor task M3.
 static void caption_overlay_show_with_markup() {
     if (!g_tray.cap.window) caption_overlay_create();
     caption_overlay_apply_markup();
@@ -729,9 +734,20 @@ static void on_record(GtkMenuItem*, gpointer) {
     // whether to render.
     g_tray.cap.captions_enabled_for_recording = run_cfg.captions_enabled;
     if (run_cfg.captions_enabled) {
-        // Pre-create the overlay window so the first caption event has
-        // somewhere to render. Stays hidden until the first event arrives.
+        // Pre-create AND pre-show the overlay so the WM places the popup
+        // ONCE at recording start. Subsequent caption events reach
+        // caption_overlay_show_with_markup() but gtk_widget_show_all() on a
+        // mapped popup is idempotent for WM placement — see the comment on
+        // caption_overlay_show_with_markup() below.
+        //
+        // Tradeoff: between record.start and the first caption event the
+        // operator sees an empty bordered rectangle (Zipformer needs ~1–2 s
+        // of audio + first endpoint detection). If the engine fails to
+        // start daemon-side, the existing caption.degraded IPC event
+        // (reason="engine_error") populates the empty overlay with the
+        // error reason. See live-captions-pivot-to-monitor task M1.
         caption_overlay_create();
+        gtk_widget_show_all(g_tray.cap.window);
     }
 
     bool reproc = !g_tray.cfg.reprocess_dir.empty();
@@ -854,8 +870,25 @@ static void on_vad_toggled(GtkCheckMenuItem* item, gpointer) {
 // NEXT recording (captions are bound to record.start params; mid-recording
 // toggles do not take effect — the menu's tooltip makes this explicit).
 static void on_captions_enabled_toggled(GtkCheckMenuItem* item, gpointer) {
-    g_tray.cfg.captions_enabled = gtk_check_menu_item_get_active(item);
+    const bool new_state = gtk_check_menu_item_get_active(item);
+    g_tray.cfg.captions_enabled = new_state;
     save_config(g_tray.cfg);
+
+    // Toggle-off mid-recording: immediately hide the overlay and stop
+    // rendering caption events. The engine binds at record.start so the
+    // daemon-side engine keeps emitting events to the IPC stream — the
+    // guard at on_caption / on_caption.degraded drops them. Toggle-on
+    // mid-recording remains inert (no way to start the daemon engine
+    // mid-recording without a new IPC verb — out of scope).
+    if (!new_state && g_tray.cap.captions_enabled_for_recording) {
+        g_tray.cap.captions_enabled_for_recording = false;
+        if (g_tray.cap.window) {
+            gtk_widget_hide(g_tray.cap.window);
+            g_tray.cap.state.clear();
+            if (g_tray.cap.label)
+                gtk_label_set_markup(GTK_LABEL(g_tray.cap.label), "");
+        }
+    }
 }
 
 // --- Provider / model callbacks ---

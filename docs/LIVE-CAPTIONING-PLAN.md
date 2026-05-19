@@ -279,6 +279,22 @@ The sherpa-onnx streaming path (Approach A) is roughly a week of focused work
 for someone familiar with the codebase. The whisper fallback (Approach B) adds
 another few days, mostly for the deduplication logic.
 
+## Live captions: source policy (post-iter-148)
+
+Live captions are wired to the **monitor** source in dual-mode recordings
+(the default — when both a mic and a monitor are detected). This serves
+the hearing-comprehension use case: captioning remote speakers (accents,
+hearing issues, response latency). The operator's own voice is recorded
+and transcribed in post-processing but does NOT appear in the live
+caption overlay.
+
+In `--mic-only` recordings, live captions fall back to captioning the mic
+source — useful as a dictation preview. Note that the `captions.vtt`
+sidecar reflects whichever source the engine was wired to.
+
+See `agentctx/tasks/done/live-captions-pivot-to-monitor.md` for the
+implementation history and the H2 policy decision rationale.
+
 ## Conclusion
 
 Live captioning on CPU-only hardware with 16 GB RAM is feasible and
