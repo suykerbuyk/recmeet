@@ -1,7 +1,8 @@
 {
-  "iter_n": 169,
-  "anchor_sha": "d019794a58b3c0bec46cc9251ab546bd5ecc2e7e",
+  "iter_n": 170,
+  "anchor_sha": "e14f6c22a0966d011cb232ba51ceba54ac5b676c",
   "active": [
+    "live-captions-pivot-to-monitor",
     "thin-client-recording-server",
     "webui-live-captions"
   ],
