@@ -800,4 +800,688 @@ void save_config(const Config& cfg, const fs::path& config_path) {
     chmod(path.c_str(), 0600);
 }
 
+// ---------------------------------------------------------------------------
+// Phase E.2 Wave 2.2a — ServerConfig / ClientConfig load+save+migrate
+// ---------------------------------------------------------------------------
+//
+// The new split-file APIs live alongside the monolithic load_config /
+// save_config so the existing 193 consumers compile unchanged. Wave 2.2b
+// retypes consumers and removes the monolithic surface.
+
+ServerConfig to_server_config(const Config& cfg) {
+    ServerConfig s;
+    s.whisper_model              = cfg.whisper_model;
+    s.llm_model                  = cfg.llm_model;
+    s.llm_mmap                   = cfg.llm_mmap;
+    s.captions_enabled           = cfg.captions_enabled;
+    s.caption_model              = cfg.caption_model;
+    s.provider                   = cfg.provider;
+    s.api_url                    = cfg.api_url;
+    s.api_key                    = cfg.api_key;
+    s.api_model                  = cfg.api_model;
+    s.api_keys                   = cfg.api_keys;
+    s.diarize                    = cfg.diarize;
+    s.num_speakers               = cfg.num_speakers;
+    s.cluster_threshold          = cfg.cluster_threshold;
+    s.chunk_minutes              = cfg.chunk_minutes;
+    s.chunk_overlap_sec          = cfg.chunk_overlap_sec;
+    s.stitch_threshold           = cfg.stitch_threshold;
+    s.speaker_id                 = cfg.speaker_id;
+    s.speaker_threshold          = cfg.speaker_threshold;
+    s.speaker_db                 = cfg.speaker_db;
+    s.vad                        = cfg.vad;
+    s.vad_threshold              = cfg.vad_threshold;
+    s.vad_min_silence            = cfg.vad_min_silence;
+    s.vad_min_speech             = cfg.vad_min_speech;
+    s.vad_max_speech             = cfg.vad_max_speech;
+    s.threads                    = cfg.threads;
+    s.log_level_str              = cfg.log_level_str;
+    s.log_dir                    = cfg.log_dir;
+    s.log_retention_hours        = cfg.log_retention_hours;
+    s.web_port                   = cfg.web_port;
+    s.web_bind                   = cfg.web_bind;
+    s.max_message_bytes          = cfg.max_message_bytes;
+    s.max_upload_bytes           = cfg.max_upload_bytes;
+    s.max_clients                = cfg.max_clients;
+    s.slot_postprocess           = cfg.slot_postprocess;
+    s.slot_streaming             = cfg.slot_streaming;
+    s.slot_model_download        = cfg.slot_model_download;
+    s.allow_client_downloads     = cfg.allow_client_downloads;
+    s.retain_terminal_hours      = cfg.retain_terminal_hours;
+    s.diarization_cache_ttl_secs = cfg.diarization_cache_ttl_secs;
+    return s;
+}
+
+ClientConfig to_client_config(const Config& cfg) {
+    ClientConfig c;
+    c.device_pattern             = cfg.device_pattern;
+    c.mic_source                 = cfg.mic_source;
+    c.monitor_source             = cfg.monitor_source;
+    c.mic_only                   = cfg.mic_only;
+    c.keep_sources               = cfg.keep_sources;
+    c.language                   = cfg.language;
+    c.vocabulary                 = cfg.vocabulary;
+    c.summary_style              = cfg.summary_style;
+    c.no_summary                 = cfg.no_summary;
+    c.provider                   = cfg.provider;
+    c.api_url                    = cfg.api_url;
+    c.api_key                    = cfg.api_key;
+    c.api_model                  = cfg.api_model;
+    c.api_keys                   = cfg.api_keys;
+    c.llm_model                  = cfg.llm_model;
+    c.llm_mmap                   = cfg.llm_mmap;
+    c.caption_latency_ms         = cfg.caption_latency_ms;
+    c.caption_normalize_display  = cfg.caption_normalize_display;
+    c.output_dir                 = cfg.output_dir;
+    c.output_dir_explicit        = cfg.output_dir_explicit;
+    c.note_dir                   = cfg.note_dir;
+    c.note                       = cfg.note;
+    c.context_file               = cfg.context_file;
+    c.context_inline             = cfg.context_inline;
+    c.reprocess_dir              = cfg.reprocess_dir;
+    c.reprocess_batch_dir        = cfg.reprocess_batch_dir;
+    c.reprocess_batch_dry_run    = cfg.reprocess_batch_dry_run;
+    c.batch_mode                 = cfg.batch_mode;
+    c.staging_max_bytes          = cfg.staging_max_bytes;
+    c.servers                    = cfg.servers;
+    c.enroll_mode                = cfg.enroll_mode;
+    c.enroll_name                = cfg.enroll_name;
+    return c;
+}
+
+ServerConfig load_server_config(const fs::path& config_path) {
+    ServerConfig cfg;
+    fs::path path = config_path.empty() ? config_dir() / "daemon.yaml" : config_path;
+
+    // DUAL fallback: env-provided API key seeds api_key the same way
+    // the monolithic load_config does.
+    for (size_t i = 0; i < NUM_PROVIDERS; ++i) {
+        if (const char* key = std::getenv(PROVIDERS[i].env_var)) {
+            cfg.api_key = key;
+            break;
+        }
+    }
+
+    if (!fs::exists(path)) return cfg;
+
+    std::ifstream in(path);
+    if (!in) return cfg;
+    std::ostringstream buf;
+    buf << in.rdbuf();
+    std::string raw = buf.str();
+    auto entries = parse_yaml(raw);
+
+    // Transcription — server picks the model.
+    cfg.whisper_model = get_val(entries, "transcription", "model", cfg.whisper_model);
+
+    // Summary — DUAL fallback subset on the daemon side.
+    cfg.provider  = get_val(entries, "summary", "provider", cfg.provider);
+    cfg.api_url   = get_val(entries, "summary", "api_url", cfg.api_url);
+    std::string fk = get_val(entries, "summary", "api_key", "");
+    if (!fk.empty()) cfg.api_key = fk;
+    cfg.api_model = get_val(entries, "summary", "model", cfg.api_model);
+    cfg.llm_model = get_val(entries, "summary", "llm_model", "");
+    cfg.llm_mmap  = get_bool(entries, "summary", "llm_mmap", false);
+
+    // Per-provider API keys.
+    for (size_t i = 0; i < NUM_PROVIDERS; ++i) {
+        std::string k = get_val(entries, "api_keys", PROVIDERS[i].name, "");
+        if (!k.empty()) cfg.api_keys[PROVIDERS[i].name] = k;
+    }
+
+    // Diarization.
+    cfg.diarize = get_bool(entries, "diarization", "enabled", true);
+    std::string ns = get_val(entries, "diarization", "num_speakers", "0");
+    cfg.num_speakers = std::atoi(ns.c_str());
+    std::string ct = get_val(entries, "diarization", "cluster_threshold", "");
+    if (!ct.empty()) cfg.cluster_threshold = std::atof(ct.c_str());
+    {
+        float cm = cfg.chunk_minutes;
+        float co = cfg.chunk_overlap_sec;
+        float st_thr = cfg.stitch_threshold;
+        std::string cm_s = get_val(entries, "diarization", "chunk_minutes", "");
+        std::string co_s = get_val(entries, "diarization", "chunk_overlap_sec", "");
+        std::string st_s = get_val(entries, "diarization", "stitch_threshold", "");
+        if (!cm_s.empty()) cm = static_cast<float>(std::atof(cm_s.c_str()));
+        if (!co_s.empty()) co = static_cast<float>(std::atof(co_s.c_str()));
+        if (!st_s.empty()) st_thr = static_cast<float>(std::atof(st_s.c_str()));
+        bool any_loaded = !cm_s.empty() || !co_s.empty();
+        if (any_loaded && cm * 60.0f <= co + 60.0f) {
+            log_warn("config: invalid chunked-diarize values "
+                     "(chunk_minutes=%.3f, chunk_overlap_sec=%.3f); "
+                     "chunk_minutes*60 must exceed chunk_overlap_sec+60. "
+                     "Falling back to defaults (15.0, 30.0).", cm, co);
+            if (!st_s.empty()) cfg.stitch_threshold = st_thr;
+        } else {
+            cfg.chunk_minutes = cm;
+            cfg.chunk_overlap_sec = co;
+            cfg.stitch_threshold = st_thr;
+        }
+    }
+
+    // Speaker identification.
+    cfg.speaker_id = get_bool(entries, "speaker_id", "enabled", true);
+    std::string st = get_val(entries, "speaker_id", "threshold", "");
+    if (!st.empty()) cfg.speaker_threshold = std::atof(st.c_str());
+    std::string sdb = get_val(entries, "speaker_id", "database", "");
+    if (!sdb.empty()) cfg.speaker_db = sdb;
+
+    // VAD.
+    cfg.vad = get_bool(entries, "vad", "enabled", true);
+    std::string vt = get_val(entries, "vad", "threshold", "");
+    if (!vt.empty()) cfg.vad_threshold = std::atof(vt.c_str());
+    std::string vms = get_val(entries, "vad", "min_silence", "");
+    if (!vms.empty()) cfg.vad_min_silence = std::atof(vms.c_str());
+    std::string vmsp = get_val(entries, "vad", "min_speech", "");
+    if (!vmsp.empty()) cfg.vad_min_speech = std::atof(vmsp.c_str());
+    std::string vmxs = get_val(entries, "vad", "max_speech", "");
+    if (!vmxs.empty()) cfg.vad_max_speech = std::atof(vmxs.c_str());
+
+    // Captions (server side — engine + model only; normalize_display is
+    // a client-render knob and stays in client.yaml).
+    cfg.captions_enabled = get_bool(entries, "captions", "enabled", false);
+    cfg.caption_model = get_val(entries, "captions", "model", "");
+
+    // General.
+    std::string threads_str = get_val(entries, "general", "threads", "0");
+    cfg.threads = std::atoi(threads_str.c_str());
+
+    // Logging.
+    cfg.log_level_str = get_val(entries, "logging", "level", "error");
+    std::string log_dir_val = get_val(entries, "logging", "directory", "");
+    if (!log_dir_val.empty()) cfg.log_dir = log_dir_val;
+    std::string retention_val = get_val(entries, "logging", "retention_hours", "4");
+    if (!retention_val.empty()) cfg.log_retention_hours = std::stoi(retention_val);
+    if (const char* env_level = std::getenv("RECMEET_LOG_LEVEL"))
+        cfg.log_level_str = env_level;
+
+    // Web server.
+    std::string port_str = get_val(entries, "web", "port", "8384");
+    cfg.web_port = std::atoi(port_str.c_str());
+    cfg.web_bind = get_val(entries, "web", "bind", "127.0.0.1");
+
+    // IPC limits.
+    {
+        std::string mmb = get_val(entries, "ipc", "max_message_bytes", "");
+        if (!mmb.empty()) {
+            long long v = std::atoll(mmb.c_str());
+            if (v > 0) cfg.max_message_bytes = static_cast<size_t>(v);
+            else
+                log_warn("config: invalid [ipc] max_message_bytes=%s; "
+                         "keeping default %zu", mmb.c_str(),
+                         cfg.max_message_bytes);
+        }
+    }
+    {
+        std::string mub = get_val(entries, "server", "max_upload_bytes", "");
+        if (!mub.empty()) {
+            long long v = std::atoll(mub.c_str());
+            if (v > 0) cfg.max_upload_bytes = static_cast<size_t>(v);
+            else
+                log_warn("config: invalid [server] max_upload_bytes=%s; "
+                         "keeping default %zu", mub.c_str(),
+                         cfg.max_upload_bytes);
+        }
+    }
+    {
+        std::string mc = get_val(entries, "ipc", "max_clients", "");
+        if (!mc.empty()) {
+            long long v = std::atoll(mc.c_str());
+            if (v > 0) cfg.max_clients = static_cast<size_t>(v);
+            else
+                log_warn("config: invalid [ipc] max_clients=%s; "
+                         "keeping default %zu", mc.c_str(),
+                         cfg.max_clients);
+        }
+    }
+    {
+        auto parse_slot = [&](const char* key, int& dst) {
+            std::string v = get_val(entries, "server", key, "");
+            if (v.empty()) return;
+            long long n = std::atoll(v.c_str());
+            if (n > 0) dst = static_cast<int>(n);
+            else
+                log_warn("config: invalid [server] slot.%s=%s; keeping "
+                         "default %d", key, v.c_str(), dst);
+        };
+        parse_slot("slot.postprocess", cfg.slot_postprocess);
+        parse_slot("slot.streaming", cfg.slot_streaming);
+        parse_slot("slot.model_download", cfg.slot_model_download);
+
+        std::string acd = get_val(entries, "server", "allow_client_downloads", "");
+        if (!acd.empty()) {
+            cfg.allow_client_downloads =
+                (acd == "true" || acd == "1" || acd == "yes" || acd == "on");
+        }
+
+        std::string dct = get_val(entries, "server",
+                                  "diarization_cache_ttl_secs", "");
+        bool legacy_dct_set = !dct.empty();
+        if (legacy_dct_set) {
+            long long v = std::atoll(dct.c_str());
+            if (v >= 0) cfg.diarization_cache_ttl_secs = static_cast<int64_t>(v);
+            else {
+                log_warn("config: invalid [server] diarization_cache_ttl_secs=%s; "
+                         "keeping default %lld", dct.c_str(),
+                         (long long)cfg.diarization_cache_ttl_secs);
+                legacy_dct_set = false;
+            }
+        }
+
+        std::string rth = get_val(entries, "server", "retain_terminal_hours", "");
+        if (!rth.empty()) {
+            long long v = std::atoll(rth.c_str());
+            if (v >= 0) {
+                cfg.retain_terminal_hours = static_cast<int>(v);
+                int64_t derived = static_cast<int64_t>(v) * 3600;
+                if (legacy_dct_set && cfg.diarization_cache_ttl_secs != derived) {
+                    log_warn("config: [server] retain_terminal_hours=%lld overrides "
+                             "[server] diarization_cache_ttl_secs=%lld "
+                             "(unified knob wins per C.13 M-1)",
+                             (long long)v,
+                             (long long)cfg.diarization_cache_ttl_secs);
+                }
+                cfg.diarization_cache_ttl_secs = derived;
+            } else {
+                log_warn("config: invalid [server] retain_terminal_hours=%s; "
+                         "keeping default %d", rth.c_str(),
+                         cfg.retain_terminal_hours);
+            }
+        } else if (legacy_dct_set) {
+            cfg.retain_terminal_hours = static_cast<int>(
+                cfg.diarization_cache_ttl_secs / 3600);
+            if (cfg.retain_terminal_hours <= 0)
+                cfg.retain_terminal_hours = 24;
+        }
+    }
+
+    return cfg;
+}
+
+ClientConfig load_client_config(const fs::path& config_path) {
+    ClientConfig cfg;
+    fs::path path = config_path.empty() ? config_dir() / "client.yaml" : config_path;
+
+    // DUAL primary: env-provided API key seeds api_key.
+    for (size_t i = 0; i < NUM_PROVIDERS; ++i) {
+        if (const char* key = std::getenv(PROVIDERS[i].env_var)) {
+            cfg.api_key = key;
+            break;
+        }
+    }
+
+    if (!fs::exists(path)) return cfg;
+
+    std::ifstream in(path);
+    if (!in) return cfg;
+    std::ostringstream buf;
+    buf << in.rdbuf();
+    std::string raw = buf.str();
+    auto entries = parse_yaml(raw);
+
+    // Audio.
+    cfg.device_pattern  = get_val(entries, "audio", "device_pattern", cfg.device_pattern);
+    cfg.mic_source      = get_val(entries, "audio", "mic_source", "");
+    cfg.monitor_source  = get_val(entries, "audio", "monitor_source", "");
+    cfg.mic_only        = get_bool(entries, "audio", "mic_only", false);
+    cfg.keep_sources    = get_bool(entries, "audio", "keep_sources", false);
+
+    // Transcription (NO model — server picks).
+    cfg.language   = get_val(entries, "transcription", "language", "");
+    cfg.vocabulary = get_val(entries, "transcription", "vocabulary", "");
+
+    // Summary — DUAL primary subset + E.2(a) style.
+    cfg.provider  = get_val(entries, "summary", "provider", cfg.provider);
+    cfg.api_url   = get_val(entries, "summary", "api_url", cfg.api_url);
+    std::string fk = get_val(entries, "summary", "api_key", "");
+    if (!fk.empty()) cfg.api_key = fk;
+    cfg.api_model = get_val(entries, "summary", "model", cfg.api_model);
+    cfg.no_summary = get_bool(entries, "summary", "disabled", false);
+    cfg.llm_model = get_val(entries, "summary", "llm_model", "");
+    cfg.llm_mmap  = get_bool(entries, "summary", "llm_mmap", false);
+    cfg.summary_style = get_val(entries, "summary", "style", "");
+
+    // Per-provider API keys.
+    for (size_t i = 0; i < NUM_PROVIDERS; ++i) {
+        std::string k = get_val(entries, "api_keys", PROVIDERS[i].name, "");
+        if (!k.empty()) cfg.api_keys[PROVIDERS[i].name] = k;
+    }
+
+    // Output.
+    std::string out = get_val(entries, "output", "directory", "");
+    if (!out.empty()) cfg.output_dir = out;
+
+    // Notes.
+    std::string note_domain = get_val(entries, "notes", "domain", "");
+    if (note_domain.empty())
+        note_domain = get_val(entries, "obsidian", "domain", cfg.note.domain);
+    cfg.note.domain = note_domain;
+    std::string note_dir_val = get_val(entries, "notes", "directory", "");
+    if (!note_dir_val.empty()) cfg.note_dir = note_dir_val;
+
+    // Captions (client-side render knob).
+    cfg.caption_normalize_display =
+        get_bool(entries, "captions", "normalize_display", true);
+
+    // [client] section — staging budget + caption latency + servers.
+    {
+        std::string smb = get_val(entries, "client", "staging_max_bytes", "");
+        if (!smb.empty()) {
+            long long v = std::atoll(smb.c_str());
+            if (v > 0) cfg.staging_max_bytes = static_cast<size_t>(v);
+            else
+                log_warn("config: invalid [client] staging_max_bytes=%s; "
+                         "keeping default %zu", smb.c_str(),
+                         cfg.staging_max_bytes);
+        }
+    }
+    {
+        std::string clm = get_val(entries, "client", "caption_latency_ms", "");
+        if (!clm.empty()) {
+            long long v = std::atoll(clm.c_str());
+            if (v >= 200 && v <= 2000) {
+                cfg.caption_latency_ms = static_cast<int>(v);
+            } else {
+                log_warn("config: invalid [client] caption_latency_ms=%s "
+                         "(must be in [200, 2000]); keeping default %d",
+                         clm.c_str(), cfg.caption_latency_ms);
+            }
+        }
+    }
+    cfg.servers = parse_yaml_servers(raw, "client", "servers");
+
+    return cfg;
+}
+
+void save_server_config(const ServerConfig& cfg, const fs::path& config_path) {
+    fs::path path;
+    if (config_path.empty()) {
+        fs::path dir = config_dir();
+        fs::create_directories(dir);
+        path = dir / "daemon.yaml";
+    } else {
+        fs::create_directories(config_path.parent_path());
+        path = config_path;
+    }
+
+    std::ofstream out(path);
+    if (!out)
+        throw RecmeetError("Cannot write daemon.yaml: " + path.string());
+
+    out << "# recmeet daemon configuration\n\n"
+        << "transcription:\n"
+        << "  model: " << cfg.whisper_model << "\n";
+
+    out << "\nsummary:\n"
+        << "  provider: " << cfg.provider << "\n";
+    if (!cfg.api_url.empty())
+        out << "  api_url: \"" << cfg.api_url << "\"\n";
+    out << "  model: " << cfg.api_model << "\n";
+    if (!cfg.llm_model.empty())
+        out << "  llm_model: \"" << cfg.llm_model << "\"\n";
+    if (cfg.llm_mmap)
+        out << "  llm_mmap: true\n";
+
+    {
+        bool has_keys = false;
+        for (const auto& [name, key] : cfg.api_keys) {
+            if (!key.empty()) { has_keys = true; break; }
+        }
+        if (has_keys) {
+            out << "\napi_keys:\n";
+            for (const auto& [name, key] : cfg.api_keys) {
+                if (!key.empty())
+                    out << "  " << name << ": \"" << key << "\"\n";
+            }
+        }
+    }
+
+    if (!cfg.diarize || cfg.num_speakers > 0 || cfg.cluster_threshold != 1.18f ||
+        cfg.chunk_minutes != 15.0f || cfg.chunk_overlap_sec != 30.0f ||
+        cfg.stitch_threshold != 0.6f) {
+        out << "\ndiarization:\n";
+        if (!cfg.diarize) out << "  enabled: false\n";
+        if (cfg.num_speakers > 0) out << "  num_speakers: " << cfg.num_speakers << "\n";
+        if (cfg.cluster_threshold != 1.18f)
+            out << "  cluster_threshold: " << cfg.cluster_threshold << "\n";
+        if (cfg.chunk_minutes != 15.0f)
+            out << "  chunk_minutes: " << cfg.chunk_minutes << "\n";
+        if (cfg.chunk_overlap_sec != 30.0f)
+            out << "  chunk_overlap_sec: " << cfg.chunk_overlap_sec << "\n";
+        if (cfg.stitch_threshold != 0.6f)
+            out << "  stitch_threshold: " << cfg.stitch_threshold << "\n";
+    }
+
+    if (!cfg.speaker_id || cfg.speaker_threshold != 0.6f || !cfg.speaker_db.empty()) {
+        out << "\nspeaker_id:\n";
+        if (!cfg.speaker_id) out << "  enabled: false\n";
+        if (cfg.speaker_threshold != 0.6f)
+            out << "  threshold: " << cfg.speaker_threshold << "\n";
+        if (!cfg.speaker_db.empty())
+            out << "  database: \"" << cfg.speaker_db.string() << "\"\n";
+    }
+
+    if (!cfg.vad || cfg.vad_threshold != 0.5f || cfg.vad_min_silence != 0.5f ||
+        cfg.vad_min_speech != 0.25f || cfg.vad_max_speech != 30.0f) {
+        out << "\nvad:\n";
+        if (!cfg.vad) out << "  enabled: false\n";
+        if (cfg.vad_threshold != 0.5f) out << "  threshold: " << cfg.vad_threshold << "\n";
+        if (cfg.vad_min_silence != 0.5f)
+            out << "  min_silence: " << cfg.vad_min_silence << "\n";
+        if (cfg.vad_min_speech != 0.25f)
+            out << "  min_speech: " << cfg.vad_min_speech << "\n";
+        if (cfg.vad_max_speech != 30.0f)
+            out << "  max_speech: " << cfg.vad_max_speech << "\n";
+    }
+
+    // Captions (server side: enabled + model only).
+    if (cfg.captions_enabled || !cfg.caption_model.empty()) {
+        out << "\ncaptions:\n";
+        if (cfg.captions_enabled) out << "  enabled: true\n";
+        if (!cfg.caption_model.empty())
+            out << "  model: " << cfg.caption_model << "\n";
+    }
+
+    if (cfg.threads > 0) {
+        out << "\ngeneral:\n"
+            << "  threads: " << cfg.threads << "\n";
+    }
+
+    if (cfg.log_level_str != "error" || !cfg.log_dir.empty() || cfg.log_retention_hours != 4) {
+        out << "\nlogging:\n"
+            << "  level: " << cfg.log_level_str << "\n";
+        if (!cfg.log_dir.empty())
+            out << "  directory: \"" << cfg.log_dir.string() << "\"\n";
+        if (cfg.log_retention_hours != 4)
+            out << "  retention_hours: " << cfg.log_retention_hours << "\n";
+    }
+
+    if (cfg.web_port != 8384 || cfg.web_bind != "127.0.0.1") {
+        out << "\nweb:\n";
+        if (cfg.web_port != 8384) out << "  port: " << cfg.web_port << "\n";
+        if (cfg.web_bind != "127.0.0.1")
+            out << "  bind: \"" << cfg.web_bind << "\"\n";
+    }
+
+    bool emit_ipc_section = (cfg.max_message_bytes != 8ull * 1024 * 1024)
+                         || (cfg.max_clients       != 16);
+    if (emit_ipc_section) {
+        out << "\nipc:\n";
+        if (cfg.max_message_bytes != 8ull * 1024 * 1024)
+            out << "  max_message_bytes: " << cfg.max_message_bytes << "\n";
+        if (cfg.max_clients != 16)
+            out << "  max_clients: " << cfg.max_clients << "\n";
+    }
+
+    {
+        bool emit_server_section =
+            cfg.max_upload_bytes != 4ull * 1024 * 1024 * 1024 ||
+            cfg.slot_postprocess != 1 || cfg.slot_streaming != 1 ||
+            cfg.slot_model_download != 1 || !cfg.allow_client_downloads ||
+            cfg.retain_terminal_hours != 24 ||
+            cfg.diarization_cache_ttl_secs != 86400;
+        if (emit_server_section) {
+            out << "\nserver:\n";
+            if (cfg.max_upload_bytes != 4ull * 1024 * 1024 * 1024)
+                out << "  max_upload_bytes: " << cfg.max_upload_bytes << "\n";
+            if (cfg.slot_postprocess != 1)
+                out << "  slot.postprocess: " << cfg.slot_postprocess << "\n";
+            if (cfg.slot_streaming != 1)
+                out << "  slot.streaming: " << cfg.slot_streaming << "\n";
+            if (cfg.slot_model_download != 1)
+                out << "  slot.model_download: " << cfg.slot_model_download << "\n";
+            if (!cfg.allow_client_downloads)
+                out << "  allow_client_downloads: false\n";
+            if (cfg.retain_terminal_hours != 24)
+                out << "  retain_terminal_hours: " << cfg.retain_terminal_hours << "\n";
+            // Emit the legacy cache TTL only when it has diverged from the
+            // derived `retain_terminal_hours * 3600` value (i.e. an operator
+            // explicitly set the legacy knob without setting the unified one).
+            if (cfg.diarization_cache_ttl_secs !=
+                static_cast<int64_t>(cfg.retain_terminal_hours) * 3600 &&
+                cfg.diarization_cache_ttl_secs != 86400)
+                out << "  diarization_cache_ttl_secs: "
+                    << cfg.diarization_cache_ttl_secs << "\n";
+        }
+    }
+
+    out.close();
+    chmod(path.c_str(), 0600);
+}
+
+void save_client_config(const ClientConfig& cfg, const fs::path& config_path) {
+    fs::path path;
+    if (config_path.empty()) {
+        fs::path dir = config_dir();
+        fs::create_directories(dir);
+        path = dir / "client.yaml";
+    } else {
+        fs::create_directories(config_path.parent_path());
+        path = config_path;
+    }
+
+    std::ofstream out(path);
+    if (!out)
+        throw RecmeetError("Cannot write client.yaml: " + path.string());
+
+    out << "# recmeet client configuration\n\n"
+        << "audio:\n"
+        << "  device_pattern: \"" << cfg.device_pattern << "\"\n";
+    if (!cfg.mic_source.empty())
+        out << "  mic_source: \"" << cfg.mic_source << "\"\n";
+    if (!cfg.monitor_source.empty())
+        out << "  monitor_source: \"" << cfg.monitor_source << "\"\n";
+    if (cfg.mic_only) out << "  mic_only: true\n";
+    if (cfg.keep_sources) out << "  keep_sources: true\n";
+
+    if (!cfg.language.empty() || !cfg.vocabulary.empty()) {
+        out << "\ntranscription:\n";
+        if (!cfg.language.empty())
+            out << "  language: " << cfg.language << "\n";
+        if (!cfg.vocabulary.empty())
+            out << "  vocabulary: \"" << cfg.vocabulary << "\"\n";
+    }
+
+    out << "\nsummary:\n"
+        << "  provider: " << cfg.provider << "\n";
+    if (!cfg.api_url.empty())
+        out << "  api_url: \"" << cfg.api_url << "\"\n";
+    out << "  model: " << cfg.api_model << "\n";
+    if (cfg.no_summary) out << "  disabled: true\n";
+    if (!cfg.llm_model.empty())
+        out << "  llm_model: \"" << cfg.llm_model << "\"\n";
+    if (cfg.llm_mmap) out << "  llm_mmap: true\n";
+    if (!cfg.summary_style.empty())
+        out << "  style: " << cfg.summary_style << "\n";
+
+    {
+        bool has_keys = false;
+        for (const auto& [name, key] : cfg.api_keys) {
+            if (!key.empty()) { has_keys = true; break; }
+        }
+        if (has_keys) {
+            out << "\napi_keys:\n";
+            for (const auto& [name, key] : cfg.api_keys) {
+                if (!key.empty())
+                    out << "  " << name << ": \"" << key << "\"\n";
+            }
+        }
+    }
+
+    out << "\noutput:\n"
+        << "  directory: \"" << cfg.output_dir.string() << "\"\n";
+
+    out << "\nnotes:\n"
+        << "  domain: " << cfg.note.domain << "\n";
+    if (!cfg.note_dir.empty())
+        out << "  directory: \"" << cfg.note_dir.string() << "\"\n";
+
+    if (!cfg.caption_normalize_display) {
+        out << "\ncaptions:\n"
+            << "  normalize_display: false\n";
+    }
+
+    {
+        constexpr size_t default_staging_max_bytes =
+            static_cast<size_t>(500) * 1024 * 1024 * 1024;
+        bool emit_client =
+            cfg.staging_max_bytes != default_staging_max_bytes
+            || cfg.caption_latency_ms != 500
+            || !cfg.servers.empty();
+        if (emit_client) {
+            out << "\nclient:\n";
+            if (cfg.staging_max_bytes != default_staging_max_bytes)
+                out << "  staging_max_bytes: " << cfg.staging_max_bytes << "\n";
+            if (cfg.caption_latency_ms != 500)
+                out << "  caption_latency_ms: " << cfg.caption_latency_ms << "\n";
+            if (!cfg.servers.empty()) {
+                out << "  servers:\n";
+                for (const auto& srv : cfg.servers) {
+                    out << "    - name: " << srv.name << "\n"
+                        << "      address: \"" << srv.address << "\"\n";
+                }
+            }
+        }
+    }
+
+    out.close();
+    chmod(path.c_str(), 0600);
+}
+
+void migrate_legacy_config_if_present(const fs::path& cfg_dir_in) {
+    fs::path cfg_dir = cfg_dir_in.empty() ? config_dir() : cfg_dir_in;
+    fs::path old_path    = cfg_dir / "config.yaml";
+    fs::path daemon_path = cfg_dir / "daemon.yaml";
+    fs::path client_path = cfg_dir / "client.yaml";
+    fs::path backup_path = cfg_dir / "config.yaml.v1-backup";
+
+    if (!fs::exists(old_path))
+        return;  // nothing to migrate
+
+    if (fs::exists(daemon_path) || fs::exists(client_path)) {
+        log_info("config: migration skip — split files already exist");
+        return;
+    }
+
+    // Load the monolithic legacy file, split, then write both halves.
+    Config legacy = load_config(old_path);
+    ServerConfig srv = to_server_config(legacy);
+    ClientConfig cli = to_client_config(legacy);
+
+    save_server_config(srv, daemon_path);
+    save_client_config(cli, client_path);
+
+    // Atomic rename of legacy file to backup. fs::rename is atomic on the
+    // same filesystem (config_dir is always a single FS in practice).
+    fs::rename(old_path, backup_path);
+
+    // chmod the new files explicitly (save_*_config already did so, but the
+    // rename above does not change perms — preserve the security posture).
+    chmod(daemon_path.c_str(), 0600);
+    chmod(client_path.c_str(), 0600);
+
+    log_info("config: migrated config.yaml → daemon.yaml + client.yaml "
+             "(legacy preserved as config.yaml.v1-backup)");
+}
+
 } // namespace recmeet

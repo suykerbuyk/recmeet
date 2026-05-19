@@ -316,4 +316,229 @@ Config load_config(const fs::path& config_path = {});
 /// Save config. Uses path if provided, otherwise ~/.config/recmeet/config.yaml.
 void save_config(const Config& cfg, const fs::path& config_path = {});
 
+// ---------------------------------------------------------------------------
+// Phase E.2 Wave 2.2a — split config: ServerConfig + ClientConfig
+// ---------------------------------------------------------------------------
+//
+// The thin-client recording server splits the monolithic Config into two
+// halves. ServerConfig lives in ~/.config/recmeet/daemon.yaml; ClientConfig
+// lives in ~/.config/recmeet/client.yaml.
+//
+// Wave 2.2a (this file) defines the new structs and adds new load/save
+// surfaces alongside the existing `Config` + `load_config` / `save_config`.
+// The monolithic Config stays intact so all 193 existing consumers compile
+// unchanged; Wave 2.2b retypes consumers onto the new structs and deletes
+// Config.
+//
+// Field-classification table (authoritative — kept in sync with the
+// orchestrator's E.2 brief and plan body line 423 + H-2 reword):
+//
+//   ServerConfig (daemon.yaml — server-side runtime knobs):
+//     Models:    whisper_model, llm_model, llm_mmap, caption_model
+//     Pipeline:  threads
+//     Logging:   log_level_str, log_dir, log_retention_hours
+//     Speakers:  speaker_id, speaker_threshold, speaker_db
+//     Web:       web_port, web_bind
+//     JobQueue:  slot_postprocess, slot_streaming, slot_model_download
+//     IPC:       max_message_bytes, max_clients, max_upload_bytes
+//     Policy:    allow_client_downloads
+//     Diarize:   diarize, num_speakers, cluster_threshold, chunk_minutes,
+//                chunk_overlap_sec, stitch_threshold
+//     VAD:       vad, vad_threshold, vad_min_silence, vad_min_speech,
+//                vad_max_speech
+//     Captions:  captions_enabled, caption_model
+//     Retention: retain_terminal_hours, diarization_cache_ttl_secs
+//     DUAL fb:   provider, api_keys, api_url, api_model, api_key (legacy)
+//
+//   ClientConfig (client.yaml — client-side / tray / CLI knobs):
+//     Audio:     device_pattern, mic_source, monitor_source, mic_only,
+//                keep_sources
+//     Output:    output_dir, output_dir_explicit, note_dir
+//     Notes:     note (NoteConfig — domain + tags)
+//     Trans:     vocabulary, language (client preferences for session.init)
+//     Summary:   summary_style (E.2(a) — new)
+//     Captions:  caption_latency_ms (E.2(b) — new), caption_normalize_display
+//     Context:   context_file, context_inline
+//     Reprocess: reprocess_dir, reprocess_batch_dir, reprocess_batch_dry_run,
+//                batch_mode (CLI-only; not loaded from YAML in Wave 2.2a)
+//     Staging:   staging_max_bytes (D.6 — client owns staging dir)
+//     Servers:   servers (E.2(c) — std::vector<ServerEntry>)
+//     Enroll:    enroll_mode, enroll_name (client-initiated workflow)
+//     Summary:   no_summary
+//     DUAL pri:  provider, api_keys, api_url, api_model, api_key (legacy)
+//
+// DUAL fields exist on BOTH structs per H-2 reword: client value is the
+// primary source, daemon's value is a fallback per the precedence chain at
+// plan line 74 (env > session.init > client.yaml > daemon.yaml > built-in).
+
+struct ServerConfig {
+    // -- Models (server runs the engines) --
+    std::string whisper_model = "base";
+    std::string llm_model;  // path or name, empty = use HTTP API
+    bool llm_mmap = false;
+
+    // -- Captions (server runs CaptionEngine) --
+    bool captions_enabled = false;
+    std::string caption_model;
+
+    // -- DUAL fallback: provider / API keys (client primary; daemon fb) --
+    std::string provider = "xai";
+    std::string api_url;
+    std::string api_key;
+    std::string api_model = "grok-3";
+    std::map<std::string, std::string> api_keys;
+
+    // -- Diarization (server pipeline) --
+    bool diarize = true;
+    int num_speakers = 0;
+    float cluster_threshold = 1.18f;
+    float chunk_minutes = 15.0f;
+    float chunk_overlap_sec = 30.0f;
+    float stitch_threshold = 0.6f;
+
+    // -- Speaker DB (server-resident per decision #1) --
+    bool speaker_id = true;
+    float speaker_threshold = 0.6f;
+    fs::path speaker_db;
+
+    // -- VAD (server pipeline) --
+    bool vad = true;
+    float vad_threshold = 0.5f;
+    float vad_min_silence = 0.5f;
+    float vad_min_speech = 0.25f;
+    float vad_max_speech = 30.0f;
+
+    // -- Performance --
+    int threads = 0;
+
+    // -- Logging --
+    std::string log_level_str = "error";
+    fs::path log_dir;
+    int log_retention_hours = 4;
+
+    // -- Web server (server-side recmeet-web) --
+    int web_port = 8384;
+    std::string web_bind = "127.0.0.1";
+
+    // -- IPC limits --
+    size_t max_message_bytes = 8 * 1024 * 1024;
+    size_t max_upload_bytes = 4ull * 1024 * 1024 * 1024;
+    size_t max_clients = 16;
+
+    // -- JobQueue slot capacities --
+    int slot_postprocess = 1;
+    int slot_streaming = 1;
+    int slot_model_download = 1;
+
+    // -- Downloads policy --
+    bool allow_client_downloads = true;
+
+    // -- Retention (consolidated terminal-state knob) --
+    int retain_terminal_hours = 24;
+    int64_t diarization_cache_ttl_secs = 86400;
+};
+
+struct ClientConfig {
+    // -- Audio capture (client owns capture in V2) --
+    std::string device_pattern = DEFAULT_DEVICE_PATTERN;
+    std::string mic_source;
+    std::string monitor_source;
+    bool mic_only = false;
+    bool keep_sources = false;
+
+    // -- Transcription client preferences (NO model — server picks) --
+    std::string language;
+    std::string vocabulary;
+
+    // -- Summarization preferences --
+    std::string summary_style;  // E.2(a)
+    bool no_summary = false;
+
+    // -- DUAL primary: provider / API keys (client primary; daemon fb) --
+    std::string provider = "xai";
+    std::string api_url;
+    std::string api_key;
+    std::string api_model = "grok-3";
+    std::map<std::string, std::string> api_keys;
+
+    // -- Local LLM (dual subset — client may carry override) --
+    std::string llm_model;
+    bool llm_mmap = false;
+
+    // -- Captions (client UI rendering) --
+    int caption_latency_ms = 500;  // E.2(b)
+    bool caption_normalize_display = true;
+
+    // -- Output --
+    fs::path output_dir = "./meetings";
+    bool output_dir_explicit = false;
+    fs::path note_dir;
+
+    // -- Meeting notes (client-side rendering) --
+    NoteConfig note;
+
+    // -- Context (client UX) --
+    fs::path context_file;
+    std::string context_inline;
+
+    // -- Reprocess (CLI-only knobs — not loaded from YAML in Wave 2.2a) --
+    fs::path reprocess_dir;
+    fs::path reprocess_batch_dir;
+    bool reprocess_batch_dry_run = false;
+    bool batch_mode = false;
+
+    // -- Staging dir budget (D.6) --
+    size_t staging_max_bytes = static_cast<size_t>(500) * 1024 * 1024 * 1024;
+
+    // -- Server registry (E.2(c)) --
+    std::vector<ServerEntry> servers;
+
+    // -- Enroll workflow (client-initiated) --
+    bool enroll_mode = false;
+    std::string enroll_name;
+};
+
+/// Load ServerConfig from daemon.yaml. Uses path if provided, otherwise
+/// `~/.config/recmeet/daemon.yaml`. Returns a default-constructed
+/// ServerConfig when the file does not exist.
+ServerConfig load_server_config(const fs::path& config_path = {});
+
+/// Load ClientConfig from client.yaml. Uses path if provided, otherwise
+/// `~/.config/recmeet/client.yaml`. Returns a default-constructed
+/// ClientConfig when the file does not exist.
+ClientConfig load_client_config(const fs::path& config_path = {});
+
+/// Save ServerConfig to daemon.yaml. Writes with 0600 perms to preserve
+/// the security posture of the legacy config.yaml.
+void save_server_config(const ServerConfig& cfg, const fs::path& config_path = {});
+
+/// Save ClientConfig to client.yaml. Writes with 0600 perms.
+void save_client_config(const ClientConfig& cfg, const fs::path& config_path = {});
+
+/// Extract a ServerConfig from a monolithic Config (used by the legacy
+/// migration path).
+ServerConfig to_server_config(const Config& cfg);
+
+/// Extract a ClientConfig from a monolithic Config (used by the legacy
+/// migration path).
+ClientConfig to_client_config(const Config& cfg);
+
+/// Migrate legacy ~/.config/recmeet/config.yaml into daemon.yaml +
+/// client.yaml if (and only if) the legacy file exists AND neither split
+/// file is present yet. Idempotent — calling repeatedly with already-
+/// migrated state is a no-op.
+///
+/// Behavior:
+///   1. If `config.yaml` does not exist → return (nothing to migrate).
+///   2. If `daemon.yaml` or `client.yaml` exists → return (already
+///      migrated; log skip).
+///   3. Otherwise: load legacy config, split into ServerConfig +
+///      ClientConfig, write daemon.yaml + client.yaml (0600), and
+///      rename legacy file to `config.yaml.v1-backup`.
+///
+/// Never invoked from `load_config()` — opt-in only until Wave 2.2b
+/// reroutes consumers. The `config_dir` overload is for test isolation;
+/// defaults to `util.h::config_dir()`.
+void migrate_legacy_config_if_present(const fs::path& config_dir = {});
+
 } // namespace recmeet

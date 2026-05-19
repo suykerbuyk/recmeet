@@ -21,4 +21,14 @@ Config config_from_json(const std::string& json);
 JsonMap config_to_map(const Config& cfg);
 Config config_from_map(const JsonMap& map);
 
+// Phase E.2 Wave 2.2a — overloads for the split structs. Mirrors the flat
+// `key`-based shape of `config_to_map(const Config&)` so the same
+// JsonMap layout can carry either struct over the IPC boundary.
+JsonMap config_to_map(const ServerConfig& cfg);
+JsonMap config_to_map(const ClientConfig& cfg);
+
+// Reconstruct a ServerConfig / ClientConfig from a flat JsonMap.
+ServerConfig server_config_from_map(const JsonMap& map);
+ClientConfig client_config_from_map(const JsonMap& map);
+
 } // namespace recmeet
