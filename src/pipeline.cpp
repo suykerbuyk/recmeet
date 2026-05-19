@@ -117,9 +117,9 @@ namespace {
 // ordering: the producer-side callback is unsubscribed first, THEN the
 // engine is stopped (which joins its worker after draining the ring).
 //
-// Two convenience overloads cover the dual-mode (mic + monitor) and
-// single-mode (mic only) capture topologies. The engine is wired to the
-// mic capture only — monitor audio is recorded but not captioned in V1.
+// In dual-mode recordings the engine is wired to the **monitor** capture
+// (remote-speaker comprehension); in mic-only recordings it falls back
+// to the mic capture. The template parameter resolves the bifurcation.
 //
 // Phase 6 — the engine's single result callback is fanned out via a
 // `CaptionFanoutAdapter` heap-owned by this RAII wrapper: it forwards every
@@ -355,19 +355,6 @@ PostprocessInput run_recording(const Config& cfg, StopToken& stop, PhaseCallback
             mic_cap.start();
             log_debug("pipeline: capture start (mic)");
 
-            // Caption engine — wired to mic only (monitor audio is recorded
-            // but not captioned in V1). Lifetime: from here through the
-            // explicit `caption.reset()` after `mic_cap.stop()`.
-            std::unique_ptr<ActiveCaptionEngine<PipeWireCapture>> caption;
-            if (want_captions) {
-                std::unique_ptr<CaptionFanoutAdapter> adapter;
-                if (auto eng = try_start_caption_engine(cfg, caption_hooks,
-                                                        pp.out_dir, adapter)) {
-                    caption = std::make_unique<ActiveCaptionEngine<PipeWireCapture>>(
-                        std::move(eng), &mic_cap, std::move(adapter));
-                }
-            }
-
             // Start monitor capture — try PipeWire CAPTURE_SINK first, fall back to pa_simple
             std::unique_ptr<PipeWireCapture> mon_pw;
             std::unique_ptr<PulseMonitorCapture> mon_pa;
@@ -396,6 +383,26 @@ PostprocessInput run_recording(const Config& cfg, StopToken& stop, PhaseCallback
                 }
             }
 
+            // Caption engine — wired to monitor in dual mode (remote-speaker
+            // comprehension). Mic audio is recorded and transcribed in
+            // post-processing but not live-captioned. Lifetime: from here through
+            // the explicit `caption_*.reset()` after the captures stop.
+            std::unique_ptr<ActiveCaptionEngine<PipeWireCapture>>     caption_pw;
+            std::unique_ptr<ActiveCaptionEngine<PulseMonitorCapture>> caption_pa;
+            if (want_captions) {
+                std::unique_ptr<CaptionFanoutAdapter> adapter;
+                if (auto eng = try_start_caption_engine(cfg, caption_hooks,
+                                                        pp.out_dir, adapter)) {
+                    if (mon_pw) {
+                        caption_pw = std::make_unique<ActiveCaptionEngine<PipeWireCapture>>(
+                            std::move(eng), mon_pw.get(), std::move(adapter));
+                    } else {
+                        caption_pa = std::make_unique<ActiveCaptionEngine<PulseMonitorCapture>>(
+                            std::move(eng), mon_pa.get(), std::move(adapter));
+                    }
+                }
+            }
+
             // Display timer and wait for stop
             StopToken timer_stop;
             std::thread timer_thread(display_elapsed, std::ref(timer_stop));
@@ -408,19 +415,20 @@ PostprocessInput run_recording(const Config& cfg, StopToken& stop, PhaseCallback
             timer_thread.join();
             fprintf(stderr, "Recording stopped.\n");
 
-            // Stop captures. After cap.stop() returns, the capture-thread
+            // Stop captures. After capture.stop() returns, the capture-thread
             // callback no longer fires, so it is safe to tear down the
-            // caption engine before draining the buffer.
+            // caption engine before draining the buffers.
             mic_cap.stop();
             if (mon_pw) mon_pw->stop();
             if (mon_pa) mon_pa->stop();
 
-            // Phase 3 teardown ordering: cap.stop() -> engine teardown ->
-            // cap.drain(). The engine's worker drains its own ring buffer
-            // and joins inside the destructor; explicitly resetting here
-            // makes the ordering visible (and asserts vs. unsubscribe by
-            // the time drain() runs).
-            caption.reset();
+            // Phase 3 teardown ordering: capture.stop() -> caption engine
+            // teardown -> capture.drain(). The engine is wired to the monitor
+            // capture in dual mode; its worker drains its own ring buffer and
+            // joins inside the destructor. Explicitly resetting both slots
+            // here makes the ordering visible (only one is non-null).
+            caption_pw.reset();
+            caption_pa.reset();
 
             // Drain and write
             auto mic_samples = mic_cap.drain();
