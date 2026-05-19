@@ -361,9 +361,10 @@ void IpcServer::run() {
 
         // Check client sockets. POLLOUT path runs BEFORE the read path so
         // that an outstanding response goes out even if the client is
-        // simultaneously sending more data — and so that fds flagged
-        // pending_close on a prior enqueue overflow are reaped before
-        // they are read again. Hangup/error wins outright.
+        // simultaneously sending more data. Response-class enqueue
+        // overflow now reaps the client synchronously via `remove_client`
+        // (see the overflow branch in `enqueue_outbound`), so there is no
+        // deferred close-pending flag here. Hangup/error wins outright.
         for (size_t i = 2; i < fds.size(); ++i) {
             int fd = fds[i].fd;
             short rev = fds[i].revents;

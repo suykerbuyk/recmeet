@@ -159,20 +159,19 @@ static int client_status(const std::string& addr = "") {
     return 0;
 }
 
-static int client_stop(const std::string& addr = "") {
-    IpcClient client(addr);
-    if (!client.connect()) {
-        fprintf(stderr, "Daemon not running.\n");
-        return 1;
-    }
-    IpcResponse resp;
-    IpcError err;
-    if (!client.call("record.stop", resp, err)) {
-        fprintf(stderr, "Error: %s\n", err.message.c_str());
-        return 1;
-    }
-    printf("Stop signal sent.\n");
-    return 0;
+static int client_stop(const std::string& /*addr*/ = "") {
+    // Phase E.1-fix — `--stop` was a thin client wrapper around the
+    // daemon's `record.stop` verb. C.9 removed that handler as part of
+    // the v2 thin-client cut over (capture lives on the client, not the
+    // daemon). Surface a friendly migration message and exit 2 (usage
+    // error) so operators get a clear next step instead of a confusing
+    // "unknown verb" wire error.
+    fprintf(stderr,
+            "Error: --stop is not supported in v2 thin-client mode.\n"
+            "       The daemon does not own capture in v2.\n"
+            "       Use the tray Stop button, or send SIGINT to the\n"
+            "       foreground 'recmeet --record' process.\n");
+    return 2;
 }
 
 // `client_record_no_sigaction` lives in src/reprocess_batch.cpp (recmeet_core).
@@ -193,17 +192,19 @@ static int client_record(const Config& cfg, const std::string& addr = "",
     sigaction(SIGINT, nullptr, &prev_int);
     sigaction(SIGTERM, nullptr, &prev_term);
 
-    // Single-meeting SIGINT handler: forwards to record.stop on the live
-    // socket. Reads g_active_ipc_client (set by client_record_no_sigaction)
-    // so we don't need a separate function-static client pointer.
+    // Phase E.1-fix — single-meeting SIGINT/SIGTERM handler. Pre-E.1 this
+    // lambda forwarded `record.stop` to the daemon; C.9 removed that verb.
+    // In v2 the daemon doesn't own capture, so the cancellation signal
+    // flips a local StopToken published by `client_record_no_sigaction`
+    // (see `g_active_client_stop` in reprocess_batch.h). The upload chunk
+    // loop polls the token between frames and returns cleanly. We also
+    // close the live socket so any in-progress read unblocks promptly.
     struct sigaction sa{};
     sa.sa_handler = [](int) {
+        StopToken* cs = g_active_client_stop.load(std::memory_order_acquire);
+        if (cs) cs->request();
         IpcClient* c = g_active_ipc_client.load(std::memory_order_acquire);
-        if (c && c->connected()) {
-            IpcResponse r;
-            IpcError e;
-            c->call("record.stop", r, e, 5000);
-        }
+        if (c && c->connected()) c->close_connection();
     };
     sigemptyset(&sa.sa_mask);
     sigaction(SIGINT, &sa, nullptr);

@@ -19,11 +19,13 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <csignal>
 #include <cstdio>
 #include <cstring>
 #include <exception>
+#include <fstream>
 #include <regex>
 #include <string>
 #include <system_error>
@@ -138,20 +140,37 @@ std::string ensure_models_cached_or_fail(const Config& cfg) {
 
 int client_record_no_sigaction(const Config& cfg, const std::string& addr,
                                bool show_captions_on_stderr) {
+    bool is_reprocess = !cfg.reprocess_dir.empty();
+
+    // Phase E.1-fix — v2 thin-client: daemon does NOT run live capture.
+    // Pre-E.1 this path called `record.start` (no `reprocess_dir`) and the
+    // daemon spun up its own capture pipeline. C.9 deleted that handler;
+    // the only coherent daemon-mode CLI flow now is a one-shot reprocess
+    // upload via `process.submit`. Refuse live recording with a friendly
+    // migration message instead of producing an "unknown verb" error.
+    if (!is_reprocess) {
+        fprintf(stderr,
+                "Error: daemon-mode live recording is not supported in v2.\n"
+                "       The daemon does not own capture in v2 (thin-client model).\n"
+                "       Use one of:\n"
+                "         * tray Record button (live capture + post-record upload)\n"
+                "         * recmeet --no-daemon         (standalone recording)\n"
+                "         * recmeet --reprocess <file>  (post-hoc daemon processing)\n");
+        return 1;
+    }
+
     IpcClient client(addr);
     if (!client.connect()) {
         fprintf(stderr, "Error: daemon not running. Start with: recmeet-daemon\n");
         return kClientConnectFailedExitCode;
     }
 
-    bool is_reprocess = !cfg.reprocess_dir.empty();
-
-    // Phase A.6 + B-bonus — CLI sends its credentials + preferences
-    // via session.init once per connection. After A.6 the daemon
-    // ignores everything except `reprocess_dir` on record.start, so
-    // the CLI MUST hand its config off through the session handshake
-    // or summarization / output dir / vocab / etc. all silently
-    // revert to daemon.yaml defaults.
+    // Phase A.6 + B-bonus — CLI sends its credentials + preferences via
+    // session.init once per connection. After A.6 the daemon's
+    // `process.submit` handler reads job-time Config exclusively from the
+    // session snapshot, so the CLI MUST hand its config off through the
+    // session handshake or summarization / output dir / vocab / etc. all
+    // silently revert to daemon.yaml defaults.
     {
         JsonMap creds;
         creds["provider"] = cfg.provider;
@@ -184,10 +203,72 @@ int client_record_no_sigaction(const Config& cfg, const std::string& addr,
         }
     }
 
-    // Phase A.6: record.start carries only `reprocess_dir`. All other
-    // config flows through session.init above.
+    // Phase E.1-fix — resolve the audio file inside `reprocess_dir` (which
+    // may be a file or a meeting directory). `find_audio_file()` accepts
+    // both shapes and returns the canonical audio path (the same helper
+    // the daemon's reprocess subprocess uses on its end).
+    fs::path audio_path;
+    if (fs::is_directory(cfg.reprocess_dir)) {
+        audio_path = find_audio_file(cfg.reprocess_dir);
+        if (audio_path.empty()) {
+            fprintf(stderr, "Error: no audio file found in %s\n",
+                    cfg.reprocess_dir.c_str());
+            return 1;
+        }
+    } else if (fs::is_regular_file(cfg.reprocess_dir)) {
+        audio_path = cfg.reprocess_dir;
+    } else {
+        fprintf(stderr, "Error: reprocess path does not exist: %s\n",
+                cfg.reprocess_dir.c_str());
+        return 1;
+    }
+
+    // Resolve format from extension. Raw PCM (s16le/f32le) is never sent on
+    // this CLI path — operators reprocess on-disk container audio.
+    std::string ext = audio_path.extension().string();
+    std::transform(ext.begin(), ext.end(), ext.begin(),
+                   [](unsigned char c) { return std::tolower(c); });
+    std::string format;
+    if (ext == ".wav")       format = "wav";
+    else if (ext == ".flac") format = "flac";
+    else if (ext == ".mp3")  format = "mp3";
+    else if (ext == ".m4a")  format = "m4a";
+    else if (ext == ".ogg")  format = "ogg";
+    else {
+        fprintf(stderr, "Error: unsupported audio format: %s (expected wav/flac/mp3/m4a/ogg)\n",
+                ext.c_str());
+        return 1;
+    }
+
+    std::error_code ec;
+    auto audio_size = fs::file_size(audio_path, ec);
+    if (ec || audio_size == 0) {
+        fprintf(stderr, "Error: cannot stat audio file %s: %s\n",
+                audio_path.c_str(),
+                ec ? ec.message().c_str() : "empty");
+        return 1;
+    }
+
+    std::ifstream audio_in(audio_path, std::ios::binary);
+    if (!audio_in) {
+        fprintf(stderr, "Error: cannot open audio file %s\n", audio_path.c_str());
+        return 1;
+    }
+
     JsonMap params;
-    if (is_reprocess) params["reprocess_dir"] = cfg.reprocess_dir.string();
+    params["audio_size"]  = static_cast<int64_t>(audio_size);
+    params["format"]      = format;
+    params["sample_rate"] = static_cast<int64_t>(16000);
+    params["channels"]    = static_cast<int64_t>(1);
+    params["mode"]        = std::string("transcribe");
+
+    // C.11.4 dedup: thread the existing meeting_id from context.json (if
+    // any) through so the daemon overwrites the same meeting dir
+    // atomically instead of allocating a new one alongside the original.
+    if (fs::is_directory(cfg.reprocess_dir)) {
+        std::string mid = load_meeting_id(cfg.reprocess_dir);
+        if (!mid.empty()) params["meeting_id"] = mid;
+    }
 
     // Reset function-static state every entry. Three statics had retained
     // values across calls (rev 3 C2-1):
@@ -306,16 +387,22 @@ int client_record_no_sigaction(const Config& cfg, const std::string& addr,
         }
     });
 
-    // Publish the live client to the batch-level SIGINT handler. Stored
-    // unconditionally for simplicity; the single-meeting wrapper's handler
-    // also reads this same atomic to forward Ctrl-C to the daemon.
+    // Publish the live client + per-iteration StopToken to the SIGINT
+    // handlers (single-meeting wrapper + batch driver both read these).
+    // Phase E.1-fix: post-C.9 the handlers cannot call any daemon-side
+    // stop verb (none exists), so they flip `iter_stop` instead — the
+    // chunk-upload loop below polls it between chunks for a clean
+    // mid-upload abort.
+    StopToken iter_stop;
     g_active_ipc_client.store(&client, std::memory_order_release);
+    g_active_client_stop.store(&iter_stop, std::memory_order_release);
 
     IpcResponse resp;
     IpcError err;
-    if (!client.call("record.start", params, resp, err)) {
+    if (!client.call("process.submit", params, resp, err, 10000)) {
         fprintf(stderr, "Error: %s\n", err.message.c_str());
         g_active_ipc_client.store(nullptr, std::memory_order_release);
+        g_active_client_stop.store(nullptr, std::memory_order_release);
         return 1;
     }
 
@@ -324,15 +411,63 @@ int client_record_no_sigaction(const Config& cfg, const std::string& addr,
         if (jid_it != resp.result.end())
             my_job_id = json_val_as_int(jid_it->second);
     }
+    auto tit = resp.result.find("upload_token");
+    std::string upload_token =
+        (tit != resp.result.end()) ? json_val_as_string(tit->second) : "";
+    if (my_job_id <= 0 || upload_token.empty()) {
+        fprintf(stderr, "Error: process.submit response missing job_id / upload_token\n");
+        g_active_ipc_client.store(nullptr, std::memory_order_release);
+        g_active_client_stop.store(nullptr, std::memory_order_release);
+        return 1;
+    }
 
-    if (is_reprocess)
-        fprintf(stderr, "Reprocessing %s\n", cfg.reprocess_dir.c_str());
-    else
-        fprintf(stderr, "Recording started. Press Ctrl+C to stop.\n");
+    fprintf(stderr, "Reprocessing %s (job=%lld)\n",
+            cfg.reprocess_dir.c_str(), (long long)my_job_id);
 
-    client.read_events("job.complete");
+    // Stream the audio file in 64 KiB chunks via 0x01 upload frames. The
+    // daemon's UploadSession auto-finalizes once bytes_received hits
+    // audio_size; the postprocess job becomes runnable and pp_worker
+    // drains it. Events (phase / progress / job.complete) flow back
+    // through the registered callback.
+    constexpr std::size_t CHUNK_BYTES = 64 * 1024;
+    std::vector<char> buf(CHUNK_BYTES);
+    std::uint64_t sent = 0;
+    bool upload_ok = true;
+    while (sent < audio_size) {
+        if (iter_stop.stop_requested()) {
+            upload_ok = false;
+            break;
+        }
+        std::size_t want = std::min<std::size_t>(CHUNK_BYTES, audio_size - sent);
+        audio_in.read(buf.data(), static_cast<std::streamsize>(want));
+        std::streamsize got = audio_in.gcount();
+        if (got <= 0) {
+            fprintf(stderr, "Error: audio read short at offset %llu\n",
+                    (unsigned long long)sent);
+            upload_ok = false;
+            break;
+        }
+        std::string chunk(buf.data(), static_cast<std::size_t>(got));
+        if (!client.send_upload_chunk(chunk)) {
+            fprintf(stderr, "Error: send_upload_chunk failed at offset %llu\n",
+                    (unsigned long long)sent);
+            upload_ok = false;
+            break;
+        }
+        sent += static_cast<std::uint64_t>(got);
+    }
+
+    if (upload_ok) {
+        // Drain events through `job.complete`. The callback prints
+        // phase/progress, captures `output_dir`/`note_path` on success,
+        // and flips `client_exit_code` on a state.changed error.
+        client.read_events("job.complete");
+    } else {
+        client_exit_code = 1;
+    }
 
     g_active_ipc_client.store(nullptr, std::memory_order_release);
+    g_active_client_stop.store(nullptr, std::memory_order_release);
     return client_exit_code;
 }
 
@@ -349,19 +484,27 @@ int client_record_no_sigaction(const Config& cfg, const std::string& addr,
 
 static std::atomic<bool> g_batch_stop_requested{false};
 static std::atomic<StopToken*> g_active_iter_stop{nullptr};
-// External linkage — set by client_record_no_sigaction (in main.cpp).
+// External linkage — set/cleared by `client_record_no_sigaction` (this TU).
 std::atomic<IpcClient*> g_active_ipc_client{nullptr};
+// Phase E.1-fix — external linkage StopToken used by the SIGINT path to
+// signal a clean mid-upload abort to the active `client_record_no_sigaction`
+// loop. Set/cleared by `client_record_no_sigaction` around the upload
+// window; nullptr otherwise.
+std::atomic<StopToken*> g_active_client_stop{nullptr};
 
 extern "C" void batch_daemon_sigint_handler(int) {
     g_batch_stop_requested.store(true, std::memory_order_release);
     StopToken* tok = g_active_iter_stop.load(std::memory_order_acquire);
     if (tok) tok->request();
+    // Phase E.1-fix — flip the per-upload StopToken so the chunk loop in
+    // `client_record_no_sigaction` breaks out cleanly. Pre-E.1 this
+    // handler called daemon `record.stop`; C.9 deleted that verb, so the
+    // v2 equivalent is a local cancellation signal + close the socket to
+    // unblock any read in progress.
+    StopToken* cs = g_active_client_stop.load(std::memory_order_acquire);
+    if (cs) cs->request();
     IpcClient* c = g_active_ipc_client.load(std::memory_order_acquire);
-    if (c) {
-        IpcResponse r;
-        IpcError e;
-        c->call("record.stop", r, e, 5000);
-    }
+    if (c) c->close_connection();
 }
 
 // Standalone-mode batch-level SIGINT/SIGTERM handler. Trips the batch-stop
@@ -379,6 +522,12 @@ extern "C" void batch_sigint_handler(int) {
     g_batch_stop_requested.store(true, std::memory_order_release);
     StopToken* tok = g_active_iter_stop.load(std::memory_order_acquire);
     if (tok) tok->request();
+    // Phase E.1-fix — also flip the v2 client-upload StopToken; standalone
+    // mode never publishes it, but the symmetry keeps the daemon-mode
+    // sub-iteration cancellation contract consistent with the
+    // `batch_daemon_sigint_handler` above.
+    StopToken* cs = g_active_client_stop.load(std::memory_order_acquire);
+    if (cs) cs->request();
 }
 
 // Test-only hooks. Defined here so the Catch2 binary can invoke the handler

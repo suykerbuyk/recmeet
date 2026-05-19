@@ -583,6 +583,10 @@ if(RECMEET_BUILD_TESTS)
         tests/test_binary_slim.cpp
         # Phase E.4.1 — `recmeet-daemon --check-backends` diagnostic CLI flag.
         tests/test_check_backends.cpp
+        # Phase E.1-fix — regression tests for the 5 C.9-legacy refs migrated
+        # to v2 (process.submit / local StopToken on SIGINT) + the unused
+        # `ClientState::pending_close` field removal.
+        tests/test_e1_legacy_fix.cpp
     )
     # The test binary exercises both daemon-side surfaces (recmeet_core) and
     # client-side / standalone surfaces (run_recording + recmeet_capture), so

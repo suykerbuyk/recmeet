@@ -61,12 +61,23 @@ std::vector<BatchEntry> classify_batch_entries(
     const fs::path& parent_dir, const Config& cfg);
 
 /// Atomic pointer to the live IpcClient driving the in-flight daemon-mode
-/// iteration, or nullptr otherwise. Set by `client_record_no_sigaction` (in
-/// main.cpp) and read by `batch_daemon_sigint_handler` (in reprocess_batch.cpp)
-/// to send a `record.stop` to the daemon when the operator hits Ctrl-C
-/// during a daemon-routed batch iteration. Acquire/release semantics; no
-/// mutexes — signal-handler safety.
+/// iteration, or nullptr otherwise. Set by `client_record_no_sigaction` while
+/// a daemon-mode reprocess upload is in flight; cleared on return. Kept after
+/// the Phase E.1-fix migration off `record.start` because the
+/// `process.submit` upload loop still needs an externally-visible client
+/// handle for the SIGINT path's `close_connection()` call (which unblocks
+/// any in-progress read and lets the call site shut down promptly). NEVER
+/// used to call daemon verbs from a signal handler (v2: daemon has no
+/// `record.stop`); see `g_active_iter_stop` for the cancellation flag.
+/// Acquire/release semantics; no mutexes — signal-handler safety.
 extern std::atomic<IpcClient*> g_active_ipc_client;
+
+/// Phase E.1-fix — atomic pointer to the per-iteration StopToken published by
+/// `client_record_no_sigaction` for the duration of an in-flight daemon-mode
+/// upload. SIGINT/SIGTERM handlers (single-meeting CLI + batch driver) flip
+/// the token via `StopToken::request()`; the upload loop polls it between
+/// chunks to break out cleanly. Set to nullptr outside the upload window.
+extern std::atomic<StopToken*> g_active_client_stop;
 
 /// Test-only hooks for Phase 3 SIGINT plumbing. Not part of the public
 /// API surface; declared here so the Catch2 unit test can invoke the

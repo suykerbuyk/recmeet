@@ -456,7 +456,6 @@ private:
         size_t outbound_bytes = 0;       // sum of queued payload.size() - bytes_sent
         uint64_t dropped_events = 0;     // count of evicted events (drop-oldest policy)
         bool want_pollout = false;       // EAGAIN on last write — arm POLLOUT next poll
-        bool pending_close = false;      // Response-class overflow / fatal write error
     };
     std::unordered_map<int, ClientState> clients_;
 

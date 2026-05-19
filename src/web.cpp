@@ -4,6 +4,7 @@
 #include "config.h"
 #include "ipc_client.h"
 #include "log.h"
+#include "pipeline.h"
 #include "speaker_id.h"
 #include "util.h"
 #include "version.h"
@@ -11,12 +12,14 @@
 #include <httplib.h>
 
 #include <algorithm>
+#include <cctype>
 #include <csignal>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
 #include <mutex>
 #include <sstream>
+#include <vector>
 
 using namespace recmeet;
 
@@ -735,9 +738,17 @@ int main(int argc, char* argv[]) {
             return;
         }
 
-        int num_speakers = json_get_int(req.body, "num_speakers", 0);
+        // Phase E.1-fix: ported from the C.9-removed `record.start
+        // reprocess_dir=…` to v2 `process.submit` + 0x01 upload-chunk frames,
+        // mirroring tray::apply_submit_with_context. `num_speakers` was a
+        // record.start-only per-request override; on the v2 path that knob
+        // lives in the daemon's session Config (post-A.6 session.init), so
+        // the WebUI request shape no longer honours it. The previous
+        // behaviour was a request-scoped Config patch (lost at job
+        // completion) — operators that need the override should use the
+        // tray's submit flow with --num-speakers, or set it in daemon.yaml.
+        (void)json_get_int(req.body, "num_speakers", 0);
 
-        // Connect to daemon and request reprocess
         try {
             IpcClient client;
             if (!client.connect()) {
@@ -746,29 +757,115 @@ int main(int argc, char* argv[]) {
                 return;
             }
 
+            // Resolve format from the audio file's extension. Same set the
+            // daemon's UploadSession accepts (s16le/f32le are raw-PCM only —
+            // the WebUI never sees raw PCM here, so we map by container).
+            std::string ext = audio_path.extension().string();
+            std::transform(ext.begin(), ext.end(), ext.begin(),
+                           [](unsigned char c) { return std::tolower(c); });
+            std::string format;
+            if (ext == ".wav")       format = "wav";
+            else if (ext == ".flac") format = "flac";
+            else if (ext == ".mp3")  format = "mp3";
+            else if (ext == ".m4a")  format = "m4a";
+            else if (ext == ".ogg")  format = "ogg";
+            else {
+                res.status = 400;
+                res.set_content(json_error("unsupported audio format: " + ext), "application/json");
+                return;
+            }
+
+            std::error_code ec;
+            auto audio_size = fs::file_size(audio_path, ec);
+            if (ec || audio_size == 0) {
+                res.status = 400;
+                res.set_content(json_error("cannot stat audio file: " +
+                                           (ec ? ec.message() : std::string("empty"))),
+                                "application/json");
+                return;
+            }
+
+            std::ifstream audio_in(audio_path, std::ios::binary);
+            if (!audio_in) {
+                res.status = 400;
+                res.set_content(json_error("cannot open audio file for read"),
+                                "application/json");
+                return;
+            }
+
             JsonMap params;
-            params["reprocess_dir"] = meeting_path.string();
-            if (num_speakers > 0)
-                params["num_speakers"] = static_cast<int64_t>(num_speakers);
+            params["audio_size"]  = static_cast<int64_t>(audio_size);
+            params["format"]      = format;
+            params["sample_rate"] = static_cast<int64_t>(16000);
+            params["channels"]    = static_cast<int64_t>(1);
+            params["mode"]        = std::string("transcribe");
+
+            // C.11.4 dedup: if the meeting dir carries a meeting_id (in
+            // context.json), thread it through so the daemon overwrites the
+            // existing dir atomically instead of allocating a new one. Empty
+            // = legacy "fresh allocation" — for v2-shaped meetings (post-C.11)
+            // this branch is the common case and keeps reprocess in place.
+            std::string mid = load_meeting_id(meeting_path);
+            if (!mid.empty())
+                params["meeting_id"] = mid;
 
             IpcResponse ipc_resp;
             IpcError ipc_err;
-            bool ok = client.call("record.start", params, ipc_resp, ipc_err, 5000);
-
-            if (!ok) {
+            if (!client.call("process.submit", params, ipc_resp, ipc_err, 10000)) {
                 res.status = 409;
                 res.set_content(json_error(ipc_err.message.empty() ? "daemon busy" : ipc_err.message),
                                 "application/json");
                 return;
             }
 
-            // Return job_id from daemon
+            // Pull job_id + upload_token from the response. Both must be
+            // present per the C.2 contract; otherwise the daemon's
+            // UploadSessionManager rejected the request and we leave a
+            // clean 502 for the operator.
             int64_t job_id = 0;
             auto jit = ipc_resp.result.find("job_id");
             if (jit != ipc_resp.result.end())
                 job_id = json_val_as_int(jit->second);
+            auto tit = ipc_resp.result.find("upload_token");
+            std::string upload_token =
+                (tit != ipc_resp.result.end()) ? json_val_as_string(tit->second) : "";
+            if (job_id <= 0 || upload_token.empty()) {
+                res.status = 502;
+                res.set_content(json_error("process.submit response missing upload_token / job_id"),
+                                "application/json");
+                return;
+            }
 
-            res.set_content(R"({"ok":true,"job_id":)" + std::to_string(job_id) + "}", "application/json");
+            // Stream the audio file in 64 KiB chunks via 0x01 upload frames.
+            // The daemon's UploadSession auto-finalizes once bytes_received
+            // hits audio_size; postprocess proceeds asynchronously.
+            constexpr std::size_t CHUNK_BYTES = 64 * 1024;
+            std::vector<char> buf(CHUNK_BYTES);
+            std::uint64_t sent = 0;
+            while (sent < audio_size) {
+                std::size_t want = std::min<std::size_t>(CHUNK_BYTES, audio_size - sent);
+                audio_in.read(buf.data(), static_cast<std::streamsize>(want));
+                std::streamsize got = audio_in.gcount();
+                if (got <= 0) {
+                    res.status = 502;
+                    res.set_content(json_error("audio read short at offset " +
+                                               std::to_string(sent)),
+                                    "application/json");
+                    return;
+                }
+                std::string chunk(buf.data(), static_cast<std::size_t>(got));
+                if (!client.send_upload_chunk(chunk)) {
+                    res.status = 502;
+                    res.set_content(json_error("send_upload_chunk failed at offset " +
+                                               std::to_string(sent)),
+                                    "application/json");
+                    return;
+                }
+                sent += static_cast<std::uint64_t>(got);
+            }
+
+            res.set_content(R"({"ok":true,"job_id":)" + std::to_string(job_id) + "}",
+                            "application/json");
         } catch (const std::exception& e) {
             res.status = 502;
             res.set_content(json_error(std::string("daemon error: ") + e.what()), "application/json");
