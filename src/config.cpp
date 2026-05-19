@@ -85,6 +85,132 @@ bool get_bool(const std::vector<YamlEntry>& entries,
     return val == "true" || val == "yes" || val == "1";
 }
 
+// Phase E.2(c) — parse a `[<section>] <list_key>:` YAML list of
+// `{name, address}` maps. The flat parser above strips list dashes the
+// wrong way (turning `- name: default` into key=`- name`); rather than
+// extend the flat parser with a list-aware state machine, scan the raw
+// text once for the matching `<section>:` → `<list_key>:` block and
+// collect entries until the indent drops back to the section's level.
+//
+// This is intentionally narrow: only the single section→list_key pair
+// the caller passes is parsed, the indent must be a strict descent, and
+// only `name`/`address` keys are recognized per entry. Anything else is
+// ignored (forward-compat with future schema growth). Empty list when no
+// match is found.
+std::vector<ServerEntry> parse_yaml_servers(const std::string& text,
+                                            const std::string& section,
+                                            const std::string& list_key) {
+    std::vector<ServerEntry> out;
+    std::istringstream stream(text);
+    std::string line;
+
+    bool in_section = false;
+    bool in_list = false;
+    int section_indent = -1;
+    int list_indent = -1;
+    ServerEntry cur;
+    bool cur_dirty = false;
+
+    auto flush = [&]() {
+        if (cur_dirty && (!cur.name.empty() || !cur.address.empty())) {
+            out.push_back(cur);
+        }
+        cur = ServerEntry{};
+        cur_dirty = false;
+    };
+
+    while (std::getline(stream, line)) {
+        auto trimmed = trim(line);
+        if (trimmed.empty() || trimmed[0] == '#') continue;
+
+        int indent = 0;
+        while (indent < (int)line.size() && line[indent] == ' ') indent++;
+
+        // Track top-level section entry/exit.
+        if (indent == 0) {
+            // Leaving any section we were in.
+            flush();
+            in_list = false;
+            in_section = false;
+            section_indent = -1;
+            list_indent = -1;
+            auto colon = trimmed.find(':');
+            if (colon != std::string::npos) {
+                std::string k = trim(trimmed.substr(0, colon));
+                if (k == section) {
+                    in_section = true;
+                    section_indent = indent;
+                }
+            }
+            continue;
+        }
+
+        if (!in_section) continue;
+
+        // Inside the section. Look for the list_key header or a peer key
+        // at the same indent level that would terminate the list.
+        if (!in_list) {
+            auto colon = trimmed.find(':');
+            if (colon == std::string::npos) continue;
+            std::string k = trim(trimmed.substr(0, colon));
+            std::string v = trim(trimmed.substr(colon + 1));
+            if (k == list_key && v.empty()) {
+                in_list = true;
+                list_indent = indent;
+            }
+            continue;
+        }
+
+        // In the list. The list ends when the indent drops back to the
+        // section header indent or below (handled above for indent==0)
+        // OR drops back to the list_key's indent with a non-dash key.
+        if (indent <= list_indent && trimmed[0] != '-') {
+            // Sibling key of `servers:` — list is done.
+            flush();
+            in_list = false;
+            continue;
+        }
+
+        // List-item start: `- name: default` or `- address: ...`.
+        if (trimmed[0] == '-') {
+            // Begin a new entry. Flush the previous one if it had content.
+            flush();
+            // Strip the leading `- ` (or `-` plus optional spaces).
+            std::string rest = trimmed.substr(1);
+            // skip leading whitespace
+            size_t p = rest.find_first_not_of(" \t");
+            if (p == std::string::npos) {
+                // bare dash on its own — start an empty entry; next line
+                // continues it.
+                cur_dirty = true;
+                continue;
+            }
+            rest = rest.substr(p);
+            auto colon = rest.find(':');
+            if (colon == std::string::npos) continue;
+            std::string k = trim(rest.substr(0, colon));
+            std::string v = unquote(trim(rest.substr(colon + 1)));
+            if (k == "name") cur.name = v;
+            else if (k == "address") cur.address = v;
+            cur_dirty = true;
+            continue;
+        }
+
+        // Continuation line for the current entry: `  address: ...` at
+        // an indent strictly greater than the list_key.
+        auto colon = trimmed.find(':');
+        if (colon == std::string::npos) continue;
+        std::string k = trim(trimmed.substr(0, colon));
+        std::string v = unquote(trim(trimmed.substr(colon + 1)));
+        if (k == "name") cur.name = v;
+        else if (k == "address") cur.address = v;
+        cur_dirty = true;
+    }
+
+    flush();
+    return out;
+}
+
 } // anonymous namespace
 
 const ProviderInfo PROVIDERS[] = {
@@ -133,7 +259,8 @@ Config load_config(const fs::path& config_path) {
 
     std::ostringstream buf;
     buf << in.rdbuf();
-    auto entries = parse_yaml(buf.str());
+    std::string raw_text = buf.str();
+    auto entries = parse_yaml(raw_text);
 
     // Audio section
     cfg.device_pattern = get_val(entries, "audio", "device_pattern", cfg.device_pattern);
@@ -157,6 +284,9 @@ Config load_config(const fs::path& config_path) {
     cfg.no_summary = get_bool(entries, "summary", "disabled", false);
     cfg.llm_model = get_val(entries, "summary", "llm_model", "");
     cfg.llm_mmap = get_bool(entries, "summary", "llm_mmap", false);
+    // Phase E.2(a) — client-side preferred summarization style. Empty
+    // default; daemon resolves the effective style from session.init.
+    cfg.summary_style = get_val(entries, "summary", "style", "");
 
     // Per-provider API keys
     for (size_t i = 0; i < NUM_PROVIDERS; ++i) {
@@ -415,6 +545,31 @@ Config load_config(const fs::path& config_path) {
         }
     }
 
+    // Phase E.2(b) — `[client] caption_latency_ms`. Range [200, 2000]
+    // matches the session.init / session.update_prefs handler guards
+    // (see ipc_server.cpp). Out-of-range values warn-and-fall-back to the
+    // struct default rather than silent-clamping: an operator typo should
+    // surface in logs, not get massaged into silence.
+    {
+        std::string clm = get_val(entries, "client", "caption_latency_ms", "");
+        if (!clm.empty()) {
+            long long v = std::atoll(clm.c_str());
+            if (v >= 200 && v <= 2000) {
+                cfg.caption_latency_ms = static_cast<int>(v);
+            } else {
+                log_warn("config: invalid [client] caption_latency_ms=%s "
+                         "(must be in [200, 2000]); keeping default %d",
+                         clm.c_str(), cfg.caption_latency_ms);
+            }
+        }
+    }
+
+    // Phase E.2(c) — `[client] servers:` list. Uses the dedicated list
+    // parser since the flat-key parser cannot represent `{name, address}`
+    // map entries. v1 honors `servers[0]` only; the plural shape is
+    // preserved-not-precluded for the multi-server hook.
+    cfg.servers = parse_yaml_servers(raw_text, "client", "servers");
+
     return cfg;
 }
 
@@ -463,6 +618,11 @@ void save_config(const Config& cfg, const fs::path& config_path) {
         out << "  llm_model: \"" << cfg.llm_model << "\"\n";
     if (cfg.llm_mmap)
         out << "  llm_mmap: true\n";
+    // Phase E.2(a) — emit `style:` only when non-empty so the generated
+    // YAML stays compact for the common case where the client has no
+    // preference and the daemon resolves the default.
+    if (!cfg.summary_style.empty())
+        out << "  style: " << cfg.summary_style << "\n";
 
     // Per-provider API keys (never write legacy api_key)
     {
@@ -605,16 +765,34 @@ void save_config(const Config& cfg, const fs::path& config_path) {
     }
 
     // Phase D.6 — `[client]` section. New YAML namespace introduced for the
-    // first client-side scoped knob (`staging_max_bytes`). Emit the
-    // section + the knob only when it diverges from the 500 GiB default
-    // to keep generated YAML compact for the common case. Phase E.2's
-    // schema split moves this section into a separate client.yaml file.
+    // first client-side scoped knob (`staging_max_bytes`). Phase E.2 added
+    // `caption_latency_ms` and a `servers:` list to this section. Emit the
+    // section header once when ANY client-scoped knob diverges from its
+    // default, then emit only the diverging knobs to keep the YAML compact.
+    // Phase E.2's Wave 2.2 moves this section into a separate client.yaml
+    // file.
     {
         constexpr size_t default_staging_max_bytes =
             static_cast<size_t>(500) * 1024 * 1024 * 1024;
-        if (cfg.staging_max_bytes != default_staging_max_bytes) {
-            out << "\nclient:\n"
-                << "  staging_max_bytes: " << cfg.staging_max_bytes << "\n";
+        bool emit_client =
+            cfg.staging_max_bytes != default_staging_max_bytes
+            || cfg.caption_latency_ms != 500
+            || !cfg.servers.empty();
+        if (emit_client) {
+            out << "\nclient:\n";
+            if (cfg.staging_max_bytes != default_staging_max_bytes)
+                out << "  staging_max_bytes: " << cfg.staging_max_bytes << "\n";
+            if (cfg.caption_latency_ms != 500)
+                out << "  caption_latency_ms: " << cfg.caption_latency_ms << "\n";
+            // Phase E.2(c) — emit the servers list as a YAML list of
+            // `{name, address}` maps. Empty vector emits no block at all.
+            if (!cfg.servers.empty()) {
+                out << "  servers:\n";
+                for (const auto& srv : cfg.servers) {
+                    out << "    - name: " << srv.name << "\n"
+                        << "      address: \"" << srv.address << "\"\n";
+                }
+            }
         }
     }
 

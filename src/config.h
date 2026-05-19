@@ -28,6 +28,23 @@ std::string resolve_api_key(const ProviderInfo& provider,
                             const std::map<std::string, std::string>& api_keys,
                             const std::string& legacy_key = "");
 
+// Phase E.2(c) — client-side server registry entry.
+//
+// The thin-client recording server learns about the set of daemons the
+// client can connect to via a `servers:` YAML list under the `[client]`
+// section. Each entry pairs a human-readable `name` (used in tray
+// submenus and CLI `--server` arguments) with an `address` — `host:port`
+// for TCP or `unix:/path` for a Unix socket.
+//
+// Wave 2.1 lands the shape only: v1 honors `servers[0]` and ignores any
+// further entries (the plural form is preserved-not-precluded for the
+// multi-server hook). Wave 2.2 will move this onto a dedicated
+// `ClientConfig` when the Config struct splits into server/client halves.
+struct ServerEntry {
+    std::string name;     // display name; e.g. "default"
+    std::string address;  // host:port for TCP, "unix:/path" for Unix socket
+};
+
 struct Config {
     // Audio
     std::string device_pattern = DEFAULT_DEVICE_PATTERN;
@@ -47,6 +64,14 @@ struct Config {
     std::string api_key; // legacy single key (fallback)
     std::string api_model = "grok-3";
     bool no_summary = false;
+
+    // Phase E.2(a) — documented client preference for summarization style.
+    // Empty default; the daemon resolves the effective style from
+    // session.init (a non-empty value tells the daemon which prompt
+    // variant to use). Wire shape: `[summary] style:` in client.yaml
+    // (under the existing `summary:` section in this consolidated config;
+    // Wave 2.2 will move it to client.yaml proper).
+    std::string summary_style;
 
     // Per-provider API keys (env var > api_keys[provider] > api_key)
     std::map<std::string, std::string> api_keys;
@@ -102,6 +127,17 @@ struct Config {
     bool captions_enabled = false;
     std::string caption_model;
 
+    // Phase E.2(b) — client-side caption-latency preference, in
+    // milliseconds. Drives the CaptionEngine's emit cadence on the
+    // daemon side (it round-trips through session.init via the existing
+    // SessionPreferences.caption_latency_ms field — see ipc_server.h).
+    // Default 500 matches the SessionPreferences default. Range is
+    // [200, 2000]; load_config() applies a warn-and-fallback guard on
+    // out-of-range YAML values rather than silent-clamping (operator
+    // typos should surface in logs, not get massaged into silence).
+    // Wired from `[client] caption_latency_ms` in config.yaml.
+    int caption_latency_ms = 500;
+
     // Phase 5.5 — render-time caption normalization. The IPC `caption`
     // event payload always carries the raw engine output (ALL-CAPS, no
     // punctuation for the en-2023-06-26 streaming Zipformer); CLI / tray
@@ -143,6 +179,13 @@ struct Config {
     // Web server
     int web_port = 8384;
     std::string web_bind = "127.0.0.1";
+
+    // Phase E.2(c) — client-side server registry. The thin client picks
+    // the daemon address from `servers[0]` in v1; the plural shape is
+    // preserved-not-precluded for the multi-server hook. No CLI plumbing,
+    // no tray submenu, no multi-server dispatch in this wave. Wired from
+    // `[client] servers:` (a YAML list of `{name, address}` maps).
+    std::vector<ServerEntry> servers;
 
     // IPC framing limits (Phase A.2). `max_message_bytes` caps NDJSON line
     // length per connection — accumulating reads past this without a `\n`

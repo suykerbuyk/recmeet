@@ -109,12 +109,14 @@ Config merge_creds_for_job(
 
     // captions_enabled / caption_latency_ms come straight from session
     // prefs. captions_enabled is opt-in for the C.10 streaming caption
-    // path — A.6 only stores and forwards the value, no behavior yet.
-    cfg.captions_enabled = session_prefs.captions_enabled;
-    // caption_latency_ms is not yet on `Config` — the subprocess does
-    // not need it (it runs after the streaming session). C.10 will
-    // route it directly into the CaptionEngine. Intentionally not
-    // propagating here.
+    // path. Phase E.2(b) landed `caption_latency_ms` on Config, so the
+    // session value now propagates into the merged Config the daemon
+    // hands to the subprocess (and into the JSON config the streaming
+    // CaptionEngine reads). The session.init / session.update_prefs
+    // handlers enforce the [200, 2000] range upstream; this assignment
+    // does not re-validate.
+    cfg.captions_enabled    = session_prefs.captions_enabled;
+    cfg.caption_latency_ms  = session_prefs.caption_latency_ms;
 
     return cfg;
 }

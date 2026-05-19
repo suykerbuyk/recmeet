@@ -587,6 +587,9 @@ if(RECMEET_BUILD_TESTS)
         # to v2 (process.submit / local StopToken on SIGINT) + the unused
         # `ClientState::pending_close` field removal.
         tests/test_e1_legacy_fix.cpp
+        # Phase E.2 Wave 2.1 — additive Config fields (summary_style,
+        # caption_latency_ms, servers list) landed BEFORE the file split.
+        tests/test_config_e2_fields.cpp
     )
     # The test binary exercises both daemon-side surfaces (recmeet_core) and
     # client-side / standalone surfaces (run_recording + recmeet_capture), so

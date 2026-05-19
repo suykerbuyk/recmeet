@@ -32,6 +32,10 @@ JsonMap config_to_map(const Config& cfg) {
     m["no_summary"]      = cfg.no_summary;
     m["llm_model"]       = cfg.llm_model;
     m["llm_mmap"]        = cfg.llm_mmap;
+    // Phase E.2(a) — client-side summarization style preference. Empty
+    // default; round-trips through the daemon→subprocess JSON-config so
+    // a future subprocess can read it without re-resolving from session.init.
+    m["summary_style"]   = cfg.summary_style;
 
     // Diarization
     m["diarize"]             = cfg.diarize;
@@ -60,6 +64,11 @@ JsonMap config_to_map(const Config& cfg) {
     m["captions_enabled"]          = cfg.captions_enabled;
     m["caption_model"]             = cfg.caption_model;
     m["caption_normalize_display"] = cfg.caption_normalize_display;
+    // Phase E.2(b) — client-side caption-latency preference. Round-trips
+    // through the daemon→subprocess JSON-config boundary so the subprocess
+    // (and future client-side consumers) see the same value session.init
+    // applied to the Config.
+    m["caption_latency_ms"]        = static_cast<int64_t>(cfg.caption_latency_ms);
 
     // Performance
     m["threads"]          = static_cast<int64_t>(cfg.threads);
@@ -102,6 +111,19 @@ JsonMap config_to_map(const Config& cfg) {
     for (const auto& [name, key] : cfg.api_keys) {
         if (!key.empty())
             m["api_keys." + name] = key;
+    }
+
+    // Phase E.2(c) — client-side server registry. `JsonVal` is a scalar
+    // variant (string / int / double / bool / null), so nested-array
+    // shapes are not representable. Flatten as `servers.count` plus per-
+    // index `servers.<i>.name` / `servers.<i>.address` pairs. v1 only
+    // honors index 0 so the typical wire form carries at most 3 keys
+    // (count, name, address). config_from_map reconstructs the vector.
+    m["servers.count"] = static_cast<int64_t>(cfg.servers.size());
+    for (size_t i = 0; i < cfg.servers.size(); ++i) {
+        std::string prefix = "servers." + std::to_string(i) + ".";
+        m[prefix + "name"]    = cfg.servers[i].name;
+        m[prefix + "address"] = cfg.servers[i].address;
     }
 
     return m;
@@ -163,6 +185,7 @@ Config config_from_map(const JsonMap& m) {
     b("no_summary", cfg.no_summary);
     str("llm_model", cfg.llm_model);
     b("llm_mmap", cfg.llm_mmap);
+    str("summary_style", cfg.summary_style);
 
     b("diarize", cfg.diarize);
     i("num_speakers", cfg.num_speakers);
@@ -184,6 +207,7 @@ Config config_from_map(const JsonMap& m) {
     b("captions_enabled", cfg.captions_enabled);
     str("caption_model", cfg.caption_model);
     b("caption_normalize_display", cfg.caption_normalize_display);
+    i("caption_latency_ms", cfg.caption_latency_ms);
 
     i("threads", cfg.threads);
 
@@ -229,6 +253,32 @@ Config config_from_map(const JsonMap& m) {
             std::string val = json_val_as_string(v);
             if (!val.empty())
                 cfg.api_keys[provider] = val;
+        }
+    }
+
+    // Phase E.2(c) — reconstruct the servers vector from the flattened
+    // `servers.count` + `servers.<i>.name` / `servers.<i>.address` keys.
+    // Missing `servers.count` (e.g. older daemon writing the JSON without
+    // the new field) → empty vector, no diff from struct default.
+    {
+        auto cit = m.find("servers.count");
+        if (cit != m.end()) {
+            int64_t n = json_val_as_int(cit->second, 0);
+            if (n > 0) {
+                cfg.servers.clear();
+                cfg.servers.reserve(static_cast<size_t>(n));
+                for (int64_t i = 0; i < n; ++i) {
+                    ServerEntry entry;
+                    std::string ip = "servers." + std::to_string(i) + ".";
+                    auto nit = m.find(ip + "name");
+                    auto ait = m.find(ip + "address");
+                    if (nit != m.end())
+                        entry.name = json_val_as_string(nit->second);
+                    if (ait != m.end())
+                        entry.address = json_val_as_string(ait->second);
+                    cfg.servers.push_back(std::move(entry));
+                }
+            }
         }
     }
 
