@@ -116,6 +116,9 @@ static std::unique_ptr<SessionManager> g_sessions;
 static JobConfig g_config;
 static std::mutex g_config_mu;
 
+static ServerConfig g_server_config;
+static std::mutex g_server_config_mu;
+
 // Stop tokens — separate for independent cancellation. C.9 dropped
 // `g_rec_stop` along with the legacy recording worker; only the postprocess
 // kill-switch survives.
@@ -228,6 +231,10 @@ static void signal_handler(int sig) {
                     }
                     std::lock_guard<std::mutex> lock(g_config_mu);
                     g_config = cfg;
+                    {
+                        std::lock_guard<std::mutex> lk(g_server_config_mu);
+                        g_server_config = to_server_config(cfg);
+                    }
                     log_info("daemon: config reloaded via SIGHUP");
                 } catch (const std::exception& e) {
                     log_error("daemon: config reload failed: %s", e.what());
@@ -1588,6 +1595,10 @@ int main(int argc, char* argv[]) {
 
     // Load config
     g_config = load_legacy_config_as_job_config();
+    {
+        std::lock_guard<std::mutex> lk(g_server_config_mu);
+        g_server_config = load_server_config();
+    }
 
     // Resolve API key
     if (g_config.llm_model.empty()) {
@@ -2079,6 +2090,10 @@ int main(int argc, char* argv[]) {
             }
             std::lock_guard<std::mutex> lock(g_config_mu);
             g_config = cfg;
+            {
+                std::lock_guard<std::mutex> lk(g_server_config_mu);
+                g_server_config = to_server_config(cfg);
+            }
             resp.result["ok"] = true;
             return true;
         } catch (const std::exception& e) {
