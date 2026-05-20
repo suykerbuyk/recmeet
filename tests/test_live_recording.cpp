@@ -83,7 +83,7 @@ TEST_CASE("run_recording: reprocess existing WAV file returns canonical Postproc
     auto dir = test_dir("reprocess_wav");
     fs::path wav = write_minimal_wav(dir / "audio_2026-05-15_10-00.wav");
 
-    Config cfg;
+    JobConfig cfg;
     cfg.reprocess_dir = wav;
     // output_dir_explicit defaults to false — the function should use the
     // parent of the audio file as the output dir in that case.
@@ -106,7 +106,7 @@ TEST_CASE("run_recording: reprocess directory resolves to its audio file",
     fs::create_directories(meeting);
     fs::path wav = write_minimal_wav(meeting / "audio_2026-05-15_10-00.wav");
 
-    Config cfg;
+    JobConfig cfg;
     cfg.reprocess_dir = meeting;
 
     StopToken stop;
@@ -128,7 +128,7 @@ TEST_CASE("run_recording: reprocess relative path resolves against output_dir",
     fs::create_directories(meeting);
     fs::path wav = write_minimal_wav(meeting / "audio_2026-05-15_10-00.wav");
 
-    Config cfg;
+    JobConfig cfg;
     // Caller passes a path RELATIVE to output_dir — the function must try
     // the bare path first (which fails), then fall back to
     // `output_dir / reprocess_dir` and find the meeting.
@@ -145,7 +145,7 @@ TEST_CASE("run_recording: reprocess relative path resolves against output_dir",
 
 TEST_CASE("run_recording: reprocess nonexistent path throws RecmeetError",
           "[live_recording][c9][cli-standalone]") {
-    Config cfg;
+    JobConfig cfg;
     cfg.reprocess_dir = "/tmp/this/does/not/exist/audio.wav";
 
     StopToken stop;
@@ -160,7 +160,7 @@ TEST_CASE("run_recording: reprocess unsupported audio format throws with convers
     fs::path mp3 = dir / "meeting.mp3";
     { std::ofstream out(mp3); out << "x"; }
 
-    Config cfg;
+    JobConfig cfg;
     cfg.reprocess_dir = mp3;
 
     StopToken stop;
@@ -186,7 +186,7 @@ TEST_CASE("run_recording: reprocess with output_dir_explicit honors explicit out
     fs::create_directories(out_dir);
     fs::path wav = write_minimal_wav(src_dir / "audio_2026-05-15_10-00.wav");
 
-    Config cfg;
+    JobConfig cfg;
     cfg.reprocess_dir         = wav;
     cfg.output_dir            = out_dir;
     cfg.output_dir_explicit   = true;  // operator passed --output-dir
@@ -219,7 +219,7 @@ TEST_CASE("run_recording: reprocess with output_dir_explicit honors explicit out
 
 TEST_CASE("run_recording: live branch with no matching mic source raises DeviceError",
           "[live_recording][c9][cli-standalone]") {
-    Config cfg;
+    JobConfig cfg;
     // An impossible device pattern that no sane source name will match.
     cfg.device_pattern = "__recmeet_test_no_such_source_pattern_12345__";
     cfg.mic_only       = true;  // skip monitor auto-detect entirely

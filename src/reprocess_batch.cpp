@@ -86,7 +86,7 @@ void whisper_flush_line_shim() {
 // the first failure encountered.
 // ---------------------------------------------------------------------------
 
-std::string ensure_models_cached_or_fail(const Config& cfg) {
+std::string ensure_models_cached_or_fail(const JobConfig& cfg) {
     // is_whisper_model_cached throws RecmeetError for unknown model names —
     // catch + fold into the same fail-fast message.
     try {
@@ -138,7 +138,7 @@ std::string ensure_models_cached_or_fail(const Config& cfg) {
 // abort.
 // ---------------------------------------------------------------------------
 
-int client_record_no_sigaction(const Config& cfg, const std::string& addr,
+int client_record_no_sigaction(const JobConfig& cfg, const std::string& addr,
                                bool show_captions_on_stderr) {
     bool is_reprocess = !cfg.reprocess_dir.empty();
 
@@ -565,7 +565,7 @@ const std::regex& meeting_dir_regex() {
 /// Resolve the directory we expect a meeting note to live under. Mirrors
 /// `note.cpp:160-167`: if cfg.note_dir is set we add /YYYY/MM/, otherwise the
 /// note lives in the meeting directory itself.
-fs::path resolve_note_parent(const Config& cfg, const fs::path& meeting_dir,
+fs::path resolve_note_parent(const JobConfig& cfg, const fs::path& meeting_dir,
                              const std::string& timestamp) {
     if (cfg.note_dir.empty()) {
         return meeting_dir;
@@ -602,7 +602,7 @@ bool note_exists_for(const fs::path& note_parent, const std::string& timestamp) 
 } // anonymous namespace
 
 std::vector<BatchEntry> classify_batch_entries(
-    const fs::path& parent_dir, const Config& cfg) {
+    const fs::path& parent_dir, const JobConfig& cfg) {
 
     std::vector<BatchEntry> entries;
     std::error_code ec;
@@ -654,7 +654,7 @@ std::vector<BatchEntry> classify_batch_entries(
 
 namespace {
 
-Outcome dispatch_one_reprocess_daemon(const Config& cfg, const std::string& addr) {
+Outcome dispatch_one_reprocess_daemon(const JobConfig& cfg, const std::string& addr) {
     Outcome o;
     auto t0 = std::chrono::steady_clock::now();
 
@@ -705,7 +705,7 @@ Outcome dispatch_one_reprocess_daemon(const Config& cfg, const std::string& addr
     return o;
 }
 
-Outcome dispatch_one_reprocess_standalone(const Config& cfg, StopToken& iter_stop) {
+Outcome dispatch_one_reprocess_standalone(const JobConfig& cfg, StopToken& iter_stop) {
     Outcome o;
     auto t0 = std::chrono::steady_clock::now();
 
@@ -727,7 +727,7 @@ Outcome dispatch_one_reprocess_standalone(const Config& cfg, StopToken& iter_sto
     return o;
 }
 
-Outcome dispatch_one_reprocess(const Config& cfg, BatchDispatchMode mode,
+Outcome dispatch_one_reprocess(const JobConfig& cfg, BatchDispatchMode mode,
                                const std::string& addr, StopToken& iter_stop) {
     if (mode == BatchDispatchMode::Daemon) {
         return dispatch_one_reprocess_daemon(cfg, addr);
@@ -760,7 +760,7 @@ std::string format_duration(double seconds) {
 // ---------------------------------------------------------------------------
 
 int run_reprocess_batch(const CliResult& cli) {
-    const Config& orig_cfg = cli.cfg;
+    const JobConfig& orig_cfg = cli.cfg;
 
     // 1. Validate parent dir exists and is a directory.
     if (orig_cfg.reprocess_batch_dir.empty()) {
@@ -854,7 +854,7 @@ int run_reprocess_batch(const CliResult& cli) {
 
     // 10. Set per-batch flag on the working config copy. Not persisted; only
     //     propagates through IPC + subprocess JSON for this run.
-    Config cfg_for_iter = orig_cfg;
+    JobConfig cfg_for_iter = orig_cfg;
     cfg_for_iter.batch_mode = true;
 
     // 11. Install batch-level SIGINT/SIGTERM handler for standalone mode.
@@ -919,7 +919,7 @@ int run_reprocess_batch(const CliResult& cli) {
         }
 
         any_started = true;
-        Config iter_cfg = cfg_for_iter;
+        JobConfig iter_cfg = cfg_for_iter;
         iter_cfg.reprocess_dir = e.dir;
         iter_cfg.reprocess_batch_dir.clear();  // single-meeting semantics inside dispatch
 

@@ -247,7 +247,7 @@ public:
     /// preferences that were live when the client submitted).
     CreateResult create(const std::string& client_id,
                         const SubmitRequest& req,
-                        const Config& pp_cfg,
+                        const JobConfig& pp_cfg,
                         size_t max_upload_bytes);
 
     /// Route a `0x01` upload payload to the session owned by `client_id`.
@@ -346,7 +346,7 @@ private:
     /// pp_worker forwards it to the postprocess subprocess via the standard
     /// `cfg.context_inline` channel). Both are removed on finalize / cancel /
     /// disconnect so the side tables track sessions_ exactly.
-    std::map<int64_t, Config>      pp_cfg_snapshots_;
+    std::map<int64_t, JobConfig>   pp_cfg_snapshots_;
     std::map<int64_t, std::string> pp_context_overrides_;
 
     /// Phase C.8 — per-upload mode + enroll_name snapshots. Stashed at

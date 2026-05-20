@@ -178,7 +178,7 @@ static int client_stop(const std::string& /*addr*/ = "") {
 // The thin `client_record` wrapper below uses it for the single-meeting CLI
 // path with its own SIGINT/SIGTERM handlers installed.
 
-static int client_record(const Config& cfg, const std::string& addr = "",
+static int client_record(const JobConfig& cfg, const std::string& addr = "",
                          bool show_captions_on_stderr = false) {
     using namespace recmeet;
 
@@ -274,7 +274,7 @@ int main(int argc, char* argv[]) {
 
     // Model management commands — always standalone, no daemon needed
     if (cli.download_models) {
-        Config cfg = cli.cfg;
+        JobConfig cfg = cli.cfg;
         fprintf(stderr, "Downloading models...\n");
         bool ok = true;
         try {
@@ -410,7 +410,7 @@ int main(int argc, char* argv[]) {
             }
             cli.cfg.vocabulary += ", " + word;
         }
-        save_config(cli.cfg);
+        save_legacy_config_as_job_config(cli.cfg);
         printf("Added '%s' to vocabulary.\n", word.c_str());
         return 0;
     }
@@ -437,7 +437,7 @@ int main(int argc, char* argv[]) {
             if (i > 0) cli.cfg.vocabulary += ", ";
             cli.cfg.vocabulary += words[i];
         }
-        save_config(cli.cfg);
+        save_legacy_config_as_job_config(cli.cfg);
         printf("Removed '%s' from vocabulary.\n", target.c_str());
         return 0;
     }
@@ -447,7 +447,7 @@ int main(int argc, char* argv[]) {
             printf("Vocabulary is already empty.\n");
         } else {
             cli.cfg.vocabulary.clear();
-            save_config(cli.cfg);
+            save_legacy_config_as_job_config(cli.cfg);
             printf("Cleared all vocabulary words.\n");
         }
         return 0;
@@ -645,7 +645,7 @@ int main(int argc, char* argv[]) {
     }
 #endif // RECMEET_USE_SHERPA
 
-    Config cfg = cli.cfg;
+    JobConfig cfg = cli.cfg;
     bool list_sources = cli.list_sources;
 
     // Resolve API key early so both daemon and standalone paths have it
@@ -735,7 +735,7 @@ static int subprocess_main(CliResult& cli) {
         json_content = ss.str();
     }
 
-    Config cfg = config_from_json(json_content);
+    JobConfig cfg = config_from_json(json_content);
 
     // Suppress whisper log noise
     whisper_log_set([](enum ggml_log_level, const char*, void*) {}, nullptr);
@@ -869,7 +869,7 @@ static int standalone_main(CliResult& cli) {
         return subprocess_main(cli);
     }
 
-    Config cfg = cli.cfg;
+    JobConfig cfg = cli.cfg;
 
     // List sources mode
     if (cli.list_sources) {

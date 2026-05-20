@@ -113,7 +113,7 @@ static std::unique_ptr<DiarizationCache> g_diar_cache;
 // `session.init`. Daemon restart invalidates all tokens (MC-1).
 static std::unique_ptr<SessionManager> g_sessions;
 
-static Config g_config;
+static JobConfig g_config;
 static std::mutex g_config_mu;
 
 // Stop tokens — separate for independent cancellation. C.9 dropped
@@ -218,7 +218,7 @@ static void signal_handler(int sig) {
         if (g_server) {
             g_server->post([] {
                 try {
-                    Config cfg = load_config();
+                    JobConfig cfg = load_legacy_config_as_job_config();
                     if (cfg.llm_model.empty()) {
                         const auto* prov = find_provider(cfg.provider);
                         if (prov) {
@@ -1587,7 +1587,7 @@ int main(int argc, char* argv[]) {
     whisper_log_set(whisper_null_log, nullptr);
 
     // Load config
-    g_config = load_config();
+    g_config = load_legacy_config_as_job_config();
 
     // Resolve API key
     if (g_config.llm_model.empty()) {
@@ -1761,7 +1761,7 @@ int main(int argc, char* argv[]) {
     g_jobs->set_model_resolver([](const Job& job) -> std::vector<std::string> {
         std::vector<std::string> needed;
         if (job.kind != JobKind::Postprocess) return needed;
-        const Config& c = job.cfg;
+        const JobConfig& c = job.cfg;
         // Transcription needs the whisper model unless the recording phase
         // already produced transcript text.
         if (job.input.transcript_text.empty() && !c.whisper_model.empty())
@@ -2069,7 +2069,7 @@ int main(int argc, char* argv[]) {
 
     server.on("config.reload", [](const IpcRequest& req, IpcResponse& resp, IpcError& err) {
         try {
-            Config cfg = load_config();
+            JobConfig cfg = load_legacy_config_as_job_config();
             if (cfg.llm_model.empty()) {
                 const auto* prov = find_provider(cfg.provider);
                 if (prov) {
@@ -2397,7 +2397,7 @@ int main(int argc, char* argv[]) {
         // concurrently-reloaded daemon Config). The default temp_dir
         // (system temp) is used here; production daemons can swap it
         // later via a config knob.
-        Config stream_pp_cfg;
+        JobConfig stream_pp_cfg;
         {
             std::lock_guard<std::mutex> lock(g_config_mu);
             stream_pp_cfg = g_config;
@@ -2557,7 +2557,7 @@ int main(int argc, char* argv[]) {
         // to pass the live Config snapshot through to the upload manager,
         // which freezes it for the upload's lifetime so a concurrent
         // config.reload between submit and finalize can't surprise us.
-        Config cfg;
+        JobConfig cfg;
         size_t max_upload_bytes = 0;
         {
             std::lock_guard<std::mutex> lock(g_config_mu);
@@ -2734,7 +2734,7 @@ int main(int argc, char* argv[]) {
         // job.input.out_dir on every dequeue, so a stale value cannot reach
         // the subprocess via this path either way — but explicit beats
         // implicit, and mirrors what process.submit does at the same point.
-        Config cfg;
+        JobConfig cfg;
         {
             std::lock_guard<std::mutex> lock(g_config_mu);
             cfg = g_config;
@@ -3676,7 +3676,7 @@ int main(int argc, char* argv[]) {
     // FIFO is the single admission point — explicit downloads queue behind
     // any auto-triggered one (and vice-versa) instead of racing.
     server.on("models.ensure", [](const IpcRequest& req, IpcResponse& resp, IpcError& err) {
-        Config cfg;
+        JobConfig cfg;
         bool allow_dl;
         {
             std::lock_guard<std::mutex> lock(g_config_mu);

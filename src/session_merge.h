@@ -52,16 +52,16 @@ namespace recmeet {
 // drives provider/llm-path selection downstream: `"local"` forces a
 // non-empty `llm_model`; `"http"` clears `llm_model` so the subprocess
 // uses the HTTP path; empty leaves whatever the merge produced.
-Config merge_creds_for_job(
-    const Config& daemon_config,
+JobConfig merge_creds_for_job(
+    const JobConfig& daemon_config,
     const SessionCredentials& session_creds,
     const SessionPreferences& session_prefs,
     const std::function<std::string(const std::string&)>& env_lookup);
 
 // Convenience wrapper that uses `std::getenv` for the env-lookup. Used
 // at the daemon's enqueue site. Tests use the injection form above.
-Config merge_creds_for_job_with_real_env(
-    const Config& daemon_config,
+JobConfig merge_creds_for_job_with_real_env(
+    const JobConfig& daemon_config,
     const SessionCredentials& session_creds,
     const SessionPreferences& session_prefs);
 

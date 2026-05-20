@@ -172,7 +172,7 @@ TEST_CASE("UploadSession: create reserves job and returns token",
     PpDrainGuard guard(q);
     UploadSessionManager mgr(q, test_temp_dir("create"), null_progress_sink());
 
-    Config cfg;
+    JobConfig cfg;
     auto req = default_req(/*audio_size=*/3200);  // 100ms of 16kHz mono s16
     auto res = mgr.create("client-A", req, cfg, /*max_upload_bytes=*/1<<20);
 
@@ -214,7 +214,7 @@ TEST_CASE("UploadSession: validation rejects enroll mode and unknown formats",
     JobQueue q;
     PpDrainGuard guard(q);
     UploadSessionManager mgr(q, test_temp_dir("validate"), null_progress_sink());
-    Config cfg;
+    JobConfig cfg;
 
     // mode=="enroll" with no enroll_name → InvalidParams.
     {
@@ -272,7 +272,7 @@ TEST_CASE("UploadSession: multi-chunk upload finalizes on bytes_received==audio_
     fs::path tmp = test_temp_dir("multichunk");
     CountingProgressSink prog;
     UploadSessionManager mgr(q, tmp, prog.make());
-    Config cfg;
+    JobConfig cfg;
 
     // 3 chunks of 1600 samples each = 4800 samples = 9600 bytes total.
     constexpr int64_t kTotal = 9600;
@@ -331,7 +331,7 @@ TEST_CASE("UploadSession: SubmitRequest.meeting_id is stamped onto the Job at fi
 
     fs::path tmp = test_temp_dir("c11-pp-id");
     UploadSessionManager mgr(q, tmp, null_progress_sink());
-    Config cfg;
+    JobConfig cfg;
 
     constexpr int64_t kTotal = 3200;
     auto req = default_req(kTotal);
@@ -361,7 +361,7 @@ TEST_CASE("UploadSession: SubmitRequest without meeting_id leaves Job.meeting_id
     PpDrainGuard guard(q);
     fs::path tmp = test_temp_dir("c11-pp-noid");
     UploadSessionManager mgr(q, tmp, null_progress_sink());
-    Config cfg;
+    JobConfig cfg;
 
     auto req = default_req(3200);
     // req.meeting_id deliberately unset → empty string.
@@ -387,7 +387,7 @@ TEST_CASE("UploadSession: feed_chunk rejects overflow past audio_size",
     JobQueue q;
     PpDrainGuard drain(q);
     UploadSessionManager mgr(q, test_temp_dir("overflow"), null_progress_sink());
-    Config cfg;
+    JobConfig cfg;
 
     auto res = mgr.create("c", default_req(/*audio_size=*/3200), cfg, 1<<20);
     REQUIRE(res.ok);
@@ -409,7 +409,7 @@ TEST_CASE("UploadSession: feed_chunk rejects single chunk that exceeds audio_siz
     PpDrainGuard drain(q);
     UploadSessionManager mgr(q, test_temp_dir("oversize_chunk"),
                              null_progress_sink());
-    Config cfg;
+    JobConfig cfg;
 
     auto res = mgr.create("c", default_req(/*audio_size=*/1024), cfg, 1<<20);
     REQUIRE(res.ok);
@@ -429,7 +429,7 @@ TEST_CASE("UploadSession: second submit from same client is rejected Busy",
     PpDrainGuard drain(q);
     UploadSessionManager mgr(q, test_temp_dir("doublesubmit"),
                              null_progress_sink());
-    Config cfg;
+    JobConfig cfg;
 
     auto a = mgr.create("client-A", default_req(3200), cfg, 1<<20);
     REQUIRE(a.ok);
@@ -457,7 +457,7 @@ TEST_CASE("UploadSession: cancel tears down staging and marks reservation Cancel
     PpDrainGuard drain(q);
     fs::path root = test_temp_dir("cancel");
     UploadSessionManager mgr(q, root, null_progress_sink());
-    Config cfg;
+    JobConfig cfg;
 
     auto r = mgr.create("client-A", default_req(3200), cfg, 1<<20);
     REQUIRE(r.ok);
@@ -493,7 +493,7 @@ TEST_CASE("UploadSession: client disconnect mid-upload aborts the session",
     PpDrainGuard drain(q);
     fs::path root = test_temp_dir("disconnect");
     UploadSessionManager mgr(q, root, null_progress_sink());
-    Config cfg;
+    JobConfig cfg;
 
     auto r = mgr.create("client-A", default_req(6400), cfg, 1<<20);
     REQUIRE(r.ok);
@@ -533,7 +533,7 @@ TEST_CASE("UploadSession: cancel enforces client ownership of upload_token",
     PpDrainGuard drain(q);
     UploadSessionManager mgr(q, test_temp_dir("ownership"),
                              null_progress_sink());
-    Config cfg;
+    JobConfig cfg;
 
     auto a = mgr.create("client-A", default_req(1600), cfg, 1<<20);
     auto b = mgr.create("client-B", default_req(1600), cfg, 1<<20);
@@ -560,7 +560,7 @@ TEST_CASE("UploadSession: raw s16le PCM round-trips to a valid WAV",
     PpDrainGuard drain(q);
     fs::path root = test_temp_dir("roundtrip");
     UploadSessionManager mgr(q, root, null_progress_sink());
-    Config cfg;
+    JobConfig cfg;
 
     // 800 samples = 50ms of 16kHz mono → 1600 bytes total.
     constexpr int64_t kBytes = 1600;
@@ -613,7 +613,7 @@ TEST_CASE("UploadSession: container WAV upload is byte-exact on disk",
     PpDrainGuard drain(q);
     fs::path root = test_temp_dir("container_wav");
     UploadSessionManager mgr(q, root, null_progress_sink());
-    Config cfg;
+    JobConfig cfg;
 
     // Build a minimal but valid 16kHz mono S16 WAV in memory using
     // libsndfile (so the bytes that arrive on the wire really are a WAV).
@@ -734,7 +734,7 @@ TEST_CASE("UploadSession: 0x01 frames round-trip through IpcServer/IpcClient",
         sr.sample_rate = static_cast<int32_t>(gi("sample_rate", sr.sample_rate));
         sr.channels    = static_cast<int32_t>(gi("channels", sr.channels));
         sr.mode        = gs("mode", sr.mode);
-        Config cfg;
+        JobConfig cfg;
         auto cr = mgr.create(req.client_id, sr, cfg, 1<<20);
         if (!cr.ok) { err.code = cr.code; err.message = cr.error; return false; }
         resp.result["job_id"]       = cr.job_id;
@@ -844,7 +844,7 @@ TEST_CASE("UploadSession: process.submit.cancel + disconnect handler over the wi
         sr.sample_rate = 16000;
         sr.channels = 1;
         sr.mode = "transcribe";
-        Config cfg;
+        JobConfig cfg;
         auto cr = mgr.create(req.client_id, sr, cfg, 1<<20);
         if (!cr.ok) { err.code = cr.code; err.message = cr.error; return false; }
         resp.result["job_id"] = cr.job_id;
@@ -1062,7 +1062,7 @@ TEST_CASE("dedup: upload with unknown meeting_id allocates fresh meeting dir "
     SubmitRequest req = default_req(/*audio_size=*/3200);
     req.meeting_id = id;
     req.context = "Daily standup";
-    auto cr = mgr.create("client-A", req, Config{}, 1 << 20);
+    auto cr = mgr.create("client-A", req, JobConfig{}, 1 << 20);
     REQUIRE(cr.ok);
 
     REQUIRE(drive_full_upload(mgr, "client-A", 3200));
@@ -1107,7 +1107,7 @@ TEST_CASE("dedup: upload with known meeting_id overwrites the existing dir's "
     req.meeting_id = id;
     req.context = "first submit";
     {
-        auto cr = mgr.create("client-A", req, Config{}, 1 << 20);
+        auto cr = mgr.create("client-A", req, JobConfig{}, 1 << 20);
         REQUIRE(cr.ok);
         REQUIRE(drive_full_upload(mgr, "client-A", 3200));
         REQUIRE(wait_for_jobs(drain, 1));
@@ -1124,7 +1124,7 @@ TEST_CASE("dedup: upload with known meeting_id overwrites the existing dir's "
     req2.meeting_id = id;
     req2.context = "second submit overwrites";
     {
-        auto cr = mgr.create("client-A", req2, Config{}, 1 << 20);
+        auto cr = mgr.create("client-A", req2, JobConfig{}, 1 << 20);
         REQUIRE(cr.ok);
         REQUIRE(drive_full_upload(mgr, "client-A", 6400));
         REQUIRE(wait_for_jobs(drain, 2));
@@ -1165,7 +1165,7 @@ TEST_CASE("dedup: v1-shaped upload (empty meeting_id) lands in a real meeting "
 
     SubmitRequest req = default_req(3200);
     // req.meeting_id deliberately left empty
-    auto cr = mgr.create("client-A", req, Config{}, 1 << 20);
+    auto cr = mgr.create("client-A", req, JobConfig{}, 1 << 20);
     REQUIRE(cr.ok);
     REQUIRE(drive_full_upload(mgr, "client-A", 3200));
     REQUIRE(wait_for_jobs(drain, 1));
@@ -1211,7 +1211,7 @@ TEST_CASE("dedup: bound meeting_id whose dir vanished re-allocates and "
 
     SubmitRequest req = default_req(3200);
     req.meeting_id = id;
-    auto cr = mgr.create("client-A", req, Config{}, 1 << 20);
+    auto cr = mgr.create("client-A", req, JobConfig{}, 1 << 20);
     REQUIRE(cr.ok);
     REQUIRE(drive_full_upload(mgr, "client-A", 3200));
     REQUIRE(wait_for_jobs(drain, 1));
@@ -1278,8 +1278,8 @@ TEST_CASE("dedup: concurrent cross-client submits with same meeting_id "
 
     SubmitRequest req = default_req(3200);
     req.meeting_id = id;
-    auto cr_a = mgr.create("client-A", req, Config{}, 1 << 20);
-    auto cr_b = mgr.create("client-B", req, Config{}, 1 << 20);
+    auto cr_a = mgr.create("client-A", req, JobConfig{}, 1 << 20);
+    auto cr_b = mgr.create("client-B", req, JobConfig{}, 1 << 20);
     REQUIRE(cr_a.ok);
     REQUIRE(cr_b.ok);
     CHECK(cr_a.job_id != cr_b.job_id);

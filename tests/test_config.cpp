@@ -19,7 +19,7 @@ static fs::path tmp_config() {
 TEST_CASE("save_config + load_config round-trip", "[config]") {
     fs::path path = tmp_config();
 
-    Config cfg;
+    JobConfig cfg;
     cfg.device_pattern = "test-device|pattern";
     cfg.mic_source = "alsa_input.test";
     cfg.monitor_source = "alsa_output.test.monitor";
@@ -42,7 +42,7 @@ TEST_CASE("save_config + load_config round-trip", "[config]") {
     cfg.note.domain = "engineering";
     cfg.note_dir = "/home/user/obsidian/Meetings";
 
-    save_config(cfg, path);
+    save_legacy_config_as_job_config(cfg, path);
     REQUIRE(fs::exists(path));
 
     std::ifstream in(path);
@@ -73,7 +73,7 @@ TEST_CASE("save_config + load_config round-trip", "[config]") {
     CHECK(content.find("directory: \"/home/user/obsidian/Meetings\"") != std::string::npos);
 
     // Load it back and verify
-    Config loaded = load_config(path);
+    JobConfig loaded = load_legacy_config_as_job_config(path);
     CHECK(loaded.device_pattern == "test-device|pattern");
     CHECK(loaded.mic_source == "alsa_input.test");
     CHECK(loaded.monitor_source == "alsa_output.test.monitor");
@@ -103,7 +103,7 @@ TEST_CASE("load_config: returns defaults when no file exists", "[config]") {
     fs::path path = fs::temp_directory_path() / "recmeet_test_config_noexist" / "config.yaml";
     fs::remove_all(path.parent_path());
 
-    Config cfg = load_config(path);
+    JobConfig cfg = load_legacy_config_as_job_config(path);
     CHECK(cfg.whisper_model == "base");
     CHECK(cfg.provider == "xai");
     CHECK(cfg.api_url.empty());
@@ -132,7 +132,7 @@ TEST_CASE("load_config: handles malformed YAML gracefully", "[config]") {
     }
 
     // Should not crash — returns some config (likely defaults)
-    Config cfg = load_config(path);
+    JobConfig cfg = load_legacy_config_as_job_config(path);
     CHECK_FALSE(cfg.whisper_model.empty()); // Still has a default
 
     fs::remove_all(path.parent_path());
@@ -146,7 +146,7 @@ TEST_CASE("load_config: partial config fills only specified fields", "[config]")
         out << "transcription:\n  model: tiny\n";
     }
 
-    Config cfg = load_config(path);
+    JobConfig cfg = load_legacy_config_as_job_config(path);
     CHECK(cfg.whisper_model == "tiny");
     // Others should be defaults
     CHECK(cfg.provider == "xai");
@@ -166,7 +166,7 @@ TEST_CASE("load_config: reads XAI_API_KEY from environment", "[config]") {
     std::string saved_key = old_key ? old_key : "";
     setenv("XAI_API_KEY", "test-api-key-12345", 1);
 
-    Config cfg = load_config(path);
+    JobConfig cfg = load_legacy_config_as_job_config(path);
     CHECK(cfg.api_key == "test-api-key-12345");
 
     // Restore env
@@ -181,10 +181,10 @@ TEST_CASE("save_config never writes legacy api_key to YAML", "[config]") {
     fs::remove_all(dir);
     fs::path path = dir / "config.yaml";
 
-    Config cfg;
+    JobConfig cfg;
     cfg.api_key = "sk-super-secret-key-99999";
     cfg.provider = "openai";
-    save_config(cfg, path);
+    save_legacy_config_as_job_config(cfg, path);
 
     // Read the file and verify legacy api_key is NOT present
     std::ifstream in(path);
@@ -203,13 +203,13 @@ TEST_CASE("api_keys round-trip via save_config + load_config", "[config]") {
     fs::remove_all(dir);
     fs::path path = dir / "config.yaml";
 
-    Config cfg;
+    JobConfig cfg;
     cfg.api_keys["xai"] = "xai-test-key-123";
     cfg.api_keys["openai"] = "sk-test-key-456";
     cfg.api_keys["anthropic"] = "sk-ant-test-key-789";
-    save_config(cfg, path);
+    save_legacy_config_as_job_config(cfg, path);
 
-    Config loaded = load_config(path);
+    JobConfig loaded = load_legacy_config_as_job_config(path);
     CHECK(loaded.api_keys["xai"] == "xai-test-key-123");
     CHECK(loaded.api_keys["openai"] == "sk-test-key-456");
     CHECK(loaded.api_keys["anthropic"] == "sk-ant-test-key-789");
@@ -222,10 +222,10 @@ TEST_CASE("api_keys section format in YAML", "[config]") {
     fs::remove_all(dir);
     fs::path path = dir / "config.yaml";
 
-    Config cfg;
+    JobConfig cfg;
     cfg.api_keys["xai"] = "xai-key";
     cfg.api_keys["openai"] = "sk-key";
-    save_config(cfg, path);
+    save_legacy_config_as_job_config(cfg, path);
 
     std::ifstream in(path);
     std::string contents((std::istreambuf_iterator<char>(in)),
@@ -243,9 +243,9 @@ TEST_CASE("save_config sets file permissions to 0600", "[config]") {
     fs::remove_all(dir);
     fs::path path = dir / "config.yaml";
 
-    Config cfg;
+    JobConfig cfg;
     cfg.api_keys["xai"] = "xai-secret";
-    save_config(cfg, path);
+    save_legacy_config_as_job_config(cfg, path);
 
     struct stat st;
     REQUIRE(stat(path.c_str(), &st) == 0);
@@ -303,7 +303,7 @@ TEST_CASE("load_config: chunked-diarize defaults when keys absent",
     fs::path path = fs::temp_directory_path() / "recmeet_test_cfg_chunk_def" / "config.yaml";
     fs::remove_all(path.parent_path());
 
-    Config cfg = load_config(path);
+    JobConfig cfg = load_legacy_config_as_job_config(path);
     CHECK(cfg.chunk_minutes == 15.0f);
     CHECK(cfg.chunk_overlap_sec == 30.0f);
     CHECK(cfg.stitch_threshold == 0.6f);
@@ -315,11 +315,11 @@ TEST_CASE("save_config + load_config: chunked-diarize fields round-trip",
     fs::remove_all(dir);
     fs::path path = dir / "config.yaml";
 
-    Config cfg;
+    JobConfig cfg;
     cfg.chunk_minutes = 12.5f;
     cfg.chunk_overlap_sec = 45.0f;
     cfg.stitch_threshold = 0.55f;
-    save_config(cfg, path);
+    save_legacy_config_as_job_config(cfg, path);
     REQUIRE(fs::exists(path));
 
     // Verify on-disk YAML lives under the [diarization] section (M-3').
@@ -335,7 +335,7 @@ TEST_CASE("save_config + load_config: chunked-diarize fields round-trip",
     // No parallel [diarize] section per M-3'.
     CHECK(content.find("\ndiarize:\n") == std::string::npos);
 
-    Config loaded = load_config(path);
+    JobConfig loaded = load_legacy_config_as_job_config(path);
     CHECK(loaded.chunk_minutes == 12.5f);
     CHECK(loaded.chunk_overlap_sec == 45.0f);
     CHECK(loaded.stitch_threshold == 0.55f);
@@ -349,8 +349,8 @@ TEST_CASE("save_config: chunked-diarize fields omitted at defaults",
     fs::remove_all(dir);
     fs::path path = dir / "config.yaml";
 
-    Config cfg;  // all defaults
-    save_config(cfg, path);
+    JobConfig cfg;  // all defaults
+    save_legacy_config_as_job_config(cfg, path);
 
     std::ifstream in(path);
     std::ostringstream buf;
@@ -379,7 +379,7 @@ TEST_CASE("load_config: M-5' invalid persisted values fall back to defaults",
             << "  stitch_threshold: 0.42\n";
     }
 
-    Config cfg = load_config(path);
+    JobConfig cfg = load_legacy_config_as_job_config(path);
     // Falls back to defaults rather than crashing the daemon at startup.
     CHECK(cfg.chunk_minutes == 15.0f);
     CHECK(cfg.chunk_overlap_sec == 30.0f);
@@ -404,7 +404,7 @@ TEST_CASE("load_config: M-5' boundary equal-to-zero spacing falls back",
             << "  chunk_overlap_sec: 0.0\n";
     }
 
-    Config cfg = load_config(path);
+    JobConfig cfg = load_legacy_config_as_job_config(path);
     CHECK(cfg.chunk_minutes == 15.0f);
     CHECK(cfg.chunk_overlap_sec == 30.0f);
 
@@ -422,7 +422,7 @@ TEST_CASE("backward compat: legacy api_key in config used as fallback", "[config
         out << "summary:\n  provider: openai\n  api_key: \"sk-legacy-fallback\"\n";
     }
 
-    Config cfg = load_config(path);
+    JobConfig cfg = load_legacy_config_as_job_config(path);
     CHECK(cfg.api_key == "sk-legacy-fallback");
     CHECK(cfg.api_keys.empty());  // No api_keys section → empty map
 
@@ -451,7 +451,7 @@ TEST_CASE("load_config: retain_terminal_hours defaults to 24 h with derived "
         std::ofstream out(path);
         out << "server:\n  max_clients: 16\n";  // unrelated key
     }
-    Config cfg = load_config(path);
+    JobConfig cfg = load_legacy_config_as_job_config(path);
     CHECK(cfg.retain_terminal_hours == 24);
     CHECK(cfg.diarization_cache_ttl_secs == 86400);
     fs::remove_all(dir);
@@ -471,7 +471,7 @@ TEST_CASE("load_config: retain_terminal_hours overrides legacy "
                "  retain_terminal_hours: 48\n"
                "  diarization_cache_ttl_secs: 3600\n";
     }
-    Config cfg = load_config(path);
+    JobConfig cfg = load_legacy_config_as_job_config(path);
     CHECK(cfg.retain_terminal_hours == 48);
     CHECK(cfg.diarization_cache_ttl_secs == 48 * 3600);
     fs::remove_all(dir);
@@ -488,7 +488,7 @@ TEST_CASE("load_config: legacy diarization_cache_ttl_secs derives "
         std::ofstream out(path);
         out << "server:\n  diarization_cache_ttl_secs: 7200\n";
     }
-    Config cfg = load_config(path);
+    JobConfig cfg = load_legacy_config_as_job_config(path);
     CHECK(cfg.diarization_cache_ttl_secs == 7200);
     // 7200 / 3600 = 2 hours
     CHECK(cfg.retain_terminal_hours == 2);
@@ -503,7 +503,7 @@ TEST_CASE("load_config: staging_max_bytes defaults to 500 GiB when absent",
           "[config][d6]") {
     fs::path dir = fs::temp_directory_path() / "recmeet_test_d6_default";
     fs::remove_all(dir);
-    Config cfg = load_config(dir / "config.yaml");
+    JobConfig cfg = load_legacy_config_as_job_config(dir / "config.yaml");
     constexpr size_t expected = static_cast<size_t>(500) * 1024 * 1024 * 1024;
     CHECK(cfg.staging_max_bytes == expected);
     fs::remove_all(dir);
@@ -516,9 +516,9 @@ TEST_CASE("save_config + load_config: staging_max_bytes round-trips via [client]
     fs::path path = dir / "config.yaml";
     fs::create_directories(dir);
 
-    Config cfg;
+    JobConfig cfg;
     cfg.staging_max_bytes = static_cast<size_t>(10) * 1024 * 1024 * 1024;  // 10 GiB
-    save_config(cfg, path);
+    save_legacy_config_as_job_config(cfg, path);
 
     std::ifstream in(path);
     std::ostringstream buf;
@@ -527,7 +527,7 @@ TEST_CASE("save_config + load_config: staging_max_bytes round-trips via [client]
     CHECK(content.find("client:") != std::string::npos);
     CHECK(content.find("staging_max_bytes: 10737418240") != std::string::npos);
 
-    Config loaded = load_config(path);
+    JobConfig loaded = load_legacy_config_as_job_config(path);
     CHECK(loaded.staging_max_bytes == cfg.staging_max_bytes);
     fs::remove_all(dir);
 }
@@ -539,8 +539,8 @@ TEST_CASE("save_config: staging_max_bytes section omitted at default",
     fs::path path = dir / "config.yaml";
     fs::create_directories(dir);
 
-    Config cfg;  // default 500 GiB
-    save_config(cfg, path);
+    JobConfig cfg;  // default 500 GiB
+    save_legacy_config_as_job_config(cfg, path);
 
     std::ifstream in(path);
     std::ostringstream buf;
@@ -562,7 +562,7 @@ TEST_CASE("load_config: invalid staging_max_bytes falls back to default",
         std::ofstream out(path);
         out << "client:\n  staging_max_bytes: 0\n";  // zero = typo → fallback
     }
-    Config cfg = load_config(path);
+    JobConfig cfg = load_legacy_config_as_job_config(path);
     constexpr size_t expected = static_cast<size_t>(500) * 1024 * 1024 * 1024;
     CHECK(cfg.staging_max_bytes == expected);
     fs::remove_all(dir);

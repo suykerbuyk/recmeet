@@ -76,7 +76,7 @@ DebateResult run_debate_pipeline(bool use_local_llm, const fs::path& llm_model_p
     fs::copy_file(audio_src, audio_path);
 
     // Configure
-    Config cfg;
+    JobConfig cfg;
     cfg.whisper_model = "base";
     cfg.language = "en";
     cfg.diarize = true;
@@ -386,7 +386,7 @@ TEST_CASE("Reprocess with context.json fallback", "[full-stack]") {
     save_meeting_context(out_dir, "Reprocess test context");
 
     // Configure for reprocess — minimal pipeline
-    Config cfg;
+    JobConfig cfg;
     cfg.whisper_model = "base";
     cfg.language = "en";
     cfg.reprocess_dir = out_dir;
@@ -451,7 +451,7 @@ TEST_CASE("Reprocess with per-instance context_<ts>.json fallback", "[full-stack
     REQUIRE(fs::exists(out_dir / "context_2020-09-29_21-00.json"));
     REQUIRE_FALSE(fs::exists(out_dir / "context.json"));
 
-    Config cfg;
+    JobConfig cfg;
     cfg.whisper_model = "base";
     cfg.language = "en";
     cfg.reprocess_dir = out_dir;

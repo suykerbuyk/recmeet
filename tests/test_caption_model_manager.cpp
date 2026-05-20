@@ -30,7 +30,7 @@ namespace {
 
 // Helper: drive parse_cli with a fake argv. Mirrors test_cli.cpp's helper
 // so the precedence assertions stay close in style. Sets XDG_CONFIG_HOME
-// to a non-existent dir so load_config() returns pure defaults rather
+// to a non-existent dir so load_legacy_config_as_job_config() returns pure defaults rather
 // than reading the operator's real config.
 CliResult run_cli(std::initializer_list<const char*> args) {
     std::vector<char*> argv;
@@ -148,17 +148,17 @@ TEST_CASE("caption_model_size_hint: returns hint for known models",
 }
 
 // ===========================================================================
-// 2. Config round-trip — Phase 3 added JSON; Phase 4 added YAML.
+// 2. JobConfig round-trip — Phase 3 added JSON; Phase 4 added YAML.
 // Both directions tested here.
 // ===========================================================================
 TEST_CASE("Config: captions fields round-trip via JSON",
           "[caption-model-manager][config]") {
-    Config cfg;
+    JobConfig cfg;
     cfg.captions_enabled = true;
     cfg.caption_model = "en-small";
 
     std::string json = config_to_json(cfg);
-    Config loaded = config_from_json(json);
+    JobConfig loaded = config_from_json(json);
 
     CHECK(loaded.captions_enabled == true);
     CHECK(loaded.caption_model == "en-small");
@@ -170,13 +170,13 @@ TEST_CASE("Config: captions fields round-trip via YAML save/load",
                    "recmeet_test_caption_yaml_roundtrip.yaml";
     std::error_code ec; fs::remove(tmp, ec);
 
-    Config cfg;
+    JobConfig cfg;
     cfg.captions_enabled = true;
     cfg.caption_model = "en-2023-06-26";
-    save_config(cfg, tmp);
+    save_legacy_config_as_job_config(cfg, tmp);
     REQUIRE(fs::exists(tmp));
 
-    Config loaded = load_config(tmp);
+    JobConfig loaded = load_legacy_config_as_job_config(tmp);
     CHECK(loaded.captions_enabled == true);
     CHECK(loaded.caption_model == "en-2023-06-26");
 
@@ -189,8 +189,8 @@ TEST_CASE("Config: captions disabled is the default and not emitted in YAML",
                    "recmeet_test_caption_yaml_default.yaml";
     std::error_code ec; fs::remove(tmp, ec);
 
-    Config cfg;  // defaults: enabled=false, model=""
-    save_config(cfg, tmp);
+    JobConfig cfg;  // defaults: enabled=false, model=""
+    save_legacy_config_as_job_config(cfg, tmp);
 
     // When both keys are at default the section is omitted from the YAML
     // (keeps the file compact for the common off case).
@@ -199,7 +199,7 @@ TEST_CASE("Config: captions disabled is the default and not emitted in YAML",
                         std::istreambuf_iterator<char>());
     CHECK(content.find("captions:") == std::string::npos);
 
-    Config loaded = load_config(tmp);
+    JobConfig loaded = load_legacy_config_as_job_config(tmp);
     CHECK(loaded.captions_enabled == false);
     CHECK(loaded.caption_model.empty());
 
@@ -255,7 +255,7 @@ TEST_CASE("parse_cli: --list-caption-models sets the flag",
 TEST_CASE("parse_cli: defaults — no caption flags = config's captions_enabled",
           "[caption-model-manager][cli]") {
     auto cli = run_cli({"recmeet"});
-    // Config defaults to captions_enabled=false, so no flag → false.
+    // JobConfig defaults to captions_enabled=false, so no flag → false.
     CHECK(cli.cfg.captions_enabled == false);
     CHECK(cli.caption_force_on == false);
     CHECK(cli.caption_force_off == false);
@@ -279,7 +279,7 @@ TEST_CASE("pre-flight: cached model means captions stay enabled",
 
     // The pre-flight branch in standalone_main checks
     // is_caption_model_cached(); if true, captions_enabled stays true.
-    Config cfg;
+    JobConfig cfg;
     cfg.captions_enabled = true;
     cfg.caption_model = fake_name;
     bool would_disable = !is_caption_model_cached(cfg.caption_model);
@@ -288,7 +288,7 @@ TEST_CASE("pre-flight: cached model means captions stay enabled",
 
 TEST_CASE("pre-flight: missing model would prompt or disable",
           "[caption-model-manager][preflight]") {
-    Config cfg;
+    JobConfig cfg;
     cfg.captions_enabled = true;
     cfg.caption_model = "nonexistent-model-name-xyzzy";
     bool would_prompt_or_disable = !is_caption_model_cached(cfg.caption_model);

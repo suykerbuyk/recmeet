@@ -12,7 +12,7 @@ using namespace recmeet;
 
 // Helper to build argv and call parse_cli.
 // getopt state must be reset between calls.
-// Redirects XDG_CONFIG_HOME to an empty temp dir so load_config()
+// Redirects XDG_CONFIG_HOME to an empty temp dir so load_legacy_config_as_job_config()
 // returns pure defaults instead of reading the user's real config.
 static CliResult run_cli(std::initializer_list<const char*> args) {
     // Build argv (must be non-const char* for getopt)
@@ -43,7 +43,7 @@ TEST_CASE("parse_cli: defaults from config when no flags", "[cli]") {
     CHECK_FALSE(cli.list_sources);
     CHECK_FALSE(cli.show_help);
     CHECK_FALSE(cli.show_version);
-    // Defaults come from load_config(), which reads the real config file.
+    // Defaults come from load_legacy_config_as_job_config(), which reads the real config file.
     // Just verify the struct is populated.
     CHECK_FALSE(cli.cfg.whisper_model.empty());
 }
@@ -433,13 +433,13 @@ TEST_CASE("parse_cli: --dry-run sets the flag",
 
 TEST_CASE("parse_cli: config_json round-trips batch_mode",
           "[reprocess-batch][cli]") {
-    Config cfg;
+    JobConfig cfg;
     cfg.batch_mode = true;
     cfg.reprocess_batch_dir = "/home/user/meetings";
     cfg.reprocess_batch_dry_run = true;
 
     std::string json = config_to_json(cfg);
-    Config loaded = config_from_json(json);
+    JobConfig loaded = config_from_json(json);
 
     CHECK(loaded.batch_mode == true);
     CHECK(loaded.reprocess_batch_dir == fs::path("/home/user/meetings"));

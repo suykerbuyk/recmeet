@@ -58,7 +58,7 @@ enum class BatchDispatchMode { Daemon, Standalone };
 /// classification consults `cfg.note_dir` and `find_audio_file()` exactly as
 /// the production pipeline does. Exposed for unit testing.
 std::vector<BatchEntry> classify_batch_entries(
-    const fs::path& parent_dir, const Config& cfg);
+    const fs::path& parent_dir, const JobConfig& cfg);
 
 /// Atomic pointer to the live IpcClient driving the in-flight daemon-mode
 /// iteration, or nullptr otherwise. Set by `client_record_no_sigaction` while
@@ -110,7 +110,7 @@ constexpr int kClientConnectFailedExitCode = 2;
 /// lines. Reads `cfg.caption_normalize_display` to decide whether to apply
 /// `normalize_caption()` before printing. Defaults to false; the
 /// reprocess-batch driver leaves it off (no captions during reprocess).
-int client_record_no_sigaction(const Config& cfg, const std::string& addr,
+int client_record_no_sigaction(const JobConfig& cfg, const std::string& addr,
                                bool show_captions_on_stderr = false);
 
 /// Once-per-batch model precheck. Validates that all models any iteration
@@ -118,7 +118,7 @@ int client_record_no_sigaction(const Config& cfg, const std::string& addr,
 /// or otherwise satisfied. Returns the empty string on success, or a
 /// human-readable error message on the first failure. Stays in main.cpp
 /// (no new file); declared here for the batch dispatcher's call site.
-std::string ensure_models_cached_or_fail(const Config& cfg);
+std::string ensure_models_cached_or_fail(const JobConfig& cfg);
 
 /// Run the reprocess batch for the given CLI invocation. Returns the process
 /// exit code:

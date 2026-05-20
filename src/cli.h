@@ -10,7 +10,7 @@ namespace recmeet {
 enum class DaemonMode { Auto, Force, Disable };
 
 struct CliResult {
-    Config cfg;
+    JobConfig cfg;
     bool list_sources = false;
     bool show_help = false;
     bool show_version = false;

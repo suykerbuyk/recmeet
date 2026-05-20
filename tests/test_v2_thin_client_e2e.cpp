@@ -54,7 +54,7 @@ namespace {
 // + waitpid on destruction; falls back to SIGKILL after a 5 s grace.
 //
 // XDG_CONFIG_HOME isolation is the important bit: it scopes the config
-// read by `load_config()` (via `config_dir()` in `src/util.cpp`) without
+// read by `load_legacy_config_as_job_config()` (via `config_dir()` in `src/util.cpp`) without
 // touching HOME, so the daemon still finds the operator's cached
 // `~/.local/share/recmeet/models/` (set via XDG_DATA_HOME / HOME). This
 // keeps the test self-contained without forcing a redundant model

@@ -219,7 +219,7 @@ void write_diarization_artifact(const fs::path& out_dir,
 
 } // anonymous namespace
 
-PipelineResult run_postprocessing(const Config& cfg, const PostprocessInput& input,
+PipelineResult run_postprocessing(const JobConfig& cfg, const PostprocessInput& input,
                                   PhaseCallback on_phase, ProgressCallback on_progress,
                                   StopToken* stop) {
     log_debug("pipeline: run_postprocessing ENTER (dir=%s)", input.out_dir.c_str());

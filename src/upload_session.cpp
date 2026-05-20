@@ -300,7 +300,7 @@ void UploadSessionManager::teardown_locked(UploadSession* sess) {
 UploadSessionManager::CreateResult
 UploadSessionManager::create(const std::string& client_id,
                              const SubmitRequest& req,
-                             const Config& pp_cfg,
+                             const JobConfig& pp_cfg,
                              size_t max_upload_bytes) {
     CreateResult res;
     // Cap reported to client: 0 means "no operator cap" — report INT64_MAX.
@@ -507,7 +507,7 @@ bool UploadSessionManager::feed_chunk(const std::string& client_id,
     bool    finalize_now = false;
     std::string staging_audio_path_str;
     fs::path staging_dir;
-    Config  pp_cfg;
+    JobConfig pp_cfg;
     std::string context_inline;
     std::string pp_mode;        // Phase C.8 — captured under the lock
     std::string pp_enroll_name; // Phase C.8 — captured under the lock

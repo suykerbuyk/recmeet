@@ -96,7 +96,7 @@ TEST_CASE("classify_batch_entries skips meetings with existing notes",
     make_note(note_dir, "2026-01-01_10-00");
     make_note(note_dir, "2026-01-02_10-00");
 
-    Config cfg;
+    JobConfig cfg;
     cfg.note_dir = note_dir;
 
     auto entries = classify_batch_entries(parent, cfg);
@@ -130,7 +130,7 @@ TEST_CASE("classify_batch_entries ignores non-meeting subdirs",
     fs::create_directories(parent / "2026-02-15");      // missing time
     fs::create_directories(parent / "audio_2026-02-15_14-30"); // wrong prefix
 
-    Config cfg;  // no note_dir → check meeting dir for note (none present)
+    JobConfig cfg;  // no note_dir → check meeting dir for note (none present)
 
     auto entries = classify_batch_entries(parent, cfg);
     REQUIRE(entries.size() == 1);
@@ -156,7 +156,7 @@ TEST_CASE("classify_batch_entries reports SKIP-no-audio for empty/audio-less mee
         out << "{}";
     }
 
-    Config cfg;
+    JobConfig cfg;
     auto entries = classify_batch_entries(parent, cfg);
     REQUIRE(entries.size() == 2);
     for (const auto& e : entries) {
@@ -186,7 +186,7 @@ TEST_CASE("classify_batch_entries: empty note_dir checks meeting dir itself",
         out << "---\nstub\n---\n";
     }
 
-    Config cfg;  // note_dir intentionally empty
+    JobConfig cfg;  // note_dir intentionally empty
     auto entries = classify_batch_entries(parent, cfg);
     REQUIRE(entries.size() == 2);
 
@@ -198,7 +198,7 @@ TEST_CASE("classify_batch_entries: empty note_dir checks meeting dir itself",
 
 TEST_CASE("ensure_models_cached_or_fail: missing whisper model fails fast",
           "[reprocess-batch]") {
-    Config cfg;
+    JobConfig cfg;
     // Unknown model name: is_whisper_model_cached() throws RecmeetError;
     // the precheck catches and folds into a fail-fast message.
     cfg.whisper_model = "this-model-does-not-exist-anywhere-xyzzy";
@@ -215,7 +215,7 @@ TEST_CASE("ensure_models_cached_or_fail: missing summary readiness fails fast",
     // the readiness check is what we want to exercise here. 'tiny' is the
     // smallest commonly-cached model. If it's not present, this test
     // becomes redundant with the whisper-miss test above and we skip it.
-    Config cfg;
+    JobConfig cfg;
     cfg.whisper_model = "tiny";
     cfg.no_summary = false;
     cfg.api_key.clear();
@@ -294,7 +294,7 @@ TEST_CASE("classify_batch_entries: per-meeting state is independent",
     }
     make_meeting_dir(parent, "2026-06-03_10-00", /*with_audio=*/true);
 
-    Config cfg;
+    JobConfig cfg;
     auto entries = classify_batch_entries(parent, cfg);
     REQUIRE(entries.size() == 3);
     CHECK(entries[0].kind == BatchEntryKind::WillReprocess);

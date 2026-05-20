@@ -110,7 +110,7 @@ fs::path make_meeting(const fs::path& root,
 struct ReprocessDeps {
     JobQueue&     q;
     MeetingIndex& idx;
-    Config        cfg_snapshot;   // stand-in for g_config under g_config_mu
+    JobConfig        cfg_snapshot;   // stand-in for g_config under g_config_mu
 };
 
 void register_process_reprocess(IpcServer& server, ReprocessDeps& deps) {
@@ -161,7 +161,7 @@ void register_process_reprocess(IpcServer& server, ReprocessDeps& deps) {
             return false;
         }
         // (6) Apply per-stage flag overrides on a snapshot of the live config.
-        Config cfg = deps.cfg_snapshot;
+        JobConfig cfg = deps.cfg_snapshot;
         cfg.reprocess_dir.clear();
 
         {
@@ -228,7 +228,7 @@ TEST_CASE("C.12 process.reprocess: validation chain rejects bad meeting_id",
     JobQueue q;
     JqShutdownGuard jqg(q);
     MeetingIndex idx;
-    ReprocessDeps deps{q, idx, Config{}};
+    ReprocessDeps deps{q, idx, JobConfig{}};
 
     IpcServer server(REPROCESS_SOCK);
     register_process_reprocess(server, deps);
@@ -304,7 +304,7 @@ TEST_CASE("C.12 process.reprocess: known meeting_id enqueues job pointing at "
     JqShutdownGuard jqg(q);
     MeetingIndex idx;
     idx.bind(id, mdir);
-    ReprocessDeps deps{q, idx, Config{}};
+    ReprocessDeps deps{q, idx, JobConfig{}};
 
     IpcServer server(REPROCESS_SOCK);
     register_process_reprocess(server, deps);
@@ -345,7 +345,7 @@ TEST_CASE("C.12 process.reprocess: known meeting_id enqueues job pointing at "
 }
 
 // ============================================================================
-// 3. Per-stage flag overrides land on the dequeued job's Config. Asserts the
+// 3. Per-stage flag overrides land on the dequeued job's JobConfig. Asserts the
 //    inversion semantics for `summarize` (positive on the wire ↔ negative
 //    cfg.no_summary) and the replace-not-merge semantics for vocabulary.
 // ============================================================================
@@ -365,7 +365,7 @@ TEST_CASE("C.12 process.reprocess: per-stage flag overrides propagate to cfg",
 
     // Seed the snapshot with the OPPOSITE of what the request will assert,
     // so a missing override-application would not coincidentally pass.
-    Config snapshot;
+    JobConfig snapshot;
     snapshot.diarize    = true;
     snapshot.speaker_id = true;
     snapshot.no_summary = false;
@@ -431,7 +431,7 @@ TEST_CASE("C.12 process.reprocess: indexed dir vanished from disk → "
     JqShutdownGuard jqg(q);
     MeetingIndex idx;
     idx.bind(id, mdir);
-    ReprocessDeps deps{q, idx, Config{}};
+    ReprocessDeps deps{q, idx, JobConfig{}};
 
     IpcServer server(REPROCESS_SOCK);
     register_process_reprocess(server, deps);

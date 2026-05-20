@@ -403,7 +403,7 @@ TEST_CASE("process.submit mode=enroll: missing enroll_name → InvalidParams",
     JobQueue q;
     JqShutdownGuard jqg(q);
     UploadSessionManager mgr(q, test_temp_dir("enroll_missing_name"));
-    Config cfg;
+    JobConfig cfg;
 
     SubmitRequest r;
     r.audio_size = 1024;
@@ -444,7 +444,7 @@ TEST_CASE("process.submit mode=enroll: finalize stamps cfg.enroll_mode",
     });
 
     UploadSessionManager mgr(q, test_temp_dir("enroll_finalize"));
-    Config cfg;
+    JobConfig cfg;
     SubmitRequest r;
     r.audio_size = 6;  // tiny — 3 s16 samples
     r.format = "s16le";
@@ -485,7 +485,7 @@ TEST_CASE("process.submit: unknown mode → InvalidParams",
     JobQueue q;
     JqShutdownGuard jqg(q);
     UploadSessionManager mgr(q, test_temp_dir("unknown_mode"));
-    Config cfg;
+    JobConfig cfg;
     SubmitRequest r;
     r.audio_size = 1024;
     r.format = "s16le";

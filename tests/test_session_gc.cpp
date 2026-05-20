@@ -343,7 +343,7 @@ TEST_CASE("C.13: GC teardown — pp WaitingForUpload routes through upload mgr",
     sr.channels = 1;
     sr.mode = "transcribe";
 
-    Config pp_cfg;
+    JobConfig pp_cfg;
     auto create_res = uploads.create("alice", sr, pp_cfg, /*max_upload_bytes=*/0);
     REQUIRE(create_res.ok);
 

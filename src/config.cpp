@@ -239,8 +239,8 @@ std::string resolve_api_key(const ProviderInfo& provider,
     return legacy_key;
 }
 
-Config load_config(const fs::path& config_path) {
-    Config cfg;
+JobConfig load_legacy_config_as_job_config(const fs::path& config_path) {
+    JobConfig cfg;
     fs::path path = config_path.empty() ? config_dir() / "config.yaml" : config_path;
 
     // Check for API key in environment (try provider-specific, then XAI_API_KEY for compat)
@@ -573,7 +573,7 @@ Config load_config(const fs::path& config_path) {
     return cfg;
 }
 
-void save_config(const Config& cfg, const fs::path& config_path) {
+void save_legacy_config_as_job_config(const JobConfig& cfg, const fs::path& config_path) {
     fs::path path;
     if (config_path.empty()) {
         fs::path dir = config_dir();
@@ -808,7 +808,7 @@ void save_config(const Config& cfg, const fs::path& config_path) {
 // save_config so the existing 193 consumers compile unchanged. Wave 2.2b
 // retypes consumers and removes the monolithic surface.
 
-ServerConfig to_server_config(const Config& cfg) {
+ServerConfig to_server_config(const JobConfig& cfg) {
     ServerConfig s;
     s.whisper_model              = cfg.whisper_model;
     s.llm_model                  = cfg.llm_model;
@@ -852,7 +852,7 @@ ServerConfig to_server_config(const Config& cfg) {
     return s;
 }
 
-ClientConfig to_client_config(const Config& cfg) {
+ClientConfig to_client_config(const JobConfig& cfg) {
     ClientConfig c;
     c.device_pattern             = cfg.device_pattern;
     c.mic_source                 = cfg.mic_source;
@@ -1464,7 +1464,7 @@ void migrate_legacy_config_if_present(const fs::path& cfg_dir_in) {
     }
 
     // Load the monolithic legacy file, split, then write both halves.
-    Config legacy = load_config(old_path);
+    JobConfig legacy = load_legacy_config_as_job_config(old_path);
     ServerConfig srv = to_server_config(legacy);
     ClientConfig cli = to_client_config(legacy);
 

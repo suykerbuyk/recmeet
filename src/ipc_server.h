@@ -24,7 +24,7 @@ namespace recmeet {
 // `session.update_credentials` / `session.update_prefs` handlers. They are
 // cleared automatically on disconnect via `remove_client()`. The daemon
 // reads them at `enqueue_postprocess()` time via `IpcServer::get_session()`
-// and merges them into the postprocess job's `Config` (see `merge_creds_for_job`)
+// and merges them into the postprocess job's `JobConfig` (see `merge_creds_for_job`)
 // — the subprocess never re-reads env or daemon.yaml, so this merge is the
 // only credential path from operator config into the subprocess JSON.
 //

@@ -440,7 +440,7 @@ TEST_CASE("Captions stress: CPU contention with concurrent reprocess",
     fs::create_directories(reproc_dir);
     fs::copy_file(audio_src, reproc_dir / "audio_2026-01-01_10-00.wav");
 
-    Config rcfg;
+    JobConfig rcfg;
     rcfg.whisper_model = "base";
     rcfg.language = "en";
     rcfg.reprocess_dir = reproc_dir;

@@ -5,7 +5,7 @@
 //
 // Validates the new ServerConfig / ClientConfig load+save APIs, the legacy
 // migration helper (`migrate_legacy_config_if_present`), and the
-// config_to_map / config_from_map overloads. The monolithic Config struct
+// config_to_map / config_from_map overloads. The monolithic JobConfig struct
 // is preserved alongside; Wave 2.2b retypes consumers and removes it.
 //
 // All TEST_CASEs are tagged `[e2]` so the orchestrator can grep-verify the

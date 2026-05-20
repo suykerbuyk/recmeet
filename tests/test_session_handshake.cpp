@@ -571,8 +571,8 @@ namespace {
 
 // Build a baseline daemon.yaml snapshot with a single known fallback
 // API key + provider. Tests overlay sessions / env on top of this.
-Config make_yaml_baseline() {
-    Config cfg;
+JobConfig make_yaml_baseline() {
+    JobConfig cfg;
     cfg.provider = "xai";
     cfg.api_key  = "yaml-fallback-xai-key";
     cfg.api_keys["xai"]    = "yaml-fallback-xai-key";
@@ -598,7 +598,7 @@ TEST_CASE("A.6.1: session creds win over daemon.yaml fallback when env unset",
           "[ipc][a61]") {
     // MANDATORY iter-139 C-2 assertion: enqueue-time merge populates
     // job.cfg credentials from the stubbed client_id→creds binding.
-    Config yaml = make_yaml_baseline();
+    JobConfig yaml = make_yaml_baseline();
 
     SessionCredentials sess;
     sess.provider = "xai";
@@ -606,7 +606,7 @@ TEST_CASE("A.6.1: session creds win over daemon.yaml fallback when env unset",
 
     SessionPreferences prefs;
 
-    Config out = merge_creds_for_job(yaml, sess, prefs, make_env({}));
+    JobConfig out = merge_creds_for_job(yaml, sess, prefs, make_env({}));
     CHECK(out.provider == "xai");
     CHECK(out.api_key  == "session-supplied-xai-key");
     // The per-provider map should still hold the daemon.yaml entry for
@@ -616,7 +616,7 @@ TEST_CASE("A.6.1: session creds win over daemon.yaml fallback when env unset",
 
 TEST_CASE("A.6.1: env var wins over session creds and daemon.yaml",
           "[ipc][a61]") {
-    Config yaml = make_yaml_baseline();
+    JobConfig yaml = make_yaml_baseline();
 
     SessionCredentials sess;
     sess.provider = "xai";
@@ -625,7 +625,7 @@ TEST_CASE("A.6.1: env var wins over session creds and daemon.yaml",
     SessionPreferences prefs;
 
     auto env = make_env({{"XAI_API_KEY", "env-supplied-xai-key"}});
-    Config out = merge_creds_for_job(yaml, sess, prefs, env);
+    JobConfig out = merge_creds_for_job(yaml, sess, prefs, env);
     CHECK(out.provider == "xai");
     CHECK(out.api_key  == "env-supplied-xai-key");
     // The per-provider map should also reflect the env override so a
@@ -636,17 +636,17 @@ TEST_CASE("A.6.1: env var wins over session creds and daemon.yaml",
 
 TEST_CASE("A.6.1: daemon.yaml fallback used when no session and no env",
           "[ipc][a61]") {
-    Config yaml = make_yaml_baseline();
+    JobConfig yaml = make_yaml_baseline();
     SessionCredentials sess;     // empty
     SessionPreferences prefs;
-    Config out = merge_creds_for_job(yaml, sess, prefs, make_env({}));
+    JobConfig out = merge_creds_for_job(yaml, sess, prefs, make_env({}));
     CHECK(out.provider == "xai");
     CHECK(out.api_key  == "yaml-fallback-xai-key");
 }
 
 TEST_CASE("A.6.1: session preferences overlay daemon.yaml prefs",
           "[ipc][a61]") {
-    Config yaml = make_yaml_baseline();
+    JobConfig yaml = make_yaml_baseline();
     SessionCredentials sess;
     SessionPreferences prefs;
     prefs.whisper_model         = "small.en";
@@ -654,7 +654,7 @@ TEST_CASE("A.6.1: session preferences overlay daemon.yaml prefs",
     prefs.summarization_backend = "http";
     prefs.captions_enabled      = true;
 
-    Config out = merge_creds_for_job(yaml, sess, prefs, make_env({}));
+    JobConfig out = merge_creds_for_job(yaml, sess, prefs, make_env({}));
     CHECK(out.whisper_model == "small.en");
     CHECK(out.language == "fr");
     CHECK(out.captions_enabled == true);
@@ -665,13 +665,13 @@ TEST_CASE("A.6.1: session preferences overlay daemon.yaml prefs",
 
 TEST_CASE("A.6.1: session summarization_backend=local sets llm_model",
           "[ipc][a61]") {
-    Config yaml = make_yaml_baseline();
+    JobConfig yaml = make_yaml_baseline();
     SessionCredentials sess;
     SessionPreferences prefs;
     prefs.summarization_backend = "local";
     prefs.llm_model             = "/models/llama3-8b.gguf";
 
-    Config out = merge_creds_for_job(yaml, sess, prefs, make_env({}));
+    JobConfig out = merge_creds_for_job(yaml, sess, prefs, make_env({}));
     CHECK(out.llm_model == "/models/llama3-8b.gguf");
 }
 
@@ -680,7 +680,7 @@ TEST_CASE("A.6.1: provider switch via session changes which env var wins",
     // Daemon.yaml is xai; session forces provider=openai. The env-var
     // lookup must follow `cfg.provider` after the session overlay, so
     // OPENAI_API_KEY (not XAI_API_KEY) is the winning env.
-    Config yaml = make_yaml_baseline();
+    JobConfig yaml = make_yaml_baseline();
     SessionCredentials sess;
     sess.provider = "openai";
     SessionPreferences prefs;
@@ -689,21 +689,21 @@ TEST_CASE("A.6.1: provider switch via session changes which env var wins",
         {"XAI_API_KEY",    "wrong-xai"},
         {"OPENAI_API_KEY", "correct-openai"},
     });
-    Config out = merge_creds_for_job(yaml, sess, prefs, env);
+    JobConfig out = merge_creds_for_job(yaml, sess, prefs, env);
     CHECK(out.provider == "openai");
     CHECK(out.api_key  == "correct-openai");
 }
 
 TEST_CASE("A.6.1: write_job_config + config_from_json round-trips merged creds",
           "[ipc][a61]") {
-    // Wire-level sanity check: the merged Config must survive
+    // Wire-level sanity check: the merged JobConfig must survive
     // serialization to a JSON file (the daemon's
     // `write_job_config()` path) and re-parsing by `config_from_json`
     // (the subprocess's only credential source). Without this guarantee
     // the merge could be correct in memory but invisible to the
     // subprocess. This test pins the contract without spinning up the
     // C.7 job queue.
-    Config yaml = make_yaml_baseline();
+    JobConfig yaml = make_yaml_baseline();
     SessionCredentials sess;
     sess.api_key  = "merged-key-survives-json";
     sess.provider = "anthropic";
@@ -712,12 +712,12 @@ TEST_CASE("A.6.1: write_job_config + config_from_json round-trips merged creds",
     prefs.whisper_model = "medium.en";
 
     auto env = make_env({});
-    Config merged = merge_creds_for_job(yaml, sess, prefs, env);
+    JobConfig merged = merge_creds_for_job(yaml, sess, prefs, env);
 
     // `config_to_json` is what `write_job_config` writes; `config_from_json`
     // is what `main.cpp` reads. Round-trip through that exact pair.
     std::string serialized = config_to_json(merged);
-    Config parsed = config_from_json(serialized);
+    JobConfig parsed = config_from_json(serialized);
 
     CHECK(parsed.provider == "anthropic");
     CHECK(parsed.api_key  == "merged-key-survives-json");
@@ -730,11 +730,11 @@ TEST_CASE("A.6.1: env var only fires for the resolved provider",
     // OPENAI_API_KEY set but provider is xai (from yaml). The env
     // lookup looks at provider_env_var("xai") = "XAI_API_KEY" and finds
     // nothing in the map → falls back to yaml's xai key.
-    Config yaml = make_yaml_baseline();
+    JobConfig yaml = make_yaml_baseline();
     SessionCredentials sess;
     SessionPreferences prefs;
     auto env = make_env({{"OPENAI_API_KEY", "wrong-openai"}});
-    Config out = merge_creds_for_job(yaml, sess, prefs, env);
+    JobConfig out = merge_creds_for_job(yaml, sess, prefs, env);
     CHECK(out.provider == "xai");
     CHECK(out.api_key == "yaml-fallback-xai-key");
 }
@@ -744,13 +744,13 @@ TEST_CASE("A.6.1: unknown provider has no env override path",
     // Defensive: a provider name the lookup does not know about should
     // not crash and must simply not get an env override. Session and
     // yaml resolution still apply.
-    Config yaml = make_yaml_baseline();
+    JobConfig yaml = make_yaml_baseline();
     yaml.provider = "homemade";
     yaml.api_key  = "from-yaml-homemade";
     SessionCredentials sess;
     SessionPreferences prefs;
     auto env = make_env({{"HOMEMADE_API_KEY", "never-applied"}});
-    Config out = merge_creds_for_job(yaml, sess, prefs, env);
+    JobConfig out = merge_creds_for_job(yaml, sess, prefs, env);
     CHECK(out.provider == "homemade");
     CHECK(out.api_key  == "from-yaml-homemade");  // env not honored
 }
@@ -771,7 +771,7 @@ TEST_CASE("A.6.1: session-only api_key wins when env unset and daemon.yaml empty
     // Build an EMPTY daemon.yaml snapshot — no provider, no api_key, no
     // per-provider api_keys map. This is the "operator never configured a
     // fallback" state, the freshly-installed daemon.
-    Config yaml;  // default-constructed
+    JobConfig yaml;  // default-constructed
     REQUIRE(yaml.api_key.empty());
     REQUIRE(yaml.api_keys.empty());
 
@@ -784,7 +784,7 @@ TEST_CASE("A.6.1: session-only api_key wins when env unset and daemon.yaml empty
     SessionPreferences prefs;
 
     // Empty environment — no XAI_API_KEY / OPENAI_API_KEY / ANTHROPIC_API_KEY.
-    Config out = merge_creds_for_job(yaml, sess, prefs, make_env({}));
+    JobConfig out = merge_creds_for_job(yaml, sess, prefs, make_env({}));
 
     // Session wins outright — there's no other source to compete.
     CHECK(out.provider == "xai");

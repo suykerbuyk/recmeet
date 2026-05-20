@@ -217,7 +217,7 @@ StreamingSessionManager::CreateResult
 StreamingSessionManager::create(const std::string& client_id,
                                 const StreamRequest& req,
                                 const fs::path& temp_dir,
-                                const Config& pp_cfg) {
+                                const JobConfig& pp_cfg) {
     CreateResult res;
 
     // --- Validate request shape (cheap checks first, before any allocation).

@@ -11,8 +11,8 @@
 
 using namespace recmeet;
 
-static Config make_test_config() {
-    Config cfg;
+static JobConfig make_test_config() {
+    JobConfig cfg;
     cfg.device_pattern = "test-device|pattern";
     cfg.mic_source = "alsa_input.test";
     cfg.monitor_source = "alsa_output.test.monitor";
@@ -52,13 +52,13 @@ static Config make_test_config() {
 }
 
 TEST_CASE("config_to_json + config_from_json round-trip", "[config_json]") {
-    Config original = make_test_config();
+    JobConfig original = make_test_config();
     std::string json = config_to_json(original);
 
     REQUIRE_FALSE(json.empty());
     REQUIRE(json[0] == '{');
 
-    Config loaded = config_from_json(json);
+    JobConfig loaded = config_from_json(json);
 
     CHECK(loaded.device_pattern == original.device_pattern);
     CHECK(loaded.mic_source == original.mic_source);
@@ -107,9 +107,9 @@ TEST_CASE("config_to_json + config_from_json round-trip", "[config_json]") {
 }
 
 TEST_CASE("config_to_map + config_from_map round-trip", "[config_json]") {
-    Config original = make_test_config();
+    JobConfig original = make_test_config();
     JsonMap map = config_to_map(original);
-    Config loaded = config_from_map(map);
+    JobConfig loaded = config_from_map(map);
 
     CHECK(loaded.device_pattern == original.device_pattern);
     CHECK(loaded.mic_only == original.mic_only);
@@ -123,41 +123,41 @@ TEST_CASE("config_to_map + config_from_map round-trip", "[config_json]") {
 }
 
 TEST_CASE("note.tags round-trip: empty tags", "[config_json]") {
-    Config cfg;
+    JobConfig cfg;
     cfg.note.tags.clear();
     std::string json = config_to_json(cfg);
-    Config loaded = config_from_json(json);
+    JobConfig loaded = config_from_json(json);
     CHECK(loaded.note.tags.empty());
 }
 
 TEST_CASE("note.tags round-trip: single tag", "[config_json]") {
-    Config cfg;
+    JobConfig cfg;
     cfg.note.tags = {"solo"};
     std::string json = config_to_json(cfg);
-    Config loaded = config_from_json(json);
+    JobConfig loaded = config_from_json(json);
     REQUIRE(loaded.note.tags.size() == 1);
     CHECK(loaded.note.tags[0] == "solo");
 }
 
 TEST_CASE("config_from_json: returns defaults on invalid JSON", "[config_json]") {
-    Config cfg = config_from_json("not valid json");
+    JobConfig cfg = config_from_json("not valid json");
     CHECK(cfg.whisper_model == "base");
     CHECK(cfg.provider == "xai");
     CHECK(cfg.threads == 0);
 }
 
 TEST_CASE("config_from_json: returns defaults on empty input", "[config_json]") {
-    Config cfg = config_from_json("");
+    JobConfig cfg = config_from_json("");
     CHECK(cfg.whisper_model == "base");
 }
 
 TEST_CASE("config_to_json: handles special characters in paths", "[config_json]") {
-    Config cfg;
+    JobConfig cfg;
     cfg.output_dir = "/home/user/my \"meetings\"/output";
     cfg.device_pattern = "device\\pattern";
 
     std::string json = config_to_json(cfg);
-    Config loaded = config_from_json(json);
+    JobConfig loaded = config_from_json(json);
 
     CHECK(loaded.output_dir == cfg.output_dir);
     CHECK(loaded.device_pattern == cfg.device_pattern);
@@ -168,23 +168,23 @@ TEST_CASE("caption_normalize_display round-trips through JSON",
     // Phase 5.5 — render-side knob; default true. Verifies round-trip and
     // negation persistence through both the map and string round-trips.
     SECTION("default true preserved") {
-        Config original;
+        JobConfig original;
         REQUIRE(original.caption_normalize_display == true);
-        Config loaded = config_from_json(config_to_json(original));
+        JobConfig loaded = config_from_json(config_to_json(original));
         CHECK(loaded.caption_normalize_display == true);
     }
     SECTION("explicit false preserved") {
-        Config original;
+        JobConfig original;
         original.caption_normalize_display = false;
-        Config loaded = config_from_json(config_to_json(original));
+        JobConfig loaded = config_from_json(config_to_json(original));
         CHECK(loaded.caption_normalize_display == false);
     }
     SECTION("paired with captions_enabled") {
-        Config original;
+        JobConfig original;
         original.captions_enabled = true;
         original.caption_model = "en-2023-06-26";
         original.caption_normalize_display = false;
-        Config loaded = config_from_map(config_to_map(original));
+        JobConfig loaded = config_from_map(config_to_map(original));
         CHECK(loaded.captions_enabled == true);
         CHECK(loaded.caption_model == "en-2023-06-26");
         CHECK(loaded.caption_normalize_display == false);
@@ -192,7 +192,7 @@ TEST_CASE("caption_normalize_display round-trips through JSON",
 }
 
 TEST_CASE("config_to_map includes api_key for client-to-daemon IPC", "[config_json]") {
-    Config cfg;
+    JobConfig cfg;
     cfg.api_key = "sk-secret-key-12345";
     cfg.provider = "openai";
 
@@ -203,14 +203,14 @@ TEST_CASE("config_to_map includes api_key for client-to-daemon IPC", "[config_js
     CHECK(json_val_as_string(map.at("api_key")) == "sk-secret-key-12345");
 
     // Round-trip preserves api_key
-    Config loaded = config_from_map(map);
+    JobConfig loaded = config_from_map(map);
     CHECK(loaded.api_key == "sk-secret-key-12345");
 }
 
 TEST_CASE("config_to_json: default config round-trips", "[config_json]") {
-    Config original;
+    JobConfig original;
     std::string json = config_to_json(original);
-    Config loaded = config_from_json(json);
+    JobConfig loaded = config_from_json(json);
 
     CHECK(loaded.whisper_model == "base");
     CHECK(loaded.provider == "xai");
@@ -222,7 +222,7 @@ TEST_CASE("config_to_json: default config round-trips", "[config_json]") {
 }
 
 TEST_CASE("api_keys IPC round-trip via config_to_map/config_from_map", "[config_json]") {
-    Config original;
+    JobConfig original;
     original.api_keys["xai"] = "xai-key-123";
     original.api_keys["openai"] = "sk-key-456";
     original.api_keys["anthropic"] = "sk-ant-789";
@@ -234,7 +234,7 @@ TEST_CASE("api_keys IPC round-trip via config_to_map/config_from_map", "[config_
     CHECK(json_val_as_string(map.at("api_keys.openai")) == "sk-key-456");
     CHECK(json_val_as_string(map.at("api_keys.anthropic")) == "sk-ant-789");
 
-    Config loaded = config_from_map(map);
+    JobConfig loaded = config_from_map(map);
     CHECK(loaded.api_keys["xai"] == "xai-key-123");
     CHECK(loaded.api_keys["openai"] == "sk-key-456");
     CHECK(loaded.api_keys["anthropic"] == "sk-ant-789");
@@ -245,7 +245,7 @@ TEST_CASE("api_keys not leaked in IPC events", "[config_json]") {
     // but event broadcasts should never contain them.
     // This test verifies that api_keys use dot-prefix encoding (not nested)
     // and that api_key is a separate field (existing behavior).
-    Config cfg;
+    JobConfig cfg;
     cfg.api_key = "sk-secret";
     cfg.api_keys["xai"] = "xai-secret";
 
@@ -261,7 +261,7 @@ TEST_CASE("api_keys not leaked in IPC events", "[config_json]") {
 }
 
 TEST_CASE("config_to_json file round-trip (subprocess config transfer)", "[config_json]") {
-    Config original = make_test_config();
+    JobConfig original = make_test_config();
 
     // Write to temp file (same as daemon's write_job_config)
     auto path = std::filesystem::temp_directory_path() / "recmeet-test-config.json";
@@ -281,7 +281,7 @@ TEST_CASE("config_to_json file round-trip (subprocess config transfer)", "[confi
         json_content = ss.str();
     }
 
-    Config loaded = config_from_json(json_content);
+    JobConfig loaded = config_from_json(json_content);
 
     CHECK(loaded.whisper_model == original.whisper_model);
     CHECK(loaded.reprocess_dir == original.reprocess_dir);

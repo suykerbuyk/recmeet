@@ -728,7 +728,7 @@ TEST_CASE("C.10b — reconnect batch-fallback: buffered WAV resubmits via "
     sr.channels = 1;
     sr.mode = "transcribe";
 
-    Config pp_cfg;          // default Config — the daemon would snapshot
+    JobConfig pp_cfg;          // default JobConfig — the daemon would snapshot
     auto cr = um.create("client-A", sr, pp_cfg, /*max_upload_bytes=*/0);
     REQUIRE(cr.ok);
     CHECK(cr.job_id > 0);

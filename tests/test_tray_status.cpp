@@ -285,7 +285,7 @@ TEST_CASE("D.4: per-server display iterates a list from day one — v1 has "
     // Multi-server shape (v2 forward-compat): build a length-2 vector
     // by hand and iterate it the same way `build_menu()` does. This
     // proves the renderer + iteration shape generalize unchanged when
-    // Phase E.2 lands `Config::servers` as a list.
+    // Phase E.2 lands `JobConfig::servers` as a list.
     {
         std::vector<ServerView> servers;
         ServerView a;

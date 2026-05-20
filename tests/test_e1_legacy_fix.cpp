@@ -460,7 +460,7 @@ TEST_CASE("client_record_no_sigaction (reprocess) uses process.submit",
     fs::create_directories(meeting);
     write_test_wav(meeting / "audio.wav");
 
-    Config cfg;
+    JobConfig cfg;
     cfg.reprocess_dir = meeting;
     cfg.no_summary = true;          // no API key needed
     cfg.captions_enabled = false;
@@ -493,7 +493,7 @@ TEST_CASE("client_record_no_sigaction (reprocess) uses process.submit",
 
 TEST_CASE("client_record_no_sigaction rejects live recording with friendly error",
           "[e1-fix]") {
-    Config cfg;
+    JobConfig cfg;
     // cfg.reprocess_dir is empty → live-recording shape
 
     StderrCapture cap;
@@ -563,7 +563,7 @@ TEST_CASE("client_record_no_sigaction publishes StopToken during upload window",
     // Larger WAV so the upload loop runs for at least one polling pass.
     write_test_wav(meeting / "audio.wav", /*n_samples=*/80000);
 
-    Config cfg;
+    JobConfig cfg;
     cfg.reprocess_dir = meeting;
     cfg.no_summary = true;
     cfg.captions_enabled = false;

@@ -153,7 +153,7 @@ private:
 // `meeting_dir` is empty (e.g. a test that doesn't want a sidecar) the
 // engine is wired directly to the daemon's hooks — no adapter, no writer.
 std::unique_ptr<CaptionEngine> try_start_caption_engine(
-        const Config& cfg, const CaptionHooks* hooks,
+        const JobConfig& cfg, const CaptionHooks* hooks,
         const fs::path& meeting_dir,
         std::unique_ptr<CaptionFanoutAdapter>& out_adapter) {
     out_adapter.reset();
@@ -197,7 +197,7 @@ std::unique_ptr<CaptionEngine> try_start_caption_engine(
 
 } // anonymous namespace
 
-PostprocessInput run_recording(const Config& cfg, StopToken& stop, PhaseCallback on_phase,
+PostprocessInput run_recording(const JobConfig& cfg, StopToken& stop, PhaseCallback on_phase,
                                const CaptionHooks* caption_hooks) {
     log_debug("pipeline: run_recording ENTER (mic=%s, monitor=%s)",
               cfg.mic_source.c_str(), cfg.monitor_source.c_str());
@@ -451,7 +451,7 @@ PostprocessInput run_recording(const Config& cfg, StopToken& stop, PhaseCallback
     return pp;
 }
 
-PipelineResult run_pipeline(const Config& cfg, StopToken& stop, PhaseCallback on_phase) {
+PipelineResult run_pipeline(const JobConfig& cfg, StopToken& stop, PhaseCallback on_phase) {
     auto input = run_recording(cfg, stop, on_phase);
     if (cfg.reprocess_dir.empty()) {
         save_meeting_context(input.out_dir, cfg.context_inline, cfg.context_file, input.timestamp);

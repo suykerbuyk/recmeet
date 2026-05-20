@@ -104,7 +104,7 @@ struct Job {
 
     // --- Postprocess payload (populated for JobKind::Postprocess) ---
     PostprocessInput input;
-    Config           cfg;
+    JobConfig        cfg;
 
     // --- ModelDownload payload (populated for JobKind::ModelDownload) ---
     /// Logical model identifier the download targets, e.g. "whisper/base.en",

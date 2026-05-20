@@ -546,7 +546,7 @@ TEST_CASE("C.6 job.status: foreign client's job → PermissionDenied",
 // ===========================================================================
 // 5. job.status / job.list — `input` and `cfg` are NEVER on the wire. The
 //    Job struct carries PostprocessInput (paths, transcript text) and
-//    Config (api_keys, output_dir) — neither belongs to the wire surface.
+//    JobConfig (api_keys, output_dir) — neither belongs to the wire surface.
 //    A regression here would be a credentials-leak; the positive assertion
 //    is that those keys are ABSENT (not "empty but present").
 //

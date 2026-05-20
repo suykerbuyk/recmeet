@@ -285,7 +285,7 @@ int main(int argc, char* argv[]) {
     }
 
     // Load config
-    Config cfg = load_config(config_path);
+    JobConfig cfg = load_legacy_config_as_job_config(config_path);
 
     // CLI overrides
     if (port > 0) cfg.web_port = port;

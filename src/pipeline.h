@@ -98,7 +98,7 @@ std::string load_meeting_id(const fs::path& out_dir);
 /// `caption_hooks` (Phase 3) is consulted only when `cfg.captions_enabled`
 /// is true and a real recording is being performed (i.e. not reprocess).
 /// Pass nullptr (default) for the existing pre-Phase-3 behaviour.
-PostprocessInput run_recording(const Config& cfg, StopToken& stop,
+PostprocessInput run_recording(const JobConfig& cfg, StopToken& stop,
                                PhaseCallback on_phase = nullptr,
                                const CaptionHooks* caption_hooks = nullptr);
 
@@ -111,12 +111,12 @@ fs::path resolve_caption_model_dir(const std::string& name);
 
 /// Transcribe + diarize + summarize + note.
 /// Phases: "transcribing", "diarizing", "summarizing", "complete".
-PipelineResult run_postprocessing(const Config& cfg, const PostprocessInput& input,
+PipelineResult run_postprocessing(const JobConfig& cfg, const PostprocessInput& input,
                                   PhaseCallback on_phase = nullptr,
                                   ProgressCallback on_progress = nullptr,
                                   StopToken* stop = nullptr);
 
 /// Run the full pipeline: record → validate → mix → transcribe → summarize → note output.
-PipelineResult run_pipeline(const Config& cfg, StopToken& stop, PhaseCallback on_phase = nullptr);
+PipelineResult run_pipeline(const JobConfig& cfg, StopToken& stop, PhaseCallback on_phase = nullptr);
 
 } // namespace recmeet

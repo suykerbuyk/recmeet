@@ -21,8 +21,8 @@ const char* provider_env_var(const std::string& provider) {
 
 } // anonymous namespace
 
-Config merge_creds_for_job(
-    const Config& daemon_config,
+JobConfig merge_creds_for_job(
+    const JobConfig& daemon_config,
     const SessionCredentials& session_creds,
     const SessionPreferences& session_prefs,
     const std::function<std::string(const std::string&)>& env_lookup)
@@ -31,7 +31,7 @@ Config merge_creds_for_job(
     // model / DB paths / VAD / diarization knobs that operators configure
     // once at install time. The session and env layers overlay only the
     // fields they explicitly carry.
-    Config cfg = daemon_config;
+    JobConfig cfg = daemon_config;
 
     // ---------------------------------------------------------------
     // Provider selection — session wins over daemon.yaml when set.
@@ -121,8 +121,8 @@ Config merge_creds_for_job(
     return cfg;
 }
 
-Config merge_creds_for_job_with_real_env(
-    const Config& daemon_config,
+JobConfig merge_creds_for_job_with_real_env(
+    const JobConfig& daemon_config,
     const SessionCredentials& session_creds,
     const SessionPreferences& session_prefs)
 {

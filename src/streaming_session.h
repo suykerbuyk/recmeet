@@ -196,7 +196,7 @@ private:
     /// `process.stream.commit` cannot surprise the postprocess handoff.
     /// Used by `commit()` to populate `Job.cfg` for the new Postprocess
     /// job.
-    Config       pp_cfg_;
+    JobConfig    pp_cfg_;
 
     /// Phase C.10b — the meeting context the client passed at
     /// `process.stream` time. Forwarded to the postprocess subprocess at
@@ -292,7 +292,7 @@ public:
     CreateResult create(const std::string& client_id,
                         const StreamRequest& req,
                         const fs::path& temp_dir = {},
-                        const Config& pp_cfg = Config{});
+                        const JobConfig& pp_cfg = JobConfig{});
 
     /// Route a `0x03` streaming-audio payload (raw S16LE PCM bytes) to the
     /// session identified by `stream_token`. Appends the PCM to the

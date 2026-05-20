@@ -274,7 +274,7 @@ TEST_CASE("run_postprocessing: transcribe minimal WAV with no summary/diarize", 
     std::vector<int16_t> silence(SAMPLE_RATE, 0);  // 1 second
     write_wav(audio, silence);
 
-    Config cfg;
+    JobConfig cfg;
     cfg.whisper_model = "tiny";
     cfg.no_summary = true;
     cfg.diarize = false;

@@ -6,10 +6,10 @@
 namespace recmeet {
 
 // ---------------------------------------------------------------------------
-// Config → JsonMap
+// JobConfig → JsonMap
 // ---------------------------------------------------------------------------
 
-JsonMap config_to_map(const Config& cfg) {
+JsonMap config_to_map(const JobConfig& cfg) {
     JsonMap m;
 
     // Audio
@@ -130,19 +130,19 @@ JsonMap config_to_map(const Config& cfg) {
 }
 
 // ---------------------------------------------------------------------------
-// Config → JSON string
+// JobConfig → JSON string
 // ---------------------------------------------------------------------------
 
-std::string config_to_json(const Config& cfg) {
+std::string config_to_json(const JobConfig& cfg) {
     return serialize_json_map(config_to_map(cfg));
 }
 
 // ---------------------------------------------------------------------------
-// JsonMap → Config
+// JsonMap → JobConfig
 // ---------------------------------------------------------------------------
 
-Config config_from_map(const JsonMap& m) {
-    Config cfg;
+JobConfig config_from_map(const JsonMap& m) {
+    JobConfig cfg;
 
     auto str = [&](const std::string& key, std::string& dst) {
         auto it = m.find(key);
@@ -286,10 +286,10 @@ Config config_from_map(const JsonMap& m) {
 }
 
 // ---------------------------------------------------------------------------
-// JSON string → Config
+// JSON string → JobConfig
 // ---------------------------------------------------------------------------
 
-Config config_from_json(const std::string& json) {
+JobConfig config_from_json(const std::string& json) {
     IpcMessage msg;
     // Wrap in a dummy message to reuse our parser, or parse directly
     JsonMap map;
@@ -301,7 +301,7 @@ Config config_from_json(const std::string& json) {
     std::string wrapped = "{\"id\":0,\"result\":" + json + "}";
     if (parse_ipc_message(wrapped, msg) && msg.type == IpcMessageType::Response)
         return config_from_map(msg.response.result);
-    return Config{};
+    return JobConfig{};
 }
 
 // ---------------------------------------------------------------------------

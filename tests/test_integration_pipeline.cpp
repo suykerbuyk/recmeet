@@ -158,7 +158,7 @@ TEST_CASE("Chunked pipeline: long-audio reprocess under memory cap",
     fs::path audio_path = out_dir / "audio_2026-04-30_12-00.wav";
     fs::copy_file(audio_src, audio_path, fs::copy_options::overwrite_existing);
 
-    Config cfg;
+    JobConfig cfg;
     cfg.whisper_model = "base";
     cfg.language = "en";
     cfg.diarize = true;

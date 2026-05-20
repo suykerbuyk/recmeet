@@ -45,7 +45,7 @@ struct ServerEntry {
     std::string address;  // host:port for TCP, "unix:/path" for Unix socket
 };
 
-struct Config {
+struct JobConfig {
     // Audio
     std::string device_pattern = DEFAULT_DEVICE_PATTERN;
     std::string mic_source;     // empty = auto-detect
@@ -310,11 +310,16 @@ struct Config {
     int retain_terminal_hours = 24;
 };
 
-/// Load config. Uses path if provided, otherwise ~/.config/recmeet/config.yaml.
-Config load_config(const fs::path& config_path = {});
+/// Load legacy monolithic config (now a JobConfig). Uses path if provided,
+/// otherwise ~/.config/recmeet/config.yaml. Kept under its post-rename name
+/// `load_legacy_config_as_job_config` because the legacy single-file path
+/// is preserved for `config.yaml.v1-backup` round-trip; new code uses
+/// `load_server_config` + `load_client_config` instead.
+JobConfig load_legacy_config_as_job_config(const fs::path& config_path = {});
 
-/// Save config. Uses path if provided, otherwise ~/.config/recmeet/config.yaml.
-void save_config(const Config& cfg, const fs::path& config_path = {});
+/// Save legacy monolithic config (a JobConfig). Uses path if provided,
+/// otherwise ~/.config/recmeet/config.yaml.
+void save_legacy_config_as_job_config(const JobConfig& cfg, const fs::path& config_path = {});
 
 // ---------------------------------------------------------------------------
 // Phase E.2 Wave 2.2a — split config: ServerConfig + ClientConfig
@@ -515,13 +520,13 @@ void save_server_config(const ServerConfig& cfg, const fs::path& config_path = {
 /// Save ClientConfig to client.yaml. Writes with 0600 perms.
 void save_client_config(const ClientConfig& cfg, const fs::path& config_path = {});
 
-/// Extract a ServerConfig from a monolithic Config (used by the legacy
+/// Extract a ServerConfig from a monolithic JobConfig (used by the legacy
 /// migration path).
-ServerConfig to_server_config(const Config& cfg);
+ServerConfig to_server_config(const JobConfig& cfg);
 
-/// Extract a ClientConfig from a monolithic Config (used by the legacy
+/// Extract a ClientConfig from a monolithic JobConfig (used by the legacy
 /// migration path).
-ClientConfig to_client_config(const Config& cfg);
+ClientConfig to_client_config(const JobConfig& cfg);
 
 /// Migrate legacy ~/.config/recmeet/config.yaml into daemon.yaml +
 /// client.yaml if (and only if) the legacy file exists AND neither split

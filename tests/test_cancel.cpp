@@ -419,7 +419,7 @@ TEST_CASE("process.cancel: WaitingForUpload — upload session torn down",
 
     UploadSessionManager uploads(q, tmp, null_progress_sink());
 
-    Config cfg;
+    JobConfig cfg;
     auto cr = uploads.create("alice", default_submit_req(/*audio_size=*/1024),
                              cfg, /*max_upload_bytes=*/0);
     REQUIRE(cr.ok);
