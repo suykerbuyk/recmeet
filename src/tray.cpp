@@ -18,6 +18,7 @@
 #include "staging_sweep.h"
 #include "tray_capture.h"
 #include "tray_status.h"
+#include "tray_web.h"
 #include "util.h"
 #include "uuid.h"
 #include "version.h"
@@ -166,9 +167,6 @@ struct TrayState {
     std::mutex models_mutex;
     bool models_fetching = false;
     std::string models_provider; // which provider the cache is for
-
-    // Managed web server process
-    pid_t web_server_pid = -1;  // -1 = not managed by us
 
     // Pre-recording context dialog
     struct {
@@ -2749,102 +2747,22 @@ static void on_edit_config(GtkMenuItem*, gpointer) {
     }
 }
 
-static bool is_port_listening(const std::string& addr, int port) {
-    int fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (fd < 0) return false;
-
-    struct sockaddr_in sa{};
-    sa.sin_family = AF_INET;
-    sa.sin_port = htons(static_cast<uint16_t>(port));
-    inet_pton(AF_INET,
-              (addr == "0.0.0.0" || addr.empty()) ? "127.0.0.1" : addr.c_str(),
-              &sa.sin_addr);
-
-    bool ok = (connect(fd, reinterpret_cast<struct sockaddr*>(&sa), sizeof(sa)) == 0);
-    close(fd);
-    return ok;
-}
-
-static void reap_web_server() {
-    if (g_tray.web_server_pid > 0) {
-        int status;
-        pid_t r = waitpid(g_tray.web_server_pid, &status, WNOHANG);
-        if (r == g_tray.web_server_pid || r == -1)
-            g_tray.web_server_pid = -1;
-    }
-}
-
-static bool spawn_web_server() {
-    reap_web_server();
-    if (g_tray.web_server_pid > 0) return true;  // still running
-
-    // Resolve binary: sibling of our own executable first, then PATH
-    std::string web_bin;
-    {
-        std::error_code ec;
-        auto self = std::filesystem::read_symlink("/proc/self/exe", ec);
-        if (!ec) {
-            auto sibling = self.parent_path() / "recmeet-web";
-            if (std::filesystem::exists(sibling, ec))
-                web_bin = sibling.string();
-        }
-    }
-
-    pid_t pid = fork();
-    if (pid < 0) {
-        log_warn("[tray] fork() failed: %s", strerror(errno));
-        return false;
-    }
-    if (pid == 0) {
-        // Child — redirect stdout/stderr to /dev/null to avoid blocking
-        int devnull = open("/dev/null", O_WRONLY);
-        if (devnull >= 0) { dup2(devnull, STDOUT_FILENO); dup2(devnull, STDERR_FILENO); close(devnull); }
-
-        std::string port_arg = std::to_string(g_tray.cfg.web_port);
-        const std::string& bind_arg = g_tray.cfg.web_bind;
-
-        if (!web_bin.empty()) {
-            execl(web_bin.c_str(), "recmeet-web",
-                  "--port", port_arg.c_str(),
-                  "--bind", bind_arg.c_str(),
-                  nullptr);
-        }
-        // Fallback to PATH
-        execlp("recmeet-web", "recmeet-web",
-               "--port", port_arg.c_str(),
-               "--bind", bind_arg.c_str(),
-               nullptr);
-        _exit(127);
-    }
-
-    g_tray.web_server_pid = pid;
-    log_info("[tray] spawned recmeet-web (pid %d) on port %d", pid, g_tray.cfg.web_port);
-    return true;
-}
-
+// Phase E.6.2 — open Speaker Management menu item.
+//
+// Pre-E.6.2 this forked an external web subprocess, polled the port
+// until it answered, then xdg-open'd it. Post-E.6.2 the WebUI is a
+// tray subsystem: start_web_listener() binds an embedded httplib::Server
+// on a kernel-picked loopback port (idempotent — re-entry returns the
+// already-bound port) and we xdg-open that URL directly. No subprocess
+// supervision, no SIGCHLD reaper, no port probing.
 static void on_open_speaker_ui(GtkMenuItem*, gpointer) {
-    std::string bind = g_tray.cfg.web_bind;
-    int port = g_tray.cfg.web_port;
-
-    if (!is_port_listening(bind, port)) {
-        if (!spawn_web_server()) {
-            notify("Speaker Management", "Failed to start recmeet-web");
-            return;
-        }
-        // Poll for up to 2s
-        for (int i = 0; i < 40; ++i) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(50));
-            if (is_port_listening(bind, port)) break;
-        }
-        if (!is_port_listening(bind, port)) {
-            notify("Speaker Management", "recmeet-web did not start in time");
-            return;
-        }
+    int port = recmeet::start_web_listener(g_tray.ipc);
+    if (port <= 0) {
+        notify("Speaker Management", "Failed to start embedded WebUI listener");
+        return;
     }
-
-    std::string display_host = (bind == "0.0.0.0" || bind.empty()) ? "127.0.0.1" : bind;
-    std::string url = "http://" + display_host + ":" + std::to_string(port);
-    std::string cmd = "xdg-open '" + url + "' &";
+    const std::string url = "http://127.0.0.1:" + std::to_string(port);
+    const std::string cmd = "xdg-open '" + url + "' &";
     if (std::system(cmd.c_str()) != 0)
         log_warn("[tray] xdg-open failed for: %s", url.c_str());
 }
@@ -2894,24 +2812,6 @@ static void on_about(GtkMenuItem*, gpointer) {
 
     gtk_dialog_run(GTK_DIALOG(dialog));
     gtk_widget_destroy(dialog);
-}
-
-static void stop_web_server() {
-    if (g_tray.web_server_pid <= 0) return;
-    log_info("[tray] stopping recmeet-web (pid %d)", g_tray.web_server_pid);
-    kill(g_tray.web_server_pid, SIGTERM);
-    for (int i = 0; i < 10; ++i) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(50));
-        int status;
-        if (waitpid(g_tray.web_server_pid, &status, WNOHANG) != 0) {
-            g_tray.web_server_pid = -1;
-            return;
-        }
-    }
-    log_warn("[tray] recmeet-web did not exit, sending SIGKILL");
-    kill(g_tray.web_server_pid, SIGKILL);
-    waitpid(g_tray.web_server_pid, nullptr, 0);
-    g_tray.web_server_pid = -1;
 }
 
 static void on_quit(GtkMenuItem*, gpointer) {
@@ -3759,7 +3659,11 @@ int main(int argc, char* argv[]) {
     build_menu();
     fetch_provider_models();
 
-    // Install SIGCHLD handler to reap zombie processes (e.g. recmeet-web)
+    // Phase E.6.2 — SIGCHLD handler retained as a safety net. The
+    // pre-E.6.2 reason for this hook was reaping web-subprocess zombies,
+    // which is gone (the WebUI is now an in-process httplib listener).
+    // A no-op reaper still catches stray children spawned via `system()`
+    // (xdg-open, $EDITOR, etc.) so they never linger as zombies.
     {
         struct sigaction sa{};
         sa.sa_handler = [](int) {
@@ -3803,7 +3707,10 @@ int main(int argc, char* argv[]) {
     }
     teardown_ipc_watch();
     g_tray.ipc.close_connection();
-    stop_web_server();
+    // Phase E.6.2 — stop the embedded WebUI listener (no-op if it was
+    // never started). Replaces the pre-E.6.2 helper that SIGTERM'd
+    // the supervised external web subprocess.
+    recmeet::stop_web_listener();
     caption_overlay_destroy();   // Phase 5.1 — release overlay window/timer
 
     if (g_tray.reconnect_timer)

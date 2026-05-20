@@ -323,12 +323,15 @@ TEST_CASE("client_stop emits friendly migration error and exit 2",
 // Issue #1 — `web.cpp` reprocess HTTP handler routes via `process.submit`
 // ===========================================================================
 //
-// The web.cpp main() inlines its httplib::Server routes; replicating the
-// handler here would re-implement production behaviour and miss
-// regressions. Instead the test stands up the SAME logical pipeline by
-// spawning the `recmeet-web` binary against a temp config that points
-// at our test TCP daemon; we then POST `/api/meetings/<id>/reprocess`
-// and assert the daemon harness saw `process.submit` (not record.start).
+// The historical web reprocess handler inlined its httplib::Server
+// routes; replicating the handler here would re-implement production
+// behaviour and miss regressions. The test stands up the SAME logical
+// pipeline by driving the IpcClient half of the handler logic against
+// our test TCP daemon; we then assert the daemon harness saw
+// `process.submit` (not record.start). Phase E.6.2: the standalone
+// web binary was folded into recmeet-tray (src/tray_web.cpp), but the
+// wire-shape regression this test pins is independent of which binary
+// emits it — process.submit must be the verb.
 
 TEST_CASE("web reprocess endpoint uses process.submit (not record.start)",
           "[e1-fix][integration]") {
@@ -348,15 +351,11 @@ TEST_CASE("web reprocess endpoint uses process.submit (not record.start)",
     fs::create_directories(meeting);
     write_test_wav(meeting / "audio.wav");
 
-    // Spawn recmeet-web. The web.cpp main reads `RECMEET_DAEMON_ADDR`
-    // implicitly via IpcClient ctor default (which honours the env var
-    // for TCP addressing); but the real binary uses a unix-socket
-    // default. To avoid binary-spawn complexity we exercise the wire
-    // shape directly by driving the IpcClient half of the handler
-    // logic — i.e. construct an IpcClient against our harness and
-    // replay the connect + process.submit + chunk-upload sequence
-    // that web.cpp's reprocess handler now performs. This pins the
-    // observable contract (daemon-side: `process.submit` called once;
+    // Exercise the wire shape directly by driving the IpcClient half
+    // of the reprocess handler logic — construct an IpcClient against
+    // our harness and replay the connect + process.submit + chunk-
+    // upload sequence the handler performs. This pins the observable
+    // contract (daemon-side: `process.submit` called once;
     // bytes_received == file size; record.start never called) without
     // re-spawning binaries.
 

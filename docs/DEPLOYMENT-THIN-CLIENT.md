@@ -330,17 +330,18 @@ V2 currently ships as a single `recmeet-git` package on Arch (and equivalent uni
 
 ### Forward plan: two PKGBUILDs
 
-- **`recmeet-client-git`** — slim client install for laptops. Ships `recmeet`, `recmeet-tray`, `recmeet-mcp`, `recmeet-agent`. Pulls in PipeWire + PulseAudio + GTK3 + ayatana-appindicator — no ML deps. `ldd $(recmeet-tray) | grep -E 'whisper|sherpa|llama|onnx|ggml'` should be empty (Phase E.3 binary slimming guarantees this). Install size: small.
-- **`recmeet-server-git`** — full server install for daemon hosts. Ships `recmeet-daemon`, `recmeet-web`. Pulls in whisper.cpp + sherpa-onnx + llama.cpp + onnxruntime + libcurl. Does **not** depend on PipeWire or PulseAudio — `ldd $(recmeet-daemon) | grep -E 'pipewire|pulse'` is empty (Phase E.4 binary slimming guarantees this).
+- **`recmeet-client-git`** — slim client install for laptops. Ships `recmeet`, `recmeet-tray`, `recmeet-mcp`, `recmeet-agent`. Pulls in PipeWire + PulseAudio + GTK3 + ayatana-appindicator — no ML deps. The tray binary embeds the speaker-management WebUI (see [WebUI section](#webui-speaker-management) below); no separate web binary. `ldd $(recmeet-tray) | grep -E 'whisper|sherpa|llama|onnx|ggml'` should be empty (Phase E.3 binary slimming guarantees this). Install size: small.
+- **`recmeet-server-git`** — full server install for daemon hosts. Ships `recmeet-daemon`. Pulls in whisper.cpp + sherpa-onnx + llama.cpp + onnxruntime + libcurl. Does **not** depend on PipeWire or PulseAudio — `ldd $(recmeet-daemon) | grep -E 'pipewire|pulse'` is empty (Phase E.4 binary slimming guarantees this).
 - **`recmeet-vulkan-git`** — optional GPU acceleration plugin. Installs `libggml-vulkan.so` under the server's plugin path. Only needed on daemon hosts with a Vulkan-capable GPU. Picked up automatically by `recmeet-daemon` at startup (see the active-backend banner above).
 
 Until the split lands, packagers and operators can still get the slim shape on a client host by building with the right CMake flags:
 
 ```bash
-# Client-only build: skip the daemon, web, and ML deps
+# Client-only build: skip the daemon and ML deps. The tray binary
+# carries the embedded WebUI (httplib + bundled static assets), so
+# there is no separate -DRECMEET_BUILD_WEB flag to toggle.
 cmake -B build -G Ninja \
     -DRECMEET_BUILD_TRAY=ON \
-    -DRECMEET_BUILD_WEB=OFF \
     -DRECMEET_USE_SHERPA=OFF \
     -DRECMEET_USE_LLAMA=OFF
 ninja -C build recmeet-tray recmeet
@@ -350,11 +351,27 @@ ninja -C build recmeet-tray recmeet
 # Server-only build: headless, no tray, full ML stack
 cmake -B build -G Ninja \
     -DRECMEET_BUILD_TRAY=OFF \
-    -DRECMEET_BUILD_WEB=ON \
     -DRECMEET_USE_SHERPA=ON \
     -DRECMEET_USE_LLAMA=ON
-ninja -C build recmeet-daemon recmeet-web
+ninja -C build recmeet-daemon
 ```
+
+---
+
+## WebUI (speaker management)
+
+The speaker-management WebUI is an **embedded HTTP listener inside `recmeet-tray`** (Phase E.6.2). There is no separate `recmeet-web` process or systemd unit.
+
+Operator workflow:
+
+1. Start `recmeet-tray` (already running if you started it on login).
+2. Right-click the tray icon → "Open Speaker Management".
+3. The tray binds an `httplib::Server` on `127.0.0.1:<kernel-picked-port>`, then `xdg-open`s `http://127.0.0.1:<port>` in the default browser.
+4. The browser issues `/api/*` calls; the tray translates each into a daemon IPC verb (see [`IPC-VERBS.md`](IPC-VERBS.md) "Speakers / meetings introspection" section) and forwards the response.
+
+Lifecycle: lazy — the listener starts on first menu click and stays up until tray quit. Re-clicking "Open Speaker Management" reuses the bound port (idempotent). The kernel-picked port changes every tray restart, so do not bookmark the URL across sessions.
+
+Pre-C.11 legacy meetings (no `meeting_id` in `context.json`) are read-only in the WebUI: relabel / reprocess / enroll buttons are hidden and a "Legacy meeting — stamp meeting_id to enable editing" banner is shown. Regenerate the meeting via the tray's reprocess flow to stamp a fresh `meeting_id` (C.11.4 dedup contract).
 
 The corresponding install steps are obvious — copy the built binaries plus their systemd units into the target host's filesystem. See [`BUILD.md`](BUILD.md) for the full build-flag matrix.
 

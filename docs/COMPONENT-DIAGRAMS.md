@@ -37,9 +37,10 @@ only as framed binary uploads (0x01) or streaming PCM (0x03) over IPC.
 
 ```mermaid
 graph TB
-    subgraph CLIENT_TIER ["Client Tier (audio capture lives here)"]
+    subgraph CLIENT_TIER ["Client Tier (audio capture + WebUI listener)"]
         CLI["recmeet<br/>(CLI — client or standalone)"]
-        TRAY["recmeet-tray<br/>(system tray)"]
+        TRAY["recmeet-tray<br/>(system tray +<br/>embedded WebUI listener)"]
+        BROWSER["Browser<br/>(speaker management UI)"]
     end
 
     subgraph SERVER_TIER ["Server Tier (heavy compute)"]
@@ -47,7 +48,6 @@ graph TB
     end
 
     subgraph AUX ["Auxiliary Services"]
-        WEB["recmeet-web<br/>(REST API)"]
         MCP["recmeet-mcp<br/>(Go MCP server)"]
         AGENT["recmeet-agent<br/>(Go AI agent CLI)"]
     end
@@ -113,13 +113,13 @@ graph TB
     CLI -->|"links"| CAPTURE
     TRAY -->|"links (thin client)"| IPC
     TRAY -->|"links"| CAPTURE
+    TRAY -->|"embeds (E.6.2)"| HTTPLIB
     TRAY --> GTK
     TRAY --> APPIND
+    BROWSER -.->|"HTTP /api/*<br/>(loopback)"| TRAY
 
     %% Server-tier binary links (NO capture lib)
     DAEMON -->|"links"| CORE
-    WEB -->|"links"| CORE
-    WEB --> HTTPLIB
 
     %% Runtime IPC paths (framed: 0x00/0x01/0x02/0x03)
     CLI -.->|"client mode<br/>0x00/0x01/0x02/0x03"| UNIX
@@ -139,8 +139,7 @@ graph TB
     DAEMON --> MEETINGS
     DAEMON --> LOGS
     TRAY --> CONFIG
-    WEB --> MEETINGS
-    WEB --> SPEAKERS
+    DAEMON --> SPEAKERS
     CORE --> MODELS
     CORE --> SPEAKERS
 
@@ -189,8 +188,7 @@ graph TB
     subgraph BINS ["Executables"]
         BIN_CLI["recmeet<br/>(main.cpp)"]
         BIN_DAEMON["recmeet-daemon<br/>(daemon.cpp)"]
-        BIN_WEB["recmeet-web<br/>(web.cpp + httplib.cpp)"]
-        BIN_TRAY["recmeet-tray<br/>(tray.cpp)"]
+        BIN_TRAY["recmeet-tray<br/>(tray.cpp +<br/>tray_web.cpp +<br/>httplib.cpp)"]
         BIN_TEST["recmeet_tests<br/>(tests/test_*.cpp)"]
     end
 
@@ -237,10 +235,9 @@ graph TB
     BIN_CLI --> CAP_SRC
     BIN_DAEMON --> CORE_SRC
     BIN_DAEMON -.->|"NO recmeet_capture"| CAP_SRC
-    BIN_WEB --> CORE_SRC
-    BIN_WEB --> V_HTTPLIB
     BIN_TRAY -->|"thin client"| IPC_SRC
     BIN_TRAY --> CAP_SRC
+    BIN_TRAY -->|"embedded WebUI (E.6.2)"| V_HTTPLIB
     BIN_TRAY --> SYS_GTK
     BIN_TRAY --> SYS_AI
     BIN_TEST --> CORE_SRC
@@ -1041,9 +1038,9 @@ flowchart TD
     CONNECT["connect_to_daemon()"]
     CONNECT_OK{connected?}
     MENU["build_menu()<br/>fetch_provider_models()"]
-    SIGNALS["SIGCHLD → reap recmeet-web zombies<br/>SIGTERM/SIGINT → gtk_main_quit"]
+    SIGNALS["SIGCHLD → safety-net reaper for stray<br/>child procs (xdg-open, $EDITOR)<br/>SIGTERM/SIGINT → gtk_main_quit"]
     GTK_MAIN["gtk_main()<br/>(blocks in GTK event loop)"]
-    CLEANUP["recmeet_capture::stop() if active<br/>process.stream.cancel if streaming<br/>teardown_ipc_watch()<br/>close IPC connection<br/>stop_web_server()<br/>log_shutdown()"]
+    CLEANUP["recmeet_capture::stop() if active<br/>process.stream.cancel if streaming<br/>teardown_ipc_watch()<br/>close IPC connection<br/>stop_web_listener() (E.6.2)<br/>log_shutdown()"]
 
     MAIN --> PARSE --> INIT --> INDICATOR --> SOURCES --> CONNECT
     CONNECT --> CONNECT_OK

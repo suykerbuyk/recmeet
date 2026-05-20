@@ -983,6 +983,148 @@ under `enroll_name`.
 `src/diarization_cache.cpp`. SpeakerProfile load/save is in
 `src/api_models.cpp`.
 
+## Speakers / meetings introspection (Phase E.6.1)
+
+Eight verbs back the embedded WebUI listener in `recmeet-tray`
+(`src/tray_web.cpp`). Each one is a thin façade over an existing
+`recmeet_core` helper (`load_speaker_db`, `save_speaker`,
+`remove_embedding`, `load_meeting_speakers`, `save_meeting_speakers`,
+`re_identify_meeting`, `discover_meetings`). Validation chain follows
+the daemon-wide pattern: `is_safe_dirname` on names; `is_valid_meeting_id`
+on canonical-UUID-v4 strings; `MeetingIndex::find()` for
+`meeting_id → meeting_dir` resolution.
+
+### `speakers.get`
+
+**Purpose** — return slim metadata for a single speaker profile.
+
+**Request params** — `{name: string}` (must pass `is_safe_dirname`).
+
+**Response result** —
+`{name, enrollments, created, updated, embedding_dim, embedding_count}`.
+The raw embedding blobs are omitted from the wire shape — only the
+first vector's dimension + the count are returned, so the WebUI can
+tunnel over Tailscale / SSH without leaking biometric vectors.
+
+**Errors** — `InvalidParams` on validation failure or when the profile
+does not exist (`not_found`).
+
+### `speakers.enroll`
+
+**Purpose** — append one meeting cluster's embedding to a speaker
+profile (creating the profile if absent).
+
+**Request params** — `{name, meeting_id, cluster_id}`.
+
+**Response result** — `{ok, duration_sec, confidence, warning?}`. The
+`warning` field is emitted when `confidence < 0.5f` and reads
+"Low confidence (…) — this enrollment may be inaccurate".
+
+**Errors** — `InvalidParams` for invalid name / meeting_id / cluster_id,
+unknown meeting_id, missing cluster, empty embedding, or sub-5s
+duration (the quality gate inherited from V1).
+
+### `speakers.remove_embedding`
+
+**Purpose** — delete one embedding (by index) from a speaker profile.
+When the resulting profile has zero embeddings the profile is deleted
+entirely.
+
+**Request params** — `{name, index}` (`index` ≥ 0, int).
+
+**Response result** — `{ok, remaining}`. `remaining: 0` indicates the
+profile itself was removed.
+
+**Errors** — `InvalidParams` for invalid name / negative index / index
+out of range / profile not found.
+
+### `speakers.relabel`
+
+**Purpose** — change a meeting speaker's label, optionally moving its
+embedding from the previous profile to the new one.
+
+**Request params** —
+`{meeting_id, cluster_id, new_label, update_profile?: bool=true}`.
+
+**Response result** — `{ok, old_label}`.
+
+**Errors** — `InvalidParams` for any validation failure (meeting_id,
+cluster_id, new_label), unknown meeting_id, or unknown cluster.
+
+### `speakers.batch_reidentify`
+
+**Purpose** — re-identify speakers across all meetings under
+`meetings_root` against the current speaker DB. **Async by
+construction**: the verb returns immediately and runs the
+re-identification on a detached worker thread, because a 100-meeting
+batch with sherpa-onnx re-identification can take 60+ seconds and would
+otherwise block every other client's caption + health traffic on the
+IPC poll thread.
+
+**Request params** — `{}`.
+
+**Response result** — `{ok, async: true, started_at}` where
+`started_at` is an ISO-8601 UTC timestamp.
+
+**Bookkeeping** — a single `std::atomic<bool> g_batch_reidentify_running`
+gates re-entry. A second call while a worker is in flight is rejected
+with `InvalidParams "speakers.batch_reidentify: batch in progress"`. The
+flag is set before the worker is detached and cleared in the worker's
+epilogue (RAII). No progress events are emitted in v1 — operators
+refresh `meetings.list` to see updates.
+
+**Errors** — `InvalidParams` on the overlapping-call reject path.
+
+### `meetings.list`
+
+**Purpose** — enumerate the top-level meeting directories under
+`meetings_root`.
+
+**Request params** — `{}`.
+
+**Response result** — `{meetings: <JSON-encoded array>, count}`. Each
+array entry is `{name, meeting_id?, has_audio, has_speakers,
+has_summary, mtime_iso}`. `meeting_id` is `null` for pre-C.11 legacy
+meetings whose `context.json` has no `meeting_id` field; the WebUI
+uses this nullability to hide relabel / reprocess / enroll buttons and
+show a "Legacy meeting — stamp meeting_id to enable editing" banner.
+
+**Errors** — `InternalError` on filesystem failure (rare; a missing or
+non-directory `meetings_root` returns an empty list, not an error).
+
+### `meetings.speakers`
+
+**Purpose** — return the per-speaker entries from a meeting's
+`speakers.json`.
+
+**Request params** — `{meeting_id}`.
+
+**Response result** — `{speakers: <JSON-encoded array>, count}`. Each
+entry is `{cluster_id, label, identified, confidence, duration_sec}` —
+**no embedding blobs** (relabel / enroll fetch them server-side via
+`load_meeting_speakers`).
+
+**Errors** — `InvalidParams` for invalid or unknown meeting_id.
+
+### `meetings.read_note`
+
+**Purpose** — return the `Meeting_*.md` note from a meeting directory.
+
+**Request params** — `{meeting_id}`.
+
+**Response result** — `{path, content}` where `path` is the basename of
+the matched note file and `content` is the full markdown body. The
+client-side `note_dir` mirror fallback that v1 supported is gone in
+v2 thin-client (the daemon does not see operator-side `note_dir`).
+
+**Errors** — `InvalidParams` for invalid / unknown meeting_id, or
+`not_found` when no `Meeting_*.md` exists in the meeting dir.
+
+**Code refs** — `src/daemon.cpp:3699+` (8 handlers),
+`src/meetings_browse.{h,cpp}` (`discover_meetings`),
+`tests/test_speakers_meetings_ipc.cpp` (16 round-trip cases),
+`src/tray_web.cpp` (HTTP-to-IPC translator).
+
 ## Events (daemon → client)
 
 All events ride on the NDJSON `0x00` frame as `{"event": "...",

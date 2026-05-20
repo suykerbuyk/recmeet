@@ -2,6 +2,27 @@
 
 All notable changes to recmeet are documented in this file. The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.0.0] — Unreleased (`feat/v2-thin-client` branch)
+
+### Added
+
+- **Tray-bundled WebUI** (Phase E.6.2, iter 183):
+  - The speaker-management web UI now ships as an embedded HTTP listener inside `recmeet-tray` (`src/tray_web.cpp`) instead of as a supervised subprocess. The tray binds on `127.0.0.1:<kernel-picked-port>` via `httplib::Server::bind_to_any_port` on first "Open Speaker Management" menu click; `xdg-open` carries the resolved URL.
+  - Four static assets (`index.html`, `app.js`, `style.css`, `favicon.svg`) are baked into the binary by a pure-CMake `file(READ HEX)` generator (`cmake/embed_assets.cmake`). No xxd / Perl / Python dependency. Each asset is served with `Cache-Control: no-cache`.
+  - 13 HTTP-to-IPC endpoint translations cover every operation the WebUI exposes: speaker introspection (`/api/speakers`, `/api/speakers/:name`), mutation (`enroll`, `remove`, `remove-embedding`, `reset`, `batch-reidentify`), and per-meeting actions (`/api/meetings`, `/api/meetings/:meeting_id/speakers`, `/relabel`, `/reprocess`, `/note`).
+  - 32 new tests under `[e6][tray-web]` (`tests/test_tray_web.cpp`) exercise the real translator (not a parallel reimplementation) against an in-process DaemonSim.
+
+### Changed (user-visible)
+
+- **WebUI no longer renders notes from operator-side `note_dir` mirror.** Pre-E.6 the WebUI's note view fell back to `note_dir/YYYY/MM/Meeting_*.md` when the canonical copy in the meeting dir was missing. Under the thin-client architecture the daemon does not see operator-side directories; `meetings.read_note` reads from the meeting dir only. For tray-and-daemon-same-host operators with an Obsidian-mirror workflow this is a regression on cosmetic browsing of the mirror copy — the canonical copy in the meeting dir is unaffected.
+- **Legacy V1 meetings (pre-`meeting_id`) are read-only in the WebUI.** `meetings.list` returns them with `meeting_id: null`. The frontend hides the relabel / reprocess / enroll buttons for these and shows a "Legacy meeting — stamp meeting_id to enable editing" banner. Operators who want write access regenerate the meeting through the tray's reprocess flow (C.11.4 dedup stamps a fresh `meeting_id`).
+- **`recmeet-web` binary is gone.** Source, CMake target, systemd unit, install rule, `--port` / `--bind` CLI flags — all removed. Operators who relied on a headless `recmeet-web` process (no tray running) lose that surface. A future `recmeet-webd` headless variant can factor `src/tray_web.cpp` into a small library; not on the v2.0.0 critical path.
+
+### Removed
+
+- `src/web.cpp`, `tests/test_web.cpp`, `dist/recmeet-web.service.in`, the `RECMEET_BUILD_WEB` CMake option, the `recmeet-web` install rule, the `share/web/` install rule.
+- `tray.cpp` web-server lifecycle plumbing: `spawn_web_server`, `stop_web_server`, `reap_web_server`, `is_port_listening`, and the `web_server_pid` field on `TrayState`. The SIGCHLD reaper is preserved as a safety net for stray `system()`-spawned children (xdg-open, $EDITOR).
+
 ## [1.6.0] — Unreleased
 
 First release on the `v1-maintenance` branch. Delivers the "build once per platform, run everywhere" GPU acceleration story as a bundled pair: configure-time auto-detect of Vulkan + a runtime-loadable plugin model so the same binary uses GPU when available and silently falls back to CPU when not.

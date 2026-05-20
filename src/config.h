@@ -423,7 +423,12 @@ struct ServerConfig {
     fs::path log_dir;
     int log_retention_hours = 4;
 
-    // -- Web server (server-side recmeet-web) --
+    // -- Web server (legacy fields; pre-E.6.2 these drove the
+    //    standalone web binary's --port / --bind. The binary was folded
+    //    into recmeet-tray (src/tray_web.cpp) in Phase E.6.2 — the
+    //    embedded listener now kernel-picks a port and the tray-side
+    //    readers were deleted. Fields preserved for the subprocess wire
+    //    format only; emit-side readers in tray.cpp are gone.) --
     int web_port = 8384;
     std::string web_bind = "127.0.0.1";
 

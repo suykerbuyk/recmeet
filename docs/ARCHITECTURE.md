@@ -11,7 +11,7 @@ Two additional Go binaries provide AI-powered tooling — an MCP server for IDE 
 ```mermaid
 graph TD
     CLI["recmeet<br/>(CLI, client or standalone)"]
-    TRAY["recmeet-tray<br/>(system tray)"]
+    TRAY["recmeet-tray<br/>(system tray + embedded WebUI listener)"]
     DAEMON["recmeet-daemon<br/>(headless compute server)"]
     LISTEN["Unix socket OR<br/>TCP host:port<br/>(framed wire protocol)"]
     CAPTURE["recmeet_capture<br/>(PipeWire / PulseAudio,<br/>client-only)"]
@@ -19,11 +19,12 @@ graph TD
     LIVECAP["recmeet_live_capture<br/>(standalone CLI only)"]
     MCP["recmeet-mcp<br/>(MCP server)"]
     AGENT["recmeet-agent<br/>(AI agent CLI)"]
-    WEB["recmeet-web<br/>(REST + browser UI)"]
+    BROWSER["Browser<br/>(speaker management UI)"]
     MDATA["meetingdata<br/>(Go library)"]
 
     TRAY --> CAPTURE
     TRAY --> LISTEN
+    BROWSER -->|"HTTP /api/* → IPC verbs"| TRAY
     CLI -->|--no-daemon| LIVECAP
     LIVECAP --> CAPTURE
     LIVECAP --> CORE
@@ -36,7 +37,6 @@ graph TD
     CORE --> SHERPA["sherpa-onnx"]
     CORE --> API["Cloud API<br/>(xAI / OpenAI / Anthropic)"]
 
-    WEB --> CORE
     MCP --> MDATA
     AGENT --> MDATA
     AGENT --> CLAUDE["Anthropic API<br/>(Claude)"]
@@ -67,8 +67,7 @@ CMake builds four static libraries — `recmeet_ipc`, `recmeet_capture`, `recmee
 |---|---|---|---|
 | `recmeet` (CLI) | `src/main.cpp` | `recmeet_core`, `recmeet_live_capture` | — |
 | `recmeet-daemon` | `src/daemon.cpp` | `recmeet_core` only (no capture, no PipeWire/Pulse) | — |
-| `recmeet-tray` | `src/tray.cpp` | `recmeet_ipc`, `recmeet_capture`, SNDFILE, GTK3, ayatana-appindicator3 | `RECMEET_BUILD_TRAY` |
-| `recmeet-web` | `src/web.cpp` + cpp-httplib | `recmeet_core` | `RECMEET_BUILD_WEB` |
+| `recmeet-tray` | `src/tray.cpp` + `src/tray_web.cpp` + `vendor/cpp-httplib/httplib.cpp` + generated `web_assets.h` | `recmeet_ipc`, `recmeet_capture`, SNDFILE, GTK3, ayatana-appindicator3 | `RECMEET_BUILD_TRAY` |
 | `recmeet-mcp` | `tools/cmd/recmeet-mcp/main.go` | mcp-go | — |
 | `recmeet-agent` | `tools/cmd/recmeet-agent/main.go` | anthropic-sdk-go, cobra | — |
 
@@ -78,8 +77,7 @@ The daemon-side `streaming_session.cpp` lives in `recmeet_core` (not in `recmeet
 
 | Flag | Default | Effect |
 |---|---|---|
-| `RECMEET_BUILD_TRAY` | ON | Build `recmeet-tray` |
-| `RECMEET_BUILD_WEB` | ON | Build `recmeet-web` |
+| `RECMEET_BUILD_TRAY` | ON | Build `recmeet-tray` (includes the embedded WebUI listener) |
 | `RECMEET_BUILD_GO_TOOLS` | ON | Build the Go MCP server + agent CLI |
 | `RECMEET_USE_LLAMA` | ON | Link llama.cpp for local summarization |
 | `RECMEET_USE_SHERPA` | ON | Link sherpa-onnx for diarization + VAD |

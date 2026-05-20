@@ -83,7 +83,9 @@ JobConfig make_job_config(
     cfg.log_dir                    = srv.log_dir;
     cfg.log_retention_hours        = srv.log_retention_hours;
 
-    // Web server (server-side recmeet-web)
+    // Web server (legacy fields; the standalone web binary was folded
+    // into recmeet-tray in Phase E.6.2. Kept on the JobConfig wire shape
+    // for subprocess-format stability; tray no longer reads them.)
     cfg.web_port                   = srv.web_port;
     cfg.web_bind                   = srv.web_bind;
 

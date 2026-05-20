@@ -12,7 +12,10 @@ const API = '';
 let currentView = 'speakers';
 let speakers = [];
 let meetings = [];
-// Cache: meeting dir name -> speaker array
+// Cache: meeting_id -> speaker array. Phase E.6.2 — URL scheme keys off
+// `meeting_id` (stable UUID) instead of dir name (operator-readable but
+// not a stable identity). Legacy V1 meetings have `meeting_id: null`
+// and skip the cache entirely (their mutation buttons are hidden).
 const meetingSpeakerCache = {};
 
 // ---------------------------------------------------------------------------
@@ -69,11 +72,11 @@ async function fetchMeetings() {
   meetings = await api('GET', '/api/meetings');
 }
 
-async function fetchMeetingSpeakers(dirName) {
-  if (!meetingSpeakerCache[dirName]) {
-    meetingSpeakerCache[dirName] = await api('GET', `/api/meetings/${encodeURIComponent(dirName)}/speakers`);
+async function fetchMeetingSpeakers(meetingId) {
+  if (!meetingSpeakerCache[meetingId]) {
+    meetingSpeakerCache[meetingId] = await api('GET', `/api/meetings/${encodeURIComponent(meetingId)}/speakers`);
   }
-  return meetingSpeakerCache[dirName];
+  return meetingSpeakerCache[meetingId];
 }
 
 async function deleteSpeaker(name) {
@@ -84,20 +87,20 @@ async function resetAllSpeakers() {
   return await api('POST', '/api/speakers/reset');
 }
 
-async function enrollSpeaker(name, meetingDir, clusterId) {
+async function enrollSpeaker(name, meetingId, clusterId) {
   const result = await api('POST', '/api/speakers/enroll', {
-    name, meeting_dir: meetingDir, cluster_id: clusterId
+    name, meeting_id: meetingId, cluster_id: clusterId
   });
   // Invalidate cache for this meeting
-  delete meetingSpeakerCache[meetingDir];
+  delete meetingSpeakerCache[meetingId];
   return result;
 }
 
-async function relabelSpeaker(meetingDir, clusterId, newLabel, updateProfile = true) {
-  const result = await api('POST', `/api/meetings/${encodeURIComponent(meetingDir)}/speakers/relabel`, {
-    cluster_id: clusterId, new_label: newLabel, update_profile: updateProfile ? 'true' : 'false'
+async function relabelSpeaker(meetingId, clusterId, newLabel, updateProfile = true) {
+  const result = await api('POST', `/api/meetings/${encodeURIComponent(meetingId)}/speakers/relabel`, {
+    cluster_id: clusterId, new_label: newLabel, update_profile: !!updateProfile
   });
-  delete meetingSpeakerCache[meetingDir];
+  delete meetingSpeakerCache[meetingId];
   return result;
 }
 
@@ -105,10 +108,10 @@ async function removeEmbedding(name, index) {
   return await api('POST', `/api/speakers/${encodeURIComponent(name)}/remove-embedding`, { index });
 }
 
-async function reprocessMeeting(meetingDir, numSpeakers) {
-  return await api('POST', `/api/meetings/${encodeURIComponent(meetingDir)}/reprocess`, {
-    num_speakers: numSpeakers || 0
-  });
+async function reprocessMeeting(meetingId, flags) {
+  // Phase E.6.2 — per-stage flags (diarize/summarize/vocabulary) replace
+  // the v1 num_speakers knob. Caller passes whichever flags are set.
+  return await api('POST', `/api/meetings/${encodeURIComponent(meetingId)}/reprocess`, flags || {});
 }
 
 async function batchReidentify() {
@@ -383,34 +386,57 @@ function renderMeetings() {
   }
 
   for (const mtg of meetings) {
-    const headerRight = html('span', { style: 'display:flex;align-items:center;gap:10px' },
-      html('button', {
+    // Phase E.6.2 — `meeting_id` is the stable identity used for every
+    // mutation URL. Pre-C.11 legacy meetings come back with
+    // `meeting_id: null`; those are read-only — relabel/reprocess/enroll
+    // are hidden and we surface an explanation banner.
+    const hasId = !!mtg.meeting_id;
+    const mid = mtg.meeting_id;
+
+    const headerRightKids = [];
+    if (hasId) {
+      headerRightKids.push(html('button', {
         className: 'btn btn-sm',
-        onclick: () => openMeetingNote(mtg.name)
-      }, 'View Note'),
-      html('button', {
+        onclick: () => openMeetingNote(mid)
+      }, 'View Note'));
+      headerRightKids.push(html('button', {
         className: 'btn btn-sm',
-        onclick: () => showReprocessDialog(mtg.name)
-      }, 'Reprocess'),
-      html('span', { className: 'card-date' },
-        mtg.has_speakers
-          ? `${mtg.speaker_count} speaker(s)`
-          : 'No speaker data'
-      )
-    );
-    const card = html('div', { className: 'card', id: `meeting-${mtg.name}` },
+        onclick: () => showReprocessDialog(mid, mtg.name)
+      }, 'Reprocess'));
+    }
+    headerRightKids.push(html('span', { className: 'card-date' },
+      mtg.has_speakers ? 'Speaker data' : 'No speaker data'
+    ));
+    const headerRight = html('span',
+      { style: 'display:flex;align-items:center;gap:10px' },
+      ...headerRightKids);
+
+    // Render the operator-readable dir name as the card title; the URL
+    // scheme keys off meeting_id, but the title is what the operator
+    // recognizes at a glance.
+    const card = html('div', { className: 'card' },
       html('div', { className: 'card-header' },
         html('span', { className: 'card-title' }, mtg.name),
         headerRight
       )
     );
 
-    if (mtg.has_speakers) {
+    if (!hasId) {
+      card.appendChild(html('div', { className: 'meeting-legacy-banner',
+                                     style: 'padding:8px 0;color:var(--fg-muted);font-size:0.85rem' },
+        'Legacy meeting — stamp meeting_id to enable editing'));
+    }
+
+    if (mtg.has_speakers && hasId) {
       const speakersDiv = html('div', { className: 'meeting-speakers' });
       speakersDiv.textContent = 'Loading...';
       card.appendChild(speakersDiv);
-      loadMeetingSpeakers(mtg.name, speakersDiv);
-    } else {
+      loadMeetingSpeakers(mid, speakersDiv);
+    } else if (mtg.has_speakers) {
+      card.appendChild(html('div', { className: 'meeting-speakers', style: 'padding:8px 0;color:var(--fg-muted);font-size:0.85rem' },
+        'Speaker data is present but read-only on legacy meetings.'
+      ));
+    } else if (hasId) {
       card.appendChild(html('div', { className: 'meeting-speakers', style: 'padding:8px 0;color:var(--fg-muted);font-size:0.85rem' },
         'No speakers.json — run with diarization enabled to generate speaker data.'
       ));
@@ -420,9 +446,9 @@ function renderMeetings() {
   }
 }
 
-async function loadMeetingSpeakers(dirName, container) {
+async function loadMeetingSpeakers(meetingId, container) {
   try {
-    const spks = await fetchMeetingSpeakers(dirName);
+    const spks = await fetchMeetingSpeakers(meetingId);
 
     // Preserve unsaved input values before rebuild
     const drafts = {};
@@ -462,7 +488,7 @@ async function loadMeetingSpeakers(dirName, container) {
         row.appendChild(html('span', { className: 'badge badge-success' }, 'identified'));
         const relabelBtn = html('button', {
           className: 'btn btn-sm',
-          onclick: () => showRelabelForm(row, relabelBtn, dirName, spk, container)
+          onclick: () => showRelabelForm(row, relabelBtn, meetingId, spk, container)
         }, 'Relabel');
         row.appendChild(relabelBtn);
       } else {
@@ -480,14 +506,14 @@ async function loadMeetingSpeakers(dirName, container) {
             try {
               enrollBtn.disabled = true;
               enrollBtn.textContent = '...';
-              const result = await enrollSpeaker(name, dirName, spk.cluster_id);
+              const result = await enrollSpeaker(name, meetingId, spk.cluster_id);
               let msg = `Enrolled "${name}"`;
               if (result && result.warning) {
                 msg += ' — ' + result.warning;
               }
               toast(msg);
               await fetchSpeakers();
-              await loadMeetingSpeakers(dirName, container);
+              await loadMeetingSpeakers(meetingId, container);
             } catch (e) {
               toast('Enroll failed: ' + e.message);
               enrollBtn.disabled = false;
@@ -511,28 +537,33 @@ async function loadMeetingSpeakers(dirName, container) {
   }
 }
 
-function showReprocessDialog(dirName) {
-  const input = html('input', {
-    type: 'number', min: '0', max: '20', value: '',
-    placeholder: 'auto', style: 'width:80px'
-  });
+function showReprocessDialog(meetingId, dirName) {
+  // Phase E.6.2 — reprocess flags follow the daemon's process.reprocess
+  // per-stage shape (diarize?, summarize?, vocabulary?). No num_speakers
+  // hint anymore — that knob was a record.start-only field retired in C.9.
+  const diarizeChk = html('input', { type: 'checkbox', checked: 'checked' });
+  const summarizeChk = html('input', { type: 'checkbox', checked: 'checked' });
   const overlay = html('div', { className: 'overlay' },
     html('div', { className: 'dialog' },
       html('h3', null, 'Reprocess Meeting'),
-      html('p', null, `Re-diarize "${dirName}" with a speaker count hint.`),
-      html('div', { style: 'margin:12px 0' },
-        html('label', { style: 'font-weight:600' }, 'Number of speakers: '),
-        input
+      html('p', null, `Re-run the pipeline on "${dirName}".`),
+      html('div', { style: 'margin:12px 0;display:flex;flex-direction:column;gap:6px' },
+        html('label', { style: 'display:flex;align-items:center;gap:6px' },
+          diarizeChk, 'Re-diarize speakers'),
+        html('label', { style: 'display:flex;align-items:center;gap:6px' },
+          summarizeChk, 'Re-summarize')
       ),
       html('div', { className: 'dialog-actions' },
         html('button', { className: 'btn', onclick: () => overlay.remove() }, 'Cancel'),
         html('button', {
           className: 'btn btn-primary',
           onclick: async () => {
-            const num = parseInt(input.value) || 0;
             overlay.remove();
             try {
-              const result = await reprocessMeeting(dirName, num);
+              const result = await reprocessMeeting(meetingId, {
+                diarize: !!diarizeChk.checked,
+                summarize: !!summarizeChk.checked,
+              });
               toast(`Reprocessing started (job #${result.job_id})`);
             } catch (e) {
               toast('Reprocess failed: ' + e.message);
@@ -543,10 +574,9 @@ function showReprocessDialog(dirName) {
     )
   );
   document.body.appendChild(overlay);
-  input.focus();
 }
 
-function showRelabelForm(row, btn, dirName, spk, container) {
+function showRelabelForm(row, btn, meetingId, spk, container) {
   btn.style.display = 'none';
   const input = html('input', {
     className: 'enroll-input',
@@ -565,10 +595,10 @@ function showRelabelForm(row, btn, dirName, spk, container) {
       try {
         saveBtn.disabled = true;
         saveBtn.textContent = '...';
-        await relabelSpeaker(dirName, spk.cluster_id, name, updateChk.checked);
+        await relabelSpeaker(meetingId, spk.cluster_id, name, updateChk.checked);
         toast(`Relabeled to "${name}"`);
         await fetchSpeakers();
-        await loadMeetingSpeakers(dirName, container);
+        await loadMeetingSpeakers(meetingId, container);
       } catch (e) {
         toast('Relabel failed: ' + e.message);
         saveBtn.disabled = false;
@@ -593,9 +623,9 @@ function showRelabelForm(row, btn, dirName, spk, container) {
   input.select();
 }
 
-async function openMeetingNote(dirName) {
+async function openMeetingNote(meetingId) {
   try {
-    const data = await api('GET', `/api/meetings/${encodeURIComponent(dirName)}/note`);
+    const data = await api('GET', `/api/meetings/${encodeURIComponent(meetingId)}/note`);
     const tab = window.open('', '_blank');
     if (!tab) { toast('Pop-up blocked — allow pop-ups for this site'); return; }
 

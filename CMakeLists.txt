@@ -44,7 +44,6 @@ option(RECMEET_USE_LLAMA   "Enable local summarization via llama.cpp" ON)
 option(RECMEET_USE_SHERPA  "Enable speaker diarization via sherpa-onnx" ON)
 option(RECMEET_USE_NOTIFY "Enable desktop notifications via libnotify" ON)
 option(RECMEET_BUILD_TESTS "Build unit tests" ON)
-option(RECMEET_BUILD_WEB   "Build web UI server" ON)
 
 # Version header — regenerated at build time from git describe
 # (find_package(Git QUIET) was already called pre-project; GIT_EXECUTABLE is set.)
@@ -417,23 +416,51 @@ target_link_libraries(recmeet PRIVATE recmeet_core recmeet_live_capture)
 add_executable(recmeet-daemon src/daemon.cpp)
 target_link_libraries(recmeet-daemon PRIVATE recmeet_core)
 
-# Web server binary
-if(RECMEET_BUILD_WEB)
-    add_executable(recmeet-web src/web.cpp vendor/cpp-httplib/httplib.cpp)
-    target_include_directories(recmeet-web PRIVATE vendor/cpp-httplib)
-    target_link_libraries(recmeet-web PRIVATE recmeet_core)
-    target_compile_definitions(recmeet-web PRIVATE
-        RECMEET_WEB_ROOT="${CMAKE_INSTALL_FULL_DATADIR}/recmeet/web")
-endif()
-
 # Tray binary
 # Phase B.1+B.2: tray owns the local audio capture lifecycle, so it links
 # recmeet_capture for PipeWireCapture + list_sources(). recmeet_ipc still
 # carries the daemon IPC client surface; SNDFILE comes via recmeet_ipc
 # transitively is not the case (SNDFILE belongs to recmeet_core), so the
 # tray's WAV stager needs SNDFILE linked directly here.
+#
+# Phase E.6.2: tray gains an embedded HTTP listener (tray_web.cpp +
+# vendored cpp-httplib unity TU) so the WebUI ships as a tray subsystem
+# instead of a supervised subprocess. Four static assets (share/web/) are
+# baked into the binary via cmake/embed_assets.cmake -> generated/web_assets.h.
+# The asset generator is wired as an OUTPUT dependency on a custom command
+# so editing any share/web/ file rebuilds the header automatically.
 if(RECMEET_BUILD_TRAY)
-    add_executable(recmeet-tray src/tray.cpp)
+    set(_RECMEET_WEB_ASSETS_HDR
+        ${CMAKE_CURRENT_BINARY_DIR}/generated/web_assets.h)
+    set(_RECMEET_WEB_ASSETS_SRC
+        ${CMAKE_CURRENT_SOURCE_DIR}/share/web/index.html
+        ${CMAKE_CURRENT_SOURCE_DIR}/share/web/app.js
+        ${CMAKE_CURRENT_SOURCE_DIR}/share/web/style.css
+        ${CMAKE_CURRENT_SOURCE_DIR}/share/web/favicon.svg)
+
+    add_custom_command(
+        OUTPUT  ${_RECMEET_WEB_ASSETS_HDR}
+        DEPENDS ${_RECMEET_WEB_ASSETS_SRC}
+                ${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_assets.cmake
+        COMMAND ${CMAKE_COMMAND}
+            "-DASSETS=${_RECMEET_WEB_ASSETS_SRC}"
+            "-DNAMES=index_html;app_js;style_css;favicon_svg"
+            "-DCONTENT_TYPES=text/html\\;charset=utf-8;application/javascript;text/css;image/svg+xml"
+            "-DOUTPUT=${_RECMEET_WEB_ASSETS_HDR}"
+            "-DNAMESPACE=recmeet::web_assets"
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_assets.cmake
+        COMMENT "Generating embedded WebUI asset bundle (web_assets.h)"
+        VERBATIM)
+
+    add_executable(recmeet-tray
+        src/tray.cpp
+        src/tray_web.cpp
+        vendor/cpp-httplib/httplib.cpp
+        ${_RECMEET_WEB_ASSETS_HDR})
+    target_include_directories(recmeet-tray PRIVATE
+        vendor/cpp-httplib
+        ${CMAKE_CURRENT_BINARY_DIR}/generated
+        ${CMAKE_CURRENT_BINARY_DIR})
     target_link_libraries(recmeet-tray PRIVATE
         recmeet_ipc
         recmeet_capture
@@ -607,7 +634,18 @@ if(RECMEET_BUILD_TESTS)
         # Phase E.6.1 — IPC round-trip tests for the 8 new speakers.* /
         # meetings.* verbs that back the tray-bundled WebUI.
         tests/test_speakers_meetings_ipc.cpp
+        # Phase E.6.2 — tray_web HTTP→IPC translator tests. Exercises the
+        # production translator against an in-process DaemonSim that
+        # registers the 11 new + 3 existing speakers/meetings verbs +
+        # process.reprocess. Embedded cpp-httplib unity TU is linked here.
+        tests/test_tray_web.cpp
+        src/tray_web.cpp
+        vendor/cpp-httplib/httplib.cpp
+        ${_RECMEET_WEB_ASSETS_HDR}
     )
+    target_include_directories(recmeet_tests PRIVATE
+        vendor/cpp-httplib
+        ${CMAKE_CURRENT_BINARY_DIR}/generated)
     # The test binary exercises both daemon-side surfaces (recmeet_core) and
     # client-side / standalone surfaces (run_recording + recmeet_capture), so
     # it must link the full stack — same as the CLI binary.
@@ -637,10 +675,6 @@ if(RECMEET_BUILD_TESTS)
     # RECMEET_BUILD_DIR wins if set.
     target_compile_definitions(recmeet_tests PRIVATE
         RECMEET_BUILD_DIR_DEFAULT="${CMAKE_BINARY_DIR}")
-    if(RECMEET_BUILD_WEB)
-        target_sources(recmeet_tests PRIVATE tests/test_web.cpp vendor/cpp-httplib/httplib.cpp)
-        target_include_directories(recmeet_tests PRIVATE vendor/cpp-httplib)
-    endif()
     catch_discover_tests(recmeet_tests)
 endif()
 
@@ -705,17 +739,6 @@ install(FILES ${CMAKE_BINARY_DIR}/recmeet-daemon.service
     DESTINATION ${CMAKE_INSTALL_DATADIR}/systemd/user)
 install(FILES dist/recmeet-daemon.socket
     DESTINATION ${CMAKE_INSTALL_DATADIR}/systemd/user)
-
-if(RECMEET_BUILD_WEB)
-    install(TARGETS recmeet-web RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
-    install(DIRECTORY share/web/
-        DESTINATION ${CMAKE_INSTALL_DATADIR}/recmeet/web)
-    set(RECMEET_WEB_EXEC "${CMAKE_INSTALL_FULL_BINDIR}/recmeet-web")
-    configure_file(dist/recmeet-web.service.in
-        ${CMAKE_BINARY_DIR}/recmeet-web.service @ONLY)
-    install(FILES ${CMAKE_BINARY_DIR}/recmeet-web.service
-        DESTINATION ${CMAKE_INSTALL_DATADIR}/systemd/user)
-endif()
 
 if(RECMEET_BUILD_TRAY)
     install(TARGETS recmeet-tray RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})

@@ -87,7 +87,7 @@ Phase E is in progress.
   | E.3 | Tray binary slimming (`ldd $(tray)` shows no onnxruntime / sherpa-onnx / whisper / llama / ggml) | COMPLETE |
   | E.4 | Daemon binary slimming (`ldd $(daemon)` shows no PipeWire / PulseAudio) | COMPLETE |
   | E.2 | Config schema split — `config.yaml` → `client.yaml` + `daemon.yaml` plus three new fields (`summary_style`, `caption_show_partials`, `caption_overlay_position`), one-shot migrator, and the **three-type runtime model** (`ServerConfig` at-rest daemon view + `ClientConfig` at-rest tray view + `JobConfig` per-job assembled by `make_job_config()` at the postprocess-enqueue seams) | COMPLETE (Wave 2.2b iter 177) |
-  | E.6 | Backward-compat, web migration, decision-#9 web bundling (`speakers.get_voiceprint` + `web.serve_assets` verbs; embedded asset bundle; legacy-path fallback) | IN PROGRESS |
+  | E.6 | WebUI folded into recmeet-tray; embedded asset bundle; 8 new `speakers.*` / `meetings.*` IPC verbs back the embedded HTTP listener; standalone web binary + systemd unit removed | COMPLETE (Phase E.6.1 + E.6.2) |
   | E.5 | Docs sweep — refresh A/B/C/D wave + new `DEPLOYMENT-THIN-CLIENT.md` + operator-workflow appendix on `V2-DEPLOYMENT.md` | IN PROGRESS (this document update) |
 
 The V2 wire protocol is stable. The architectural-proof test
@@ -127,11 +127,24 @@ Outstanding before a `v2.0.0` tag:
   monolithic `config.yaml` is migrated on daemon start by
   `migrate_legacy_config_if_present()` and is preserved as
   `config.yaml.v1-backup` for one-shot recovery.
-- **Phase E.6 — Web migration + decision-#9 bundling.** Migrate the
-  speaker-management web UI off direct filesystem reads onto the V2
-  IPC (`speakers.get_voiceprint`, `web.serve_assets`); bundle the
-  static assets into the binary; preserve legacy `~/.config/recmeet/`
-  paths via a fallback shim.
+- **Phase E.6 — Tray-bundled WebUI. COMPLETE (E.6.1 + E.6.2).** The
+  separate `recmeet-web` binary, source, systemd unit, install rule,
+  CLI flags, and parallel-reimplementation test file have been removed.
+  The tray (`recmeet-tray`) now embeds an httplib::Server on a
+  kernel-picked loopback port; static assets (index.html / app.js /
+  style.css / favicon.svg) are baked into the binary via a pure-CMake
+  `file(READ HEX)` generator (`cmake/embed_assets.cmake`); every
+  `/api/*` endpoint translates to a daemon IPC call. Eight new
+  daemon-side verbs (`speakers.get` / `speakers.enroll` /
+  `speakers.remove_embedding` / `speakers.relabel` /
+  `speakers.batch_reidentify` / `meetings.list` / `meetings.speakers` /
+  `meetings.read_note`) back the listener; `speakers.batch_reidentify`
+  is async (returns `{ok, async:true, started_at}` immediately, runs a
+  detached worker, atomic flag rejects overlapping calls). Browser URL
+  scheme keys off `meeting_id` (stable UUID); legacy V1 meetings come
+  back with `meeting_id: null` and the frontend hides
+  relabel/reprocess/enroll buttons + shows a "Legacy meeting — stamp
+  meeting_id to enable editing" banner.
 - **Phase E.5 — Final docs sweep.** Reflects the final landed state
   of E.2 + E.6 once those land. The current pass (this document
   update) covers the Phase D + E partial state and forward-references
@@ -296,8 +309,9 @@ V1 binaries (unchanged):
 
 - `recmeet` — CLI front-end (record, reprocess, speakers, vocab)
 - `recmeet-daemon` — long-running daemon
-- `recmeet-tray` — system tray applet
-- `recmeet-web` — speaker management web UI (tray-spawned)
+- `recmeet-tray` — system tray applet; embeds the speaker-management
+  WebUI as a tray subsystem on a kernel-picked loopback port (Phase
+  E.6.2; the v1 standalone web binary is gone)
 - `recmeet-mcp` — MCP server for AI agent integration
 - `recmeet-agent` — agent CLI for prep/follow-up workflows
 
@@ -848,12 +862,14 @@ continues. Feature work does not happen on `v1-maintenance` after
   from V1's (frame types, JobQueue, FrameReader), so shared-library
   extraction is less attractive than it looked pre-Phase-C. No action
   needed unless backport friction becomes a real problem.
-- **Web UI fate.** V1's `recmeet-web` (speaker management) and V2's
-  `recmeet-client-web` are likely identical in scope. Worth deciding
-  whether they stay separate or share a codebase via a shared static
-  asset directory. *STILL OPEN — Phase E or post-2.0.* No urgency
-  while V2's speaker DB lives server-side and the WebUI surface has
-  not yet been re-pointed at the V2 IPC.
+- **Web UI fate.** *RESOLVED — Phase E.6.2.* The standalone `recmeet-web`
+  binary is gone. The speaker-management UI is now an embedded HTTP
+  listener inside `recmeet-tray`: bind on a kernel-picked loopback
+  port, four static assets compiled into the binary, every `/api/*`
+  endpoint translates 1:1 to a daemon IPC call. A future headless
+  variant (operators who want WebUI without GTK) can factor
+  `src/tray_web.cpp` into a small library and stand up a separate
+  `recmeet-webd` binary; not on the v2.0.0 critical path.
 - **PSK handshake deadline.** *NEW, STILL OPEN — Phase E candidate.*
   Wave 2 of the iter-156 stabilization surfaced (as SUCCEED-with-INFO)
   the fact that the `IpcServer` poll loop has no per-connection

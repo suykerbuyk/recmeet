@@ -186,3 +186,20 @@ TEST_CASE("binaries have expected core deps", "[binary-slim][sanity]") {
     // Sanity: daemon must also pull in whisper for transcription.
     REQUIRE(contains(daemon_ldd, "libwhisper"));
 }
+
+// Phase E.6.2 — positive-direction sanity that cpp-httplib actually
+// linked into the tray. Pre-E.6.2 the tray spawned an external web
+// subprocess for the WebUI; post-E.6.2 the tray embeds an
+// httplib::Server itself (src/tray_web.cpp). A degenerate build that
+// configured tray_web.cpp out of the source list but left CMakeLists.txt
+// expecting the symbols would otherwise pass the negative-direction
+// "tray excludes ML deps" check above (httplib has no ML deps) while
+// still being broken. `nm <binary>` lists defined + undefined symbols;
+// grep for any httplib:: occurrence picks up either the inlined member
+// functions or the unity-TU httplib.cpp definitions.
+TEST_CASE("tray has httplib symbols linked", "[binary-slim][e6][sanity]") {
+    const std::string tray = build_dir() + "/recmeet-tray";
+    const std::string nm_out = run_capture("nm '" + tray + "'");
+    REQUIRE_FALSE(nm_out.empty());
+    REQUIRE(contains(nm_out, "httplib"));
+}
