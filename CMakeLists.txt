@@ -423,8 +423,14 @@ if(RECMEET_BUILD_TESTS)
 endif()
 
 # --- Install rules ---
-# Strip binaries on install (cmake --install); CPack already strips via CPACK_STRIP_FILES.
-install(CODE "set(CMAKE_INSTALL_DO_STRIP ON)")
+# Strip binaries on install for Release / MinSizeRel (cmake --install); CPack already strips
+# via CPACK_STRIP_FILES. RelWithDebInfo and Debug builds keep their symbols so that operator
+# diagnostic workflows (coredumpctl gdb, perf, eBPF) can resolve frames without rebuilding.
+install(CODE "
+    if(\"\${CMAKE_BUILD_TYPE}\" STREQUAL \"Release\" OR \"\${CMAKE_BUILD_TYPE}\" STREQUAL \"MinSizeRel\")
+        set(CMAKE_INSTALL_DO_STRIP ON)
+    endif()
+")
 include(GNUInstallDirs)
 
 install(TARGETS recmeet RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
