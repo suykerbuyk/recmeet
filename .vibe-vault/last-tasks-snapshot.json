@@ -1,11 +1,10 @@
 {
-  "iter_n": 177,
-  "anchor_sha": "aea9be221a9421b6d3c9e32a3803df3de572751f",
+  "iter_n": 183,
+  "anchor_sha": "07bf266a368808d6b9601776e0b289050b94fdc9",
   "active": [
-    "fullstack-captions-quality-gates",
-    "phase-e2-wave-2-2b-config-split-finish",
-    "postprocess-onnxruntime-crash-short-recording",
+    "e6-tray-bundled-webui",
     "thin-client-recording-server",
+    "v1-doc-review-and-readme-local-ai-positioning",
     "webui-live-captions"
   ],
   "done": [
@@ -28,6 +27,7 @@
     "fix-watchdog-diarization-deadlock",
     "floofy-percolating-dahl",
     "full-stack-pipeline-integration-test",
+    "fullstack-captions-quality-gates",
     "giggly-dreaming-cascade",
     "gleaming-mixing-squirrel",
     "go-tools-integration-tests",
@@ -56,9 +56,11 @@
     "optimized-dancing-pearl",
     "persist-meeting-context-per-instance-file-naming",
     "persistent-documentation-validation-update-pass",
+    "phase-e2-wave-2-2b-config-split-finish",
     "pipeline-write-error-checks",
     "portable-onnxruntime-build-detail",
     "postprocess-memory-containment",
+    "postprocess-onnxruntime-crash-short-recording",
     "pre-recording-meeting-context-dialog",
     "radiant-bubbling-nova",
     "radiant-toasting-lightning",
