@@ -15,13 +15,16 @@ process companion.
 
 ## Context
 
-V1 has reached operational maturity. The pipeline (capture → transcribe →
-diarize → identify → summarize) is correct and well-tested across 451 unit
-tests, 51 IPC integration tests, 3 full-stack tests, and the iter-121 work
-landed the long-audio containment target (4-hour audio on a 16 GB host).
-The remaining V1-shaped capstone is live captioning (`docs/ROADMAP.md`
-Phase 2b). Beyond that, V1 is a useful product on its own terms: simple,
-single-host, multi-provider LLM support including local self-hosted models.
+V1 is feature-complete and operationally mature. The pipeline (capture →
+transcribe → diarize → identify → summarize → caption) is correct and
+well-tested across 541 unit tests / 2124 assertions, 66 IPC integration
+tests / 458 assertions, 16 reprocess-batch cases, 12 benchmark cases, 5
+full-stack pipeline tests, and 1 long-audio cgroup integration gate. The
+iter-121 work landed the long-audio containment target (4-hour audio on a
+16 GB host); live captioning shipped as the V1 capstone at `v1.5.0`
+(2026-05-09). V1 is a useful product on its own terms: simple, single-host,
+multi-provider LLM support including local self-hosted models, GPU
+acceleration via runtime-loadable Vulkan plugin (v1.6.0).
 
 V2 is a near-rewrite. The thin-client / heavy-server split changes where
 audio capture happens, what the daemon links against, the wire protocol

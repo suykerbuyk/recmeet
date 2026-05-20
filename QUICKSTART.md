@@ -35,13 +35,14 @@ cd recmeet
 make build
 ```
 
-This produces four C++ binaries in `build/`:
+This produces five C++ binaries in `build/`:
 
 | Binary | Purpose |
 |--------|---------|
 | `recmeet` | CLI tool (standalone or daemon client) |
 | `recmeet-daemon` | Background daemon (owns pipeline logic) |
 | `recmeet-tray` | System tray applet (GTK3, daemon client) |
+| `recmeet-web` | Speaker-management WebUI (HTTP, daemon client) |
 | `recmeet_tests` | Test suite |
 
 `make build` also builds the Go-based AI tools (requires Go 1.25+):
@@ -300,6 +301,15 @@ summary:
 #   xai: "xai-..."
 #   openai: "sk-..."
 #   anthropic: "sk-ant-..."
+
+captions:
+  enabled: false                # true = enable live captions during recording (V1.5+)
+  model: en-2023-06-26          # streaming Zipformer; en-small (~128 MB) is the fast alternative
+  # normalize_display: true     # lowercase ALL-CAPS engine output + capitalize sentence boundaries
+
+web:
+  port: 8384                    # speaker-management WebUI port (recmeet-web)
+  bind: "127.0.0.1"             # loopback only by default
 
 output:
   directory: ./meetings
@@ -637,7 +647,7 @@ recmeet --num-speakers 3
 
 **No audio captured** — Verify PipeWire is running: `pw-cli info`. List sources with `recmeet --list-sources` and check that your mic appears.
 
-**Whisper model not found** — Models are auto-downloaded on first use. If behind a proxy, download manually (see [BUILD.md](BUILD.md)).
+**Whisper model not found** — Models are auto-downloaded on first use. If behind a proxy, download manually (see [docs/BUILD.md](docs/BUILD.md)).
 
 **Tray shows "Disconnected"** — The tray reconnects automatically when the daemon starts. Check `systemctl --user status recmeet-daemon.service`.
 

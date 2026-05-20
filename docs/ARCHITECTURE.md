@@ -4,7 +4,7 @@
 
 Recmeet records, transcribes, and summarizes meetings entirely on-device. Audio is captured via PipeWire/PulseAudio, transcribed with whisper.cpp, optionally diarized with sherpa-onnx, identified against enrolled voiceprints, and summarized either locally (llama.cpp) or through a cloud API. Everything runs on the user's machine — no audio or transcript data leaves the system unless the user explicitly configures a cloud summarization provider.
 
-The system ships as three cooperating C++ binaries connected by a Unix socket IPC layer, plus a static library that contains all shared logic. Two additional Go binaries provide AI-powered meeting tooling — an MCP server for IDE integration and an agent CLI for automated meeting prep and follow-up.
+The system ships as four cooperating C++ binaries connected by a Unix socket (or optional TCP) IPC layer, plus two static libraries that hold the shared logic — `recmeet_ipc` for config, IPC, and shared utilities, and `recmeet_core` for the full ML pipeline (whisper, sherpa-onnx, llama, audio capture). The split is load-bearing for the system tray applet: linking `recmeet_ipc` only means `recmeet-tray` ships without onnxruntime, whisper, llama, or ggml in its `DT_NEEDED` list, and unblocks the future thin-client architecture. Two additional Go binaries provide AI-powered meeting tooling — an MCP server for IDE integration and an agent CLI for automated meeting prep and follow-up.
 
 ## High-Level Architecture
 
@@ -13,17 +13,25 @@ graph TD
     CLI["recmeet<br/>(CLI)"]
     DAEMON["recmeet-daemon<br/>(IPC server)"]
     TRAY["recmeet-tray<br/>(system tray)"]
-    CORE["recmeet_core<br/>(static library)"]
-    SOCK["Unix socket<br/>$XDG_RUNTIME_DIR/recmeet/daemon.sock"]
+    WEB["recmeet-web<br/>(speaker WebUI)"]
+    IPC_LIB["recmeet_ipc<br/>(static library: no ML deps)"]
+    CORE["recmeet_core<br/>(static library: recmeet_ipc + ML)"]
+    SOCK["Unix socket / TCP<br/>$XDG_RUNTIME_DIR/recmeet/daemon.sock"]
     MCP["recmeet-mcp<br/>(MCP server)"]
     AGENT["recmeet-agent<br/>(AI agent CLI)"]
     MDATA["meetingdata<br/>(Go library)"]
 
-    CLI -->|standalone| CORE
+    TRAY --> IPC_LIB
+    CLI --> CORE
+    DAEMON --> CORE
+    WEB --> CORE
+    CORE --> IPC_LIB
+
+    CLI -->|standalone| PW
     CLI -->|client mode| SOCK
     TRAY --> SOCK
+    WEB --> SOCK
     SOCK --> DAEMON
-    DAEMON --> CORE
 
     CORE --> PW["PipeWire"]
     CORE --> PA["PulseAudio"]
@@ -43,15 +51,17 @@ graph TD
 
 ## Build System and Binary Topology
 
-CMake builds one static library (`recmeet_core`) from all shared sources, then links it into three C++ executables. Two additional Go binaries are also built by `make build`.
+CMake builds two static libraries (the iter-104 split): `recmeet_ipc` for config + IPC + util (no ML deps), and `recmeet_core` for `recmeet_ipc` + the full ML pipeline (whisper.cpp, sherpa-onnx, llama.cpp). Four C++ executables and one test binary link against one of those libraries; two additional Go binaries are also built by `make build`.
 
-| Target | Language | Source | Extra deps | Feature-gated |
+| Target | Language | Source | Links | Feature-gated |
 |---|---|---|---|---|
-| `recmeet` | C++ | `src/main.cpp` | — | — |
-| `recmeet-daemon` | C++ | `src/daemon.cpp` | — | — |
-| `recmeet-tray` | C++ | `src/tray.cpp` | GTK3, ayatana-appindicator3 | `RECMEET_BUILD_TRAY` |
-| `recmeet-mcp` | Go | `tools/cmd/recmeet-mcp/main.go` | mcp-go | — |
-| `recmeet-agent` | Go | `tools/cmd/recmeet-agent/main.go` | anthropic-sdk-go, cobra | — |
+| `recmeet` | C++ | `src/main.cpp` | `recmeet_core` | — |
+| `recmeet-daemon` | C++ | `src/daemon.cpp` | `recmeet_core` | — |
+| `recmeet-tray` | C++ | `src/tray.cpp` | `recmeet_ipc` + GTK3 + ayatana-appindicator3 | `RECMEET_BUILD_TRAY` |
+| `recmeet-web` | C++ | `src/web.cpp` | `recmeet_core` + cpp-httplib | `RECMEET_BUILD_WEB` |
+| `recmeet_tests` | C++ | `tests/*.cpp` | `recmeet_core` + Catch2 | `RECMEET_BUILD_TESTS` |
+| `recmeet-mcp` | Go | `tools/cmd/recmeet-mcp/main.go` | mcp-go | `RECMEET_BUILD_GO_TOOLS` |
+| `recmeet-agent` | Go | `tools/cmd/recmeet-agent/main.go` | anthropic-sdk-go, cobra | `RECMEET_BUILD_GO_TOOLS` |
 
 ### Feature flags (CMake options)
 
@@ -62,6 +72,10 @@ CMake builds one static library (`recmeet_core`) from all shared sources, then l
 | `RECMEET_USE_SHERPA` | ON | Link sherpa-onnx for diarization + VAD |
 | `RECMEET_USE_NOTIFY` | ON | Link libnotify for desktop notifications |
 | `RECMEET_BUILD_TESTS` | ON | Build Catch2 test suite |
+| `RECMEET_BUILD_WEB` | ON | Build the speaker-management WebUI binary (`recmeet-web`) |
+| `RECMEET_BUILD_GO_TOOLS` | ON | Build the Go-based MCP server and AI agent under `tools/` |
+| `RECMEET_GGML_VULKAN` | AUTO | Vulkan GPU acceleration tri-state: `AUTO` probes the build host's toolchain, `ON` requires it, `OFF` force-disables. Selects the `libggml-vulkan.so` runtime-loadable plugin (no `DT_NEEDED` on the recmeet binary). |
+| `RECMEET_PATCH_SHERPA_ARENA` | ON | T1B memory-containment patch that disables the vendored sherpa-onnx CPU memory arena. A/B-toggleable for benchmarking; toggling requires `make clean-deps` between runs. |
 
 ### systemd units
 
@@ -70,6 +84,7 @@ CMake builds one static library (`recmeet_core`) from all shared sources, then l
 | `recmeet-daemon.service` | simple | Runs the daemon, restarts on failure |
 | `recmeet-daemon.socket` | socket | Socket activation at `%t/recmeet/daemon.sock` |
 | `recmeet-tray.service` | simple | Runs the tray, `Wants=recmeet-daemon.service` |
+| `recmeet-web.service` | simple | Runs the speaker-management WebUI, `Wants=recmeet-daemon.service` (operator-launched; tray also spawns this on demand) |
 
 ## Binary: `recmeet` (CLI)
 
@@ -152,6 +167,13 @@ The tray builds a GTK menu with radio groups for mic source, monitor source, whi
 
 Newline-delimited JSON (NDJSON) over a Unix stream socket at `$XDG_RUNTIME_DIR/recmeet/daemon.sock` (fallback: `/tmp/recmeet-<uid>/daemon.sock`).
 
+### Transport
+
+Two transports are supported on the same wire format:
+
+- **Unix domain socket (default).** Path resolves to `$XDG_RUNTIME_DIR/recmeet/daemon.sock` (fallback `/tmp/recmeet-<uid>/daemon.sock`). Used by the local CLI, tray, and WebUI clients.
+- **TCP loopback / network (opt-in).** The daemon binds a TCP listener when launched with `--listen <host:port>`; clients reach it via `--daemon-addr <host:port>`. Connect uses non-blocking sockets and `TCP_KEEPALIVE`; IPv6 supported. Same NDJSON framing, no per-message length prefix on the V1 line. (See iter 107 + the `thin-client-recording-server` task for the V2 binary-frame extension.)
+
 ### Message types
 
 | Direction | Type | Discriminant field | Structure |
@@ -185,8 +207,11 @@ Values are `string | int64 | double | bool | null`. Nested objects/arrays are st
 |---|---|---|
 | `state.changed` | `{state, error?}` | Any state transition |
 | `phase` | `{name}` | Pipeline phase change (recording, transcribing, etc.) |
+| `progress` | `{phase, percent, segment?}` | Granular transcribe/diarize progress |
 | `job.complete` | `{note_path, output_dir}` | Recording + postprocessing finished |
 | `model.downloading` | `{model, status, error?}` | Model download progress |
+| `caption` | `{text, is_partial, timestamp_ms, job_id}` | Live captioning streaming-ASR output (V1.5+, opt-in via `record.start {captions_enabled: true}`) |
+| `caption.degraded` | `{reason, job_id}` | Caption engine unavailable / disabled mid-recording (e.g. sherpa-OFF build, model missing, non-English language) |
 
 ### Error codes
 
@@ -567,9 +592,11 @@ result.segments = merge_speakers(result.segments, diar, names);
 
 | Library | Purpose | CMake target |
 |---|---|---|
-| whisper.cpp | Speech-to-text transcription | `whisper` |
-| llama.cpp | Local LLM summarization | `llama` (gated by `RECMEET_USE_LLAMA`) |
-| sherpa-onnx | Speaker diarization, identification + VAD | `sherpa-onnx-c-api` (gated by `RECMEET_USE_SHERPA`) |
+| whisper.cpp | Speech-to-text transcription | `whisper` (shared library, plus runtime-loadable `libggml-cpu-*.so` and `libggml-vulkan.so` plugins via `GGML_BACKEND_DL`) |
+| llama.cpp | Local LLM summarization | `llama` (shared library, gated by `RECMEET_USE_LLAMA`) |
+| sherpa-onnx | Speaker diarization, identification, VAD, streaming captions | `sherpa-onnx-c-api` (gated by `RECMEET_USE_SHERPA`) |
+| onnxruntime | sherpa-onnx inference engine | Built from source via `scripts/build-onnxruntime.sh` on hosts with GCC 12+ (~20 min, installs to `vendor/onnxruntime-local/`). Pre-built system packages used otherwise. Carries its own vendored protobuf to immunize against system-package ABI skew (iter 99–100). |
+| cpp-httplib | WebUI HTTP server | Header + single TU under `vendor/cpp-httplib/` (gated by `RECMEET_BUILD_WEB`) |
 
 ### Platform (pkg-config)
 
@@ -949,7 +976,7 @@ The Go tools have two complementary test layers; both gate `make integration` an
 
 | Layer | Count | Build tag | Scope |
 |---|---|---|---|
-| Library + `testutil` | 118 | (default) | Unit-level — proves each component (`meetingdata` parsers, `mcpserver` handlers, `agent` workflows, `testutil` helpers) works correctly in isolation. `make test` runs these alongside the C++ suite. |
+| Library + `testutil` | 123 (41 `agent` + 23 `mcpserver` + 34 `meetingdata` + 25 `testutil`) | (default) | Unit-level — proves each component (`meetingdata` parsers, `mcpserver` handlers, `agent` workflows, `testutil` helpers) works correctly in isolation. `make test` runs these alongside the C++ suite. |
 | Integration | 39 (18 `recmeet-mcp` + 21 `recmeet-agent`) | `//go:build integration` | End-to-end — builds the as-built binaries via `testutil.BuildBinaryOnce`, then drives them as real subprocesses against the MCP stdio protocol and a mock Anthropic httptest server. Proves the deployable artifacts complete a real session, not just that components compose. `make integration-go` runs these. |
 
 `tools/testutil/` is the shared infrastructure: package-scope binary build cache (via `TestMain` + `os.MkdirTemp`), `MockAnthropic` httptest server, fixture builders (`BuildMeetingsFixture` writes `Meeting_<date>.md` files matching `meetingdata.findMDFiles`'s glob), a custom MCP stdio transport that supports stdout-teeing for the hygiene test, and a named usability-assertion table so each error-path test names its actionable-stderr expectation rather than duplicating string-match logic.

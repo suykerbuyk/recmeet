@@ -21,6 +21,7 @@ source code implementation, not aspirational design.
 12. [Audio Capture Subsystem](#12-audio-capture-subsystem)
 13. [Go Tools Module](#13-go-tools-module)
 14. [Live Captioning Pipeline](#14-live-captioning-pipeline)
+15. [GPU Plugin Architecture (ggml backends)](#15-gpu-plugin-architecture-ggml-backends)
 
 ---
 
@@ -167,7 +168,7 @@ graph TB
         BIN_DAEMON["recmeet-daemon<br/>(daemon.cpp)"]
         BIN_WEB["recmeet-web<br/>(web.cpp + httplib.cpp)"]
         BIN_TRAY["recmeet-tray<br/>(tray.cpp)"]
-        BIN_TEST["recmeet_tests<br/>(tests/test_*.cpp × 26)"]
+        BIN_TEST["recmeet_tests<br/>(tests/test_*.cpp × 35)"]
     end
 
     subgraph "Vendored"
@@ -1585,3 +1586,99 @@ flowchart TD
 - Sherpa-OFF builds compile every component cleanly; `CaptionEngine::start`
   returns false with the canonical error message and recording continues
   without captions.
+
+---
+
+## 15. GPU Plugin Architecture (ggml backends)
+
+Starting in v1.6.0, the vendored `whisper.cpp` and `llama.cpp` subbuilds ship as **shared libraries** with ggml's `GGML_BACKEND_DL=ON` plugin model. Compute backends (CPU variants, Vulkan, future CUDA / HIP / Metal) are no longer statically linked into the `recmeet` binary — they are separate `libggml-*.so` files loaded at startup by `dlopen()`. `recmeet::load_backends()` in `src/backend_info.cpp` is the daemon-side entry point; the diagram below walks plugin discovery, ggml's plugin-load callback, and the active-device picker that selects the highest-priority enumerable device.
+
+```mermaid
+flowchart TD
+    START["recmeet::load_backends()<br/>(src/backend_info.cpp)"]
+
+    subgraph DISCOVER["Plugin directory resolution (candidate ladder)"]
+        ENV{"RECMEET_GGML_BACKEND_PATH<br/>env set + directory?"}
+        SELF["fs::read_symlink('/proc/self/exe')<br/>→ exe_dir"]
+        CAND1{"exe_dir/../lib<br/>directory?"}
+        CAND2{"exe_dir/bin<br/>directory?"}
+        CAND3{"exe_dir<br/>directory?"}
+        NONE["return ''<br/>(no plugins loadable)"]
+        DIR["plugin_dir resolved"]
+
+        ENV -->|"yes"| DIR
+        ENV -->|"no"| SELF --> CAND1
+        CAND1 -->|"yes (install layout)"| DIR
+        CAND1 -->|"no"| CAND2
+        CAND2 -->|"yes (in-tree layout)"| DIR
+        CAND2 -->|"no"| CAND3
+        CAND3 -->|"yes"| DIR
+        CAND3 -->|"no"| NONE
+    end
+
+    subgraph LOAD["ggml plugin load (vendored libggml-base)"]
+        SCAN["ggml_backend_load_all_from_path(plugin_dir)<br/>scans for libggml-*.so"]
+        CPU_PLUGINS["libggml-cpu-sse42.so<br/>libggml-cpu-avx.so<br/>libggml-cpu-avx2.so<br/>libggml-cpu-avx512.so<br/>libggml-cpu-amx.so<br/>(per-ISA variants; scored vs host)"]
+        VULKAN_PLUGIN["libggml-vulkan.so<br/>(only when libvulkan.so.1 + ICD present)"]
+        REGISTRY["ggml_backend_reg_count() &gt; 0<br/>registry populated"]
+
+        SCAN --> CPU_PLUGINS
+        SCAN --> VULKAN_PLUGIN
+        CPU_PLUGINS --> REGISTRY
+        VULKAN_PLUGIN --> REGISTRY
+    end
+
+    subgraph PICK["Active-device picker (pick_active_device)"]
+        ITER["Iterate ggml_backend_dev_get(0..N-1)"]
+        TYPE{"device type?"}
+        GPU["GPU<br/>(discrete)"]
+        IGPU["IGPU<br/>(integrated)"]
+        ACCEL["ACCEL<br/>(NPU / TPU)"]
+        CPU["CPU<br/>(always-present)"]
+        PRIORITY["Priority: GPU &gt; IGPU &gt; ACCEL &gt; CPU<br/>(first non-null wins)"]
+        ACTIVE["active_device"]
+
+        ITER --> TYPE
+        TYPE --> GPU
+        TYPE --> IGPU
+        TYPE --> ACCEL
+        TYPE --> CPU
+        GPU --> PRIORITY
+        IGPU --> PRIORITY
+        ACCEL --> PRIORITY
+        CPU --> PRIORITY
+        PRIORITY --> ACTIVE
+    end
+
+    subgraph BANNER["Startup banner (log_backend_summary)"]
+        WARN_ZERO{"any non-CPU backend<br/>registered with<br/>zero devices?"}
+        WARN["log warn:<br/>'libggml-vulkan.so loaded but exposed zero devices —<br/>missing or broken Vulkan ICD'"]
+        REG_LINE["log info + stderr:<br/>'ggml backends: CPU, Vulkan'"]
+        ACTIVE_LINE["log info + stderr:<br/>'active backend: Vulkan (Radeon Pro W5500)'<br/>or 'active backend: CPU (haswell)'"]
+
+        WARN_ZERO -->|"yes"| WARN --> REG_LINE
+        WARN_ZERO -->|"no"| REG_LINE
+        REG_LINE --> ACTIVE_LINE
+    end
+
+    subgraph BIND["whisper/llama backend binding"]
+        WHISPER_INIT["whisper_init_from_file_with_params(...)"]
+        WHISPER_PICK["whisper.cpp picks best registered<br/>backend per layer (GPU offload if available;<br/>per-ISA CPU plugin otherwise)"]
+        LLAMA_INIT["llama_model_load_from_file(...)"]
+        LLAMA_PICK["llama.cpp picks best registered<br/>backend (CPU only in v1.6.x — no GPU offload<br/>for summarization yet)"]
+    end
+
+    START --> ENV
+    DIR --> SCAN
+    NONE -.->|"CPU-only fallback"| REGISTRY
+    REGISTRY --> ITER
+    ACTIVE --> WARN_ZERO
+    ACTIVE_LINE --> WHISPER_INIT --> WHISPER_PICK
+    ACTIVE_LINE --> LLAMA_INIT --> LLAMA_PICK
+```
+
+**Why the deterministic plugin-dir resolution matters.** The ggml plugin loader's built-in search uses `$ORIGIN/../lib` baked into `libggml-base.so` at compile time, plus a CWD fallback. `dlopen` does not expand `$ORIGIN` the way `ld.so` does for `DT_RPATH`, so the macro never resolves; the loader falls back to CWD, which is operator-controllable and attacker-plantable. `recmeet::load_backends()` resolves the plugin directory itself from `/proc/self/exe` and passes the absolute path to `ggml_backend_load_all_from_path()`, bypassing both the unresolved-`$ORIGIN` and CWD-fallback paths.
+
+**Why per-ISA CPU plugins matter.** `GGML_NATIVE=OFF` + `GGML_CPU_ALL_VARIANTS=ON` produces one `libggml-cpu-<isa>.so` per supported instruction-set baseline (sse4_2, avx, avx2, avx512, amx on x86). At startup ggml scores each one against `__builtin_cpu_supports()` results and picks the highest-supported variant. The same recmeet binary then runs unchanged on a 2015 server (sse4_2) and a 2024 laptop (avx512), with the latter getting ~3× the per-core matmul throughput from AVX-512 without recompilation. Distro packagers benefit because one binary build covers their entire user base; operators benefit because there is no "did I build for the right CPU baseline?" question.
+
+**Binary invariants.** `ldd build/recmeet | grep -E 'vulkan|cuda'` returns empty on every build. `ldd build/recmeet-tray | grep -E 'onnxruntime|whisper|llama|ggml'` returns empty on every build (the iter-104 library split keeps these out of the tray entirely; the GPU plugin model adds runtime-loaded GPU libs to the same exclusion list).

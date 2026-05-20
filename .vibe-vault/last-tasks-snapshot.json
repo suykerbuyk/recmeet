@@ -1,9 +1,11 @@
 {
-  "iter_n": 180,
-  "anchor_sha": "1d2af09b1690e0187ce5c7406bce6eac08b7ecd2",
+  "iter_n": 184,
+  "anchor_sha": "9d5b71c616798f4c1393131215c0c8bb4c542289",
   "active": [
-    "fullstack-captions-quality-gates",
+    "diarize-overcount-and-context-aware-speaker-hints",
+    "e6-tray-bundled-webui",
     "thin-client-recording-server",
+    "v1-doc-review-and-readme-local-ai-positioning",
     "webui-live-captions"
   ],
   "done": [
@@ -26,6 +28,7 @@
     "fix-watchdog-diarization-deadlock",
     "floofy-percolating-dahl",
     "full-stack-pipeline-integration-test",
+    "fullstack-captions-quality-gates",
     "giggly-dreaming-cascade",
     "gleaming-mixing-squirrel",
     "go-tools-integration-tests",

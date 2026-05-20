@@ -159,7 +159,7 @@ spawning real subprocesses, exercising the MCP stdio protocol against a
 real client, and round-tripping the agent CLI against a mock Anthropic
 HTTP server. The suite lives next to each binary's source under a
 `//go:build integration` tag, so the default `go test ./...` stays fast
-(~0.5 seconds across 118 library + testutil tests) and the integration
+(~0.5 seconds across 123 library + testutil tests) and the integration
 work only runs when explicitly requested.
 
 ```bash
@@ -181,7 +181,7 @@ green merge to `v1-maintenance`.
 
 | Suite | Count | Where | Tag |
 |---|---|---|---|
-| Library + testutil | 118 | `tools/{agent,mcpserver,meetingdata,testutil}` | (default) |
+| Library + testutil | 123 | `tools/{agent,mcpserver,meetingdata,testutil}` | (default) |
 | `recmeet-mcp` integration | 18 | `tools/cmd/recmeet-mcp/*_integration_test.go` | `integration` |
 | `recmeet-agent` integration | 21 | `tools/cmd/recmeet-agent/*_integration_test.go` | `integration` |
 
@@ -314,9 +314,10 @@ ls -lh ~/.local/share/recmeet/models/llama/   # optional
 
 ## CMake options
 
-recmeet has six build options you can toggle at configure time. All features
-default to ON and the build type defaults to Release, so a plain
-`cmake -B build -G Ninja` gives you a fully-featured optimized build.
+recmeet has nine build options you can toggle at configure time. All features
+default to ON (with `RECMEET_GGML_VULKAN=AUTO`), and the build type defaults
+to Release, so a plain `cmake -B build -G Ninja` gives you a fully-featured
+optimized build.
 
 ```bash
 # Disable the system tray applet (skips GTK3/AppIndicator dependency)
@@ -328,8 +329,14 @@ cmake -B build -G Ninja -DRECMEET_USE_LLAMA=OFF
 # Disable sherpa-onnx speaker diarization (saves build time)
 cmake -B build -G Ninja -DRECMEET_USE_SHERPA=OFF
 
+# Disable libnotify desktop notifications (tray runs without bubble notifications)
+cmake -B build -G Ninja -DRECMEET_USE_NOTIFY=OFF
+
 # Disable building tests (skips Catch2 download)
 cmake -B build -G Ninja -DRECMEET_BUILD_TESTS=OFF
+
+# Disable building the speaker-management WebUI binary (recmeet-web)
+cmake -B build -G Ninja -DRECMEET_BUILD_WEB=OFF
 
 # Disable building the Go tools (skips Go toolchain requirement)
 cmake -B build -G Ninja -DRECMEET_BUILD_GO_TOOLS=OFF
@@ -380,7 +387,7 @@ rarely necessary; `PATCH_COMMAND` handles toggling automatically.
 
 ## What the build targets are
 
-`CMakeLists.txt` defines six targets across two static libraries (the iter-104 split that lets `recmeet-tray` ship without ML dependencies):
+`CMakeLists.txt` defines seven C++ targets across two static libraries (the iter-104 split that lets `recmeet-tray` ship without ML dependencies):
 
 ```
 recmeet_ipc   (static library — config, IPC client/server, util, NDJSON, no ML deps)
@@ -391,8 +398,11 @@ recmeet_core  (static library — recmeet_ipc + ML pipeline: whisper, sherpa-onn
     │
     ├── recmeet-daemon (daemon binary = daemon.cpp + recmeet_core)
     ├── recmeet        (CLI binary = main.cpp + recmeet_core)
+    ├── recmeet-web    (speaker-management WebUI = web.cpp + cpp-httplib + recmeet_core; built when `RECMEET_BUILD_WEB=ON`)
     └── recmeet_tests  (test binary = tests/*.cpp + recmeet_core + Catch2)
 ```
+
+Two additional Go binaries — `recmeet-mcp` and `recmeet-agent` — build under `tools/` when `RECMEET_BUILD_GO_TOOLS=ON` (default). They are stand-alone Go modules; the C++ build system shells out to `go build` and installs the resulting binaries alongside the C++ targets.
 
 `recmeet_ipc` and `recmeet_core` are each compiled once as static libraries (`.a` files), then linked into the binaries that need them. The split is load-bearing for the tray applet: linking `recmeet_ipc` only means `recmeet-tray` does not pull in onnxruntime, whisper.cpp, or llama.cpp, keeping the applet's binary size and runtime memory low and unblocking the future thin-client architecture (operator-host applet, compute on a separate daemon host). Changing a test file only recompiles that test file and re-links `recmeet_tests` — it doesn't recompile or re-link the
 other binaries.
@@ -509,9 +519,16 @@ strip build/recmeet build/recmeet-tray
 ## Installing
 
 After building, you can install recmeet into a prefix on the filesystem using
-CMake's install step. The install rules use `GNUInstallDirs` for portable paths
-and only install recmeet's own files — the vendored libraries (whisper.cpp,
-llama.cpp) are statically linked and excluded from the install tree.
+CMake's install step. The install rules use `GNUInstallDirs` for portable
+paths. Starting in v1.6.0 the vendored ML libraries (whisper.cpp, llama.cpp,
+their ggml dependency) build with `BUILD_SHARED_LIBS=ON` to support the
+`GGML_BACKEND_DL=ON` plugin model — so `libwhisper.so`, `libllama.so`,
+`libggml*.so`, and the per-ISA `libggml-cpu-*.so` plugins now install into
+`<prefix>/lib/` alongside the recmeet binaries. Compute backends
+(`libggml-vulkan.so`, future `libggml-cuda.so` etc.) ship as separate `.so`
+files in the same directory and are loaded at startup via `dlopen()`. The
+recmeet binaries themselves carry no `DT_NEEDED` entry for any GPU library.
+See "Plugin architecture (ggml backends)" above for the full story.
 
 ### Install to the default prefix (`/usr/local`)
 

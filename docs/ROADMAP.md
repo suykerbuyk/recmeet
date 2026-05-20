@@ -83,8 +83,9 @@ Phase 7 added stress + memory-bound + full-stack [captions]-tagged
 tests, doc sync, and the `v1.5.0` tag preconditions.
 
 **Model choice:** `sherpa-onnx-streaming-zipformer-en-2023-06-26`
-(int8, ~74 MB, Apache-2.0, English-only). `en-small` (~28 MB) ships as
-a low-end-host alternative.
+(int8, ~74 MB runtime, Apache-2.0, English-only; ~310 MB tarball ships both
+int8 and fp32 weights). `en-small` (~128 MB tarball) ships as a low-end-host
+alternative.
 
 **Follow-ups (post-V1):**
 
