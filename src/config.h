@@ -443,6 +443,14 @@ struct ServerConfig {
     // -- Retention (consolidated terminal-state knob) --
     int retain_terminal_hours = 24;
     int64_t diarization_cache_ttl_secs = 86400;
+
+    // -- Meetings root (server owns the on-disk meeting tree) --
+    // Where the daemon persists meeting directories (postprocess output,
+    // streaming-session WAVs, MeetingIndex source-of-truth). The client's
+    // ClientConfig.output_dir is the at-rest *client* knob; the daemon's
+    // view of "where do meetings live on this host" is THIS field. See
+    // iter-172 plan addendum on `phase-e2-wave-2-2b-config-split-finish.md`.
+    fs::path meetings_root = "./meetings";
 };
 
 struct ClientConfig {

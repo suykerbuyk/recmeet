@@ -595,8 +595,8 @@ teardown_orphan_jobs(const std::string& token_prefix8,
 
     fs::path meetings_root;
     {
-        std::lock_guard<std::mutex> lk(g_config_mu);
-        meetings_root = g_config.output_dir;
+        std::lock_guard<std::mutex> lk(g_server_config_mu);
+        meetings_root = g_server_config.meetings_root;
     }
 
     auto owned = g_jobs->list_by_client(client_id);
@@ -1617,9 +1617,9 @@ int main(int argc, char* argv[]) {
     // after the IpcServer exists (the event sink captures it).
     {
         JobQueue::SlotCapacities caps;
-        caps.postprocess = g_config.slot_postprocess;
-        caps.streaming = g_config.slot_streaming;
-        caps.model_download = g_config.slot_model_download;
+        caps.postprocess = g_server_config.slot_postprocess;
+        caps.streaming = g_server_config.slot_streaming;
+        caps.model_download = g_server_config.slot_model_download;
         g_jobs = std::make_unique<JobQueue>(caps);
         log_info("daemon: JobQueue slots — postprocess=%d streaming=%d "
                  "model_download=%d",
@@ -1631,22 +1631,22 @@ int main(int argc, char* argv[]) {
     // by design (see diarization_cache.h header for the rationale).
     {
         g_diar_cache = std::make_unique<DiarizationCache>(
-            g_config.diarization_cache_ttl_secs);
+            g_server_config.diarization_cache_ttl_secs);
         log_info("daemon: diarization cache ready (ttl=%lld s)",
-                 (long long)g_config.diarization_cache_ttl_secs);
+                 (long long)g_server_config.diarization_cache_ttl_secs);
     }
 
     // Phase C.11.4 — construct the meeting-id index BEFORE the upload /
     // streaming managers are wired so they can pass it into their
     // constructors. The startup `rebuild_from_disk` walks
-    // `g_config.output_dir` once, reads each meeting dir's `context.json`,
-    // and repopulates the map. Cost amortizes against startup; no on-disk
-    // index file in v1.
+    // `g_server_config.meetings_root` once, reads each meeting dir's
+    // `context.json`, and repopulates the map. Cost amortizes against
+    // startup; no on-disk index file in v1.
     {
         g_meeting_index = std::make_unique<MeetingIndex>();
-        std::size_t n = g_meeting_index->rebuild_from_disk(g_config.output_dir);
+        std::size_t n = g_meeting_index->rebuild_from_disk(g_server_config.meetings_root);
         log_info("daemon: meeting index ready (rebuilt %zu binding%s from %s)",
-                 n, n == 1 ? "" : "s", g_config.output_dir.string().c_str());
+                 n, n == 1 ? "" : "s", g_server_config.meetings_root.string().c_str());
     }
 
     // Phase C.13 — construct the resume_token store. In-memory only (MC-1);
@@ -1657,11 +1657,11 @@ int main(int argc, char* argv[]) {
     // std::chrono::system_clock; tests inject a fake.
     {
         const int64_t ttl_s =
-            static_cast<int64_t>(g_config.retain_terminal_hours) * 3600;
+            static_cast<int64_t>(g_server_config.retain_terminal_hours) * 3600;
         g_sessions = std::make_unique<SessionManager>(ttl_s);
         log_info("daemon: session manager ready (TTL=%dh, in-memory only — "
                  "restart invalidates all tokens)",
-                 g_config.retain_terminal_hours);
+                 g_server_config.retain_terminal_hours);
     }
 
     notify_init();
@@ -1883,16 +1883,16 @@ int main(int argc, char* argv[]) {
         };
         std::string model_dir;
         {
-            std::lock_guard<std::mutex> lock(g_config_mu);
-            model_dir = resolve_caption_model_dir(g_config.caption_model).string();
+            std::lock_guard<std::mutex> lock(g_server_config_mu);
+            model_dir = resolve_caption_model_dir(g_server_config.caption_model).string();
         }
         g_streaming = std::make_unique<StreamingSessionManager>(
             *g_jobs, sink, model_dir,
             g_meeting_index.get(),    // C.11.4 — convergence-principle dedup
-            g_config.output_dir);
+            g_server_config.meetings_root);
         log_info("daemon: streaming session manager ready (caption_model_dir=%s, "
                  "meetings_root=%s)",
-                 model_dir.c_str(), g_config.output_dir.string().c_str());
+                 model_dir.c_str(), g_server_config.meetings_root.string().c_str());
     }
 
     // Phase C.2 — construct the UploadSessionManager. The progress sink
@@ -1958,9 +1958,9 @@ int main(int argc, char* argv[]) {
         g_uploads = std::make_unique<UploadSessionManager>(
             *g_jobs, /*staging_root=*/fs::path{}, std::move(upsink),
             g_meeting_index.get(),    // C.11.4 — convergence-principle dedup
-            g_config.output_dir);
+            g_server_config.meetings_root);
         log_info("daemon: upload session manager ready (meetings_root=%s)",
-                 g_config.output_dir.string().c_str());
+                 g_server_config.meetings_root.string().c_str());
     }
 
     // Phase C.10a — route inbound `0x03` streaming-audio frames into the
@@ -2034,14 +2034,14 @@ int main(int argc, char* argv[]) {
 
     // Phase A.2: apply the NDJSON line cap from config before start().
     // Default is 8 MB; a daemon.yaml override via `[ipc] max_message_bytes`
-    // is already resolved in g_config by load_config().
-    server.set_max_message_bytes(g_config.max_message_bytes);
+    // is already resolved in g_server_config by load_server_config().
+    server.set_max_message_bytes(g_server_config.max_message_bytes);
 
     // Phase A.3: apply the connection cap from config before start() so
     // the listen backlog (max_clients * 2) is sized off the configured
     // value rather than the struct default. Default is 16 / backlog 32;
     // override via `[ipc] max_clients` in daemon.yaml.
-    server.set_max_clients(g_config.max_clients);
+    server.set_max_clients(g_server_config.max_clients);
 
     // Phase A.1 PSK gate: TCP listeners require RECMEET_AUTH_TOKEN. Unix
     // listeners trust the kernel's peer credentials and skip the PSK check.
@@ -2577,7 +2577,10 @@ int main(int argc, char* argv[]) {
         {
             std::lock_guard<std::mutex> lock(g_config_mu);
             cfg = g_config;
-            max_upload_bytes = g_config.max_upload_bytes;
+        }
+        {
+            std::lock_guard<std::mutex> lock(g_server_config_mu);
+            max_upload_bytes = g_server_config.max_upload_bytes;
         }
         // Force the subprocess into reprocess mode (the staging dir IS the
         // out_dir). pp_worker_loop sets this from input.out_dir, but be
@@ -3553,9 +3556,9 @@ int main(int argc, char* argv[]) {
         // semantic — the on-disk format stays append-one-embedding.
         fs::path db_dir;
         {
-            std::lock_guard<std::mutex> lock(g_config_mu);
-            db_dir = g_config.speaker_db.empty()
-                ? default_speaker_db_dir() : g_config.speaker_db;
+            std::lock_guard<std::mutex> lock(g_server_config_mu);
+            db_dir = g_server_config.speaker_db.empty()
+                ? default_speaker_db_dir() : g_server_config.speaker_db;
         }
         try {
             auto profiles = load_speaker_db(db_dir);
@@ -3598,9 +3601,9 @@ int main(int argc, char* argv[]) {
         try {
             fs::path db_dir;
             {
-                std::lock_guard<std::mutex> lock(g_config_mu);
-                db_dir = g_config.speaker_db.empty()
-                    ? default_speaker_db_dir() : g_config.speaker_db;
+                std::lock_guard<std::mutex> lock(g_server_config_mu);
+                db_dir = g_server_config.speaker_db.empty()
+                    ? default_speaker_db_dir() : g_server_config.speaker_db;
             }
             auto profiles = load_speaker_db(db_dir);
             std::string arr = "[";
@@ -3632,9 +3635,9 @@ int main(int argc, char* argv[]) {
         std::string name = json_val_as_string(it->second);
         fs::path db_dir;
         {
-            std::lock_guard<std::mutex> lock(g_config_mu);
-            db_dir = g_config.speaker_db.empty()
-                ? default_speaker_db_dir() : g_config.speaker_db;
+            std::lock_guard<std::mutex> lock(g_server_config_mu);
+            db_dir = g_server_config.speaker_db.empty()
+                ? default_speaker_db_dir() : g_server_config.speaker_db;
         }
         if (remove_speaker(db_dir, name)) {
             resp.result["ok"] = true;
@@ -3651,9 +3654,9 @@ int main(int argc, char* argv[]) {
         try {
             fs::path db_dir;
             {
-                std::lock_guard<std::mutex> lock(g_config_mu);
-                db_dir = g_config.speaker_db.empty()
-                    ? default_speaker_db_dir() : g_config.speaker_db;
+                std::lock_guard<std::mutex> lock(g_server_config_mu);
+                db_dir = g_server_config.speaker_db.empty()
+                    ? default_speaker_db_dir() : g_server_config.speaker_db;
             }
             int count = reset_speakers(db_dir);
             resp.result["ok"] = true;
@@ -3745,8 +3748,8 @@ int main(int argc, char* argv[]) {
     server.on("models.update", [](const IpcRequest& req, IpcResponse& resp, IpcError& err) {
         bool allow_dl;
         {
-            std::lock_guard<std::mutex> lock(g_config_mu);
-            allow_dl = g_config.allow_client_downloads;
+            std::lock_guard<std::mutex> lock(g_server_config_mu);
+            allow_dl = g_server_config.allow_client_downloads;
         }
         if (!allow_dl) {
             err.code = static_cast<int>(IpcErrorCode::PermissionDenied);

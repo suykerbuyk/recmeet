@@ -363,6 +363,9 @@ JsonMap config_to_map(const ServerConfig& cfg) {
     m["retain_terminal_hours"]    = static_cast<int64_t>(cfg.retain_terminal_hours);
     m["diarization_cache_ttl_secs"] = static_cast<int64_t>(cfg.diarization_cache_ttl_secs);
 
+    // iter-172 — meetings_root: server-side on-disk meeting-tree root.
+    m["meetings_root"]            = cfg.meetings_root.string();
+
     return m;
 }
 
@@ -516,6 +519,9 @@ ServerConfig server_config_from_map(const JsonMap& m) {
 
     i("retain_terminal_hours", cfg.retain_terminal_hours);
     i64("diarization_cache_ttl_secs", cfg.diarization_cache_ttl_secs);
+
+    // iter-172 — meetings_root: server-side on-disk meeting-tree root.
+    path("meetings_root", cfg.meetings_root);
 
     return cfg;
 }

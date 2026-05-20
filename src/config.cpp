@@ -849,6 +849,12 @@ ServerConfig to_server_config(const JobConfig& cfg) {
     s.allow_client_downloads     = cfg.allow_client_downloads;
     s.retain_terminal_hours      = cfg.retain_terminal_hours;
     s.diarization_cache_ttl_secs = cfg.diarization_cache_ttl_secs;
+    // iter-172 plan addendum — lift the legacy `output_dir` (a JobConfig /
+    // pre-split monolith field) into ServerConfig's new server-side slot.
+    // The client's ClientConfig.output_dir continues to carry the client's
+    // at-rest view; the daemon now consults `meetings_root` for "where do
+    // meetings live on this host".
+    s.meetings_root              = cfg.output_dir;
     return s;
 }
 
@@ -1090,6 +1096,13 @@ ServerConfig load_server_config(const fs::path& config_path) {
             if (cfg.retain_terminal_hours <= 0)
                 cfg.retain_terminal_hours = 24;
         }
+
+        // iter-172 — meetings_root: the daemon's on-disk meeting-tree root.
+        // Default is "./meetings" (the struct default); operator may override
+        // via `[server] meetings_root`. The legacy single-file migration shim
+        // (to_server_config) lifts the pre-split `output_dir` into this slot.
+        std::string mr = get_val(entries, "server", "meetings_root", "");
+        if (!mr.empty()) cfg.meetings_root = mr;
     }
 
     return cfg;
@@ -1316,7 +1329,8 @@ void save_server_config(const ServerConfig& cfg, const fs::path& config_path) {
             cfg.slot_postprocess != 1 || cfg.slot_streaming != 1 ||
             cfg.slot_model_download != 1 || !cfg.allow_client_downloads ||
             cfg.retain_terminal_hours != 24 ||
-            cfg.diarization_cache_ttl_secs != 86400;
+            cfg.diarization_cache_ttl_secs != 86400 ||
+            cfg.meetings_root != fs::path("./meetings");
         if (emit_server_section) {
             out << "\nserver:\n";
             if (cfg.max_upload_bytes != 4ull * 1024 * 1024 * 1024)
@@ -1339,6 +1353,11 @@ void save_server_config(const ServerConfig& cfg, const fs::path& config_path) {
                 cfg.diarization_cache_ttl_secs != 86400)
                 out << "  diarization_cache_ttl_secs: "
                     << cfg.diarization_cache_ttl_secs << "\n";
+            // iter-172 — meetings_root: the daemon's view of the on-disk
+            // meeting tree (the migration shim populates it from legacy
+            // `output_dir`).
+            if (cfg.meetings_root != fs::path("./meetings"))
+                out << "  meetings_root: \"" << cfg.meetings_root.string() << "\"\n";
         }
     }
 
