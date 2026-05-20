@@ -19,6 +19,7 @@
 #include "notify.h"
 #include "pipeline.h"
 #include "meeting_index.h"
+#include "meetings_browse.h"
 #include "session_manager.h"
 #include "streaming_session.h"
 #include "upload_session.h"
@@ -209,6 +210,25 @@ static void broadcast_state_inline(IpcServer& server, const std::string& error =
     if (!error.empty()) ev.data["error"] = error;
     server.broadcast(ev);
 }
+
+// Phase E.6.1 — path-traversal guard for the speakers.* IPC verbs.
+// `name` becomes the basename of `<db_dir>/<name>.json`; rejecting `.`,
+// `..`, and any path separator keeps the surface confined to db_dir.
+// Matches the static helper in src/web.cpp:100 verbatim.
+static bool is_safe_dirname(const std::string& name) {
+    if (name.empty()) return false;
+    if (name == "." || name == "..") return false;
+    if (name.find('/') != std::string::npos) return false;
+    if (name.find('\\') != std::string::npos) return false;
+    if (name.find('\0') != std::string::npos) return false;
+    return true;
+}
+
+// Phase E.6.1 — `speakers.batch_reidentify` async bookkeeping. A second
+// call while one is in flight is rejected with InvalidParams "batch in
+// progress". Flag is set before the worker spawns and cleared in the
+// worker epilogue (try/catch ensures it always clears).
+static std::atomic<bool> g_batch_reidentify_running{false};
 
 // ---------------------------------------------------------------------------
 // Signal handling
@@ -3660,6 +3680,599 @@ int main(int argc, char* argv[]) {
             int count = reset_speakers(db_dir);
             resp.result["ok"] = true;
             resp.result["removed"] = static_cast<int64_t>(count);
+            return true;
+        } catch (const std::exception& e) {
+            err.code = static_cast<int>(IpcErrorCode::InternalError);
+            err.message = e.what();
+            return false;
+        }
+    });
+
+    // --- Phase E.6.1 — speakers.* / meetings.* IPC surface ---
+    //
+    // These eight verbs back the tray-bundled WebUI (E.6). All meeting
+    // lookups resolve `meeting_id → meeting_dir_path` via
+    // `g_meeting_index->find()` (NOT a dir-name parameter); the WebUI
+    // keys all URLs off meeting_id. `db_dir` is resolved the same way as
+    // the speakers.list/remove/reset handlers above: snapshot
+    // g_server_config, fall back to default_speaker_db_dir() on empty.
+
+    // speakers.get { name } → { name, enrollments, created, updated,
+    //                           embedding_dim, embedding_count }
+    //
+    // Slim shape: the raw embedding blobs are NOT returned (browser only
+    // renders count + dimension; biometric data shouldn't leak over a
+    // possibly-tunneled WebUI). embedding_dim is the first vector's
+    // length, 0 when there are no embeddings. embedding_count is
+    // embeddings.size().
+    server.on("speakers.get", [](const IpcRequest& req, IpcResponse& resp, IpcError& err) {
+        try {
+            auto it = req.params.find("name");
+            std::string name = (it != req.params.end()) ? json_val_as_string(it->second) : "";
+            if (!is_safe_dirname(name)) {
+                err.code = static_cast<int>(IpcErrorCode::InvalidParams);
+                err.message = "speakers.get: invalid 'name'";
+                return false;
+            }
+            fs::path db_dir;
+            {
+                std::lock_guard<std::mutex> lock(g_server_config_mu);
+                db_dir = g_server_config.speaker_db.empty()
+                    ? default_speaker_db_dir() : g_server_config.speaker_db;
+            }
+            auto profiles = load_speaker_db(db_dir);
+            const SpeakerProfile* found = nullptr;
+            for (const auto& p : profiles) {
+                if (p.name == name) { found = &p; break; }
+            }
+            if (!found) {
+                err.code = static_cast<int>(IpcErrorCode::InvalidParams);
+                err.message = "speakers.get: not_found";
+                return false;
+            }
+            const int64_t emb_count = static_cast<int64_t>(found->embeddings.size());
+            const int64_t emb_dim = emb_count > 0
+                ? static_cast<int64_t>(found->embeddings[0].size()) : 0;
+            resp.result["name"] = found->name;
+            resp.result["enrollments"] = emb_count;
+            resp.result["created"] = found->created;
+            resp.result["updated"] = found->updated;
+            resp.result["embedding_dim"] = emb_dim;
+            resp.result["embedding_count"] = emb_count;
+            return true;
+        } catch (const std::exception& e) {
+            err.code = static_cast<int>(IpcErrorCode::InternalError);
+            err.message = e.what();
+            return false;
+        }
+    });
+
+    // speakers.enroll { name, meeting_id, cluster_id }
+    //   → { ok, duration_sec, confidence, warning? }
+    //
+    // Resolve meeting_id via g_meeting_index->find() (NOT dir name); find
+    // the cluster_id within the meeting's speakers.json; reject when
+    // duration_sec < 5.0f (web.cpp:457-463 quality gate); append the
+    // cluster's embedding to the named speaker profile, creating the
+    // profile if absent. `warning` fires when 0 < confidence < 0.5f.
+    server.on("speakers.enroll", [](const IpcRequest& req, IpcResponse& resp, IpcError& err) {
+        try {
+            if (!g_meeting_index) {
+                err.code = static_cast<int>(IpcErrorCode::InternalError);
+                err.message = "speakers.enroll: meeting index unavailable";
+                return false;
+            }
+            std::string name;
+            std::string meeting_id;
+            int64_t cluster_id = -1;
+            {
+                auto it = req.params.find("name");
+                if (it != req.params.end()) name = json_val_as_string(it->second);
+                auto it2 = req.params.find("meeting_id");
+                if (it2 != req.params.end()) meeting_id = json_val_as_string(it2->second);
+                auto it3 = req.params.find("cluster_id");
+                if (it3 != req.params.end()) cluster_id = json_val_as_int(it3->second, -1);
+            }
+            if (!is_safe_dirname(name)) {
+                err.code = static_cast<int>(IpcErrorCode::InvalidParams);
+                err.message = "speakers.enroll: invalid 'name'";
+                return false;
+            }
+            if (meeting_id.empty() || !is_valid_meeting_id(meeting_id)) {
+                err.code = static_cast<int>(IpcErrorCode::InvalidParams);
+                err.message = "speakers.enroll: 'meeting_id' must be a canonical "
+                              "lowercase UUID v4";
+                return false;
+            }
+            if (cluster_id < 0) {
+                err.code = static_cast<int>(IpcErrorCode::InvalidParams);
+                err.message = "speakers.enroll: 'cluster_id' missing or negative";
+                return false;
+            }
+            auto hit = g_meeting_index->find(meeting_id);
+            if (!hit.has_value()) {
+                err.code = static_cast<int>(IpcErrorCode::InvalidParams);
+                err.message = "speakers.enroll: unknown meeting_id " + meeting_id;
+                return false;
+            }
+            const fs::path meeting_path = *hit;
+
+            auto speakers = load_meeting_speakers(meeting_path);
+            const MeetingSpeaker* spk = nullptr;
+            for (const auto& s : speakers) {
+                if (s.cluster_id == static_cast<int>(cluster_id)) { spk = &s; break; }
+            }
+            if (!spk) {
+                err.code = static_cast<int>(IpcErrorCode::InvalidParams);
+                err.message = "speakers.enroll: cluster_id not found in meeting speakers";
+                return false;
+            }
+            if (spk->embedding.empty()) {
+                err.code = static_cast<int>(IpcErrorCode::InvalidParams);
+                err.message = "speakers.enroll: cluster has no embedding data";
+                return false;
+            }
+            if (spk->duration_sec < 5.0f) {
+                err.code = static_cast<int>(IpcErrorCode::InvalidParams);
+                err.message = "speakers.enroll: speaker has less than 5 seconds of audio — "
+                              "enrollment would be unreliable";
+                return false;
+            }
+
+            fs::path db_dir;
+            {
+                std::lock_guard<std::mutex> lock(g_server_config_mu);
+                db_dir = g_server_config.speaker_db.empty()
+                    ? default_speaker_db_dir() : g_server_config.speaker_db;
+            }
+            auto profiles = load_speaker_db(db_dir);
+            SpeakerProfile profile;
+            for (const auto& p : profiles) {
+                if (p.name == name) { profile = p; break; }
+            }
+            if (profile.name.empty()) {
+                profile.name = name;
+                profile.created = iso_now();
+            }
+            profile.updated = iso_now();
+            profile.embeddings.push_back(spk->embedding);
+            save_speaker(db_dir, profile);
+
+            resp.result["ok"] = true;
+            resp.result["duration_sec"] = static_cast<double>(spk->duration_sec);
+            resp.result["confidence"] = static_cast<double>(spk->confidence);
+            if (spk->confidence > 0.0f && spk->confidence < 0.5f) {
+                std::string warning = "Low confidence ("
+                    + std::to_string(spk->confidence).substr(0, 4)
+                    + ") — this enrollment may be inaccurate";
+                resp.result["warning"] = warning;
+            }
+            return true;
+        } catch (const std::exception& e) {
+            err.code = static_cast<int>(IpcErrorCode::InternalError);
+            err.message = e.what();
+            return false;
+        }
+    });
+
+    // speakers.remove_embedding { name, index } → { ok, remaining }
+    //
+    // Validate 0 <= index < embeddings.size(); erase by index; if the
+    // resulting profile is empty, remove the profile entirely via
+    // remove_speaker() and return remaining:0. Same wire shape as
+    // web.cpp:514's body — `index` is an int parameter, NOT an embedding
+    // blob to L2-match.
+    server.on("speakers.remove_embedding",
+              [](const IpcRequest& req, IpcResponse& resp, IpcError& err) {
+        try {
+            std::string name;
+            int64_t index = -1;
+            {
+                auto it = req.params.find("name");
+                if (it != req.params.end()) name = json_val_as_string(it->second);
+                auto it2 = req.params.find("index");
+                if (it2 != req.params.end()) index = json_val_as_int(it2->second, -1);
+            }
+            if (!is_safe_dirname(name)) {
+                err.code = static_cast<int>(IpcErrorCode::InvalidParams);
+                err.message = "speakers.remove_embedding: invalid 'name'";
+                return false;
+            }
+            if (index < 0) {
+                err.code = static_cast<int>(IpcErrorCode::InvalidParams);
+                err.message = "speakers.remove_embedding: 'index' missing or negative";
+                return false;
+            }
+
+            fs::path db_dir;
+            {
+                std::lock_guard<std::mutex> lock(g_server_config_mu);
+                db_dir = g_server_config.speaker_db.empty()
+                    ? default_speaker_db_dir() : g_server_config.speaker_db;
+            }
+            auto profiles = load_speaker_db(db_dir);
+            SpeakerProfile* found = nullptr;
+            for (auto& p : profiles) {
+                if (p.name == name) { found = &p; break; }
+            }
+            if (!found) {
+                err.code = static_cast<int>(IpcErrorCode::InvalidParams);
+                err.message = "speakers.remove_embedding: not_found";
+                return false;
+            }
+            if (static_cast<std::size_t>(index) >= found->embeddings.size()) {
+                err.code = static_cast<int>(IpcErrorCode::InvalidParams);
+                err.message = "speakers.remove_embedding: index out of range";
+                return false;
+            }
+            found->embeddings.erase(found->embeddings.begin() + static_cast<std::ptrdiff_t>(index));
+            if (found->embeddings.empty()) {
+                remove_speaker(db_dir, name);
+                resp.result["ok"] = true;
+                resp.result["remaining"] = static_cast<int64_t>(0);
+            } else {
+                found->updated = iso_now();
+                save_speaker(db_dir, *found);
+                resp.result["ok"] = true;
+                resp.result["remaining"] =
+                    static_cast<int64_t>(found->embeddings.size());
+            }
+            return true;
+        } catch (const std::exception& e) {
+            err.code = static_cast<int>(IpcErrorCode::InternalError);
+            err.message = e.what();
+            return false;
+        }
+    });
+
+    // speakers.relabel { meeting_id, cluster_id, new_label, update_profile? }
+    //   → { ok, old_label }
+    //
+    // Resolve meeting_id via find(); load_meeting_speakers; find cluster_id;
+    // capture old_label. When update_profile != false AND the cluster has
+    // an embedding: remove the embedding from the old profile via the
+    // L2-distance blob match helper at speaker_id.h:43 (remove_embedding —
+    // NOT an index removal — the daemon holds the blob via the meeting
+    // speakers.json), then add it to the new profile (create if absent).
+    // Then mutate the meeting speaker: label = new_label, identified = true,
+    // confidence = 1.0f. Save via save_meeting_speakers with the meeting's
+    // derive_meeting_timestamp.
+    server.on("speakers.relabel",
+              [](const IpcRequest& req, IpcResponse& resp, IpcError& err) {
+        try {
+            if (!g_meeting_index) {
+                err.code = static_cast<int>(IpcErrorCode::InternalError);
+                err.message = "speakers.relabel: meeting index unavailable";
+                return false;
+            }
+            std::string meeting_id;
+            std::string new_label;
+            int64_t cluster_id = -1;
+            bool update_profile = true;
+            {
+                auto it = req.params.find("meeting_id");
+                if (it != req.params.end()) meeting_id = json_val_as_string(it->second);
+                auto it2 = req.params.find("cluster_id");
+                if (it2 != req.params.end()) cluster_id = json_val_as_int(it2->second, -1);
+                auto it3 = req.params.find("new_label");
+                if (it3 != req.params.end()) new_label = json_val_as_string(it3->second);
+                auto it4 = req.params.find("update_profile");
+                if (it4 != req.params.end())
+                    update_profile = json_val_as_bool(it4->second, true);
+            }
+            if (meeting_id.empty() || !is_valid_meeting_id(meeting_id)) {
+                err.code = static_cast<int>(IpcErrorCode::InvalidParams);
+                err.message = "speakers.relabel: 'meeting_id' must be a canonical "
+                              "lowercase UUID v4";
+                return false;
+            }
+            if (cluster_id < 0) {
+                err.code = static_cast<int>(IpcErrorCode::InvalidParams);
+                err.message = "speakers.relabel: 'cluster_id' missing or negative";
+                return false;
+            }
+            if (new_label.empty() || !is_safe_dirname(new_label)) {
+                err.code = static_cast<int>(IpcErrorCode::InvalidParams);
+                err.message = "speakers.relabel: invalid 'new_label'";
+                return false;
+            }
+            auto hit = g_meeting_index->find(meeting_id);
+            if (!hit.has_value()) {
+                err.code = static_cast<int>(IpcErrorCode::InvalidParams);
+                err.message = "speakers.relabel: unknown meeting_id " + meeting_id;
+                return false;
+            }
+            const fs::path meeting_path = *hit;
+
+            auto meeting_speakers = load_meeting_speakers(meeting_path);
+            MeetingSpeaker* spk = nullptr;
+            for (auto& s : meeting_speakers) {
+                if (s.cluster_id == static_cast<int>(cluster_id)) { spk = &s; break; }
+            }
+            if (!spk) {
+                err.code = static_cast<int>(IpcErrorCode::InvalidParams);
+                err.message = "speakers.relabel: cluster_id not found in meeting speakers";
+                return false;
+            }
+
+            const std::string old_label = spk->label;
+
+            fs::path db_dir;
+            {
+                std::lock_guard<std::mutex> lock(g_server_config_mu);
+                db_dir = g_server_config.speaker_db.empty()
+                    ? default_speaker_db_dir() : g_server_config.speaker_db;
+            }
+
+            if (update_profile && !spk->embedding.empty()) {
+                if (spk->identified && !old_label.empty())
+                    remove_embedding(db_dir, old_label, spk->embedding);
+
+                auto profiles = load_speaker_db(db_dir);
+                SpeakerProfile profile;
+                for (const auto& p : profiles) {
+                    if (p.name == new_label) { profile = p; break; }
+                }
+                if (profile.name.empty()) {
+                    profile.name = new_label;
+                    profile.created = iso_now();
+                }
+                profile.updated = iso_now();
+                profile.embeddings.push_back(spk->embedding);
+                save_speaker(db_dir, profile);
+            }
+
+            spk->label = new_label;
+            spk->identified = true;
+            spk->confidence = 1.0f;
+            save_meeting_speakers(meeting_path, meeting_speakers,
+                                  derive_meeting_timestamp(meeting_path));
+
+            resp.result["ok"] = true;
+            resp.result["old_label"] = old_label;
+            return true;
+        } catch (const std::exception& e) {
+            err.code = static_cast<int>(IpcErrorCode::InternalError);
+            err.message = e.what();
+            return false;
+        }
+    });
+
+    // speakers.batch_reidentify → { ok, async: true, started_at }
+    //
+    // Async by construction. Sync execution on the poll thread would block
+    // every other client's health check + caption broadcast for 60+ s on
+    // a 100-meeting batch. We spawn a detached std::thread that runs
+    // load_speaker_db + discover_meetings + per-meeting re_identify_meeting
+    // + save_meeting_speakers, then clears the running flag. A second
+    // call while one is in flight is rejected with InvalidParams
+    // "batch in progress".
+    server.on("speakers.batch_reidentify",
+              [](const IpcRequest&, IpcResponse& resp, IpcError& err) {
+        bool expected = false;
+        if (!g_batch_reidentify_running.compare_exchange_strong(expected, true)) {
+            err.code = static_cast<int>(IpcErrorCode::InvalidParams);
+            err.message = "speakers.batch_reidentify: batch in progress";
+            return false;
+        }
+
+        fs::path db_dir;
+        fs::path meetings_root;
+        {
+            std::lock_guard<std::mutex> lock(g_server_config_mu);
+            db_dir = g_server_config.speaker_db.empty()
+                ? default_speaker_db_dir() : g_server_config.speaker_db;
+            meetings_root = g_server_config.meetings_root;
+        }
+
+#if RECMEET_USE_SHERPA
+        std::thread worker([db_dir, meetings_root]() {
+            try {
+                auto db = load_speaker_db(db_dir);
+                if (db.empty()) {
+                    g_batch_reidentify_running.store(false);
+                    return;
+                }
+                auto meetings = discover_meetings(meetings_root);
+                for (const auto& mtg : meetings) {
+                    if (!mtg.has_speakers) continue;
+                    const fs::path mp = meetings_root / mtg.name;
+                    auto spks = load_meeting_speakers(mp);
+                    if (spks.empty()) continue;
+                    auto result = re_identify_meeting(spks, db);
+                    if (!result.empty()) {
+                        save_meeting_speakers(mp, result,
+                                              derive_meeting_timestamp(mp));
+                    }
+                }
+            } catch (...) {
+                // Swallow — flag is the only thing other callers observe.
+            }
+            g_batch_reidentify_running.store(false);
+        });
+        worker.detach();
+#else
+        // Without sherpa we have no re_identify_meeting; clear the flag
+        // immediately and report success (no-op batch). Matches the
+        // best-effort character of the speakers.* family on non-sherpa
+        // builds.
+        g_batch_reidentify_running.store(false);
+#endif
+
+        resp.result["ok"] = true;
+        resp.result["async"] = true;
+        resp.result["started_at"] = iso_now();
+        return true;
+    });
+
+    // meetings.list → { meetings: <json_array_string>, count }
+    //
+    // Server-side equivalent of web.cpp's discover_meetings(). Iterates
+    // g_server_config.meetings_root and emits one MeetingInfo per dir
+    // (name, optional meeting_id, has_audio, has_speakers, has_summary,
+    // mtime_iso). meeting_id is omitted/null for legacy V1 meetings
+    // (pre-C.11 context.json without meeting_id) — the WebUI hides
+    // mutation buttons for these (migration note #2).
+    server.on("meetings.list", [](const IpcRequest&, IpcResponse& resp, IpcError& err) {
+        try {
+            fs::path meetings_root;
+            {
+                std::lock_guard<std::mutex> lock(g_server_config_mu);
+                meetings_root = g_server_config.meetings_root;
+            }
+            auto meetings = discover_meetings(meetings_root);
+            std::string arr = "[";
+            for (std::size_t i = 0; i < meetings.size(); ++i) {
+                if (i > 0) arr += ",";
+                const auto& m = meetings[i];
+                arr += "{\"name\":\"" + json_escape(m.name) + "\"";
+                if (m.meeting_id.has_value())
+                    arr += ",\"meeting_id\":\"" + json_escape(*m.meeting_id) + "\"";
+                else
+                    arr += ",\"meeting_id\":null";
+                arr += ",\"has_audio\":";
+                arr += (m.has_audio ? "true" : "false");
+                arr += ",\"has_speakers\":";
+                arr += (m.has_speakers ? "true" : "false");
+                arr += ",\"has_summary\":";
+                arr += (m.has_summary ? "true" : "false");
+                arr += ",\"mtime_iso\":\"" + json_escape(m.mtime_iso) + "\"}";
+            }
+            arr += "]";
+            resp.result["meetings"] = arr;
+            resp.result["count"] = static_cast<int64_t>(meetings.size());
+            return true;
+        } catch (const std::exception& e) {
+            err.code = static_cast<int>(IpcErrorCode::InternalError);
+            err.message = e.what();
+            return false;
+        }
+    });
+
+    // meetings.speakers { meeting_id } → { speakers: <json_array_string>, count }
+    //
+    // Resolve meeting_id via find(). Serialize each MeetingSpeaker as
+    // {cluster_id, label, identified, confidence, duration_sec}. The
+    // embedding blob is omitted — large, never rendered, and the relabel /
+    // enroll verbs that need it call load_meeting_speakers themselves.
+    server.on("meetings.speakers",
+              [](const IpcRequest& req, IpcResponse& resp, IpcError& err) {
+        try {
+            if (!g_meeting_index) {
+                err.code = static_cast<int>(IpcErrorCode::InternalError);
+                err.message = "meetings.speakers: meeting index unavailable";
+                return false;
+            }
+            std::string meeting_id;
+            {
+                auto it = req.params.find("meeting_id");
+                if (it != req.params.end())
+                    meeting_id = json_val_as_string(it->second);
+            }
+            if (meeting_id.empty() || !is_valid_meeting_id(meeting_id)) {
+                err.code = static_cast<int>(IpcErrorCode::InvalidParams);
+                err.message = "meetings.speakers: 'meeting_id' must be a canonical "
+                              "lowercase UUID v4";
+                return false;
+            }
+            auto hit = g_meeting_index->find(meeting_id);
+            if (!hit.has_value()) {
+                err.code = static_cast<int>(IpcErrorCode::InvalidParams);
+                err.message = "meetings.speakers: unknown meeting_id " + meeting_id;
+                return false;
+            }
+            const fs::path meeting_path = *hit;
+            auto speakers = load_meeting_speakers(meeting_path);
+            std::string arr = "[";
+            for (std::size_t i = 0; i < speakers.size(); ++i) {
+                if (i > 0) arr += ",";
+                const auto& s = speakers[i];
+                arr += "{\"cluster_id\":" + std::to_string(s.cluster_id)
+                    + ",\"label\":\"" + json_escape(s.label) + "\""
+                    + ",\"identified\":" + (s.identified ? "true" : "false")
+                    + ",\"confidence\":" + std::to_string(s.confidence)
+                    + ",\"duration_sec\":" + std::to_string(s.duration_sec)
+                    + "}";
+            }
+            arr += "]";
+            resp.result["speakers"] = arr;
+            resp.result["count"] = static_cast<int64_t>(speakers.size());
+            return true;
+        } catch (const std::exception& e) {
+            err.code = static_cast<int>(IpcErrorCode::InternalError);
+            err.message = e.what();
+            return false;
+        }
+    });
+
+    // meetings.read_note { meeting_id } → { path, content }
+    //
+    // Read Meeting_*.md from the meeting directory ONLY. No note_dir
+    // fallback (deliberate behavior change — see plan migration note #1).
+    // If no Meeting_*.md is found, return InvalidParams "not_found".
+    server.on("meetings.read_note",
+              [](const IpcRequest& req, IpcResponse& resp, IpcError& err) {
+        try {
+            if (!g_meeting_index) {
+                err.code = static_cast<int>(IpcErrorCode::InternalError);
+                err.message = "meetings.read_note: meeting index unavailable";
+                return false;
+            }
+            std::string meeting_id;
+            {
+                auto it = req.params.find("meeting_id");
+                if (it != req.params.end())
+                    meeting_id = json_val_as_string(it->second);
+            }
+            if (meeting_id.empty() || !is_valid_meeting_id(meeting_id)) {
+                err.code = static_cast<int>(IpcErrorCode::InvalidParams);
+                err.message = "meetings.read_note: 'meeting_id' must be a canonical "
+                              "lowercase UUID v4";
+                return false;
+            }
+            auto hit = g_meeting_index->find(meeting_id);
+            if (!hit.has_value()) {
+                err.code = static_cast<int>(IpcErrorCode::InvalidParams);
+                err.message = "meetings.read_note: unknown meeting_id " + meeting_id;
+                return false;
+            }
+            const fs::path meeting_path = *hit;
+
+            // Find Meeting_*.md in the meeting dir. No note_dir fallback.
+            fs::path note_path;
+            std::error_code ec;
+            if (fs::is_directory(meeting_path, ec)) {
+                for (const auto& entry : fs::directory_iterator(meeting_path, ec)) {
+                    if (ec) break;
+                    if (!entry.is_regular_file()) continue;
+                    const std::string fname = entry.path().filename().string();
+                    static constexpr const char* PREFIX = "Meeting_";
+                    static constexpr const char* SUFFIX = ".md";
+                    const std::size_t pre_n = std::strlen(PREFIX);
+                    const std::size_t suf_n = std::strlen(SUFFIX);
+                    if (fname.size() < pre_n + suf_n) continue;
+                    if (fname.compare(0, pre_n, PREFIX) != 0) continue;
+                    if (fname.compare(fname.size() - suf_n, suf_n, SUFFIX) != 0) continue;
+                    note_path = entry.path();
+                    break;
+                }
+            }
+            if (note_path.empty()) {
+                err.code = static_cast<int>(IpcErrorCode::InvalidParams);
+                err.message = "meetings.read_note: not_found";
+                return false;
+            }
+
+            std::ifstream in(note_path, std::ios::binary);
+            if (!in) {
+                err.code = static_cast<int>(IpcErrorCode::InternalError);
+                err.message = "meetings.read_note: cannot open note file";
+                return false;
+            }
+            std::string content((std::istreambuf_iterator<char>(in)),
+                                std::istreambuf_iterator<char>());
+            resp.result["path"] = note_path.filename().string();
+            resp.result["content"] = content;
             return true;
         } catch (const std::exception& e) {
             err.code = static_cast<int>(IpcErrorCode::InternalError);

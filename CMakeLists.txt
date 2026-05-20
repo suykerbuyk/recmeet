@@ -371,6 +371,13 @@ target_sources(recmeet_core PRIVATE src/upload_session.cpp)
 # into pipeline.cpp's load_meeting_id() (context.json reader).
 target_sources(recmeet_core PRIVATE src/meeting_index.cpp)
 
+# Phase E.6.1 — server-side meeting discovery helper (discover_meetings).
+# Pure std::filesystem; no ML deps. Colocated with the meetings.list IPC
+# verb in daemon.cpp rather than folded into meeting_index.cpp (which is a
+# strict meeting_id → path map — different concern). Lives in recmeet_core
+# alongside meeting_index.cpp; the daemon links it transitively.
+target_sources(recmeet_core PRIVATE src/meetings_browse.cpp)
+
 # Phase C.8 — server-resident per-job diarization cache. Pure stdlib; no
 # sherpa dependency (consumes already-extracted centroids). Lives in
 # recmeet_core so the daemon and pipeline.cpp's writer share the file
@@ -597,6 +604,9 @@ if(RECMEET_BUILD_TESTS)
         # out the three-type JobConfig model: precedence, submit/stream
         # round-trip, servers list, grep guards, moved-field migration.
         tests/test_w22b_phase4.cpp
+        # Phase E.6.1 — IPC round-trip tests for the 8 new speakers.* /
+        # meetings.* verbs that back the tray-bundled WebUI.
+        tests/test_speakers_meetings_ipc.cpp
     )
     # The test binary exercises both daemon-side surfaces (recmeet_core) and
     # client-side / standalone surfaces (run_recording + recmeet_capture), so
