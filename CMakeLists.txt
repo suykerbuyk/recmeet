@@ -467,8 +467,22 @@ if(GGML_AVAILABLE_BACKENDS)
     install(TARGETS ${GGML_AVAILABLE_BACKENDS} LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR})
 endif()
 
+# Always clean stale onnxruntime shadow libs from the install dir before
+# placing new ones (or none). Prevents a vendored→system transition from
+# leaving a stale, version-incompatible shadow that wins via the binary's
+# RUNPATH=$ORIGIN/../lib and breaks the loader with a missing-symbol error.
+install(CODE "
+    file(GLOB _stale_ort
+        \"\${CMAKE_INSTALL_PREFIX}/${CMAKE_INSTALL_LIBDIR}/libonnxruntime*.so*\")
+    foreach(_f IN LISTS _stale_ort)
+        message(STATUS \"Removing stale onnxruntime shadow: \${_f}\")
+        file(REMOVE \"\${_f}\")
+    endforeach()
+")
+
 # Install vendored onnxruntime shared libraries (built by scripts/build-onnxruntime.sh).
-# The binaries link against these at build time; RPATH ($ORIGIN/../lib) finds them at runtime.
+# Only fires when vendor/onnxruntime-local/ exists; otherwise the loader falls
+# through to the system onnxruntime via default search paths.
 set(_ORT_LOCAL_LIB "${CMAKE_SOURCE_DIR}/vendor/onnxruntime-local/lib")
 if(IS_DIRECTORY "${_ORT_LOCAL_LIB}")
     file(GLOB _ORT_LIBS "${_ORT_LOCAL_LIB}/libonnxruntime*.so*")
