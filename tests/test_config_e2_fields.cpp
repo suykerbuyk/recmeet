@@ -174,15 +174,20 @@ TEST_CASE("[e2] caption_latency_ms boundary values are accepted",
 
 TEST_CASE("[e2] caption_latency_ms session merge propagates into Config",
           "[e2][session_merge]") {
-    JobConfig daemon_yaml;
-    daemon_yaml.caption_latency_ms = 500;  // struct default
+    // ServerConfig has no `caption_latency_ms` (it's a client-side knob
+    // — see ClientConfig). The session-merge layer drops the session
+    // preference value straight onto JobConfig.caption_latency_ms, so
+    // the daemon-side base value comes from the JobConfig struct default
+    // (500), then session prefs overlay to 750.
+    ServerConfig daemon_yaml;
 
     SessionCredentials sess;
     SessionPreferences prefs;
     prefs.caption_latency_ms = 750;
 
+    PostprocessInput input{};
     auto env_lookup = [](const std::string&) { return std::string(); };
-    JobConfig merged = merge_creds_for_job(daemon_yaml, sess, prefs, env_lookup);
+    JobConfig merged = make_job_config(daemon_yaml, sess, prefs, input, env_lookup);
     CHECK(merged.caption_latency_ms == 750);
 }
 

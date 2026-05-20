@@ -5,6 +5,7 @@
 
 #include "config.h"
 #include "ipc_server.h"   // SessionCredentials, SessionPreferences
+#include "pipeline.h"     // PostprocessInput
 
 #include <functional>
 #include <map>
@@ -12,57 +13,64 @@
 
 namespace recmeet {
 
-// Phase A.6.1 — subprocess credential merge.
+// Phase E.2 Wave 2.2b — daemon-side per-job JobConfig assembly.
 //
-// The postprocess subprocess (`main.cpp`) reads its `Config` solely from
+// The postprocess subprocess (`main.cpp`) reads its `JobConfig` solely from
 // the JSON written by `daemon::write_job_config()`; it does NOT re-read
-// env vars or daemon.yaml. Without this merge, every postprocess job
-// loses summarization silently.
+// env vars or daemon.yaml. Without this assembly, every postprocess job
+// would lose summarization / per-client preferences / per-call dynamics
+// silently.
 //
-// `merge_creds_for_job` resolves the per-job `Config` from three sources
-// with the precedence chain documented in the plan body:
+// `make_job_config` constructs the per-job `JobConfig` from FOUR sources
+// with the precedence chain documented in the plan body and the
+// W2.2b dispatch brief:
 //
 //   1. Daemon env vars (`XAI_API_KEY` / `OPENAI_API_KEY` / `ANTHROPIC_API_KEY`)
-//      — operator override on the daemon host wins outright.
-//   2. `session.init` per-client credentials (the `SessionCredentials`
-//      slot populated through the A.6 handshake).
-//   3. `daemon.yaml` fallback — already loaded into `daemon_config` by
-//      `load_config()` at daemon startup.
+//      — operator override on the daemon host wins outright over the
+//      seven dual-resident fields (provider, api_keys, api_url, api_model,
+//      api_key, llm_model, llm_mmap).
+//   2. `session.init` per-client preferences + credentials
+//      (`SessionCredentials` + `SessionPreferences` populated through
+//      the A.6 handshake).
+//   3. `PostprocessInput` per-call dynamics — reprocess_dir, enroll_mode,
+//      enroll_name, context_inline. These are the W2.2b (E.2 d.1) fields
+//      that moved off ClientConfig because they are per-call, not
+//      persisted to client.yaml.
+//   4. `ServerConfig` fallback — daemon.yaml's view of provider, models,
+//      diarization knobs, VAD knobs, speaker DB, log paths, etc. This is
+//      the base layer; everything above overlays selectively.
 //
 // `env_lookup` is a pure-function injection point so tests can drive the
-// merge without `setenv` / `unsetenv`. The production callsite in
-// daemon.cpp passes a thin wrapper around `std::getenv`. The function
-// signature returns `std::map<std::string, std::string>` (rather than
-// `const char*`) so tests can build a static lookup with zero dependency
-// on the shell environment.
+// assembly without `setenv` / `unsetenv`. The production call site in
+// daemon.cpp passes a thin wrapper around `std::getenv` (via
+// `make_job_config_with_real_env` below). The function signature returns
+// `std::string` (rather than `const char*`) so tests can build a static
+// lookup with zero dependency on the shell environment.
 //
-// Pure / stateless — takes the inputs and returns a merged Config. No
-// global state, no I/O. The unit assertion required by iter-139 C-2
-// hangs off this function directly.
+// Pure / stateless — takes the inputs and returns a constructed JobConfig.
+// No global state, no I/O.
 //
-// `job_cfg` is the starting point — usually daemon.yaml's `g_config`
-// snapshot; the merge overlays env > session on top. Per-job fields
-// (output_dir, reprocess_dir, etc.) that are not part of the A.6
-// session pref surface pass through untouched.
-//
-// The `prefs` parameter also flows the A.6 preference fields
+// The `prefs` parameter flows the A.6 preference fields
 // (whisper_model, language, vocabulary, output_dir, note_dir,
-// mic_source, monitor_source, llm_model, captions_enabled) into
-// `job_cfg` so the subprocess sees the per-client view. `summarization_backend`
-// drives provider/llm-path selection downstream: `"local"` forces a
-// non-empty `llm_model`; `"http"` clears `llm_model` so the subprocess
-// uses the HTTP path; empty leaves whatever the merge produced.
-JobConfig merge_creds_for_job(
-    const JobConfig& daemon_config,
+// mic_source, monitor_source, llm_model, captions_enabled,
+// caption_latency_ms) into the JobConfig so the subprocess sees the
+// per-client view. `summarization_backend` drives provider/llm-path
+// selection downstream: `"local"` forces a non-empty `llm_model`;
+// `"http"` clears `llm_model` so the subprocess uses the HTTP path;
+// empty leaves whatever the assembly produced.
+JobConfig make_job_config(
+    const ServerConfig& srv,
     const SessionCredentials& session_creds,
     const SessionPreferences& session_prefs,
+    const PostprocessInput& input,
     const std::function<std::string(const std::string&)>& env_lookup);
 
 // Convenience wrapper that uses `std::getenv` for the env-lookup. Used
 // at the daemon's enqueue site. Tests use the injection form above.
-JobConfig merge_creds_for_job_with_real_env(
-    const JobConfig& daemon_config,
+JobConfig make_job_config_with_real_env(
+    const ServerConfig& srv,
     const SessionCredentials& session_creds,
-    const SessionPreferences& session_prefs);
+    const SessionPreferences& session_prefs,
+    const PostprocessInput& input);
 
 } // namespace recmeet

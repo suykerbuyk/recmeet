@@ -51,6 +51,20 @@ struct PostprocessInput {
     fs::path audio_path;
     std::string transcript_text;  ///< If empty, postprocessing will transcribe from audio_path.
     std::string timestamp;  ///< YYYY-MM-DD_HH-MM form. Empty if dir/audio doesn't match the canonical pattern.
+
+    // -- W2.2b: per-job dynamic fields, moved off ClientConfig (E.2 d.1) --
+    //
+    // These four fields used to live on the monolithic Config (and on
+    // ClientConfig briefly in W2.2a); Phase E.2 Wave 2.2b removes them
+    // from ClientConfig because they are per-call dynamics — never
+    // persisted to client.yaml. They are read by `make_job_config()`
+    // on the daemon side and copied into the resulting JobConfig that
+    // the subprocess sees. Empty / false defaults preserve the current
+    // behaviour of consumers that don't populate them.
+    fs::path reprocess_dir;
+    bool enroll_mode = false;
+    std::string enroll_name;
+    std::string context_inline;
 };
 
 /// Phase callback — called with phase name: "recording", "transcribing", "diarizing", "summarizing", "complete".
