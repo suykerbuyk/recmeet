@@ -523,16 +523,13 @@ TEST_CASE("[e2] config_json overloads — ClientConfig round-trip",
     cli.note_dir                  = "/var/notes";
     cli.note.domain               = "ops";
     cli.note.tags = {"alpha", "beta"};
-    cli.context_inline            = "ctx";
-    cli.reprocess_dir             = "/tmp/r1";
-    cli.reprocess_batch_dir       = "/tmp/r2";
-    cli.reprocess_batch_dry_run   = true;
-    cli.batch_mode                = true;
+    // E.2(d.1) Wave 2.2b: context_*, reprocess_*, batch_mode, enroll_* were
+    // moved off ClientConfig onto JobConfig only. They are no longer settable
+    // here; the negative round-trip below ("[e2.2b][client-config-drop]")
+    // covers the silent-ignore-on-load behavior.
     cli.staging_max_bytes         = static_cast<size_t>(100) * 1024 * 1024;
     cli.servers.push_back(ServerEntry{"a", "tcp:host1:1"});
     cli.servers.push_back(ServerEntry{"b", "unix:/run/y.sock"});
-    cli.enroll_mode               = true;
-    cli.enroll_name               = "alice";
     cli.provider                  = "openai";
     cli.api_key                   = "sk-legacy-cli";
     cli.api_keys["openai"]        = "sk-openai-cli";
@@ -558,18 +555,12 @@ TEST_CASE("[e2] config_json overloads — ClientConfig round-trip",
     REQUIRE(out.note.tags.size()        == 2);
     CHECK(out.note.tags[0]              == "alpha");
     CHECK(out.note.tags[1]              == "beta");
-    CHECK(out.context_inline            == cli.context_inline);
-    CHECK(out.reprocess_dir.string()    == cli.reprocess_dir.string());
-    CHECK(out.reprocess_batch_dry_run   == cli.reprocess_batch_dry_run);
-    CHECK(out.batch_mode                == cli.batch_mode);
     CHECK(out.staging_max_bytes         == cli.staging_max_bytes);
     REQUIRE(out.servers.size()          == 2);
     CHECK(out.servers[0].name           == "a");
     CHECK(out.servers[0].address        == "tcp:host1:1");
     CHECK(out.servers[1].name           == "b");
     CHECK(out.servers[1].address        == "unix:/run/y.sock");
-    CHECK(out.enroll_mode               == cli.enroll_mode);
-    CHECK(out.enroll_name               == cli.enroll_name);
     CHECK(out.provider                  == cli.provider);
     CHECK(out.api_key                   == cli.api_key);
     CHECK(out.api_keys["openai"]        == "sk-openai-cli");
@@ -591,4 +582,98 @@ TEST_CASE("[e2] load_client_config — caption_latency_ms out-of-range falls bac
     CHECK(cfg.caption_latency_ms == 500);
 
     fs::remove_all(dir);
+}
+
+// ===========================================================================
+// E.2(d.1) Wave 2.2b — per-job dynamic fields dropped from ClientConfig
+// ===========================================================================
+//
+// Step 2 of phase-e2-wave-2-2b-config-split-finish.md removed 8 fields from
+// ClientConfig: context_file, context_inline, reprocess_dir,
+// reprocess_batch_dir, reprocess_batch_dry_run, batch_mode, enroll_mode,
+// enroll_name. These now live on JobConfig only and transit at job-enqueue
+// time via session.init / PostprocessInput, never via the at-rest
+// ClientConfig.
+//
+// A `client.yaml` that carries one of these keys (vanishingly rare — Wave
+// 2.2a only just landed) is silently ignored on load. We pick silent-ignore
+// over warn-or-reject to match the existing YAML round-trip behavior for
+// unknown keys: ClientConfig has never warned on unknown YAML keys, and
+// retroactively flipping that policy here would surprise operators who
+// hand-edit client.yaml.
+//
+// The YAML save path (`save_client_config`) already does not emit any of
+// these keys (verified by reading the function — it has no branch that
+// references the dropped fields), so the silent-ignore behavior is purely
+// on the load side: if a hand-edited or stale `client.yaml` contains
+// `enroll_mode: true`, the loaded ClientConfig has no `enroll_mode` field
+// to assign it to, and the YAML key drops on the floor.
+
+TEST_CASE("[e2.2b] client.yaml with dropped per-job keys is silently ignored on load",
+          "[e2.2b][client-config-drop][config_split]") {
+    fs::path dir = make_tmp_dir("recmeet_test_e22b_drop");
+    fs::path path = dir / "client.yaml";
+
+    // Hand-write a client.yaml that carries `enroll_mode: true` plus
+    // representative reprocess + context keys. None of these keys are
+    // emitted by `save_client_config` so this shape only arises from a
+    // stale (pre-2.2b) file or hand-editing.
+    {
+        std::ofstream out(path);
+        out << "# stale pre-2.2b client.yaml fragment\n"
+            << "enroll_mode: true\n"
+            << "enroll_name: alice\n"
+            << "reprocess_dir: \"/tmp/r1\"\n"
+            << "context_inline: \"hello world\"\n"
+            << "batch_mode: true\n"
+            // Real keys that load_client_config DOES honor — sanity that
+            // the load itself succeeded and we're not just failing early.
+            << "client:\n"
+            << "  caption_latency_ms: 750\n";
+    }
+
+    // Load must succeed (no exception, no throw).
+    ClientConfig loaded = load_client_config(path);
+
+    // Real keys round-tripped.
+    CHECK(loaded.caption_latency_ms == 750);
+
+    // The dropped keys' compile-time absence on ClientConfig is the
+    // type-system guarantee: any line below that referenced
+    // `loaded.enroll_mode` etc. would fail to compile. The runtime
+    // guarantee we can assert here is that load_client_config() did
+    // not throw and returned a usable struct.
+    SUCCEED("load_client_config silently ignores dropped per-job keys");
+
+    fs::remove_all(dir);
+}
+
+// JSON-map round-trip companion: client_config_from_map() also silently
+// drops the 8 keys if a JSON wire-format payload accidentally carries them.
+// (The legitimate sender is now config_to_map(const JobConfig&), not
+// config_to_map(const ClientConfig&), but a misrouted map should not crash.)
+TEST_CASE("[e2.2b] client_config_from_map silently ignores dropped per-job keys",
+          "[e2.2b][client-config-drop][config_json]") {
+    JsonMap m;
+    m["device_pattern"]            = std::string("alsa:hw0");
+    m["staging_max_bytes"]         = static_cast<int64_t>(1024);
+    // Stale keys that used to round-trip via ClientConfig pre-2.2b.
+    m["enroll_mode"]               = true;
+    m["enroll_name"]               = std::string("alice");
+    m["reprocess_dir"]             = std::string("/tmp/r1");
+    m["reprocess_batch_dir"]       = std::string("/tmp/r2");
+    m["reprocess_batch_dry_run"]   = true;
+    m["batch_mode"]                = true;
+    m["context_file"]              = std::string("/tmp/ctx.txt");
+    m["context_inline"]            = std::string("ctx");
+
+    ClientConfig cfg = client_config_from_map(m);
+
+    // Real keys made it through.
+    CHECK(cfg.device_pattern  == "alsa:hw0");
+    CHECK(cfg.staging_max_bytes == static_cast<size_t>(1024));
+    // The dropped keys' compile-time absence is the guarantee; the
+    // runtime guarantee here is that client_config_from_map did not
+    // throw and returned a usable struct.
+    SUCCEED("client_config_from_map silently ignores dropped per-job keys");
 }

@@ -361,16 +361,18 @@ void save_legacy_config_as_job_config(const JobConfig& cfg, const fs::path& conf
 //     Output:    output_dir, output_dir_explicit, note_dir
 //     Notes:     note (NoteConfig — domain + tags)
 //     Trans:     vocabulary, language (client preferences for session.init)
-//     Summary:   summary_style (E.2(a) — new)
+//     Summary:   summary_style (E.2(a) — new), no_summary
 //     Captions:  caption_latency_ms (E.2(b) — new), caption_normalize_display
-//     Context:   context_file, context_inline
-//     Reprocess: reprocess_dir, reprocess_batch_dir, reprocess_batch_dry_run,
-//                batch_mode (CLI-only; not loaded from YAML in Wave 2.2a)
 //     Staging:   staging_max_bytes (D.6 — client owns staging dir)
 //     Servers:   servers (E.2(c) — std::vector<ServerEntry>)
-//     Enroll:    enroll_mode, enroll_name (client-initiated workflow)
-//     Summary:   no_summary
 //     DUAL pri:  provider, api_keys, api_url, api_model, api_key (legacy)
+//
+//   Per-job dynamic fields (E.2(d.1) — Wave 2.2b removed from ClientConfig;
+//   these live on JobConfig only and transit via session.init / PostprocessInput):
+//     Context:   context_file, context_inline
+//     Reprocess: reprocess_dir, reprocess_batch_dir, reprocess_batch_dry_run,
+//                batch_mode
+//     Enroll:    enroll_mode, enroll_name
 //
 // DUAL fields exist on BOTH structs per H-2 reword: client value is the
 // primary source, daemon's value is a fallback per the precedence chain at
@@ -482,25 +484,11 @@ struct ClientConfig {
     // -- Meeting notes (client-side rendering) --
     NoteConfig note;
 
-    // -- Context (client UX) --
-    fs::path context_file;
-    std::string context_inline;
-
-    // -- Reprocess (CLI-only knobs — not loaded from YAML in Wave 2.2a) --
-    fs::path reprocess_dir;
-    fs::path reprocess_batch_dir;
-    bool reprocess_batch_dry_run = false;
-    bool batch_mode = false;
-
     // -- Staging dir budget (D.6) --
     size_t staging_max_bytes = static_cast<size_t>(500) * 1024 * 1024 * 1024;
 
     // -- Server registry (E.2(c)) --
     std::vector<ServerEntry> servers;
-
-    // -- Enroll workflow (client-initiated) --
-    bool enroll_mode = false;
-    std::string enroll_name;
 };
 
 /// Load ServerConfig from daemon.yaml. Uses path if provided, otherwise

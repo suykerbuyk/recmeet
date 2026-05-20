@@ -876,16 +876,13 @@ ClientConfig to_client_config(const JobConfig& cfg) {
     c.output_dir_explicit        = cfg.output_dir_explicit;
     c.note_dir                   = cfg.note_dir;
     c.note                       = cfg.note;
-    c.context_file               = cfg.context_file;
-    c.context_inline             = cfg.context_inline;
-    c.reprocess_dir              = cfg.reprocess_dir;
-    c.reprocess_batch_dir        = cfg.reprocess_batch_dir;
-    c.reprocess_batch_dry_run    = cfg.reprocess_batch_dry_run;
-    c.batch_mode                 = cfg.batch_mode;
     c.staging_max_bytes          = cfg.staging_max_bytes;
     c.servers                    = cfg.servers;
-    c.enroll_mode                = cfg.enroll_mode;
-    c.enroll_name                = cfg.enroll_name;
+    // Per-job dynamic fields (context_file, context_inline, reprocess_dir,
+    // reprocess_batch_dir, reprocess_batch_dry_run, batch_mode, enroll_mode,
+    // enroll_name) are intentionally dropped on convert — they live on
+    // JobConfig only (E.2(d.1), Wave 2.2b) and transit via session.init /
+    // PostprocessInput, never via the at-rest ClientConfig.
     return c;
 }
 

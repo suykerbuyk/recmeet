@@ -408,14 +408,6 @@ JsonMap config_to_map(const ClientConfig& cfg) {
         m["note_tags"] = joined;
     }
 
-    m["context_file"]              = cfg.context_file.string();
-    m["context_inline"]            = cfg.context_inline;
-
-    m["reprocess_dir"]             = cfg.reprocess_dir.string();
-    m["reprocess_batch_dir"]       = cfg.reprocess_batch_dir.string();
-    m["reprocess_batch_dry_run"]   = cfg.reprocess_batch_dry_run;
-    m["batch_mode"]                = cfg.batch_mode;
-
     m["staging_max_bytes"]         = static_cast<int64_t>(cfg.staging_max_bytes);
 
     m["servers.count"]             = static_cast<int64_t>(cfg.servers.size());
@@ -425,9 +417,9 @@ JsonMap config_to_map(const ClientConfig& cfg) {
         m[prefix + "address"] = cfg.servers[i].address;
     }
 
-    m["enroll_mode"]               = cfg.enroll_mode;
-    m["enroll_name"]               = cfg.enroll_name;
-
+    // Per-job dynamic fields (context_*, reprocess_*, batch_mode, enroll_*)
+    // are NOT part of the ClientConfig wire format — they live on JobConfig
+    // and transit via session.init / PostprocessInput (E.2(d.1), Wave 2.2b).
     return m;
 }
 
@@ -608,14 +600,6 @@ ClientConfig client_config_from_map(const JsonMap& m) {
         }
     }
 
-    path("context_file", cfg.context_file);
-    str("context_inline", cfg.context_inline);
-
-    path("reprocess_dir", cfg.reprocess_dir);
-    path("reprocess_batch_dir", cfg.reprocess_batch_dir);
-    b("reprocess_batch_dry_run", cfg.reprocess_batch_dry_run);
-    b("batch_mode", cfg.batch_mode);
-
     sz("staging_max_bytes", cfg.staging_max_bytes);
 
     {
@@ -638,9 +622,12 @@ ClientConfig client_config_from_map(const JsonMap& m) {
         }
     }
 
-    b("enroll_mode", cfg.enroll_mode);
-    str("enroll_name", cfg.enroll_name);
-
+    // Per-job dynamic fields (context_*, reprocess_*, batch_mode, enroll_*)
+    // are silently ignored on load — they were removed from ClientConfig in
+    // E.2(d.1) Wave 2.2b. Existing client.yaml files carrying these keys
+    // (vanishingly rare since Wave 2.2a only just landed) lose them on
+    // round-trip. This matches the existing YAML round-trip behavior for
+    // unknown keys (read-then-drop, no warning, no rejection).
     return cfg;
 }
 
