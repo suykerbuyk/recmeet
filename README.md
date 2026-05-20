@@ -1,6 +1,6 @@
 # recmeet
 
-A local-first meeting recorder for Linux. Records audio from any source (Zoom, Teams, Google Meet, VoIP, phone calls), transcribes with [whisper.cpp](https://github.com/ggerganov/whisper.cpp), identifies speakers, and summarizes into structured Markdown notes — all on your own hardware. No cloud accounts, no subscriptions, no bots joining your meetings, no one else touching your data.
+A local-first meeting recorder for Linux. Records audio from any source (Zoom, Teams, Google Meet, VoIP, phone calls), transcribes with [whisper.cpp](https://github.com/ggerganov/whisper.cpp), identifies speakers with [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx), and summarizes with [llama.cpp](https://github.com/ggerganov/llama.cpp) or a cloud API — all on your own hardware. No cloud accounts, no subscriptions, no bots joining your meetings, no one else touching your data.
 
 ## Why this exists
 
@@ -8,14 +8,14 @@ Every commercial meeting transcription service — Otter, Fireflies, and the res
 
 Unacceptable.
 
-recmeet was designed as a Python prototype in under two hours using local open-source models, proving that a single Linux machine can record, transcribe, and summarize any meeting without sending a byte off-box. It was then rewritten as a single C++ binary to eliminate the Python/pip/venv dependency chain entirely — one static binary, zero runtime dependencies, runs on any Linux box with PipeWire.
+recmeet was designed as a Python prototype in under two hours using local open-source models, proving that a single Linux machine can record, transcribe, and summarize any meeting without sending a byte off-box. It was then rewritten as a C++ binary anchored to three native-code inference engines (whisper.cpp + sherpa-onnx + llama.cpp), eliminating the Python/pip/venv dependency chain and producing a deployment that runs on hardware ranging from a 2015 server to a 2024 laptop.
 
 The result: full transcriptions with speaker labels, professionally structured summaries with action items, output as standard Markdown files on your local filesystem. No subscriptions. No cloud uploads. No one between you and your data.
 
 ## What it does
 
 - **Records** mic input and speaker output simultaneously via PipeWire/PulseAudio — captures both sides of any conversation regardless of platform
-- **Transcribes** with whisper.cpp (tiny through large-v3 models, auto-downloaded on first use), with vocabulary hints to improve accuracy for names and domain-specific terms; auto-detects Vulkan GPU acceleration at build time (~26× faster on whisper-medium / Radeon Pro W5500) with transparent CPU fallback
+- **Transcribes** with whisper.cpp (tiny through large-v3 models, auto-downloaded on first use), with vocabulary hints to improve accuracy for names and domain-specific terms; auto-detects Vulkan GPU acceleration at build time (~4× real-time on whisper-medium / Radeon Pro W5500) with transparent CPU fallback
 - **Identifies speakers** via sherpa-onnx diarization (Pyannote segmentation + 3D-Speaker embeddings), with cross-session speaker identification — enroll voices once, get real names in every transcript
 - **Summarizes** via cloud API (xAI/OpenAI/Anthropic — all OpenAI-compatible) or a local GGUF model via llama.cpp — your choice
 - **Outputs** timestamped transcripts, structured summaries, and meeting notes with YAML frontmatter (Obsidian-compatible)
@@ -23,6 +23,178 @@ The result: full transcriptions with speaker labels, professionally structured s
 - **Daemon architecture** — a background daemon owns all pipeline logic; the CLI and tray are thin IPC clients
 - **MCP server** for IDE integration — exposes meeting data to Claude Code, Claude Desktop, and other MCP-compatible tools
 - **AI agent CLI** for pre-meeting prep and post-meeting follow-up — searches past meetings, drafts briefings, and generates follow-up communications using Claude
+
+## Local AI infrastructure
+
+recmeet is anchored to four native-code inference engines linked into one C++ binary. Two engineering choices set the constraints that shape everything else: **a hard 16 GB host memory ceiling target** (4 hours of audio plus context notes, no OOM, no swap) and **a single-binary deployment** with GPU and per-ISA CPU compute backends loaded as `dlopen()` plugins — the same artifact runs on a 2015 server with SSE 4.2 and a 2024 laptop with AVX-512 and a Vulkan-capable GPU.
+
+### Memory containment — 4 hours of audio on a 16 GB host
+
+The target: process up to **4 hours of meeting audio plus context notes on a host with a hard 16 GB total memory ceiling**, end-to-end through transcription, diarization, speaker identification, and summarization, without OOM and without the operator pre-splitting the file. Validated end-to-end against a 60-minute real fixture under a `MemoryMax=8G` systemd cgroup gate.
+
+Three load-bearing containment layers, each enforced independently:
+
+1. **systemd cgroup caps** (`dist/recmeet-daemon.service.in`) — `MemoryHigh=10G`, `MemoryMax=14G`, `MemorySwapMax=0`. Cgroup-enforced by the kernel. Even an unrecoverable workload reaps only this unit, not the host.
+2. **Subprocess isolation** — postprocessing runs as a `fork()`ed child. Crashes or cgroup hard-cap hits kill only the child. The daemon stays alive, the recorded audio is preserved, and the operator gets a precise error rather than a global SIGKILL.
+3. **Chunked diarization** (next section) — when audio length exceeds ~17.5 minutes, the pipeline auto-engages a custom chunked algorithm so peak working set is bounded by chunk size rather than meeting length.
+
+Below the chunk threshold the single-call path runs unchanged — short meetings pay no chunking overhead. The postprocessing subprocess also self-limits at 12 GB (`RECMEET_RSS_LIMIT_MB=12288`) as defense-in-depth behind the cgroup; on overflow it writes a precise error to stderr and exits cleanly without a deadlock or zombie.
+
+### Long-audio diarization — chunked windows with centroid stitching
+
+A custom algorithm built on top of sherpa-onnx that bounds per-chunk peak working set to ≤ 6 GB on 60-minute real audio (vs. ~11 GB working set for the equivalent un-chunked single-call path on the same fixture):
+
+1. **Slice** the audio into ~15-minute windows with ~30-second overlap. Each chunk has a *core* (segment-ownership zone) and an *overlap* region (extra context across boundaries).
+2. **Reuse one `DiarizeSession` and one `SpeakerEmbeddingSession`** across every chunk. sherpa's pyannote segmentation and 3D-Speaker embedding models (~45 MB combined) stay loaded for the whole run; only the cheap clustering object rebuilds per chunk via `set_clustering()`. Without session reuse, a 16-chunk run would reload ~720 MB of models — the chunking wall-clock budget falls apart.
+3. **Extract one centroid per chunk-local speaker** with the shared embedding session.
+4. **Stitch** chunk-local IDs into a global registry by cosine similarity on L2-normalized centroids (threshold `0.6` by default, matching the existing voiceprint match default). Centroids are stored *raw* (non-normalized) so the on-disk `MeetingSpeaker.embedding` byte-shape stays compatible with the single-call path.
+5. **Own segments by midpoint-in-core, emit at full extent.** A boundary segment whose midpoint falls inside chunk *i*'s core is emitted by chunk *i* in full, even if its trailing edge spills into chunk *i+1*. The downstream `merge_speakers()` max-overlap rule absorbs the benign duplicate.
+6. **Compact global IDs to `0..N-1` contiguous** after optional `num_speakers` ceiling enforcement. Without compaction a greedy-merge of `{0,1,2,3} → {0,1,3}` would surface as `Speaker_01, Speaker_02, Speaker_04` in transcripts.
+7. **Bypass re-extraction in identify-speakers.** The chunked diarize has already produced one centroid per global cluster; the pipeline calls `identify_speakers_with_centroids(centroids, db, threshold)` instead of `identify_speakers(samples, ...)`. This skips the ~10 GB working-set spike the second extractor pass would otherwise cost on long audio.
+
+Implementation in `src/diarize.cpp`; data-flow diagrams in `docs/ARCHITECTURE.md#diarization`.
+
+### Inference stack at a glance
+
+| Engine | Role | Format | Where it runs |
+|---|---|---|---|
+| **whisper.cpp** | Batch transcription | GGUF (75 MB – 3.1 GB) | CPU or Vulkan GPU |
+| **sherpa-onnx** | Diarization (Pyannote segmentation + 3D-Speaker embeddings), voiceprint matching, Silero VAD, streaming Zipformer captions | ONNX | CPU |
+| **llama.cpp** | Local LLM summarization | GGUF (~2 – 5 GB) | CPU |
+| **onnxruntime** (vendored, built from source) | sherpa-onnx backend | shared library | CPU |
+
+All four engines vendored and integrated at build time. No Python, no pip, no virtualenv. The main binary is C++; compute backends ship as `dlopen`-loaded `libggml-*.so` plugins so the same artifact runs across a wide ISA + GPU matrix without `DT_NEEDED` entries for any GPU library.
+
+<details>
+<summary><b>GPU plugin architecture — Vulkan + per-ISA CPU plugin discovery</b></summary>
+
+`recmeet` builds with **Vulkan GPU acceleration** auto-detected at configure time whenever the host has the toolchain (`libvulkan` + headers + `glslc`). The build is a **single binary that uses GPU when available and silently falls back to CPU when not.** GPU backends ship as separate `libggml-vulkan.so` plugins loaded at startup; `ldd build/recmeet | grep vulkan` is empty even on a Vulkan-enabled build. Move the binary to a host with no GPU and it still runs.
+
+The same plugin model carries per-ISA CPU variants. With `GGML_BACKEND_DL=ON` + `GGML_CPU_ALL_VARIANTS=ON`, ggml emits one CPU plugin per x86 ISA tier (`libggml-cpu-sse42.so`, `libggml-cpu-avx.so`, `libggml-cpu-avx2.so`, `libggml-cpu-skylakex.so`, `libggml-cpu-icelake.so`, and more — 10+ variants on a current Arch build). At startup each is scored against the host's CPU capability flags; the highest-supported variant wins. The same binary runs on a 2015 Sandy Bridge server and a 2024 Cooper Lake laptop.
+
+Plugin discovery is deterministic. `recmeet::load_backends()` resolves the plugin directory from `/proc/self/exe`:
+
+1. `$RECMEET_GGML_BACKEND_PATH` — test/dev override
+2. `<exe-dir>/../lib` — production install layout (e.g. `~/.local/bin/recmeet` → `~/.local/lib/`)
+3. `<exe-dir>/bin` — in-tree build layout (`build/recmeet` → `build/bin/`)
+4. `<exe-dir>` — alternate co-located layout
+
+We resolve the path ourselves rather than relying on ggml's built-in `$ORIGIN/../lib` macro because `dlopen()` does not expand `$ORIGIN` the way `ld.so` does for `RPATH` — ggml's default search ultimately falls through to a CWD scan (attacker-plantable). The compile-time `GGML_BACKEND_DIR=$ORIGIN/../lib` pin remains as defense in depth.
+
+```bash
+# Default — autodetect Vulkan if the toolchain is present, warn if missing, fall back to CPU
+make build
+
+# Required — fail configure if Vulkan can't be enabled
+cmake -B build -G Ninja -DRECMEET_GGML_VULKAN=ON
+
+# Force CPU-only (e.g. distro packagers shipping a universal artifact)
+cmake -B build -G Ninja -DRECMEET_GGML_VULKAN=OFF
+```
+
+At daemon startup the **active-backend banner** prints on stderr (mirrored unconditionally, so it shows up under `journalctl --user -u recmeet-daemon.service` even at the default `error` log level):
+
+    ggml: backend registry: CPU, Vulkan
+    ggml: active backend: Vulkan (AMD Radeon Pro W5500 (RADV NAVI10), 8192 MB)
+
+If a non-CPU backend registered but exposes zero devices (e.g. `libggml-vulkan.so` loaded on a host without a working Vulkan ICD), a `WARN` line surfaces the gap before showing the CPU-fallback active-backend line.
+
+See [docs/BUILD.md](docs/BUILD.md#gpu-acceleration-vulkan) for the toolchain matrix, per-distro install hints, and the full plugin discovery flow.
+
+</details>
+
+<details>
+<summary><b>Subprocess crash isolation and watchdog</b></summary>
+
+Postprocessing runs as a `fork()`ed child of the daemon, not in-process. The child receives its config via a `--config-json` handoff (parent serializes, child reads), reports phase + progress events back over a stdout pipe as NDJSON, and writes the meeting note + speakers file before exiting.
+
+This shape solves two real problems that long-audio postprocessing hits in production:
+
+- **onnxruntime memory growth.** sherpa-onnx's underlying onnxruntime can leak working set across long-audio diarization runs. In-process this eventually OOMs the daemon. Forked, it eventually exits or the cgroup reaps it; the daemon stays alive.
+- **onnxruntime thread-pool deadlock.** With sherpa-onnx threads uncapped on long audio, the onnxruntime thread pool can deadlock during diarization. Mitigated by capping sherpa-onnx to 4 threads, but the watchdog catches anything that slips through.
+
+The watchdog is dual-timestamp:
+
+- `last_progress_at` — updated on every progress event the child writes
+- `last_heartbeat_at` — updated on every 10 s heartbeat the child's heartbeat thread writes
+
+If `last_progress_at` lags by more than 300 s the daemon SIGTERMs the child (with SIGKILL escalation and cgroup-aware grace handling). Heartbeat-only liveness is explicitly *not* sufficient to suppress detection — that was the failure mode of the v1 watchdog that the iter-95 dual-timestamp rewrite fixed.
+
+Defense in depth: the child also self-limits at `RECMEET_RSS_LIMIT_MB=12288` and writes a precise error to stderr on overflow. The cgroup at `MemoryMax=14G` is the real backstop; the self-limit is faster to fire under uncontended growth but stalls under uninterruptible kernel sleep.
+
+</details>
+
+<details>
+<summary><b>Speaker identification — cross-session voiceprint matching</b></summary>
+
+Diarization assigns generic `Speaker_01`, `Speaker_02`, … labels to clusters within a single recording. Speaker identification matches those clusters against a persistent voiceprint database so the same person gets their real name in every transcript.
+
+**Embedding model:** sherpa-onnx 3D-Speaker `eres2net_base` — same model already loaded for diarization. No additional download required when speaker ID is enabled.
+
+**Match algorithm:** cosine similarity on averaged speaker centroids. Each enrolled speaker has one or more 192-dimensional float embedding vectors stored as JSON; the in-memory `SpeakerEmbeddingManager` averages them internally. `GetBestMatches(mgr, embedding, threshold, 1)` returns the highest-scoring enrolled name above the threshold (`0.6` default, configurable via `--speaker-threshold`). Conflict resolution prevents two clusters from being assigned the same name — highest score wins.
+
+**On-disk database:** `~/.local/share/recmeet/speakers/<Name>.json` — one file per person:
+
+```json
+{
+  "name": "John",
+  "created": "2026-03-08T10:00:00Z",
+  "updated": "2026-03-09T14:30:00Z",
+  "embeddings": [
+    [0.12, -0.34, 0.56, ...],
+    [0.11, -0.32, 0.58, ...]
+  ]
+}
+```
+
+Each embedding is ~2–4 KB. Multiple enrollments per speaker improve accuracy; sherpa-onnx averages them at match time.
+
+**Feedback loop to transcription:** enrolled speaker names are automatically passed to whisper as `initial_prompt` vocabulary hints, biasing the decoder toward correct spellings. Enroll "John Suykerbuyk" once and whisper stops producing phonetic mangles like "John Seck-Rick" in every subsequent transcript.
+
+Enroll from any past recording:
+
+```bash
+# Interactive — recmeet shows speakers with durations, you pick one
+./build/recmeet --enroll "John" --from meetings/2026-03-08_14-30/
+
+# Non-interactive — directly enroll speaker 1
+./build/recmeet --enroll "John" --from meetings/2026-03-08_14-30/ --speaker 1
+```
+
+Test identification on a recording without modifying it:
+
+```bash
+./build/recmeet --identify meetings/2026-03-09_09-00/
+```
+
+Implementation in `src/speaker_id.cpp`; full data flow in `docs/ARCHITECTURE.md#speaker-identification`.
+
+</details>
+
+<details>
+<summary><b>Vendored dependencies and build pipeline</b></summary>
+
+The four inference engines are vendored via CMake `FetchContent`, integrated at build time, and shipped as part of the install set:
+
+- **whisper.cpp + ggml** — `BUILD_SHARED_LIBS=ON` since v1.6.0; installs `libwhisper.so` + `libggml.so` + `libggml-base.so` to `<prefix>/lib/`
+- **llama.cpp** — `BUILD_SHARED_LIBS=ON`; installs `libllama.so` to `<prefix>/lib/`
+- **sherpa-onnx** — static lib (`libsherpa-onnx-c-api.so`), pulled from upstream `k2-fsa/sherpa-onnx@v1.12.27` with a small set of vendored patches (see `cmake/sherpa-onnx-patches/`)
+- **onnxruntime** — *can* be built from source via `scripts/build-onnxruntime.sh` (~20 min on first build, see below); otherwise comes from the distro package
+
+The onnxruntime build-from-source path solves a real problem on rolling-release distros: the system `onnxruntime-cpu` package can break unpredictably from protobuf version upgrades or GCC ABI changes (Arch's protobuf 33 → 34 jump produced SIGABRT during ONNX model parsing for several months). Building it locally with the host GCC and bundling protobuf internally eliminates both crash vectors.
+
+The script also auto-patches onnxruntime 1.23.2 for GCC 15's stricter transitive-include behavior: `core/common/semver.h` no longer compiles cleanly because it relied on `<cstdint>` being pulled in by another header. The build script detects the missing include via `grep` and `sed`-injects `#include <cstdint>` after `#include "core/common/status.h"` before invoking the upstream `build.sh`. No operator action needed; the patch is documented so rolling-distro users on GCC 15+ know what the script is doing.
+
+**Library split (iter 104) for thin-client deployment.** The C++ source compiles into two static libraries:
+
+- `recmeet_ipc` — config, IPC client/server, util, NDJSON. **No ML deps.**
+- `recmeet_core` — `recmeet_ipc` + the ML pipeline (whisper, sherpa-onnx, llama).
+
+`recmeet-tray` links only `recmeet_ipc` — the tray applet does not pull in onnxruntime, whisper.cpp, or llama.cpp. This keeps the tray's binary size and resident memory low, and unblocks a future thin-client architecture (operator-host tray, compute on a separate daemon host).
+
+**Other portability investigations:** `zig cc` + `musl` was investigated as a static-binary path (iter 100) and ruled out — libc++/libstdc++ ABI incompatibility, musl C++ exception handling bugs, no pre-built musl onnxruntime. Revisit when zig adds libstdc++ linking support (issue [#3936](https://github.com/ziglang/zig/issues/3936)).
+
+</details>
 
 ## Quick start
 
@@ -101,11 +273,11 @@ Record ──► Transcribe ──► Diarize ──► Identify ──► Summa
 
 1. **Record**: PipeWire captures the mic via `pw_stream`; PulseAudio's `pa_simple` captures the speaker monitor (`.monitor` sources are a PulseAudio abstraction that PipeWire doesn't reliably handle, especially over Bluetooth). Both streams are mixed in-process into a single WAV.
 
-2. **Transcribe**: whisper.cpp runs locally on CPU, producing timestamped segments. Models are GGUF format, auto-downloaded from Hugging Face on first use (141 MB for `base`, up to 1.5 GB for `large-v3`). Vocabulary hints bias the decoder toward correct spellings of names and domain terms — enrolled speaker names are included automatically.
+2. **Transcribe**: whisper.cpp runs locally on CPU or Vulkan GPU, producing timestamped segments. Models are GGUF format, auto-downloaded from Hugging Face on first use (141 MB for `base`, up to 1.5 GB for `large-v3`). Vocabulary hints bias the decoder toward correct spellings of names and domain terms — enrolled speaker names are included automatically.
 
-3. **Diarize** (optional, on by default): sherpa-onnx labels each segment with `Speaker_01`, `Speaker_02`, etc. using neural speaker embeddings and clustering. Configurable threshold for tuning speaker count detection. Long audio (over ~17 minutes at default settings) is automatically processed in overlapping chunks; chunk-local speaker IDs are stitched into a global registry by cosine-similarity matching on raw centroids, keeping peak memory bounded by chunk size rather than meeting length. See `docs/ARCHITECTURE.md#diarization` for the chunk + stitch flow.
+3. **Diarize** (optional, on by default): sherpa-onnx labels each segment with `Speaker_01`, `Speaker_02`, etc. using neural speaker embeddings and clustering. Configurable threshold for tuning speaker count detection. Long audio (over ~17 minutes at default settings) is automatically processed in overlapping chunks with shared diarize + embedding sessions and cosine-similarity centroid stitching, keeping peak memory bounded by chunk size rather than meeting length. See [Long-audio diarization](#long-audio-diarization--chunked-windows-with-centroid-stitching) above for the algorithm.
 
-4. **Identify** (optional, on by default when speakers are enrolled): Matches diarization clusters against enrolled voiceprints using cosine similarity on 3D-Speaker embeddings. Enrolled speakers get their real names (`John`, `Alice`) instead of generic labels. The speaker database lives at `~/.local/share/recmeet/speakers/` — one JSON file per person containing their averaged embedding vectors. Enroll speakers from past recordings with `recmeet --enroll "Name" --from meetings/DIR/`. Enrolled names are automatically passed to whisper as vocabulary hints, improving transcription accuracy for unusual names.
+4. **Identify** (optional, on by default when speakers are enrolled): Matches diarization clusters against enrolled voiceprints using cosine similarity on 3D-Speaker embeddings. Enrolled speakers get their real names (`John`, `Alice`) instead of generic labels. Enroll speakers from past recordings with `recmeet --enroll "Name" --from meetings/DIR/`. See [Speaker identification](#local-ai-infrastructure) for the algorithm + database format.
 
 5. **Summarize**: Either a cloud API call (xAI, OpenAI, or Anthropic — all use the same OpenAI-compatible endpoint) or a local GGUF model via llama.cpp. Same structured prompt for both paths. Dynamic context sizing with token-level truncation for long meetings.
 
@@ -196,7 +368,7 @@ Any GGUF-format model compatible with llama.cpp will work. Download quantized ve
 
 Real-time English captions during recording, displayed on the connected tray
 client and (optionally) on stderr from the CLI. Captions appear with
-~200-700 ms latency and are persisted as a `.vtt` sidecar alongside the
+~200–700 ms latency and are persisted as a `.vtt` sidecar alongside the
 meeting audio.
 
 Captions are **opt-in per recording** — they consume CPU that some users
@@ -230,7 +402,7 @@ opens a small caption overlay window during the next recording.
 Apache-2.0, English-only). Auto-downloaded on first use into
 `~/.local/share/recmeet/models/sherpa/online/en-2023-06-26/`. The CLI / tray
 prompts before downloading if the model isn't cached. A smaller
-`en-small` (~28 MB) variant is available via `--caption-model en-small`
+`en-small` variant is available via `--caption-model en-small`
 for low-end hosts.
 
 ### Output
@@ -256,6 +428,15 @@ hello and welcome to the meeting
 let's start with the status update
 ```
 
+### Source policy
+
+In dual-mode recordings (both mic and monitor) live captions are wired to
+the **monitor source** — the operator's own voice is recorded and
+post-processed normally but does NOT appear in the live caption overlay.
+This serves the hearing-comprehension use case (captioning remote speakers
+with accents, hearing issues, or response latency). In `--mic-only`
+recordings, captions fall back to the mic as a dictation preview.
+
 ### Limitations (V1)
 
 - **English-only.** Captions emit only when `language` is `en` (or unset
@@ -270,30 +451,6 @@ let's start with the status update
   cleanly but `--show-captions` is a no-op (the engine reports a
   one-shot degraded event and recording continues without captions).
 
-## GPU acceleration
-
-`recmeet` builds with **Vulkan GPU acceleration** by default whenever the host has the toolchain installed (`libvulkan` + headers + `glslc`). On a Radeon Pro W5500 with Mesa RADV, whisper-medium on a 63-minute meeting runs in ~16 minutes on GPU vs ~7 hours on CPU — roughly 26× faster. Speaker diarization stays on CPU regardless (onnxruntime would need a separate ROCm/MIGraphX build).
-
-The build is a **single binary that uses GPU when available and silently falls back to CPU when not.** GPU backends ship as separate `libggml-vulkan.so` plugins loaded at startup; `ldd build/recmeet | grep vulkan` is empty even on a Vulkan-enabled build. Move the binary to a host with no GPU and it still runs.
-
-```bash
-# Default — autodetect Vulkan if the toolchain is present, warn if missing pieces, fall back to CPU
-make build
-
-# Required — fail configure if Vulkan can't be enabled
-cmake -B build -G Ninja -DRECMEET_GGML_VULKAN=ON
-
-# Force CPU-only (e.g. distro packagers shipping a universal artifact)
-cmake -B build -G Ninja -DRECMEET_GGML_VULKAN=OFF
-```
-
-At daemon startup, look for the **active-backend banner** on stderr or in `journalctl --user -u recmeet-daemon.service`:
-
-    ggml: backend registry: CPU, Vulkan
-    ggml: active backend: Vulkan (AMD Radeon Pro W5500 (RADV NAVI10), 8192 MB)
-
-If you built with Vulkan but the GPU isn't being used (missing ICD driver, headless host, …), the banner emits a `WARN` line naming the gap before falling back to CPU. See [BUILD.md](docs/BUILD.md#gpu-acceleration-vulkan) for the full toolchain matrix, per-distro install hints, and VRAM measurements.
-
 ## Output
 
 ### Directory structure
@@ -303,10 +460,11 @@ meetings/2026-02-20_14-30/
   audio_2026-02-20_14-30.wav      # Mixed mic + monitor (16kHz mono S16LE)
   context_2026-02-20_14-30.json   # Pre-recording context note (only if provided)
   speakers_2026-02-20_14-30.json  # Per-meeting speaker data (only if --diarize)
+  captions.vtt                    # Live captions sidecar (only if --show-captions)
   Meeting_2026-02-20_14-30_Project_Kickoff.md  # Meeting note
 ```
 
-Up to four files per meeting. The audio + meeting note are always present. The context file is written only when the user provided context (via the tray dialog, `--context-text`, or `--context-file`) — it persists the prompt across reprocess. The speakers file is written only when diarization runs.
+Up to five files per meeting. The audio + meeting note are always present. The context file is written only when the user provided context (via the tray dialog, `--context-text`, or `--context-file`) — it persists the prompt across reprocess. The speakers file is written only when diarization runs. The captions sidecar is written only when live captions were enabled.
 
 Every artifact carries the meeting's `YYYY-MM-DD_HH-MM` timestamp suffix. Older meetings written before this convention used unsuffixed names (`audio.wav`, `context.json`, `speakers.json`); they continue to read correctly via legacy-name fallback, and reprocessing them writes the new per-instance filenames alongside.
 
@@ -375,7 +533,121 @@ This widens per-chunk RSS headroom at a small cost to per-chunk centroid quality
 
 `--reprocess-batch` is mutually exclusive with `--reprocess`. To re-process a single meeting that already has a note, delete the note manually and re-run; v1 has no `--force` overwrite (frontmatter and manual body edits warrant a deliberate design — tracked as follow-up).
 
+## Performance
+
+All numbers below come from `scripts/bench-with-telemetry.sh` runs on the reference host. Per-bench artifacts (`amdgpu_top` JSONL stream, `vmstat`, raw sysfs CSV, and `summary.txt`) land in `bench-results/<workload>/` for direct inspection.
+
+**Reference host:** AMD Radeon Pro W5500 (Navi14 / RDNA1 / 8 GB GDDR6 / Mesa RADV), 105 W TDP cap. Arch Linux, kernel 6.15.x. Vulkan-enabled `recmeet` build linked against locally-built onnxruntime 1.23.2.
+
+### Whisper-medium transcription — Vulkan GPU
+
+Real 47-minute meeting reprocessed via `recmeet --no-daemon --reprocess <wav> --model medium --no-summary --no-diarize`.
+
+| Metric | Value |
+|---|---|
+| Audio length | 47 min |
+| Wall-clock | 11.3 min |
+| Real-time factor | **4.16× faster than real-time** |
+| GPU shader activity (mean / peak) | **95.6% / 99%** |
+| VRAM used (peak) | **4.1 GB / 8 GB** |
+| Power draw (mean / peak) | 61 W / 108 W (58% of 105 W TDP avg) |
+| Peak GPU temperature | 94 °C |
+| Samples (1 Hz) | 674 |
+
+Sustained 95.6% Shader Processor Interpolator activity is the headline: the GPU is being kept fed continuously, not waiting on data. VRAM peak well under the 8 GB ceiling leaves headroom for `whisper-large-v3` (~3.1 GB model) on the same hardware.
+
+### Long-audio diarization under cgroup cap
+
+The `[integration][slow][t2-1]` gate: chunked diarize end-to-end on a long-audio fixture, wrapped with `systemd-run --user --scope -p MemoryMax=8G -p MemorySwapMax=0` so the kernel SIGKILLs the bench process if the RSS cap is breached.
+
+| Metric | Value |
+|---|---|
+| Wall-clock | 14.9 min |
+| **Peak host RSS** | **4.4 GB** (44% of the 8 GB cgroup cap) |
+| OOM kills | 0 |
+| Swap consumption | 0 (cgroup forbids it) |
+| GPU activity (mean) | 5.5% (CPU-bound workload) |
+| VRAM used (peak) | 2.4 GB (desktop baseline; no GPU allocation by the bench) |
+
+Memory containment intact: a long-audio chunked-diarize run that would have OOMed the un-chunked single-call path (≥ 11 GB peak working set) completes inside the cgroup with comfortable headroom. The 4-hours-on-16-GB target is the headline architectural claim; this run is the cgroup-enforced empirical validation.
+
+### Benchmark suite — 12 cases, mixed CPU + GPU
+
+| Metric | Value |
+|---|---|
+| Cases passed | 16 (2 skipped — uncached models, environmental) |
+| Total wall-clock | 49 min |
+| VRAM peak across suite | 7.6 GB (whisper-medium-on-Vulkan benchmark case) |
+| GPU peak | 99% (during whisper-on-Vulkan cases) |
+| GPU mean (whole suite) | 7.6% (most cases are CPU diarize / embedding-session parity benches) |
+| Power peak | 111 W (brief headroom over the 105 W TDP) |
+
+Five `[t2-0a]`/`[t2-0b]` parity benches in the suite verify that the session-reuse refactor (`DiarizeSession` + `SpeakerEmbeddingSession`) produces bit-identical output to the legacy direct-call path — the chunked-diarize correctness foundation.
+
+### Cost in context
+
+The CPU-only baseline for whisper-medium on the same 47-minute audio would be approximately 4–5 hours on this host (estimate from the iter-121 63-minute measurement of ~7 hours CPU). The 4.16× real-time GPU result represents ~22× speedup over the CPU baseline on this specific hardware, in line with the iter-121 validation that produced the ~26× number quoted in [docs/BUILD.md](docs/BUILD.md#gpu-acceleration-vulkan).
+
+## Installing
+
+```bash
+make install                                         # install to ~/.local (default, no sudo)
+sudo make install PREFIX=/usr/local                  # or system-wide
+make install PREFIX=/tmp/test-install                # or a custom prefix
+
+# Or manually:
+# cmake --install build --prefix ~/.local
+# sudo cmake --install build
+```
+
+`make install` also downloads default models (whisper, sherpa, VAD) and enables the daemon via systemd. Use `make uninstall` to reverse everything.
+
+The install set includes the recmeet binaries, the vendored shared libraries (`libwhisper.so`, `libllama.so`, `libggml*.so`), the per-ISA CPU plugins (`libggml-cpu-*.so`), `libggml-vulkan.so` when Vulkan was enabled, `libonnxruntime.so.1` when built from source, and the systemd user units.
+
+### Packages
+
+```bash
+make package-arch       # Arch Linux (split package: base + recmeet-vulkan companion)
+make package-deb        # Debian/Ubuntu (.deb via CPack)
+make package-rpm        # Fedora/RHEL (.rpm via CPack)
+```
+
+The Arch PKGBUILD is a split package — `recmeet-git` (always installed, CPU-capable, no GPU deps) plus an optional `recmeet-vulkan-git` companion that ships only `libggml-vulkan.so`. Missing ICD at runtime is a graceful fallback to CPU. See [docs/BUILD.md](docs/BUILD.md#packaging) for the full split-packaging mechanics and per-distro details.
+
+### Autostart via systemd
+
+The daemon and tray each have a systemd user service. The tray service depends on the daemon — enabling the tray automatically pulls in the daemon.
+
+```bash
+# Daemon only (headless / CLI usage)
+systemctl --user enable --now recmeet-daemon.service
+
+# Daemon + tray (desktop usage — daemon starts automatically)
+systemctl --user enable --now recmeet-tray.service
+
+# Check status
+systemctl --user status recmeet-daemon.service
+systemctl --user status recmeet-tray.service
+
+# Stop and disable
+systemctl --user disable --now recmeet-tray.service
+systemctl --user disable --now recmeet-daemon.service
+```
+
+Socket activation is also available — `recmeet-daemon.socket` starts the daemon on first connection:
+
+```bash
+systemctl --user enable --now recmeet-daemon.socket
+```
+
+The tray service is tied to `graphical-session.target` and restarts automatically on crash. On Sway, your config must activate that target — see [docs/BUILD.md](docs/BUILD.md) for details.
+
 ## CLI reference
+
+The full CLI surface is large (64 flags across recording, reprocess, model management, daemon control, captioning, and speakers). The canonical reference is `recmeet --help`; the table below documents the full set for offline reading.
+
+<details>
+<summary><b>Full CLI flag table</b> (64 flags)</summary>
 
 ### recmeet (CLI)
 
@@ -405,13 +677,17 @@ Options:
   --no-summary         Skip summarization (record + transcribe only)
   --device-pattern RE  Regex for device auto-detection
   --context-file PATH  Pre-meeting notes to include in summary prompt
+  --context-text TEXT  Inline pre-meeting context for summary
   --llm-model PATH     Local GGUF model for summarization (instead of API)
   --mmap               Use mmap for LLM model loading (faster load, may cause swap)
   --no-mmap            Disable mmap for LLM model loading (default, avoids swap thrashing)
   --no-diarize         Disable speaker diarization
-  --num-speakers N     Number of speakers (0 = auto-detect, default: 0)
-  --cluster-threshold F  Clustering distance threshold (default: 1.18, higher = fewer speakers)
-  --diarize-chunk-minutes N  Chunked-diarize window (default: 15.0; auto-engages above ~17.5 min audio)
+  --num-speakers N     Number of speakers (0 = auto-detect, default: 0).
+                       For long audio that runs the chunked path, this is
+                       enforced post-stitch as a global count limit via
+                       sample-weighted greedy-merge (not per-chunk).
+  --cluster-threshold F        Clustering distance threshold (default: 1.18; higher = fewer speakers)
+  --diarize-chunk-minutes N    Chunked-diarize window (default: 15.0; auto-engages above ~17.5 min audio)
   --diarize-chunk-overlap-sec N  Overlap between chunks (default: 30.0)
   --diarize-stitch-threshold F   Cosine similarity floor for cross-chunk centroid stitching (default: 0.6)
   --no-speaker-id      Disable speaker identification (voiceprint matching)
@@ -427,7 +703,7 @@ Options:
   --no-vad             Disable VAD segmentation (transcribe full audio)
   --vad-threshold F    VAD speech detection threshold (default: 0.5)
   --threads N          Number of CPU threads for inference (0 = auto-detect, default: 0)
-  --reprocess DIR      Reprocess existing recording directory
+  --reprocess PATH     Reprocess existing recording directory or audio file
   --reprocess-batch DIR  Reprocess every meeting subdir under DIR (skips meetings with existing notes)
   --dry-run            With --reprocess-batch: classify and tally only, don't run any pipeline work
   --log-level LEVEL    Log level: none, error, warn, info, debug (default: error)
@@ -441,6 +717,11 @@ Options:
   --daemon-addr ADDR   Daemon address override (Unix socket path or host:port for TCP)
   --status             Query daemon status and exit
   --stop               Stop daemon recording and exit
+  --caption-model NAME  Streaming caption model name (default: en-2023-06-26)
+  --list-caption-models  List available streaming caption models and exit
+  --show-captions      Force-enable live captions for this recording
+                       (V1: English only; ignored with --language != en)
+  --no-captions        Force-disable live captions for this recording
   --progress-json      Emit machine-readable NDJSON progress on stdout (subprocess mode)
   --config-json FILE   Subprocess-mode config file (internal: parent-to-child handoff)
   -h, --help           Show this help
@@ -464,9 +745,14 @@ Options:
   -v, --version        Show version
 ```
 
+</details>
+
 ## Configuration
 
 `~/.config/recmeet/config.yaml` — all fields are optional, CLI flags override.
+
+<details>
+<summary><b>Full config schema</b></summary>
 
 ```yaml
 audio:
@@ -498,6 +784,11 @@ vad:
   min_speech: 0.25      # minimum speech duration (seconds)
   max_speech: 30.0      # maximum speech segment length (seconds)
 
+captions:
+  enabled: false           # opt-in per recording or globally here
+  model: "en-2023-06-26"   # default streaming Zipformer model
+  # normalize_display: true  # lowercase + sentence-cap at render time (default)
+
 summary:
   provider: xai
   model: grok-3
@@ -516,6 +807,10 @@ output:
 notes:
   domain: general
 
+web:
+  port: 8384
+  bind: "127.0.0.1"
+
 logging:
   level: error # none, error, warn, info, debug
   # retention_hours: 4   # hours of log history to keep before rotation
@@ -525,36 +820,33 @@ general:
   threads: 0 # 0 = auto-detect (cores - 1)
 ```
 
+</details>
+
 ## Build options
 
-| Option                | Default | Effect                                                                                        |
-| --------------------- | ------- | --------------------------------------------------------------------------------------------- |
-| `RECMEET_GGML_VULKAN` | AUTO    | GPU acceleration via ggml Vulkan backend. AUTO probes; ON requires; OFF disables. See below.  |
-| `RECMEET_USE_SHERPA`  | ON      | Enable speaker diarization (fetches sherpa-onnx via CMake)                                    |
-| `RECMEET_USE_LLAMA`   | ON      | Enable local LLM summarization via llama.cpp                                                  |
-| `RECMEET_USE_NOTIFY`  | ON      | Enable desktop notifications via libnotify                                                    |
-| `RECMEET_BUILD_TRAY`  | ON      | Build the system tray applet (requires GTK3 + AppIndicator)                                   |
-| `RECMEET_BUILD_TESTS` | ON      | Build the Catch2 test suite                                                                   |
+| Option                       | Default | Effect                                                                                        |
+| ---------------------------- | ------- | --------------------------------------------------------------------------------------------- |
+| `RECMEET_GGML_VULKAN`        | AUTO    | GPU acceleration via ggml Vulkan backend. AUTO probes; ON requires; OFF disables.             |
+| `RECMEET_USE_SHERPA`         | ON      | Enable speaker diarization (fetches sherpa-onnx via CMake)                                    |
+| `RECMEET_USE_LLAMA`          | ON      | Enable local LLM summarization via llama.cpp                                                  |
+| `RECMEET_USE_NOTIFY`         | ON      | Enable desktop notifications via libnotify                                                    |
+| `RECMEET_BUILD_TRAY`         | ON      | Build the system tray applet (requires GTK3 + AppIndicator)                                   |
+| `RECMEET_BUILD_TESTS`        | ON      | Build the Catch2 test suite                                                                   |
+| `RECMEET_BUILD_WEB`          | ON      | Build the `recmeet-web` speaker-management UI                                                 |
+| `RECMEET_BUILD_GO_TOOLS`     | ON      | Build `recmeet-mcp` + `recmeet-agent` (requires Go 1.25+)                                     |
+| `RECMEET_PATCH_SHERPA_ARENA` | ON      | Apply the vendored sherpa-onnx CPU memory arena patch (T1B memory containment fix)            |
 
 ```bash
-# Example: headless build without tray or diarization
-make RECMEET_BUILD_TRAY=OFF RECMEET_USE_SHERPA=OFF
+# Example: headless build without tray, diarization, or Go tools
+make RECMEET_BUILD_TRAY=OFF RECMEET_USE_SHERPA=OFF RECMEET_BUILD_GO_TOOLS=OFF
 
 # Or manually:
-# cmake -B build -G Ninja -DRECMEET_BUILD_TRAY=OFF -DRECMEET_USE_SHERPA=OFF
-```
-
-### Go tools (MCP server + AI agent)
-
-`make build` also builds the Go tools (requires Go 1.25+). For coverage:
-
-```bash
-make coverage            # Go test coverage report
+# cmake -B build -G Ninja -DRECMEET_BUILD_TRAY=OFF -DRECMEET_USE_SHERPA=OFF -DRECMEET_BUILD_GO_TOOLS=OFF
 ```
 
 ## Testing
 
-451 C++ unit-test cases (1734 assertions) across 28 modules, plus 54 IPC integration cases (368 assertions), 16 reprocess-batch cases, 15 [t2-1] long-audio integration cases, 17 benchmark cases, 5 full-stack end-to-end cases, and 93 Go test functions across the MCP server and AI agent.
+541 C++ unit test cases (2124 assertions) across 28 modules, plus 66 IPC integration cases (458 assertions), 16 reprocess-batch cases, 12 benchmark cases, 5 full-stack end-to-end cases, 1 long-audio cgroup integration gate, and a Go test suite covering the MCP server, agent CLI, and shared `meetingdata` library.
 
 ```bash
 make test                # C++ unit + Go tests (no hardware needed)
@@ -574,126 +866,46 @@ make build-onnxruntime   # build vendored onnxruntime from source (~20 min, see 
 ./build/recmeet_tests "[cli]"                         # single module
 ```
 
-## Installing
-
-```bash
-make install                                         # install to ~/.local (default, no sudo)
-sudo make install PREFIX=/usr/local                  # or system-wide
-make install PREFIX=/tmp/test-install                # or a custom prefix
-
-# Or manually:
-# cmake --install build --prefix ~/.local
-# sudo cmake --install build
-```
-
-`make install` also downloads default models (whisper, sherpa, VAD) and enables the daemon via systemd. Use `make uninstall` to reverse everything.
-
-### Packages
-
-```bash
-make package-arch       # Arch Linux (PKGBUILD)
-make package-deb        # Debian/Ubuntu (.deb via CPack)
-make package-rpm        # Fedora/RHEL (.rpm via CPack)
-```
-
-See [BUILD.md](BUILD.md) for packaging details and per-distro build dependencies.
-
-### Autostart via systemd
-
-The daemon and tray each have a systemd user service. The tray service depends on the daemon — enabling the tray automatically pulls in the daemon.
-
-```bash
-# Daemon only (headless / CLI usage)
-systemctl --user enable --now recmeet-daemon.service
-
-# Daemon + tray (desktop usage — daemon starts automatically)
-systemctl --user enable --now recmeet-tray.service
-
-# Check status
-systemctl --user status recmeet-daemon.service
-systemctl --user status recmeet-tray.service
-
-# Stop and disable
-systemctl --user disable --now recmeet-tray.service
-systemctl --user disable --now recmeet-daemon.service
-```
-
-Socket activation is also available — `recmeet-daemon.socket` starts the daemon on first connection:
-
-```bash
-systemctl --user enable --now recmeet-daemon.socket
-```
-
-The tray service is tied to `graphical-session.target` and restarts automatically on crash. On Sway, your config must activate that target — see [BUILD.md](BUILD.md) for details.
-
-### Postprocessing memory limits
-
-**Target met (iter 121):** recmeet processes up to **4 hours of audio plus context notes on a host with a hard 16 GB memory ceiling**, end-to-end through transcription, diarization, speaker identification, and summarization. Validated against a 60-min real meeting and a 4-hour synthetic fixture under a `MemoryMax=16G` cgroup with no swap.
-
-The architecture has three layers of containment, each load-bearing:
-
-1. **systemd cgroup caps** (`dist/recmeet-daemon.service.in`): `MemoryHigh=10G` / `MemoryMax=14G` / `MemorySwapMax=0`. Cgroup-enforced so even an unrecoverable workload reaps only this unit, not the whole host.
-2. **Subprocess isolation**: postprocessing runs as a forked child. Crashes or the cgroup hard-cap kill only the child; the daemon stays alive, the audio is preserved, the operator gets a precise error.
-3. **Chunked diarization** (T2.1, iter 121): when audio exceeds `chunk_minutes·60 + chunk_overlap_sec + 120` seconds (≈17.5 min at default chunk_minutes=15), the pipeline auto-engages `diarize_chunked()` — slices audio into overlapping windows, reuses one `DiarizeSession` and one `SpeakerEmbeddingSession` across all chunks, stitches per-chunk centroids into a global registry by cosine similarity, then bypasses the second extractor pass via `identify_speakers_with_centroids()` (T2.2 H1). Per-chunk peak working set stays ≤ 6 GB on the 60-min fixture.
-
-Below the chunk threshold the single-call `diarize()` path runs unchanged — short meetings pay no chunking overhead.
-
-The postprocessing subprocess also self-limits at 12 GB (`RECMEET_RSS_LIMIT_MB=12288`); on overflow it writes `child RSS limit exceeded — split audio (ffmpeg) or raise RECMEET_RSS_LIMIT_MB` to stderr and exits cleanly. This is a defense-in-depth layer behind the cgroup; the cgroup remains the real backstop because RSS-self-limiting can stall under uninterruptible kernel sleep.
-
-**Tunable for batch runs:** `--diarize-chunk-minutes 12` narrows the chunk window from the default 15 min, widening per-chunk RSS headroom for batch reprocessing of many long meetings back-to-back. See "Batch reprocess" above for the full recipe.
-
-Forensic context for the original investigation that drove this design lives at [docs/history/DEADLOCK-INVESTIGATION.md](docs/history/DEADLOCK-INVESTIGATION.md).
-
-## Project history
-
-recmeet started as a Python prototype that proved the pipeline in a single session: `pw-record` and `parecord` for capture, `faster-whisper` for transcription, the `requests` library for Grok API calls. Within two hours the core concept was validated — a local Linux box could record, transcribe, and summarize any meeting without cloud dependencies.
-
-The prototype also surfaced the key technical insight that shaped the architecture: `.monitor` sources (how PulseAudio exposes speaker output for recording) don't work with PipeWire's native `pw-record --target`. They produce silence. `parecord --device` works. This dual-capture strategy — PipeWire for the mic, PulseAudio for the monitor — carried through into the C++ rewrite.
-
-The rewrite to C++ was motivated by deployment simplicity. The Python version required a virtualenv, pip-installed packages, system-site-packages for GTK bindings, and careful dependency management across machines. The C++ version compiles to a single static binary with whisper.cpp and llama.cpp linked in. No runtime dependencies beyond the system libraries that any desktop Linux already has. Copy the binary, run it.
-
-From there, the project evolved through extensive iteration: doubling test coverage and extracting testable modules, adding a full-featured system tray applet, model pre-download UX, fixing real bugs found during live end-to-end testing (whisper's `detect_language` trap, llama.cpp's chat template requirement), benchmark suites against reference audio, multi-provider API support, speaker diarization via sherpa-onnx, packaging for Arch/Debian/Fedora, and hardening passes on error handling, context overflow, and clustering threshold tuning.
-
 ## Architecture
 
-Four C++ binaries share a common static library. The daemon owns all pipeline logic (audio capture, transcription, diarization, summarization). The CLI and tray are thin IPC clients that communicate via a Unix domain socket using newline-delimited JSON. Two additional Go binaries provide AI-powered tooling.
+Four C++ binaries share two static libraries. The daemon owns all pipeline logic (audio capture, transcription, diarization, summarization). The CLI, tray, and web UI are thin IPC clients that communicate via a Unix domain socket (or TCP) using newline-delimited JSON. Two additional Go binaries provide AI-powered tooling.
 
 ```
-recmeet_core  (static library — 23 modules)
-    |
-    +-- recmeet-daemon  (daemon — pipeline + IPC server)
-    +-- recmeet         (CLI — dual-mode: IPC client or standalone)
-    +-- recmeet-tray    (system tray — IPC client, GTK3 + AppIndicator)
-    +-- recmeet_tests   (Catch2 test suite)
+recmeet_ipc   (static library — config, IPC, util — no ML deps)
+recmeet_core  (static library — recmeet_ipc + ML pipeline)
+    │
+    ├── recmeet-daemon  (daemon — pipeline + IPC server)        ← links recmeet_core
+    ├── recmeet         (CLI — dual-mode: client or standalone) ← links recmeet_core
+    ├── recmeet-tray    (system tray — IPC client only)         ← links recmeet_ipc (no ML)
+    ├── recmeet-web     (speaker-management web UI)             ← links recmeet_core
+    └── recmeet_tests   (Catch2 test suite)                     ← links recmeet_core
 
 tools/  (Go module — github.com/syketech/recmeet-tools)
-    |
-    +-- recmeet-mcp    (MCP server — exposes meeting data to AI tools)
-    +-- recmeet-agent  (AI agent CLI — meeting prep + follow-up workflows)
+    ├── recmeet-mcp    (MCP server — exposes meeting data to AI tools)
+    └── recmeet-agent  (AI agent CLI — meeting prep + follow-up workflows)
 ```
 
 ### Daemon mode (recommended)
 
 ```
 recmeet-daemon              recmeet (CLI)           recmeet-tray
-      |                         |                        |
+      │                         │                        │
   [pipeline]  <── IPC ──>  [thin client]  <── IPC ──>  [thin client]
   [IPC server]             [auto-detect]              [GTK + g_io_watch]
-      |
-  Unix socket: $XDG_RUNTIME_DIR/recmeet/daemon.sock
+      │
+  Unix socket: $XDG_RUNTIME_DIR/recmeet/daemon.sock   (or TCP via --listen)
 ```
 
-The CLI auto-detects a running daemon and operates as a client. Use `--no-daemon` to force standalone mode (the CLI runs the full pipeline directly, as in previous versions). The tray connects to the daemon and reconnects automatically with exponential backoff if the daemon restarts.
+The CLI auto-detects a running daemon and operates as a client. Use `--no-daemon` to force standalone mode. The tray connects to the daemon and reconnects automatically with exponential backoff if the daemon restarts.
 
 ### IPC protocol
 
-- **Transport**: Unix domain socket
+- **Transports**: Unix domain socket (default) or TCP — selected via `--listen` / `--daemon-addr`
 - **Wire format**: Newline-delimited JSON (NDJSON)
-- **Transports**: Unix domain socket (default) or TCP — selected via `--listen`/`--daemon-addr`
 - **Methods**: `record.start`, `record.stop`, `status.get`, `config.update`, `config.reload`, `sources.list`, `models.list`, `models.ensure`, `models.update`
-- **Events** (server push): `phase`, `progress`, `state.changed`, `job.complete`, `model.downloading`
+- **Events** (server push): `phase`, `progress`, `state.changed`, `job.complete`, `model.downloading`, `caption`, `caption.degraded`
 
-See [BUILD.md](BUILD.md) for a detailed build system tutorial.
+See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full topology, state machine, IPC message types, and sequence diagrams. See [docs/BUILD.md](docs/BUILD.md) for the build system tutorial.
 
 ## MCP server
 
@@ -808,6 +1020,39 @@ Common flags:
   --dry-run         Print prompts without calling the API
   --config string   Config file path (default: ~/.config/recmeet/config.yaml)
 ```
+
+## Upstream contributions
+
+recmeet vendors sherpa-onnx from upstream `k2-fsa/sherpa-onnx` at v1.12.27. Several fixes and CMake hygiene improvements developed in the course of recmeet's work have been submitted back upstream and accepted. Contributed by [@suykerbuyk](https://github.com/suykerbuyk):
+
+| PR | Topic | Status |
+|---|---|---|
+| [k2-fsa/sherpa-onnx#3214](https://github.com/k2-fsa/sherpa-onnx/pull/3214) | v1.12.26 upgrade — `FetchContent_MakeAvailable` integration hooks | merged |
+| [k2-fsa/sherpa-onnx#3215](https://github.com/k2-fsa/sherpa-onnx/pull/3215) | `wstring_convert` deprecation fix — manual UTF-8/UTF-32 codec with full RFC 3629 malformed-input handling | merged |
+| [k2-fsa/sherpa-onnx#3216](https://github.com/k2-fsa/sherpa-onnx/pull/3216) | `FetchContent_Populate` deprecation fix for current CMake | merged |
+| [k2-fsa/sherpa-onnx#3217](https://github.com/k2-fsa/sherpa-onnx/pull/3217) | CMake policy defaults for warning-free configure | merged |
+| [k2-fsa/sherpa-onnx#3628](https://github.com/k2-fsa/sherpa-onnx/pull/3628) | `TopkIndex` off-by-one clamp + short-circuit (heap-buffer-overflow fix surfaced via ASAN) | under review |
+
+## Project history
+
+recmeet started as a Python prototype that proved the pipeline in a single session: `pw-record` and `parecord` for capture, `faster-whisper` for transcription, the `requests` library for Grok API calls. Within two hours the core concept was validated — a local Linux box could record, transcribe, and summarize any meeting without cloud dependencies.
+
+The prototype also surfaced the key technical insight that shaped the architecture: `.monitor` sources (how PulseAudio exposes speaker output for recording) don't work with PipeWire's native `pw-record --target`. They produce silence. `parecord --device` works. This dual-capture strategy — PipeWire for the mic, PulseAudio for the monitor — carried through into the C++ rewrite.
+
+The rewrite to C++ was motivated by deployment simplicity. The Python version required a virtualenv, pip-installed packages, system-site-packages for GTK bindings, and careful dependency management across machines. The C++ version compiles to one binary plus a small set of `dlopen`-loaded compute plugins. No Python runtime. No pip. No venv.
+
+From there the project evolved through a sequence of named infrastructure pushes:
+
+- **Doubling test coverage and extracting testable modules** (iters 1–10) — CLI parsing extraction, helper API promotion, 45 → 86 → 145+ tests.
+- **Daemon architecture with Unix-socket IPC** (iter 42) — split the pipeline owner from its UI; CLI and tray became thin clients of a long-running compute daemon.
+- **Vocabulary hints + cross-session speaker identification** (iters 56, 85) — 3D-Speaker voiceprint embeddings as a persistent on-disk DB, with the speaker-names → whisper-vocabulary-hints feedback loop closing the spelling-accuracy gap for unusual names.
+- **Subprocess postprocessing with heartbeat watchdog** (iters 89–98) — forked-child execution so onnxruntime memory growth and thread-pool deadlocks no longer take down the daemon; dual-timestamp watchdog (progress vs. heartbeat) eliminates the false-negative class the v1 watchdog tripped on.
+- **Vendored onnxruntime build pipeline + library split** (iters 99–104) — `scripts/build-onnxruntime.sh` with protobuf-bundled internally + GCC 15 transitive-include auto-patch eliminated the rolling-distro ABI-skew crash class. The `recmeet_ipc` / `recmeet_core` split unblocked thin-client deployment by removing ML deps from the tray.
+- **Memory containment for 4-hour audio on 16 GB hosts** (iters 110–121) — the headline V1 target. Three-tier containment (cgroup caps + subprocess isolation + chunked-diarization algorithm with session reuse and centroid stitching), validated under `systemd-run --user --scope -p MemoryMax=8G`.
+- **Live captioning V1 capstone** (iters 132–135, tag `v1.5.0`) — sherpa-onnx streaming Zipformer ASR worker, `.vtt` WebVTT sidecar, tray overlay + CLI stderr renderer, opt-in per recording. The V1 capstone before cutting the `v1-maintenance` branch.
+- **Vulkan GPU acceleration with runtime-loadable backends** (iter 142, tag `v1.6.0`) — `GGML_BACKEND_DL=ON` + auto-detected Vulkan + per-ISA CPU plugin scoring at startup. Same binary runs on a 2015 server and a 2024 laptop with a Vulkan-capable GPU; 4.16× real-time on whisper-medium on the reference Radeon Pro W5500.
+
+Several fixes from this work have been contributed back to upstream sherpa-onnx — see [Upstream contributions](#upstream-contributions) above. The full per-iteration narrative for those curious about the engineering archaeology lives in `agentctx/iterations.md`.
 
 ## License
 

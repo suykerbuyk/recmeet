@@ -8,6 +8,9 @@ __pycache__/
 # Output
 meetings/
 
+# Bench telemetry artifacts (local-only; produced by scripts/bench-with-telemetry.sh)
+bench-results/
+
 # Build
 build/
 vendor/onnxruntime-local/
