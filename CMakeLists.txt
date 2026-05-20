@@ -593,6 +593,10 @@ if(RECMEET_BUILD_TESTS)
         # Phase E.2 Wave 2.2a — split config (ServerConfig + ClientConfig
         # + legacy migration). Monolithic Config preserved alongside.
         tests/test_config_split.cpp
+        # Phase E.2 Wave 2.2b — Phase 4 verification suite (T1–T6) closing
+        # out the three-type JobConfig model: precedence, submit/stream
+        # round-trip, servers list, grep guards, moved-field migration.
+        tests/test_w22b_phase4.cpp
     )
     # The test binary exercises both daemon-side surfaces (recmeet_core) and
     # client-side / standalone surfaces (run_recording + recmeet_capture), so

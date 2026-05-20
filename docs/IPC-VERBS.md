@@ -186,7 +186,7 @@ request/response pair; the frame has no `id`.
 **Purpose** — establish per-client credentials and preferences in one
 round trip. The server stores the parsed `SessionCredentials` and
 `SessionPreferences` keyed by the request's stamped `client_id`;
-subsequent job submissions inherit them via `merge_creds_for_job`.
+subsequent job submissions inherit them via `make_job_config` at the postprocess-enqueue seams.
 
 **Phase** — A.6.
 

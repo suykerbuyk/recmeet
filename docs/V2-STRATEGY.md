@@ -86,7 +86,7 @@ Phase E is in progress.
   | E.4.1 | `recmeet-daemon --check-backends` flag for active-backend reporting | COMPLETE |
   | E.3 | Tray binary slimming (`ldd $(tray)` shows no onnxruntime / sherpa-onnx / whisper / llama / ggml) | COMPLETE |
   | E.4 | Daemon binary slimming (`ldd $(daemon)` shows no PipeWire / PulseAudio) | COMPLETE |
-  | E.2 | Config schema split — `config.yaml` → `client.yaml` + `daemon.yaml` plus three new fields (`summary_style`, `caption_show_partials`, `caption_overlay_position`) and a one-shot migrator | IN PROGRESS |
+  | E.2 | Config schema split — `config.yaml` → `client.yaml` + `daemon.yaml` plus three new fields (`summary_style`, `caption_show_partials`, `caption_overlay_position`), one-shot migrator, and the **three-type runtime model** (`ServerConfig` at-rest daemon view + `ClientConfig` at-rest tray view + `JobConfig` per-job assembled by `make_job_config()` at the postprocess-enqueue seams) | COMPLETE (Wave 2.2b iter 177) |
   | E.6 | Backward-compat, web migration, decision-#9 web bundling (`speakers.get_voiceprint` + `web.serve_assets` verbs; embedded asset bundle; legacy-path fallback) | IN PROGRESS |
   | E.5 | Docs sweep — refresh A/B/C/D wave + new `DEPLOYMENT-THIN-CLIENT.md` + operator-workflow appendix on `V2-DEPLOYMENT.md` | IN PROGRESS (this document update) |
 
@@ -105,12 +105,28 @@ Operator-facing documentation is V2-aware and Phase-D-aware:
 
 Outstanding before a `v2.0.0` tag:
 
-- **Phase E.2 — Config schema split.** Split `config.yaml` into
-  `daemon.yaml` (server-side keys) and `client.yaml` (client-side
-  keys), add the three missing fields the tray already round-trips
-  via session prefs, ship a one-shot migrator. The current monolithic
-  `config.yaml` continues to work during this window — the split is
-  additive with a deprecation warning, not a breaking change.
+- **Phase E.2 — Config schema split. COMPLETE (Wave 2.2b, iter 177).**
+  Split `config.yaml` into `daemon.yaml` (server-side keys) and
+  `client.yaml` (client-side keys); landed `summary_style`,
+  `caption_latency_ms`, and the multi-server `servers: [...]` list in
+  Wave 2.1; landed the at-rest split + legacy migration in Wave 2.2a;
+  landed the three-type runtime model in Wave 2.2b — `Config` renamed
+  to `JobConfig`, the per-job-input dynamics (`reprocess_dir`,
+  `enroll_mode`, `enroll_name`, `context_inline`) moved off
+  `ClientConfig` onto `PostprocessInput`, and a new
+  `make_job_config(srv, creds, prefs, input, env_lookup)` helper
+  assembles the per-job `JobConfig` at the three postprocess-enqueue
+  seams (`daemon.cpp:2416` `process.stream`, `:2580` `process.submit`,
+  `:2758` `process.reprocess`). `models.ensure` reads
+  `g_server_config` directly (server-only policy + model paths — no
+  session merge needed). The legacy monolithic `g_config` global is
+  deleted; the build is the type-system check that every consumer
+  migrated. The 7 dual-resident fields (`provider`, `api_keys`,
+  `api_url`, `api_model`, `api_key`, `llm_model`, `llm_mmap`) resolve
+  per precedence chain **env > session > daemon.yaml**. The legacy
+  monolithic `config.yaml` is migrated on daemon start by
+  `migrate_legacy_config_if_present()` and is preserved as
+  `config.yaml.v1-backup` for one-shot recovery.
 - **Phase E.6 — Web migration + decision-#9 bundling.** Migrate the
   speaker-management web UI off direct filesystem reads onto the V2
   IPC (`speakers.get_voiceprint`, `web.serve_assets`); bundle the
@@ -458,6 +474,33 @@ daemon. Rotating the PSK silently invalidates every outstanding
 resume_token on next reconnect (PSK check happens first), giving
 operators a coarse "log everyone out" lever without per-token revocation
 machinery in V2.
+
+#### Session credentials + preferences → per-job `JobConfig` (E.2 W2.2b)
+
+`session.init` populates two server-side per-client structs alongside
+the resume_token: `SessionCredentials` (provider, api_key, per-provider
+api_keys) and `SessionPreferences` (language, vocabulary, output_dir,
+note_dir, mic/monitor sources, summarization_backend, llm_model,
+captions_enabled, caption_latency_ms). At each postprocess-enqueue
+seam — `process.submit` (`daemon.cpp:2580`), `process.stream`
+(`:2416`), `process.reprocess` (`:2758`) — the daemon snapshots
+`g_server_config` (the at-rest `ServerConfig`), looks up the calling
+client's `(creds, prefs)` via `IpcServer::get_session()`, and calls
+`make_job_config(srv, creds, prefs, input, env_lookup)` to assemble
+the per-job `JobConfig`. Precedence is **env > session > daemon.yaml**
+for the seven dual-resident fields (provider, api_keys, api_url,
+api_model, api_key, llm_model, llm_mmap); the env channel only fires
+for the *resolved* provider's matched env var
+(`XAI_API_KEY` / `OPENAI_API_KEY` / `ANTHROPIC_API_KEY`). Session
+preferences overlay daemon.yaml defaults for everything else
+(language, vocabulary, etc.). Per-job-input dynamics
+(`reprocess_dir`, `enroll_mode`, `enroll_name`, `context_inline`)
+arrive on the IPC request via `PostprocessInput`, not via session
+state — they describe per-call shape, not persisted per-client state.
+The merged `JobConfig` is what the daemon writes via
+`write_job_config()` to `/tmp/recmeet-pp-<job>.json` for the
+postprocess subprocess to read; the subprocess does NOT re-read env
+vars or daemon.yaml.
 
 #### Garbage collection (two half-lives)
 

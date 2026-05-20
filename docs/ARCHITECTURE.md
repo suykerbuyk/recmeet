@@ -177,7 +177,7 @@ Three long-lived worker threads drain the slots:
 
 All three marshal results back to the poll thread via `server.post()` + self-pipe wakeup. The poll thread is the only thread that touches the wire — workers never call `broadcast()` or `send_to_client()` directly.
 
-**Postprocess subprocess isolation.** Each postprocess job runs in a fresh `recmeet --subprocess-mode` child. This is iter-90 hard-won: onnxruntime's heap can corrupt over the lifetime of a long-lived daemon, and the only reliable mitigation is a per-job address space. The parent writes `cfg` to a tmp JSON file (`write_job_config()`), `fork()` + `execv()` the self-binary, watches the child's stdout for `progress.job` lines, and reaps via `waitpid()`. The `merge_creds_for_job()` (`src/session_merge.h:55`) call resolves the per-job `Config` from three sources with precedence `daemon env > session.init credentials > daemon.yaml` so the subprocess sees the per-client view even though it never re-reads the environment.
+**Postprocess subprocess isolation.** Each postprocess job runs in a fresh `recmeet --subprocess-mode` child. This is iter-90 hard-won: onnxruntime's heap can corrupt over the lifetime of a long-lived daemon, and the only reliable mitigation is a per-job address space. The parent writes the per-job `JobConfig` to a tmp JSON file (`write_job_config()`), `fork()` + `execv()` the self-binary, watches the child's stdout for `progress.job` lines, and reaps via `waitpid()`. The `make_job_config()` (`src/session_merge.h`) call assembles the per-job `JobConfig` from four sources — daemon-host env vars, `session.init` credentials, `session.init` preferences, and the daemon's at-rest `ServerConfig` — with precedence `env > session > daemon.yaml` for the seven dual-resident fields. Per-job-input dynamics (`reprocess_dir`, `enroll_mode`, `enroll_name`, `context_inline`) ride a separate `PostprocessInput` argument. The subprocess reads the resulting JSON exclusively — it never re-reads env vars or daemon.yaml. See V2-STRATEGY.md "Session credentials + preferences → per-job JobConfig" for the full chain.
 
 ### PID locking
 
@@ -607,7 +607,7 @@ Whisper limits `initial_prompt` to `whisper_n_text_ctx()/2` tokens (typically 22
 
 ### IPC support
 
-The `vocabulary` field is part of `SessionPreferences`, so the client pushes it once via `session.init` (and refreshes it via `session.update_prefs`). Per-job overrides ride the `context` parameter on `process.submit` / `process.stream`. Both paths fold into the per-job `Config` snapshot through `merge_creds_for_job()` (`src/session_merge.h:55`) before the postprocess subprocess sees it.
+The `vocabulary` field is part of `SessionPreferences`, so the client pushes it once via `session.init` (and refreshes it via `session.update_prefs`). Per-job overrides ride the `context` parameter on `process.submit` / `process.stream`. Both paths fold into the per-job `JobConfig` snapshot through `make_job_config()` (`src/session_merge.h`) before the postprocess subprocess sees it.
 
 ## Speaker Identification
 
