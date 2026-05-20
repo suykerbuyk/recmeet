@@ -1,0 +1,73 @@
+From: recmeet
+Subject: [PATCH] Clamp topk to size in TopkIndex to avoid heap-buffer-overflow
+
+When `OfflineSpeakerDiarizationPyannoteImpl::FinalizeLabels` calls TopkIndex
+with `k = speakers_per_frame[i]` and `size = num_cols` of the powerset
+matrix, k can exceed size on short or degenerate inputs (e.g. a single
+short voiced frame with the segmentation model claiming more active
+speakers than there are powerset columns).
+
+The unfixed TopkIndex passes `topk` directly to `std::partial_sort`:
+
+    std::partial_sort(vec_index.begin(),
+                      vec_index.begin() + topk,   // past end when topk > size
+                      vec_index.end(), ...);
+
+`std::partial_sort` requires the middle iterator to be in `[begin, end]`.
+When `topk > size`, `begin + topk > end` and partial_sort enters undefined
+behavior, reading and writing past the end of the (size-N) vector. With
+ASAN's redzones this is caught as a heap-buffer-overflow; without ASAN
+the past-the-end read silently corrupts an adjacent chunk header, which
+manifests as a SIGABRT or SIGSEGV at session destruction time inside
+onnxruntime's Graph destructor (the corrupt chunk gets double-freed when
+the Graph's internal hashtable destructs).
+
+Recmeet hit this reliably on short recordings (~44 sec) with a single
+dominant voice, where the segmentation model produced degenerate frames.
+The crash rate was also modulated by parent-process heap layout (e.g.
+tray running vs not). See the recmeet repro:
+
+    LD_PRELOAD=/usr/lib/libasan.so.8 \
+        recmeet --reprocess /path/to/short-clip --no-summary --no-daemon
+
+ASAN report excerpt (call chain):
+
+    READ of size 4 ... heap-buffer-overflow
+      #5 sherpa_onnx::TopkIndex<int> math.h:115
+      #6 OfflineSpeakerDiarizationPyannoteImpl::FinalizeLabels
+            offline-speaker-diarization-pyannote-impl.h:624
+      #7 OfflineSpeakerDiarizationPyannoteImpl::Process
+            offline-speaker-diarization-pyannote-impl.h:180
+
+Fix: clamp topk to size before the partial_sort call. The return-value
+clamp (`k_num = min(size, topk)`) was already present but only affected
+the size of the returned vector, not the partial_sort itself.
+
+Upstream PR pending against k2-fsa/sherpa-onnx.
+ sherpa-onnx/csrc/math.h | 8 ++++++--
+ 1 file changed, 6 insertions(+), 2 deletions(-)
+
+--- a/sherpa-onnx/csrc/math.h
++++ b/sherpa-onnx/csrc/math.h
+@@ -109,15 +109,19 @@
+ 
+ template <class T>
+ std::vector<int32_t> TopkIndex(const T *vec, int32_t size, int32_t topk) {
++  // Clamp topk to size: std::partial_sort(begin, begin + k, end, cmp)
++  // requires k in [0, end-begin]. Callers (e.g. FinalizeLabels) can pass
++  // topk > size on short/degenerate inputs; the unclamped call corrupts
++  // memory past vec_index's end.
++  int32_t k_num = std::min<int32_t>(size, topk);
+   std::vector<int32_t> vec_index(size);
+   std::iota(vec_index.begin(), vec_index.end(), 0);
+ 
+-  std::partial_sort(vec_index.begin(), vec_index.begin() + topk,
++  std::partial_sort(vec_index.begin(), vec_index.begin() + k_num,
+                     vec_index.end(), [vec](int32_t index_1, int32_t index_2) {
+                       return vec[index_1] > vec[index_2];
+                     });
+ 
+-  int32_t k_num = std::min<int32_t>(size, topk);
+   return {vec_index.begin(), vec_index.begin() + k_num};
+ }
+ 
