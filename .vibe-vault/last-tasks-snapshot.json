@@ -1,10 +1,8 @@
 {
-  "iter_n": 176,
-  "anchor_sha": "1d9ee626f82da6bb8027d9eaddac00e2d965a70d",
+  "iter_n": 179,
+  "anchor_sha": "c4c5a60a2f82b79871b2f400ffcf220f18721cfa",
   "active": [
     "fullstack-captions-quality-gates",
-    "phase-e2-wave-2-2b-config-split-finish",
-    "postprocess-onnxruntime-crash-short-recording",
     "thin-client-recording-server",
     "webui-live-captions"
   ],
@@ -56,9 +54,11 @@
     "optimized-dancing-pearl",
     "persist-meeting-context-per-instance-file-naming",
     "persistent-documentation-validation-update-pass",
+    "phase-e2-wave-2-2b-config-split-finish",
     "pipeline-write-error-checks",
     "portable-onnxruntime-build-detail",
     "postprocess-memory-containment",
+    "postprocess-onnxruntime-crash-short-recording",
     "pre-recording-meeting-context-dialog",
     "radiant-bubbling-nova",
     "radiant-toasting-lightning",
