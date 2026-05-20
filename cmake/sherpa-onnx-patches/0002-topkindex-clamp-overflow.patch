@@ -39,35 +39,44 @@ ASAN report excerpt (call chain):
       #7 OfflineSpeakerDiarizationPyannoteImpl::Process
             offline-speaker-diarization-pyannote-impl.h:180
 
-Fix: clamp topk to size before the partial_sort call. The return-value
-clamp (`k_num = min(size, topk)`) was already present but only affected
-the size of the returned vector, not the partial_sort itself.
+Fix: clamp topk to [0, size] before the partial_sort call. The return-
+value clamp (`k_num = min(size, topk)`) was already present but only
+affected the size of the returned vector, not the partial_sort itself.
+A negative topk would invoke the same UB and is now defended too. When
+k_num == size the partial_sort with middle == end already fully sorts
+vec_index, so the return path moves it instead of constructing a copy.
 
-Upstream PR pending against k2-fsa/sherpa-onnx.
- sherpa-onnx/csrc/math.h | 8 ++++++--
- 1 file changed, 6 insertions(+), 2 deletions(-)
+Upstream PR: k2-fsa/sherpa-onnx#3628.
+ sherpa-onnx/csrc/math.h | 14 ++++++++++++--
+ 1 file changed, 12 insertions(+), 2 deletions(-)
 
 --- a/sherpa-onnx/csrc/math.h
 +++ b/sherpa-onnx/csrc/math.h
-@@ -109,15 +109,19 @@
- 
+@@ -110,15 +110,25 @@
+
  template <class T>
  std::vector<int32_t> TopkIndex(const T *vec, int32_t size, int32_t topk) {
-+  // Clamp topk to size: std::partial_sort(begin, begin + k, end, cmp)
-+  // requires k in [0, end-begin]. Callers (e.g. FinalizeLabels) can pass
-+  // topk > size on short/degenerate inputs; the unclamped call corrupts
-+  // memory past vec_index's end.
-+  int32_t k_num = std::min<int32_t>(size, topk);
++  // Clamp topk to [0, size]: std::partial_sort(begin, begin + k, end, cmp)
++  // requires k in [0, end-begin]. Callers (e.g. FinalizeLabels in
++  // offline-speaker-diarization-pyannote-impl.h) can pass topk > size
++  // on short/degenerate inputs; the unclamped call invokes undefined
++  // behavior by reading past the end of vec_index. A negative topk would
++  // be UB for the same reason.
++  int32_t k_num = std::max<int32_t>(0, std::min<int32_t>(size, topk));
    std::vector<int32_t> vec_index(size);
    std::iota(vec_index.begin(), vec_index.end(), 0);
- 
+
 -  std::partial_sort(vec_index.begin(), vec_index.begin() + topk,
 +  std::partial_sort(vec_index.begin(), vec_index.begin() + k_num,
                      vec_index.end(), [vec](int32_t index_1, int32_t index_2) {
                        return vec[index_1] > vec[index_2];
                      });
- 
+
 -  int32_t k_num = std::min<int32_t>(size, topk);
++  if (k_num == size) {
++    // partial_sort with middle == end fully sorts vec_index; skip the copy.
++    return vec_index;
++  }
    return {vec_index.begin(), vec_index.begin() + k_num};
  }
- 
+
