@@ -1,8 +1,12 @@
 {
-  "iter_n": 170,
-  "anchor_sha": "e14f6c22a0966d011cb232ba51ceba54ac5b676c",
+  "iter_n": 171,
+  "anchor_sha": "668ebb46dc3fc9f203608fac2314baaae9d5304c",
   "active": [
+    "fullstack-captions-quality-gates",
+    "install-clean-stale-onnxruntime",
     "live-captions-pivot-to-monitor",
+    "phase-e2-wave-2-2b-config-split-finish",
+    "postprocess-onnxruntime-crash-short-recording",
     "thin-client-recording-server",
     "webui-live-captions"
   ],
