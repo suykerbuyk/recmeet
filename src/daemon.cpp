@@ -91,8 +91,9 @@ static std::unique_ptr<UploadSessionManager> g_uploads;
 // contract"). Constructed at daemon startup BEFORE the IPC listener
 // accepts so the very first `process.submit` / `process.stream` sees a
 // fully-populated index. Repopulated from on-disk `context.json` via
-// `rebuild_from_disk(g_config.output_dir)` once at startup; thereafter
-// updated incrementally by the upload finalize + streaming create paths.
+// `rebuild_from_disk(g_server_config.meetings_root)` once at startup;
+// thereafter updated incrementally by the upload finalize + streaming
+// create paths.
 static std::unique_ptr<MeetingIndex> g_meeting_index;
 
 // Phase C.8 — server-resident per-job diarization cache. Populated by
@@ -113,8 +114,6 @@ static std::unique_ptr<DiarizationCache> g_diar_cache;
 // `session.init`. Daemon restart invalidates all tokens (MC-1).
 static std::unique_ptr<SessionManager> g_sessions;
 
-static JobConfig g_config;
-static std::mutex g_config_mu;
 
 static ServerConfig g_server_config;
 static std::mutex g_server_config_mu;
@@ -221,20 +220,13 @@ static void signal_handler(int sig) {
         if (g_server) {
             g_server->post([] {
                 try {
-                    JobConfig cfg = load_legacy_config_as_job_config();
-                    if (cfg.llm_model.empty()) {
-                        const auto* prov = find_provider(cfg.provider);
-                        if (prov) {
-                            std::string key = resolve_api_key(*prov, cfg.api_keys, cfg.api_key);
-                            if (!key.empty()) cfg.api_key = key;
-                        }
-                    }
-                    std::lock_guard<std::mutex> lock(g_config_mu);
-                    g_config = cfg;
-                    {
-                        std::lock_guard<std::mutex> lk(g_server_config_mu);
-                        g_server_config = to_server_config(cfg);
-                    }
+                    // Legacy config.yaml → daemon.yaml + client.yaml migration
+                    // (no-op once daemon.yaml exists). Must run before
+                    // load_server_config() so operator-edited legacy config
+                    // takes effect on SIGHUP.
+                    migrate_legacy_config_if_present();
+                    std::lock_guard<std::mutex> lk(g_server_config_mu);
+                    g_server_config = load_server_config();
                     log_info("daemon: config reloaded via SIGHUP");
                 } catch (const std::exception& e) {
                     log_error("daemon: config reload failed: %s", e.what());
@@ -1593,23 +1585,22 @@ int main(int argc, char* argv[]) {
     // Suppress whisper output
     whisper_log_set(whisper_null_log, nullptr);
 
-    // Load config
-    g_config = load_legacy_config_as_job_config();
+    // Load config — Phase E.2 W2.2b. The server snapshot is the only
+    // daemon-global config now; per-job JobConfig is assembled at each
+    // enqueue seam via `make_job_config_with_real_env`.
+    //
+    // Legacy config.yaml → daemon.yaml + client.yaml migration runs first
+    // (no-op once daemon.yaml exists). This keeps single-file legacy
+    // installs (and tests that stage a config.yaml) working transparently.
+    migrate_legacy_config_if_present();
     {
         std::lock_guard<std::mutex> lk(g_server_config_mu);
         g_server_config = load_server_config();
     }
-
-    // Resolve API key
-    if (g_config.llm_model.empty()) {
-        const auto* prov = find_provider(g_config.provider);
-        if (prov) {
-            std::string key = resolve_api_key(*prov, g_config.api_keys, g_config.api_key);
-            if (!key.empty()) g_config.api_key = key;
-        }
-    }
-    // Note: don't auto-disable no_summary here — the decision is made per-job
-    // based on the merged config (client may send an API key)
+    // Note: env-resolved API keys are now resolved per-job inside
+    // `make_job_config()` from the requesting session's credentials and
+    // the daemon's env, not at daemon startup. The daemon does not pick
+    // "the one provider" anymore — each session picks its own.
 
     // Phase C.7 — construct the typed-slot JobQueue. Slot capacities come
     // from `[server] slot.*` (all default 1); the auto-download machinery
@@ -2080,19 +2071,13 @@ int main(int argc, char* argv[]) {
 
     server.on("config.reload", [](const IpcRequest& req, IpcResponse& resp, IpcError& err) {
         try {
-            JobConfig cfg = load_legacy_config_as_job_config();
-            if (cfg.llm_model.empty()) {
-                const auto* prov = find_provider(cfg.provider);
-                if (prov) {
-                    std::string key = resolve_api_key(*prov, cfg.api_keys, cfg.api_key);
-                    if (!key.empty()) cfg.api_key = key;
-                }
-            }
-            std::lock_guard<std::mutex> lock(g_config_mu);
-            g_config = cfg;
+            // Mirror startup + SIGHUP: run legacy migration first so an
+            // operator who edited config.yaml mid-flight gets it migrated
+            // and applied (no-op once daemon.yaml exists).
+            migrate_legacy_config_if_present();
             {
                 std::lock_guard<std::mutex> lk(g_server_config_mu);
-                g_server_config = to_server_config(cfg);
+                g_server_config = load_server_config();
             }
             resp.result["ok"] = true;
             return true;
@@ -2362,7 +2347,7 @@ int main(int argc, char* argv[]) {
     // events to send_to_client() is C.3/C.10b.
 
     server.on("process.stream",
-              [](const IpcRequest& req, IpcResponse& resp, IpcError& err) {
+              [&server](const IpcRequest& req, IpcResponse& resp, IpcError& err) {
         if (!g_streaming) {
             err.code = static_cast<int>(IpcErrorCode::InternalError);
             err.message = "streaming subsystem unavailable";
@@ -2412,15 +2397,24 @@ int main(int argc, char* argv[]) {
         // concurrently-reloaded daemon Config). The default temp_dir
         // (system temp) is used here; production daemons can swap it
         // later via a config knob.
-        JobConfig stream_pp_cfg;
+        //
+        // Phase E.2 W2.2b — build the per-job JobConfig by merging the
+        // server snapshot with this client's session credentials +
+        // preferences. Legacy clients that never called `session.init`
+        // get default-constructed creds/prefs — make_job_config treats
+        // those as "no overlay, use srv as fallback", which is the
+        // correct backward-compatible behavior.
+        ServerConfig srv_snapshot;
         {
-            std::lock_guard<std::mutex> lock(g_config_mu);
-            stream_pp_cfg = g_config;
+            std::lock_guard<std::mutex> lock(g_server_config_mu);
+            srv_snapshot = g_server_config;
         }
-        // Mirror process.submit: clear any stale `reprocess_dir` from the
-        // global Config snapshot; commit() sets it from the temp WAV's
-        // parent directory.
-        stream_pp_cfg.reprocess_dir.clear();
+        SessionCredentials creds;
+        SessionPreferences prefs;
+        server.get_session(req.client_id, creds, prefs);
+        PostprocessInput input{};
+        JobConfig stream_pp_cfg = make_job_config_with_real_env(
+            srv_snapshot, creds, prefs, input);
 
         auto cr = g_streaming->create(req.client_id, sr, {}, stream_pp_cfg);
         if (!cr.ok) {
@@ -2527,7 +2521,7 @@ int main(int argc, char* argv[]) {
     // job that is already enqueued/running is C.5. Fetching artifacts is
     // C.4. Removing record.start is C.9.
     server.on("process.submit",
-              [](const IpcRequest& req, IpcResponse& resp, IpcError& err) {
+              [&server](const IpcRequest& req, IpcResponse& resp, IpcError& err) {
         if (!g_uploads) {
             err.code = static_cast<int>(IpcErrorCode::InternalError);
             err.message = "upload subsystem unavailable";
@@ -2564,29 +2558,27 @@ int main(int argc, char* argv[]) {
         // multi-server). We deliberately do not read it.
 
         // Snapshot the per-client postprocess config for the eventual Job.
-        // The recipe matches what record.start does at handoff: take the
-        // global Config (which already reflects session.init preferences
-        // because session.update_* merges into it), then layer the
-        // per-submit context. The full session-state weave will be revisited
-        // in C.9 when record.start is removed; for now the cleanest path is
-        // to pass the live Config snapshot through to the upload manager,
-        // which freezes it for the upload's lifetime so a concurrent
-        // config.reload between submit and finalize can't surprise us.
-        JobConfig cfg;
+        // Phase E.2 W2.2b — build the per-job JobConfig by merging the
+        // server snapshot with this client's session credentials +
+        // preferences. The upload manager freezes this snapshot for the
+        // upload's lifetime so a concurrent config.reload between submit
+        // and finalize can't surprise us. Legacy clients that never
+        // called `session.init` get default-constructed creds/prefs —
+        // make_job_config treats those as "no overlay, use srv as
+        // fallback".
+        ServerConfig srv_snapshot;
         size_t max_upload_bytes = 0;
         {
-            std::lock_guard<std::mutex> lock(g_config_mu);
-            cfg = g_config;
-        }
-        {
             std::lock_guard<std::mutex> lock(g_server_config_mu);
-            max_upload_bytes = g_server_config.max_upload_bytes;
+            srv_snapshot = g_server_config;
+            max_upload_bytes = srv_snapshot.max_upload_bytes;
         }
-        // Force the subprocess into reprocess mode (the staging dir IS the
-        // out_dir). pp_worker_loop sets this from input.out_dir, but be
-        // explicit so a stale reprocess_dir from the snapshot does not
-        // leak into the staging job.
-        cfg.reprocess_dir.clear();
+        SessionCredentials creds;
+        SessionPreferences prefs;
+        server.get_session(req.client_id, creds, prefs);
+        PostprocessInput input{};
+        JobConfig cfg = make_job_config_with_real_env(
+            srv_snapshot, creds, prefs, input);
 
         auto cr = g_uploads->create(req.client_id, sr, cfg, max_upload_bytes);
         if (!cr.ok) {
@@ -2677,7 +2669,7 @@ int main(int argc, char* argv[]) {
     // job.status reconcile by content key, and so process.cancel / process.fetch
     // address the resulting job via the C.11 binding.
     server.on("process.reprocess",
-              [](const IpcRequest& req, IpcResponse& resp, IpcError& err) {
+              [&server](const IpcRequest& req, IpcResponse& resp, IpcError& err) {
         if (!g_jobs) {
             err.code = static_cast<int>(IpcErrorCode::InternalError);
             err.message = "job queue unavailable";
@@ -2747,17 +2739,24 @@ int main(int argc, char* argv[]) {
             return false;
         }
 
-        // (6) Build cfg from live snapshot + per-stage flag overrides. We
-        // clear reprocess_dir from the snapshot: pp_worker_loop sets it from
-        // job.input.out_dir on every dequeue, so a stale value cannot reach
-        // the subprocess via this path either way — but explicit beats
-        // implicit, and mirrors what process.submit does at the same point.
-        JobConfig cfg;
+        // (6) Build cfg from live snapshot + per-stage flag overrides.
+        // Phase E.2 W2.2b — build the per-job JobConfig by merging the
+        // server snapshot with this client's session credentials +
+        // preferences. pp_worker_loop sets reprocess_dir from
+        // job.input.out_dir on every dequeue, so the default empty
+        // reprocess_dir from PostprocessInput{} is fine here; the
+        // per-stage flag mutations below remain identical.
+        ServerConfig srv_snapshot;
         {
-            std::lock_guard<std::mutex> lock(g_config_mu);
-            cfg = g_config;
+            std::lock_guard<std::mutex> lock(g_server_config_mu);
+            srv_snapshot = g_server_config;
         }
-        cfg.reprocess_dir.clear();
+        SessionCredentials creds;
+        SessionPreferences prefs;
+        server.get_session(req.client_id, creds, prefs);
+        PostprocessInput merge_input{};
+        JobConfig cfg = make_job_config_with_real_env(
+            srv_snapshot, creds, prefs, merge_input);
 
         // transcribe is accepted but ignored in v1 (see header note).
         {
@@ -3694,17 +3693,18 @@ int main(int argc, char* argv[]) {
     // FIFO is the single admission point — explicit downloads queue behind
     // any auto-triggered one (and vice-versa) instead of racing.
     server.on("models.ensure", [](const IpcRequest& req, IpcResponse& resp, IpcError& err) {
-        JobConfig cfg;
-        bool allow_dl;
+        // Phase E.2 W2.2b — pure ServerConfig consumer; no session merge
+        // needed. `whisper_model`, `diarize`, `vad`, and
+        // `allow_client_downloads` are all server-resident fields.
+        ServerConfig srv;
         {
-            std::lock_guard<std::mutex> lock(g_config_mu);
-            cfg = g_config;
-            allow_dl = g_config.allow_client_downloads;
+            std::lock_guard<std::mutex> lock(g_server_config_mu);
+            srv = g_server_config;
         }
         // Download initiation policy (C.7): operator-disablable via
         // `[server] allow_client_downloads`. Any PSK-authenticated client
         // may trigger downloads when enabled (the default).
-        if (!allow_dl) {
+        if (!srv.allow_client_downloads) {
             err.code = static_cast<int>(IpcErrorCode::PermissionDenied);
             err.message = "Client-initiated model downloads are disabled "
                           "([server] allow_client_downloads=false)";
@@ -3713,7 +3713,7 @@ int main(int argc, char* argv[]) {
 
         auto it = req.params.find("whisper_model");
         std::string whisper_model = (it != req.params.end())
-            ? json_val_as_string(it->second) : cfg.whisper_model;
+            ? json_val_as_string(it->second) : srv.whisper_model;
 
         std::vector<std::string> enqueued;
         auto enqueue_if_missing = [&](const std::string& model_id, bool missing) {
@@ -3734,9 +3734,9 @@ int main(int argc, char* argv[]) {
             return false;
         }
 #if RECMEET_USE_SHERPA
-        if (cfg.diarize)
+        if (srv.diarize)
             enqueue_if_missing("sherpa/diarization", !is_sherpa_model_cached());
-        if (cfg.vad)
+        if (srv.vad)
             enqueue_if_missing("vad", !is_vad_model_cached());
 #endif
 
@@ -3902,7 +3902,7 @@ int main(int argc, char* argv[]) {
     // Phase C.13 — GC sweep worker. SCAFFOLD: spawns thread + wakes
     // periodically + invokes g_sessions->sweep_expired(); orphan-job
     // teardown deferred to the C.13 implementation pass. Hard-coded 5-min
-    // cadence; impl pass reads g_config.gc_interval_minutes.
+    // cadence; impl pass reads g_server_config.gc_interval_minutes.
     g_gc_worker = std::thread([&server]() { gc_worker_loop(server, 5); });
 
     // Signal handlers
