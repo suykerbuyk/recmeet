@@ -1,13 +1,14 @@
 {
-  "iter_n": 187,
-  "anchor_sha": "0a863ff0192358cb2b2598e052b278b8b91e9989",
+  "iter_n": 188,
+  "anchor_sha": "7ed70ef5d13e64f814b194140bbeb981a5900e47",
   "active": [
     "diarize-overcount-and-context-aware-speaker-hints",
     "e6-smoke-gate",
     "e6-tray-bundled-webui",
     "full-stack-captions-60min-regression",
     "thin-client-recording-server",
-    "webui-live-captions"
+    "webui-live-captions",
+    "whisper-vocab-hint-bleed"
   ],
   "done": [
     "audio-buffer-bounds",
