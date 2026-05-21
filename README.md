@@ -129,6 +129,14 @@ Defense in depth: the child also self-limits at `RECMEET_RSS_LIMIT_MB=12288` and
 
 Diarization assigns generic `Speaker_01`, `Speaker_02`, … labels to clusters within a single recording. Speaker identification matches those clusters against a persistent voiceprint database so the same person gets their real name in every transcript.
 
+**Auto-detect speaker count via context:** If your meeting context (typed in the pre-recording dialog, supplied via `--context-text`, or loaded from a saved `context.json` on reprocess) contains a line like:
+
+```
+Participants: Alice, Bob, Carol
+```
+
+recmeet will use the participant count (3 here) as the diarizer's target speaker count. This overrides the auto-detect default (capped at `max_auto_speakers`, default 8) but is itself overridden by explicit `--num-speakers N` on the CLI. Comma, ` and `, and ` & ` separators are all accepted; case is insensitive; multiple `Participants:` lines are summed.
+
 **Embedding model:** sherpa-onnx 3D-Speaker `eres2net_base` — same model already loaded for diarization. No additional download required when speaker ID is enabled.
 
 **Match algorithm:** cosine similarity on averaged speaker centroids. Each enrolled speaker has one or more 192-dimensional float embedding vectors stored as JSON; the in-memory `SpeakerEmbeddingManager` averages them internally. `GetBestMatches(mgr, embedding, threshold, 1)` returns the highest-scoring enrolled name above the threshold (`0.6` default, configurable via `--speaker-threshold`). Conflict resolution prevents two clusters from being assigned the same name — highest score wins.
