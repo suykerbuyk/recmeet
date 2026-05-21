@@ -31,7 +31,9 @@ jobs:
             libpipewire-0.3-dev libpulse-dev \
             libcurl4-openssl-dev libnotify-dev \
             libgtk-3-dev libayatana-appindicator3-dev \
-            libsndfile1-dev libmpg123-dev
+            libsndfile1-dev libmpg123-dev \
+            jq uuid-runtime iproute2 \
+            gcovr
 
       - name: Set up Go
         uses: actions/setup-go@v5
@@ -87,6 +89,15 @@ jobs:
       - name: Unit tests (C++ + Go)
         run: make test
 
+      # Phase E.6 smoke gate — spawns recmeet-daemon + recmeet-tray in an
+      # isolated sandbox and exercises the embedded WebUI's HTTP surface
+      # against the live daemon. Fast (<4s); catches tray/WebUI/daemon
+      # integration regressions that unit tests miss. Wired here (after
+      # unit tests, before integration) per
+      # `agentctx/tasks/test-and-verification-hardening.md` Phase 1.
+      - name: Smoke gate (WebUI + daemon)
+        run: make smoke
+
       - name: Integration tests (C++)
         run: make integration-cxx
 
@@ -98,6 +109,20 @@ jobs:
 
       - name: Full-stack pipeline
         run: make full-stack
+
+      # C++ coverage (Phase 1, test-and-verification-hardening).
+      # Reconfigures with RECMEET_COVERAGE=ON, rebuilds, reruns the default
+      # test scope, produces an HTML report + CSV summary.
+      - name: C++ coverage (gcovr)
+        run: make cxx-coverage
+
+      # Coverage no-regression gate. Warn-only in Phase 1 (does NOT pass
+      # --enforce); the script emits ::warning:: annotations naming any
+      # regressed files so they surface in the PR diff view, but the
+      # step's exit status is always 0.
+      # TODO(phase 1.5): flip to `--enforce` after the baseline settles.
+      - name: Coverage no-regression gate (warn-only)
+        run: ./scripts/check-coverage.sh
 
       - name: Surface failing logs (on failure)
         if: failure()
