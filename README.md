@@ -85,6 +85,15 @@ export XAI_API_KEY=your-key-here
 # Or use the system tray applet (also a daemon client)
 ./build/recmeet-tray
 
+# Headless WebUI mode — runs the tray without a GUI status icon, but
+# binds the embedded WebUI HTTP listener at startup (kernel-picked port
+# on 127.0.0.1). Useful on a server box without a desktop, or for
+# scripted access to the speaker/meeting management endpoints. Discover
+# the bound port from the startup log line or via `ss -ltnp`. This
+# combination subsumes the `recmeet-webd` use case that was deferred
+# from the V2 binary plan.
+./build/recmeet-tray --headless --listen-now
+
 # Daemon-control commands
 ./build/recmeet --status              # query daemon state
 ./build/recmeet --stop                # cancel a job in progress

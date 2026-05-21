@@ -770,3 +770,69 @@ TEST_CASE("start_web_listener binds a reachable kernel-picked port",
     REQUIRE(res);
     CHECK(res->status == 200);
 }
+
+// ===========================================================================
+// Phase E.6.3 — idempotent double-start under the eager-bind call pattern.
+//
+// Locks in the contract relied on by `recmeet-tray --listen-now`: the
+// flag binds the listener BEFORE the GTK main loop runs, and the
+// existing on-menu-click code path then calls `start_web_listener`
+// AGAIN when the operator clicks "Speaker Management". Both calls must
+// return the SAME port and must not leak a second httplib server.
+//
+// The pre-existing "is idempotent and returns the same port on re-entry"
+// test covers two back-to-back calls in a fresh-listener scenario; this
+// test adds a third call and asserts the embedded WebUI is still
+// reachable across all three (and that `get_listener_port` returns the
+// same value), which is the production trajectory for a `--listen-now`
+// tray with a later menu-click — the bug we are guarding against is a
+// re-entrant `start_web_listener` silently rebinding to a fresh port
+// and stranding the original listener thread.
+// ===========================================================================
+
+TEST_CASE("start_web_listener triple-call is idempotent and reachable across "
+          "all entries",
+          "[e6][tray-web]") {
+    DaemonSim sim("eager_triple_idemp");
+    IpcClient client(sim.sock_path);
+    REQUIRE(client.connect());
+
+    // 1st call — eager bind (what --listen-now triggers).
+    const int port1 = recmeet::start_web_listener(client);
+    REQUIRE(port1 > 0);
+    REQUIRE(recmeet::get_listener_port() == port1);
+
+    // Verify reachable.
+    {
+        httplib::Client http("127.0.0.1", port1);
+        http.set_connection_timeout(5);
+        auto res = http.Get("/api/health");
+        REQUIRE(res);
+        CHECK(res->status == 200);
+    }
+
+    // 2nd call — what a menu click would do post-eager. Must return the
+    // same port.
+    const int port2 = recmeet::start_web_listener(client);
+    CHECK(port2 == port1);
+    CHECK(recmeet::get_listener_port() == port1);
+
+    // 3rd call — defensive guard for any future re-entrant path. Same
+    // result.
+    const int port3 = recmeet::start_web_listener(client);
+    CHECK(port3 == port1);
+
+    // Verify still reachable on the original port (would fail if a
+    // re-entry silently rebound to a fresh listener).
+    {
+        httplib::Client http("127.0.0.1", port1);
+        http.set_connection_timeout(5);
+        auto res = http.Get("/api/health");
+        REQUIRE(res);
+        CHECK(res->status == 200);
+    }
+
+    recmeet::stop_web_listener();
+    CHECK(recmeet::get_listener_port() == -1);
+    client.close_connection();
+}

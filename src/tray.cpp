@@ -81,6 +81,14 @@ static const LangEntry LANGUAGES[] = {
 struct TrayState {
     AppIndicator* indicator = nullptr;
 
+    // Phase E.6.3 — `--headless` mode: no AppIndicator, no GTK menu, and
+    // (critically) no GIOChannel watch on the IPC socket. The embedded
+    // WebUI's HTTP handler threads do their own synchronous IPC reads
+    // inside `IpcClient::call`; a concurrent GLib-main-loop reader would
+    // race them and steal response frames. The flag is set once in
+    // `main()` and never cleared — toggle-at-runtime is not supported.
+    bool headless = false;
+
     JobConfig cfg;
     IpcClient ipc;   // daemon connection
     std::string daemon_addr;  // --daemon ADDRESS or RECMEET_DAEMON_ADDR
@@ -330,6 +338,14 @@ static void update_state(bool rec, bool pp, bool dl, bool reproc = false) {
     g_tray.postprocessing = pp;
     g_tray.downloading = dl;
     g_tray.is_reprocess = reproc;
+
+    // Phase E.6.3 — in headless mode there is no app indicator, no
+    // captions overlay window, no menu — every GUI update below is a
+    // no-op. Short-circuit here so callers (connection events, slot
+    // queue transitions, progress ticks, etc.) don't need their own
+    // guards. The non-GUI state fields above are still updated so any
+    // downstream logic reading them sees the right values.
+    if (!g_tray.indicator) return;
 
     // Close context window when recording ends (postprocessing begins)
     if (was_recording && !rec)
@@ -776,7 +792,16 @@ static bool connect_to_daemon() {
 
     g_tray.ipc.set_event_callback(handle_ipc_event);
     g_tray.daemon_connected = true;
-    setup_ipc_watch();
+    // Phase E.6.3 — headless mode does NOT install a GIOChannel watch
+    // on the IPC fd. The WebUI's HTTP handler threads do their own
+    // synchronous IPC reads via `IpcClient::call`; a concurrent
+    // GLib-main-loop reader (`on_ipc_data` → `read_and_dispatch`) would
+    // race those handler threads and consume response frames out from
+    // under them, surfacing as spurious "Not connected" errors mid-
+    // smoke. Async daemon events (progress.job, job.complete, ...)
+    // queue up in the kernel socket buffer; we don't surface them in
+    // headless mode anyway since there is no GUI to update.
+    if (!g_tray.headless) setup_ipc_watch();
 
     // Sync state. Phase C.9 — the daemon's `state.changed` /
     // `status.get` no longer carries a `recording` boolean (the
@@ -3052,6 +3077,13 @@ static void recover_pending_jobs_on_startup() {
 }
 
 static void build_menu() {
+    // Phase E.6.3 — headless: no indicator → no menu to attach. Every
+    // build_menu() call site is reachable from event handlers that may
+    // fire on the GLib main loop even in headless mode (reconnect
+    // events, postprocess transitions, model-download completions),
+    // so short-circuit here rather than guarding every call site.
+    if (!g_tray.indicator) return;
+
     auto* menu = gtk_menu_new();
     bool is_idle = !g_tray.recording && !g_tray.postprocessing && !g_tray.downloading;
     bool can_record = !g_tray.recording && !g_tray.downloading;
@@ -3566,16 +3598,84 @@ static void build_menu() {
 
 // --- Main ---
 
-int main(int argc, char* argv[]) {
-    gtk_init(&argc, &argv);
-    notify_init();
+// Phase E.6.3 — headless mode runs the tray with no GTK status icon, no
+// libnotify, and a `GMainLoop` (not `gtk_main`) for signal handling.
+// The file-static loop pointer is wired up only on the headless path; the
+// SIGTERM/SIGINT handlers (registered via `g_unix_signal_add`, so they run
+// on the GLib main loop — async-signal-safe by construction) branch on
+// whether `g_headless_loop` was populated.
+static GMainLoop* g_headless_loop = nullptr;
 
-    // Parse --daemon ADDRESS (GTK leaves unknown args in argv)
+namespace {
+
+// Print the headless-startup help line. Stderr so it doesn't pollute any
+// stdout-based smoke probe.
+void print_headless_only_rejection() {
+    fputs(
+        "recmeet-tray: --headless requires --listen-now\n"
+        "  (a headless tray with no HTTP listener has no way to be\n"
+        "   interacted with — pass both flags, or drop --headless to\n"
+        "   run a normal GUI tray)\n",
+        stderr);
+}
+
+// Pre-parse loop: walks argv and detects --listen-now / --headless WITHOUT
+// consuming or modifying argv. Called BEFORE `gtk_init` so we can skip
+// `gtk_init` entirely in headless mode (gtk_init aborts the process via
+// g_critical when no display can be opened, which would defeat the smoke
+// gate on a CI host without DISPLAY/WAYLAND_DISPLAY).
+//
+// Returns 0 if the flags are an acceptable combination, nonzero exit code
+// otherwise (e.g. --headless alone is rejected).
+int preparse_runtime_flags(int argc, char* argv[],
+                           bool& out_listen_now,
+                           bool& out_headless) {
+    out_listen_now = false;
+    out_headless = false;
     for (int i = 1; i < argc; ++i) {
-        if (std::string(argv[i]) == "--daemon" && i + 1 < argc) {
+        std::string a = argv[i];
+        if (a == "--listen-now") out_listen_now = true;
+        else if (a == "--headless") out_headless = true;
+    }
+    if (out_headless && !out_listen_now) {
+        print_headless_only_rejection();
+        return 1;
+    }
+    return 0;
+}
+
+} // namespace
+
+int main(int argc, char* argv[]) {
+    // Phase E.6.3 — pre-parse `--headless` / `--listen-now` BEFORE
+    // gtk_init. Calling gtk_init on a headless host (no DISPLAY,
+    // no WAYLAND_DISPLAY) terminates the process via g_critical from
+    // gtk_init_check; the smoke gate runs in exactly that shape.
+    bool listen_now = false;
+    bool headless = false;
+    if (int rc = preparse_runtime_flags(argc, argv, listen_now, headless))
+        return rc;
+
+    g_tray.headless = headless;
+
+    if (!headless) {
+        gtk_init(&argc, &argv);
+        notify_init();
+    }
+
+    // Parse remaining flags (GTK leaves unknown args in argv, and the
+    // headless path skipped gtk_init entirely so every argv entry is
+    // still here). --listen-now / --headless are accepted as no-ops here
+    // (they were already consumed conceptually by preparse_runtime_flags);
+    // --daemon ADDRESS is consumed.
+    for (int i = 1; i < argc; ++i) {
+        std::string a = argv[i];
+        if (a == "--daemon" && i + 1 < argc) {
             g_tray.daemon_addr = argv[++i];
-            break;
+            continue;
         }
+        if (a == "--listen-now") continue;
+        if (a == "--headless")   continue;
     }
     // RECMEET_DAEMON_ADDR env var as fallback
     if (g_tray.daemon_addr.empty()) {
@@ -3592,30 +3692,32 @@ int main(int argc, char* argv[]) {
     auto log_level = parse_log_level(g_tray.cfg.log_level_str);
     log_init(log_level, g_tray.cfg.log_dir, g_tray.cfg.log_retention_hours, true);
 
-    // Create indicator
-    G_GNUC_BEGIN_IGNORE_DEPRECATIONS
-    g_tray.indicator = app_indicator_new(
-        "recmeet-tray", ICON_IDLE,
-        APP_INDICATOR_CATEGORY_APPLICATION_STATUS);
-    G_GNUC_END_IGNORE_DEPRECATIONS
+    // Create indicator (GUI path only — headless has no system tray icon).
+    if (!headless) {
+        G_GNUC_BEGIN_IGNORE_DEPRECATIONS
+        g_tray.indicator = app_indicator_new(
+            "recmeet-tray", ICON_IDLE,
+            APP_INDICATOR_CATEGORY_APPLICATION_STATUS);
+        G_GNUC_END_IGNORE_DEPRECATIONS
 
-    // Set custom icon theme path — check relative to binary first (dev build),
-    // then fall back to installed location
-    {
-        std::error_code ec;
-        auto bin = std::filesystem::read_symlink("/proc/self/exe", ec);
-        if (!ec) {
-            auto base = bin.parent_path().parent_path() / "share" / "icons";
-            if (!std::filesystem::is_directory(base, ec))
-                base = std::filesystem::path(RECMEET_ICON_DIR);
-            app_indicator_set_icon_theme_path(g_tray.indicator, base.c_str());
+        // Set custom icon theme path — check relative to binary first (dev build),
+        // then fall back to installed location
+        {
+            std::error_code ec;
+            auto bin = std::filesystem::read_symlink("/proc/self/exe", ec);
+            if (!ec) {
+                auto base = bin.parent_path().parent_path() / "share" / "icons";
+                if (!std::filesystem::is_directory(base, ec))
+                    base = std::filesystem::path(RECMEET_ICON_DIR);
+                app_indicator_set_icon_theme_path(g_tray.indicator, base.c_str());
+            }
         }
+
+        app_indicator_set_status(g_tray.indicator, APP_INDICATOR_STATUS_ACTIVE);
+        app_indicator_set_title(g_tray.indicator, "recmeet");
+
+        refresh_sources();
     }
-
-    app_indicator_set_status(g_tray.indicator, APP_INDICATOR_STATUS_ACTIVE);
-    app_indicator_set_title(g_tray.indicator, "recmeet");
-
-    refresh_sources();
 
     // Connect to daemon (non-blocking — will retry via timer if not
     // running). Phase D.3: the first attempt at startup still goes
@@ -3653,11 +3755,17 @@ int main(int argc, char* argv[]) {
     // this periodic sweep covers the long-tail case where a sidecar
     // transitions to "fetched" between recordings and the now-evictable
     // WAV should not wait for the NEXT recording to be reclaimed.
+    //
+    // The timer only needs a `GMainLoop`, not GTK — so it is kept in
+    // headless mode too (the periodic sweep is correctness-relevant
+    // background behavior, not GUI behavior).
     g_timeout_add_seconds(D6_PERIODIC_SWEEP_SECS,
                           tray_run_periodic_staging_sweep, nullptr);
 
-    build_menu();
-    fetch_provider_models();
+    if (!headless) {
+        build_menu();
+        fetch_provider_models();
+    }
 
     // Phase E.6.2 — SIGCHLD handler retained as a safety net. The
     // pre-E.6.2 reason for this hook was reaping web-subprocess zombies,
@@ -3673,19 +3781,54 @@ int main(int argc, char* argv[]) {
         sigaction(SIGCHLD, &sa, nullptr);
     }
 
-    // Handle SIGTERM/SIGINT gracefully via GLib main loop
+    // Phase E.6.3 — Handle SIGTERM/SIGINT gracefully via GLib main loop.
+    // `g_unix_signal_add` dispatches the handler on the GLib main loop
+    // thread (NOT in raw POSIX signal context), so calling
+    // `g_main_loop_quit` from inside the handler is safe — unlike
+    // `pthread_cond_signal` / `cv.notify_all` which would be async-
+    // signal-unsafe. Same mechanism on both code paths; the handler
+    // body chooses which loop to quit based on whether the file-static
+    // `g_headless_loop` pointer was populated.
     g_unix_signal_add(SIGTERM, [](gpointer) -> gboolean {
-        gtk_main_quit();
+        if (g_headless_loop) g_main_loop_quit(g_headless_loop);
+        else gtk_main_quit();
         return G_SOURCE_REMOVE;
     }, nullptr);
     g_unix_signal_add(SIGINT, [](gpointer) -> gboolean {
-        gtk_main_quit();
+        if (g_headless_loop) g_main_loop_quit(g_headless_loop);
+        else gtk_main_quit();
         return G_SOURCE_REMOVE;
     }, nullptr);
 
-    log_info("recmeet-tray %s running (%zu mic(s), %zu monitor(s))",
-            RECMEET_VERSION, g_tray.mics.size(), g_tray.monitors.size());
-    gtk_main();
+    // Phase E.6.3 — `--listen-now` binds the embedded WebUI listener
+    // BEFORE the main loop runs, so external probes (CI smoke gate,
+    // operator debugging) can hit /api/* without first synthesizing a
+    // menu click. Idempotent with the lazy on-menu-click start path:
+    // `start_web_listener` short-circuits on re-entry.
+    if (listen_now) {
+        const int port = recmeet::start_web_listener(g_tray.ipc);
+        if (port <= 0) {
+            log_error("recmeet-tray: --listen-now requested but WebUI "
+                      "listener failed to bind");
+            return 2;
+        }
+    }
+
+    log_info("recmeet-tray %s running (%s, %zu mic(s), %zu monitor(s), "
+             "listener-port=%d)",
+             RECMEET_VERSION,
+             headless ? "headless" : "gui",
+             g_tray.mics.size(), g_tray.monitors.size(),
+             recmeet::get_listener_port());
+
+    if (headless) {
+        g_headless_loop = g_main_loop_new(nullptr, FALSE);
+        g_main_loop_run(g_headless_loop);
+        g_main_loop_unref(g_headless_loop);
+        g_headless_loop = nullptr;
+    } else {
+        gtk_main();
+    }
 
     // Cleanup — runs whether exited via on_quit, SIGTERM, or SIGINT.
     // Phase C.9: `record.stop` is gone. If a postprocess job is still in
@@ -3717,6 +3860,6 @@ int main(int argc, char* argv[]) {
         g_source_remove(g_tray.reconnect_timer);
 
     log_shutdown();
-    notify_cleanup();
+    if (!headless) notify_cleanup();
     return 0;
 }

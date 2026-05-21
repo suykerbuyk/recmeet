@@ -87,7 +87,7 @@ Phase E is in progress.
   | E.3 | Tray binary slimming (`ldd $(tray)` shows no onnxruntime / sherpa-onnx / whisper / llama / ggml) | COMPLETE |
   | E.4 | Daemon binary slimming (`ldd $(daemon)` shows no PipeWire / PulseAudio) | COMPLETE |
   | E.2 | Config schema split — `config.yaml` → `client.yaml` + `daemon.yaml` plus three new fields (`summary_style`, `caption_show_partials`, `caption_overlay_position`), one-shot migrator, and the **three-type runtime model** (`ServerConfig` at-rest daemon view + `ClientConfig` at-rest tray view + `JobConfig` per-job assembled by `make_job_config()` at the postprocess-enqueue seams) | COMPLETE (Wave 2.2b iter 177) |
-  | E.6 | WebUI folded into recmeet-tray; embedded asset bundle; 8 new `speakers.*` / `meetings.*` IPC verbs back the embedded HTTP listener; standalone web binary + systemd unit removed | COMPLETE (Phase E.6.1 + E.6.2) |
+  | E.6 | WebUI folded into recmeet-tray; embedded asset bundle; 8 new `speakers.*` / `meetings.*` IPC verbs back the embedded HTTP listener; standalone web binary + systemd unit removed; `recmeet-tray --listen-now --headless` + `scripts/smoke.sh` smoke gate (`make smoke`) | COMPLETE (Phase E.6.1 + E.6.2 + E.6.3) |
   | E.5 | Docs sweep — refresh A/B/C/D wave + new `DEPLOYMENT-THIN-CLIENT.md` + operator-workflow appendix on `V2-DEPLOYMENT.md` | IN PROGRESS (this document update) |
 
 The V2 wire protocol is stable. The architectural-proof test

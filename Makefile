@@ -66,7 +66,7 @@ endif
 endif
 
 # ── Targets ─────────────────────────────────────────────────────────
-.PHONY: build build-onnxruntime test integration integration-cxx integration-go integration-go-coverage integration-t2-1 integration-e2e benchmark full-stack install uninstall package-deb package-rpm package-arch clean coverage help daemon-start daemon-stop daemon-status ensure-submodules
+.PHONY: build build-onnxruntime test integration integration-cxx integration-go integration-go-coverage integration-t2-1 integration-e2e benchmark full-stack install uninstall package-deb package-rpm package-arch clean coverage help daemon-start daemon-stop daemon-status ensure-submodules smoke
 
 # Idempotent submodule populate. Triggered as a prerequisite of every target
 # that runs CMake, so a fresh `git clone` (without --recurse-submodules) or a
@@ -151,6 +151,15 @@ full-stack: ensure-submodules
 	ninja -C $(BUILD_DIR)
 	./$(BUILD_DIR)/recmeet --download-models --model base
 	./$(BUILD_DIR)/recmeet_tests "[full-stack]"
+
+# Phase E.6 smoke gate — spawns recmeet-daemon + recmeet-tray (headless,
+# eager listener) in an isolated sandbox and exercises the embedded
+# WebUI's HTTP surface against the live daemon. Fast (<10s); CI-friendly
+# (no display required); permanent regression gate. Extend
+# `scripts/smoke.sh`'s assertion list as new phases land. Intentionally
+# NOT a prerequisite of `full-stack` (they cover orthogonal concerns).
+smoke:
+	./scripts/smoke.sh
 
 install: build
 	@# Force-relink the C++ binaries before install. CMake's install-time
@@ -272,6 +281,7 @@ help:
 	@echo "  make integration-e2e   V2 thin-client gate: real daemon over TCP + PSK"
 	@echo "  make benchmark     Build + run benchmark tests"
 	@echo "  make full-stack    Build + run end-to-end pipeline tests"
+	@echo "  make smoke         Run Phase E.6 smoke gate (HTTP shapes against live daemon)"
 	@echo "  make install       Build + install to PREFIX (default: ~/.local)"
 	@echo "  make uninstall     Remove installed files from PREFIX"
 	@echo "  make daemon-start  Build + start daemon in background"

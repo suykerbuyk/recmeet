@@ -555,4 +555,8 @@ void stop_web_listener() {
     log_info("[tray_web] embedded WebUI stopped");
 }
 
+int get_listener_port() {
+    return g_resolved_port.load();
+}
+
 } // namespace recmeet

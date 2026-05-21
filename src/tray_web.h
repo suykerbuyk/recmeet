@@ -42,4 +42,11 @@ int start_web_listener(IpcClient& client);
 // stopped.
 void stop_web_listener();
 
+// Phase E.6.3 — accessor for the resolved listener port. Returns the
+// kernel-picked port the listener is currently bound to (>0), or -1 if
+// the listener has never been started or has been stopped. Used by the
+// tray's headless-mode startup log so operators don't need `ss -ltnp`
+// to discover the port.
+int get_listener_port();
+
 } // namespace recmeet

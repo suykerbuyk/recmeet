@@ -639,6 +639,10 @@ if(RECMEET_BUILD_TESTS)
         # registers the 11 new + 3 existing speakers/meetings verbs +
         # process.reprocess. Embedded cpp-httplib unity TU is linked here.
         tests/test_tray_web.cpp
+        # Phase E.6.3 — `recmeet-tray --listen-now / --headless` flag
+        # parser tests. Spawns the real recmeet-tray binary to exercise
+        # the pre-gtk_init flag pre-parse in main().
+        tests/test_tray_cli.cpp
         src/tray_web.cpp
         vendor/cpp-httplib/httplib.cpp
         ${_RECMEET_WEB_ASSETS_HDR}
