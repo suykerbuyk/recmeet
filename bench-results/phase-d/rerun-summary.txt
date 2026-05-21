@@ -1,0 +1,11 @@
+name=phase-d-rerun
+exit_code=0
+wall_clock_seconds=930
+samples=926
+gpu_busy_mean_pct=6.4
+gpu_busy_peak_pct=99
+vram_mean_mb=2496
+vram_peak_mb=2763
+power_mean_w=18.33
+power_peak_w=109.00
+temp_peak_c=85.0

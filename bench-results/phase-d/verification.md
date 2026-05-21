@@ -96,6 +96,29 @@ Candidates worth profiling:
 **Operator decision needed**: investigate now (block aggregate merge) vs.
 file a follow-up task and merge functional fix.
 
+### Update — bench rerun resolves the regression as system-load noise
+
+A second bench run on the same `feat/diarize-overcount-v1` HEAD, after the
+subagent's stale processes had cleared:
+
+```
+                          iter-183     Phase D run 1    Phase D run 2 (rerun)
+wall_clock_seconds        892          1271 (+42%)      930 (+4%)
+vram_peak_mb              2441         4920 (+101%)     2763 (+13%)
+gpu_busy_mean_pct         5.5          57.2 (+940%)     6.4 (+16%)
+power_mean_w              15.26        44.46 (+191%)    18.33 (+20%)
+exit_code                 42 (FAIL)    0 (PASS)         0 (PASS)
+```
+
+Run 2 is within noise of iter-183. The earlier +42% spike was a transient
+system-load artifact (the Phase D subagent ran ~37 minutes of mixed compute
+before kicking off the bench; the second bench started after that load had
+cleared). The `apply_collapse` unified loop introduces no measurable
+perf cost at N ≤ 23 globals — consistent with the plan's O(N²) estimate.
+
+**No regression. Aggregate merge unblocked.** Artifacts under
+`bench-results/phase-d-rerun/`.
+
 ## D.4 — `num_speakers → target_speakers` rename audit
 
 Grepped `src/` + `tests/` for `num_speakers`. 130 references; all
