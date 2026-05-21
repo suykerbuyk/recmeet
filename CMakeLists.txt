@@ -422,7 +422,7 @@ target_link_libraries(recmeet PRIVATE recmeet_core recmeet_live_capture)
 # Daemon binary — links recmeet_core only. After C.9 it must NOT pull in
 # PipeWire / PulseAudio / recmeet_capture. Verify with
 # `ldd build/recmeet-daemon | grep -E 'pipewire|pulse'` — expect no hits.
-add_executable(recmeet-daemon src/daemon.cpp)
+add_executable(recmeet-daemon src/daemon.cpp src/daemon_handlers.cpp)
 target_link_libraries(recmeet-daemon PRIVATE recmeet_core)
 
 # Tray binary
