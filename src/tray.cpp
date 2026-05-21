@@ -1410,6 +1410,9 @@ static void show_context_window() {
     gtk_box_pack_start(GTK_BOX(vbox), part_label, FALSE, FALSE, 0);
     auto* participants = gtk_entry_new();
     gtk_entry_set_placeholder_text(GTK_ENTRY(participants), "Participant names, comma-separated (optional)");
+    gtk_widget_set_tooltip_text(participants,
+        "Tip: a line like \"Participants: Alice, Bob, Carol\" lets recmeet "
+        "use the participant count as the speaker target during diarization.");
     gtk_box_pack_start(GTK_BOX(vbox), participants, FALSE, FALSE, 0);
 
     // Notes
