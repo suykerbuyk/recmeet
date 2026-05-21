@@ -20,6 +20,7 @@
 #include <catch2/catch_test_macros.hpp>
 #include "config.h"
 #include "config_json.h"
+#include "daemon_test_harness.h"
 #include "ipc_client.h"
 #include "ipc_protocol.h"
 #include "ipc_server.h"
@@ -34,19 +35,32 @@
 #include <unistd.h>
 
 using namespace recmeet;
+using recmeet::test::DaemonTestHarness;
 
 namespace {
 
-const char* SESSION_SOCK = "/tmp/recmeet_test_session.sock";
+// Phase 2b: register_session_handlers + ServerHarness retired in favor of
+// DaemonTestHarness — `register_daemon_handlers()` registers the
+// production session.init / session.update_credentials / session.update_prefs
+// handlers, and the harness wires the per-test g_* globals + IpcServer.
 
-// Build a server with the daemon's three A.6 session handlers wired in.
-// We register the handlers inside the test rather than reaching into
-// daemon.cpp (which has a forest of globals tied to the production
-// pipeline). The handler bodies here are intentionally a near-verbatim
-// copy of daemon.cpp's logic — keeps the test independent of the
-// production-process side, while still pinning the public IpcServer
-// session-state API. A future refactor could lift these handlers into a
-// reusable function; for v1 the duplication is bounded to this file.
+// Wrapper that mirrors the prior ServerHarness API used by the A.6
+// TEST_CASE bodies (`h.server` reference accessor) so the bodies are
+// unchanged.
+struct SessionHarness {
+    DaemonTestHarness harness;
+    IpcServer& server;
+    std::string sock_path;
+
+    SessionHarness() : server(harness.server()), sock_path(harness.socket_path()) {
+        harness.start();
+    }
+};
+
+#if 0
+// Legacy in-test stub bodies (retained as reference only — they were the
+// near-verbatim clone of the daemon.cpp handler shape that Phase 2b
+// retired). Not compiled into the test binary.
 void register_session_handlers(IpcServer& server) {
     auto parse_credentials_into = [](const JsonMap& src, SessionCredentials& dst) {
         auto pit = src.find("provider");
@@ -215,27 +229,7 @@ void register_session_handlers(IpcServer& server) {
         return true;
     });
 }
-
-// Stand up an IpcServer + worker thread bound to SESSION_SOCK with the
-// A.6 session handlers registered. Returns the started server so the
-// test can drive `get_session()` directly to inspect the slot.
-struct ServerHarness {
-    IpcServer server;
-    std::thread thr;
-
-    explicit ServerHarness(const char* sock = SESSION_SOCK) : server(sock) {
-        unlink(sock);
-        register_session_handlers(server);
-        REQUIRE(server.start());
-        thr = std::thread([this]() { server.run(); });
-        // Let the listener wind up before the first connect.
-        std::this_thread::sleep_for(std::chrono::milliseconds(50));
-    }
-    ~ServerHarness() {
-        server.stop();
-        if (thr.joinable()) thr.join();
-    }
-};
+#endif  // legacy in-test stub bodies
 
 // Synchronously read the per-client session slot from the server. Used
 // to assert handler effects. The server is single-threaded for our
@@ -254,8 +248,8 @@ bool snapshot_session(IpcServer& srv, const std::string& cid,
 
 TEST_CASE("A.6: session.init populates per-client creds and prefs",
           "[ipc][a6]") {
-    ServerHarness h;
-    IpcClient c(SESSION_SOCK);
+    SessionHarness h;
+    IpcClient c(h.sock_path);
     REQUIRE(c.connect());
     REQUIRE_FALSE(c.client_id().empty());
 
@@ -295,8 +289,8 @@ TEST_CASE("A.6: session.init populates per-client creds and prefs",
 
 TEST_CASE("A.6: session.init nested api_keys round-trips",
           "[ipc][a6]") {
-    ServerHarness h;
-    IpcClient c(SESSION_SOCK);
+    SessionHarness h;
+    IpcClient c(h.sock_path);
     REQUIRE(c.connect());
 
     // `api_keys` is a nested object in the wire shape — the client
@@ -338,8 +332,8 @@ TEST_CASE("A.6: session.init nested api_keys round-trips",
 
 TEST_CASE("A.6: session.update_credentials partial overwrites only specified fields",
           "[ipc][a6]") {
-    ServerHarness h;
-    IpcClient c(SESSION_SOCK);
+    SessionHarness h;
+    IpcClient c(h.sock_path);
     REQUIRE(c.connect());
 
     // First establish a full slot via session.init.
@@ -370,8 +364,8 @@ TEST_CASE("A.6: session.update_credentials partial overwrites only specified fie
 
 TEST_CASE("A.6: session.update_prefs partial preserves untouched fields",
           "[ipc][a6]") {
-    ServerHarness h;
-    IpcClient c(SESSION_SOCK);
+    SessionHarness h;
+    IpcClient c(h.sock_path);
     REQUIRE(c.connect());
 
     JsonMap creds;
@@ -403,8 +397,8 @@ TEST_CASE("A.6: session.update_prefs partial preserves untouched fields",
 
 TEST_CASE("A.6: session.update_prefs caption_latency_ms range enforcement",
           "[ipc][a6]") {
-    ServerHarness h;
-    IpcClient c(SESSION_SOCK);
+    SessionHarness h;
+    IpcClient c(h.sock_path);
     REQUIRE(c.connect());
 
     // Establish a clean slot.
@@ -449,8 +443,8 @@ TEST_CASE("A.6: session.update_prefs caption_latency_ms range enforcement",
 
 TEST_CASE("A.6: session.update_prefs summarization_backend value check",
           "[ipc][a6]") {
-    ServerHarness h;
-    IpcClient c(SESSION_SOCK);
+    SessionHarness h;
+    IpcClient c(h.sock_path);
     REQUIRE(c.connect());
 
     {
@@ -482,10 +476,10 @@ TEST_CASE("A.6: session.update_prefs summarization_backend value check",
 
 TEST_CASE("A.6: disconnect clears the per-client session slot",
           "[ipc][a6]") {
-    ServerHarness h;
+    SessionHarness h;
     std::string captured_id;
     {
-        IpcClient c(SESSION_SOCK);
+        IpcClient c(h.sock_path);
         REQUIRE(c.connect());
         captured_id = c.client_id();
         JsonMap creds;
@@ -512,7 +506,7 @@ TEST_CASE("A.6: disconnect clears the per-client session slot",
     // Reconnect: mints a fresh client_id. The new ClientState exists
     // (so `get_session` returns true) but `creds`/`prefs` are default-
     // constructed — no carry-over from the prior connection's session.
-    IpcClient c2(SESSION_SOCK);
+    IpcClient c2(h.sock_path);
     REQUIRE(c2.connect());
     CHECK(c2.client_id() != captured_id);
     SessionCredentials gc2;
@@ -529,8 +523,8 @@ TEST_CASE("A.6: config.update IPC is gone (method-not-found)",
     // (no `config.update` registered, mirroring the production removal).
     // A call to `config.update` must produce the standard
     // `MethodNotFound` error.
-    ServerHarness h;
-    IpcClient c(SESSION_SOCK);
+    SessionHarness h;
+    IpcClient c(h.sock_path);
     REQUIRE(c.connect());
 
     JsonMap params;

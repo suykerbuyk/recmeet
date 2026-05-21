@@ -16,6 +16,8 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include "daemon_handlers_internal.h"  // g_sessions extern for the PSK test
+#include "daemon_test_harness.h"
 #include "ipc_client.h"
 #include "ipc_protocol.h"
 #include "ipc_server.h"
@@ -32,6 +34,7 @@
 
 using namespace recmeet;
 using namespace std::chrono_literals;
+using recmeet::test::DaemonTestHarness;
 
 namespace {
 
@@ -70,9 +73,12 @@ void wire_c13_seams(IpcServer& server, SessionManager& sm) {
         [&sm](const std::string& tok) { sm.bump_last_seen(tok); });
 }
 
-// Stand-up + tear-down a TCP IpcServer harness with `status.get` wired so
-// the client has a valid round-trip verb. Caller controls the PSK +
-// SessionManager + port.
+// Stand-up + tear-down a TCP IpcServer harness with two non-production
+// verbs (`test.ack` + `ping`) wired so the client has a valid round-trip
+// verb. The PSK/rotation tests are about the AUTH path, not about the
+// semantics of a specific production verb — using non-production verb
+// names keeps the check-test-stubs.sh gate honest (no stub shadowing
+// production handlers). Caller controls the PSK + SessionManager + port.
 struct TcpServerHarness {
     std::unique_ptr<IpcServer> server;
     std::thread thr;
@@ -86,7 +92,7 @@ struct TcpServerHarness {
         server = std::make_unique<IpcServer>(addr);
         server->set_psk(psk);
         wire_c13_seams(*server, *sm);
-        server->on("status.get",
+        server->on("test.ack",
                    [this](const IpcRequest&, IpcResponse& resp, IpcError&) {
                        resp.result["state"] = std::string("idle");
                        dispatch_calls.fetch_add(1);
@@ -133,7 +139,7 @@ TEST_CASE("C.13: PSK rotation via set_psk (SIGHUP analog) rejects next-reconnect
     IpcClient c1(TCP_ADDR);
     REQUIRE(c1.connect());
     IpcResponse resp; IpcError err;
-    REQUIRE(c1.call("status.get", resp, err, 2000));
+    REQUIRE(c1.call("test.ack", resp, err, 2000));
 
     // (2) Rotate the server-side PSK — analog of SIGHUP after operator
     // updated RECMEET_AUTH_TOKEN in the unit env. This is exactly the
@@ -143,7 +149,7 @@ TEST_CASE("C.13: PSK rotation via set_psk (SIGHUP analog) rejects next-reconnect
     // (3) Existing connection still works — the rotation only checks
     // PSK on new auth.token handshakes, not on already-Authed fds.
     IpcResponse resp2; IpcError err2;
-    REQUIRE(c1.call("status.get", resp2, err2, 2000));
+    REQUIRE(c1.call("test.ack", resp2, err2, 2000));
 
     // (4) A fresh client with the OLD PSK is REJECTED on connect.
     {
@@ -158,135 +164,71 @@ TEST_CASE("C.13: PSK rotation via set_psk (SIGHUP analog) rejects next-reconnect
         IpcClient c_new(TCP_ADDR);
         REQUIRE(c_new.connect());
         IpcResponse r3; IpcError e3;
-        REQUIRE(c_new.call("status.get", r3, e3, 2000));
+        REQUIRE(c_new.call("test.ack", r3, e3, 2000));
     }
 }
 
 // ===========================================================================
-// (10) admin.evict end-to-end via Unix-socket IPC. Mirrors the daemon's
-// admin.evict handler shape; the SessionManager state is per-test.
+// (10) admin.evict end-to-end via DaemonTestHarness — drives the production
+// admin.evict handler in src/daemon_handlers.cpp against the harness-
+// wired `g_sessions` global. Phase 2b replaced the in-test stub with the
+// real handler so the wire-shape + the teardown_orphan_jobs call site
+// are exercised by the test.
 // ===========================================================================
-
-namespace {
-
-// Build a Unix-socket harness that wires admin.evict + a couple of
-// session-state inspection helpers. Used by --evict + last_seen tests.
-struct UnixServerHarness {
-    std::unique_ptr<IpcServer> server;
-    std::thread thr;
-    SessionManager* sm;
-    std::string sock_path;
-
-    UnixServerHarness(const std::string& path, SessionManager& sm_)
-        : sm(&sm_), sock_path(path) {
-        ::unlink(path.c_str());
-        server = std::make_unique<IpcServer>(path);
-        wire_c13_seams(*server, *sm);
-        server->on("status.get",
-                   [](const IpcRequest&, IpcResponse& resp, IpcError&) {
-                       resp.result["state"] = std::string("idle");
-                       return true;
-                   });
-        server->on("ping",
-                   [](const IpcRequest&, IpcResponse& resp, IpcError&) {
-                       resp.result["pong"] = true;
-                       return true;
-                   });
-        // admin.evict — verbatim copy of daemon.cpp's handler (minus the
-        // teardown_orphan_jobs call, which requires the daemon globals).
-        // The session-eviction primitive is what we pin here.
-        server->on("admin.evict",
-                   [this](const IpcRequest& req, IpcResponse& resp,
-                          IpcError& err) {
-                       auto it = req.params.find("prefix");
-                       if (it == req.params.end()) {
-                           err.code = static_cast<int>(IpcErrorCode::InvalidParams);
-                           err.message = "admin.evict: missing 'prefix'";
-                           return false;
-                       }
-                       std::string prefix = json_val_as_string(it->second);
-                       EvictResult r = sm->evict_by_prefix(prefix);
-                       switch (r.kind) {
-                       case EvictResult::Kind::PrefixTooShort:
-                           err.code = static_cast<int>(IpcErrorCode::InvalidParams);
-                           err.message = "admin.evict: prefix too short (min 8 hex chars)";
-                           return false;
-                       case EvictResult::Kind::NoMatch:
-                           err.code = static_cast<int>(IpcErrorCode::InvalidParams);
-                           err.message = "admin.evict: no matching session";
-                           return false;
-                       case EvictResult::Kind::Ambiguous:
-                           err.code = static_cast<int>(IpcErrorCode::InvalidParams);
-                           err.message = "admin.evict: ambiguous prefix";
-                           return false;
-                       case EvictResult::Kind::Evicted:
-                           resp.result["evicted"]   = r.token;
-                           resp.result["client_id"] = r.client_id;
-                           resp.result["owned_jobs_failed"] = std::string("[]");
-                           return true;
-                       }
-                       err.code = static_cast<int>(IpcErrorCode::InternalError);
-                       err.message = "unreachable";
-                       return false;
-                   });
-        REQUIRE(server->start());
-        thr = std::thread([this]() { server->run(); });
-        std::this_thread::sleep_for(50ms);
-    }
-    ~UnixServerHarness() {
-        if (server) server->stop();
-        if (thr.joinable()) thr.join();
-        ::unlink(sock_path.c_str());
-    }
-};
-
-} // anonymous namespace
 
 TEST_CASE("C.13: admin.evict happy path returns full token + client_id",
           "[c13][evict][ipc][integration]") {
-    SessionManager sm(/*ttl_seconds=*/3600);
-    std::string tok = sm.mint("client-A");
-    std::string prefix8 = tok.substr(0, 8);
+    DaemonTestHarness harness;
+    harness.start();
 
-    UnixServerHarness srv("/tmp/recmeet_c13_evict.sock", sm);
-    IpcClient c(srv.sock_path);
-    REQUIRE(c.connect());
+    // Mint a session directly on g_sessions (the global the production
+    // handler reads). The auth.token handshake adds another entry; we
+    // assert size by delta below.
+    REQUIRE(g_sessions);
+    std::string tok = g_sessions->mint("client-A");
+    std::string prefix8 = tok.substr(0, 8);
+    const auto size_before = g_sessions->size();
+
+    auto c = harness.make_client();
 
     JsonMap params;
     params["prefix"] = prefix8;
     IpcResponse resp; IpcError err;
-    REQUIRE(c.call("admin.evict", params, resp, err, 2000));
+    REQUIRE(c->call("admin.evict", params, resp, err, 2000));
     CHECK(json_val_as_string(resp.result["evicted"]) == tok);
     CHECK(json_val_as_string(resp.result["client_id"]) == "client-A");
-    // Session is gone.
-    CHECK(sm.size() == 0);
-    CHECK(!sm.resolve(tok).has_value());
+    // The owned_jobs_failed field is emitted as an embedded JSON array
+    // string; empty when no jobs were canceled (no jobs enqueued here).
+    CHECK(json_val_as_string(resp.result["owned_jobs_failed"]) == "[]");
+    // Session is gone — size decremented by exactly one (the planted token).
+    CHECK(g_sessions->size() == size_before - 1);
+    CHECK(!g_sessions->resolve(tok).has_value());
 }
 
 TEST_CASE("C.13: admin.evict prefix policy — too-short / no-match / ambiguous",
           "[c13][evict][ipc][integration]") {
-    SessionManager sm(/*ttl_seconds=*/3600);
-    std::string tok = sm.mint("client-A");
+    DaemonTestHarness harness;
+    harness.start();
+    REQUIRE(g_sessions);
+    std::string tok = g_sessions->mint("client-A");
 
-    UnixServerHarness srv("/tmp/recmeet_c13_evict2.sock", sm);
-    IpcClient c(srv.sock_path);
-    REQUIRE(c.connect());
+    auto c = harness.make_client();
 
     SECTION("too short") {
         JsonMap p;
         p["prefix"] = tok.substr(0, 7);  // 7 chars < 8
         IpcResponse r; IpcError e;
-        REQUIRE_FALSE(c.call("admin.evict", p, r, e, 2000));
+        REQUIRE_FALSE(c->call("admin.evict", p, r, e, 2000));
         CHECK(std::string(e.message).find("too short") != std::string::npos);
-        CHECK(sm.size() == 1);
+        CHECK(g_sessions->resolve(tok).has_value());
     }
     SECTION("no match") {
         JsonMap p;
         p["prefix"] = std::string("zzzzzzzz");  // 8 'z' — never a hex prefix
         IpcResponse r; IpcError e;
-        REQUIRE_FALSE(c.call("admin.evict", p, r, e, 2000));
+        REQUIRE_FALSE(c->call("admin.evict", p, r, e, 2000));
         CHECK(std::string(e.message).find("no matching") != std::string::npos);
-        CHECK(sm.size() == 1);
+        CHECK(g_sessions->resolve(tok).has_value());
     }
     SECTION("ambiguous (deterministic via insert_for_test)") {
         // Plant two colliding tokens via the test seam (gated by
@@ -300,21 +242,21 @@ TEST_CASE("C.13: admin.evict prefix policy — too-short / no-match / ambiguous"
         const std::string tok_b = prefix8 + std::string(56, '2');
         REQUIRE(tok_a.size() == 64);
         REQUIRE(tok_b.size() == 64);
-        sm.insert_for_test(tok_a, "client-amb-a");
-        sm.insert_for_test(tok_b, "client-amb-b");
-        const auto size_before = sm.size();   // includes the auth.token mint
-        REQUIRE(size_before >= 3);            // 1 (handshake) + 2 (planted)
+        g_sessions->insert_for_test(tok_a, "client-amb-a");
+        g_sessions->insert_for_test(tok_b, "client-amb-b");
+        const auto size_before = g_sessions->size();
+        REQUIRE(size_before >= 3);  // mint("client-A") + handshake + 2 planted
 
         JsonMap p;
         p["prefix"] = prefix8;
         IpcResponse r; IpcError e;
-        REQUIRE_FALSE(c.call("admin.evict", p, r, e, 2000));
+        REQUIRE_FALSE(c->call("admin.evict", p, r, e, 2000));
         CHECK(std::string(e.message).find("ambiguous") != std::string::npos);
         CHECK(e.code == static_cast<int>(IpcErrorCode::InvalidParams));
         // BOTH planted sessions must remain — Ambiguous is a no-op.
-        CHECK(sm.size() == size_before);
-        CHECK(sm.resolve(tok_a).has_value());
-        CHECK(sm.resolve(tok_b).has_value());
+        CHECK(g_sessions->size() == size_before);
+        CHECK(g_sessions->resolve(tok_a).has_value());
+        CHECK(g_sessions->resolve(tok_b).has_value());
     }
 }
 
@@ -373,7 +315,9 @@ TEST_CASE("C.13: per-handler dispatch hook bumps last_seen per inbound request",
 
     std::atomic<int> status_get_calls{0};
     std::atomic<int> ping_calls{0};
-    server->on("status.get",
+    // Non-production verb names — the test is about per-handler dispatch
+    // hook + last_seen, not about any specific production verb's body.
+    server->on("test.ack",
                [&](const IpcRequest&, IpcResponse& resp, IpcError&) {
                    resp.result["state"] = std::string("idle");
                    status_get_calls.fetch_add(1);
@@ -416,7 +360,7 @@ TEST_CASE("C.13: per-handler dispatch hook bumps last_seen per inbound request",
     for (int i = 0; i < 5; ++i) {
         IpcResponse r; IpcError e;
         fake_now.fetch_add(1);
-        REQUIRE(c.call("status.get", r, e, 2000));
+        REQUIRE(c.call("test.ack", r, e, 2000));
         fake_now.fetch_add(1);
         REQUIRE(c.call("ping", r, e, 2000));
     }
