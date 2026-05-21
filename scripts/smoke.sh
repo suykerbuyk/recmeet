@@ -49,6 +49,44 @@ cd "$PROJECT_ROOT"
 test -x build/recmeet-daemon || { echo "scripts/smoke.sh: build/recmeet-daemon missing — run 'make build' first." >&2; exit 1; }
 test -x build/recmeet-tray   || { echo "scripts/smoke.sh: build/recmeet-tray missing — run 'make build' first." >&2; exit 1; }
 
+# Freshness gate — refuse to run against a stale binary. `make smoke`
+# already depends on `build`, so this primarily fires when smoke.sh is
+# invoked directly with stale binaries.
+#
+# Heuristic: reference against the YOUNGER of the two binaries. The
+# young binary's mtime represents the most recent successful build
+# activity; the older binary, if older, did not need a rebuild during
+# that build (its sources were already current). Therefore any tracked
+# source NEWER than the young binary post-dates the last build and
+# means the working tree is ahead of the binaries on disk.
+#
+# `ninja -q` is not available in this ninja version, and `ninja -n` is
+# defeated by CMake's globbed-source regen step (it shows "Re-running
+# CMake" on every invocation regardless of true staleness). Mtime is
+# the most reliable signal we have.
+#
+# Override with RECMEET_SMOKE_SKIP_FRESHNESS=1 for the rare case where
+# mtimes are noise (fresh git checkout on a system whose clock skewed).
+if [ "${RECMEET_SMOKE_SKIP_FRESHNESS:-0}" != "1" ]; then
+    if [ build/recmeet-daemon -nt build/recmeet-tray ]; then
+        REF=build/recmeet-daemon
+    else
+        REF=build/recmeet-tray
+    fi
+    STALE=$(find src tests CMakeLists.txt cmake \
+                 \( -name '*.cpp' -o -name '*.h' -o -name '*.hpp' \
+                    -o -name '*.cc' -o -name '*.cmake' \
+                    -o -name 'CMakeLists.txt' \) \
+                 -newer "$REF" -print 2>/dev/null | head -5)
+    if [ -n "$STALE" ]; then
+        echo "scripts/smoke.sh: STALE BUILD — source newer than $REF (the younger binary):" >&2
+        echo "$STALE" | sed 's/^/  /' >&2
+        echo "Run 'make build' (or 'make smoke' which now depends on build)." >&2
+        echo "Override with RECMEET_SMOKE_SKIP_FRESHNESS=1 if intentional." >&2
+        exit 1
+    fi
+fi
+
 for tool in jq uuidgen ss curl; do
     command -v "$tool" >/dev/null 2>&1 || {
         echo "scripts/smoke.sh: required tool missing: $tool" >&2

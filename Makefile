@@ -158,7 +158,13 @@ full-stack: ensure-submodules
 # (no display required); permanent regression gate. Extend
 # `scripts/smoke.sh`'s assertion list as new phases land. Intentionally
 # NOT a prerequisite of `full-stack` (they cover orthogonal concerns).
-smoke:
+#
+# Depends on `build` so the gate ALWAYS runs against a binary refreshed
+# from current source. Ninja's incremental check is near-zero when the
+# tree is clean, so the cost in the common case is negligible. The
+# in-script freshness pre-flight catches direct `./scripts/smoke.sh`
+# invocations that bypass this target.
+smoke: build
 	./scripts/smoke.sh
 
 install: build
