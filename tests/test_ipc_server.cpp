@@ -1751,7 +1751,10 @@ TEST_CASE("A.1: TCP client that never sends auth.token is reaped by deadline",
     A2ScopedAuthToken env(TOKEN);
     IpcServer server(TCP_ADDR);
     server.set_psk(TOKEN);
-    server.on("status.get", [](const IpcRequest&, IpcResponse& resp, IpcError&) {
+    // Phase 2b: test exercises PSK timeout reaping, not status.get
+    // semantics — switched to non-production verb name so the
+    // check-test-stubs.sh gate doesn't flag plumbing as a stub.
+    server.on("test.ack", [](const IpcRequest&, IpcResponse& resp, IpcError&) {
         resp.result["state"] = std::string("idle");
         return true;
     });

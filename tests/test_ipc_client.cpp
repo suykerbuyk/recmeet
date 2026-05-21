@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 #include <catch2/catch_test_macros.hpp>
+#include "daemon_test_harness.h"
 #include "ipc_client.h"
 #include "ipc_server.h"
 
@@ -10,6 +11,7 @@
 #include <unistd.h>
 
 using namespace recmeet;
+using recmeet::test::DaemonTestHarness;
 
 namespace {
 const char* TEST_SOCK = "/tmp/recmeet_test_client.sock";
@@ -165,21 +167,13 @@ TEST_CASE("daemon_running: returns false when no daemon", "[ipc_client]") {
 }
 
 TEST_CASE("daemon_running: returns true with running server", "[ipc_client]") {
-    unlink(TEST_SOCK);
-
-    IpcServer server(TEST_SOCK);
-    server.on("status.get", [](const IpcRequest&, IpcResponse& resp, IpcError&) {
-        resp.result["state"] = std::string("idle");
-        return true;
-    });
-    REQUIRE(server.start());
-    std::thread srv([&server]() { server.run(); });
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
-
-    CHECK(daemon_running(TEST_SOCK));
-
-    server.stop();
-    srv.join();
+    // Phase 2b: daemon_running probes `status.get` (see
+    // src/ipc_client.cpp:1244), which is a production verb. Drive the
+    // production handler via DaemonTestHarness so we exercise the real
+    // status.get path instead of stubbing it locally.
+    DaemonTestHarness harness;
+    harness.start();
+    CHECK(daemon_running(harness.socket_path()));
 }
 
 // ---------------------------------------------------------------------------
