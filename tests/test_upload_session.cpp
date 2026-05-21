@@ -30,6 +30,9 @@
 #include "upload_session.h"
 #include "util.h"
 
+#include "daemon_test_harness.h"   // Phase 2b ext — wire tests drive the
+                                   // real process.submit handler.
+
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -680,20 +683,39 @@ TEST_CASE("UploadSession: container WAV upload is byte-exact on disk",
 //     NDJSON + process.submit.cancel round-trip through a real IpcServer +
 //     IpcClient. Confirms the C.1 FrameReader's interleave contract holds
 //     for `0x01` exactly as for `0x03`.
+//
+// Phase 2b extension — the wire tests now drive the PRODUCTION
+// `process.submit` / `process.submit.cancel` / `status.get` handlers via
+// `DaemonTestHarness::start()` + `register_daemon_handlers(server)`. The
+// upload-progress sink is injected via the harness so the test's progress
+// counter sees the same callbacks the production handler triggers.
 // ===========================================================================
 namespace {
 
-const char* UPLOAD_SOCK = "/tmp/recmeet_test_upload.sock";
-
-struct ServerGuard {
-    IpcServer& server;
-    std::thread thr;
-    explicit ServerGuard(IpcServer& s) : server(s) {
-        thr = std::thread([this]() { server.run(); });
+// HarnessPpDrainGuard — drives the harness's g_jobs postprocess slot the
+// same way PpDrainGuard does for a local JobQueue. Declared AFTER the
+// DaemonTestHarness in the test scope so destruction order is:
+//   1. HarnessPpDrainGuard::~ — calls g_jobs->shutdown() + joins worker
+//   2. ~DaemonTestHarness     — tears down g_uploads, g_jobs, server
+// That order is critical: the worker thread MUST exit before g_jobs is
+// reset() or it would touch a destroyed JobQueue.
+struct HarnessPpDrainGuard {
+    std::thread worker;
+    std::atomic<int> dequeued{0};
+    HarnessPpDrainGuard() {
+        worker = std::thread([this]() {
+            while (g_jobs) {
+                auto dq = g_jobs->dequeue(JobKind::Postprocess);
+                if (!dq.has_value()) return;   // shutdown signal
+                int64_t id = dq->job_id;
+                dequeued.fetch_add(1);
+                g_jobs->finish(id, /*ok=*/true);
+            }
+        });
     }
-    ~ServerGuard() {
-        server.stop();
-        if (thr.joinable()) thr.join();
+    ~HarnessPpDrainGuard() {
+        if (g_jobs) g_jobs->shutdown();
+        if (worker.joinable()) worker.join();
     }
 };
 
@@ -701,82 +723,25 @@ struct ServerGuard {
 
 TEST_CASE("UploadSession: 0x01 frames round-trip through IpcServer/IpcClient",
           "[upload-session][upload-wire]") {
-    ::unlink(UPLOAD_SOCK);
+    using namespace recmeet::test;
+    DaemonTestHarness harness;
 
-    JobQueue q;
-    PpDrainGuard pp(q);
-    fs::path root = test_temp_dir("wire");
+    // Inject a counting upload-progress sink BEFORE start() so the
+    // production handler's `on_progress` callbacks are observable.
     std::atomic<int> progress_calls{0};
     UploadProgressSink ps;
     ps.on_progress = [&](int64_t, const std::string&, int64_t, int64_t) {
         progress_calls.fetch_add(1);
     };
-    UploadSessionManager mgr(q, root, ps);
+    harness.set_upload_progress_sink(std::move(ps));
 
-    IpcServer server(UPLOAD_SOCK);
+    // The harness's default upload staging_root is its tmp_dir() — fine
+    // for these tests. We just need to know where staging dirs land so
+    // we can later observe them; use the harness's tmp_dir directly.
+    harness.start();
+    HarnessPpDrainGuard pp;   // destroyed BEFORE the harness — see comment.
 
-    std::atomic<bool> interleaved_cmd_seen{false};
-
-    // Wire handlers — mirror the daemon registration but local to this test.
-    server.on("process.submit",
-              [&](const IpcRequest& req, IpcResponse& resp, IpcError& err) {
-        SubmitRequest sr;
-        auto gs = [&](const char* k, const std::string& def) {
-            auto it = req.params.find(k);
-            return it != req.params.end() ? json_val_as_string(it->second) : def;
-        };
-        auto gi = [&](const char* k, int64_t def) {
-            auto it = req.params.find(k);
-            return it != req.params.end() ? json_val_as_int(it->second) : def;
-        };
-        sr.audio_size  = gi("audio_size", 0);
-        sr.format      = gs("format", sr.format);
-        sr.sample_rate = static_cast<int32_t>(gi("sample_rate", sr.sample_rate));
-        sr.channels    = static_cast<int32_t>(gi("channels", sr.channels));
-        sr.mode        = gs("mode", sr.mode);
-        JobConfig cfg;
-        auto cr = mgr.create(req.client_id, sr, cfg, 1<<20);
-        if (!cr.ok) { err.code = cr.code; err.message = cr.error; return false; }
-        resp.result["job_id"]       = cr.job_id;
-        resp.result["upload_token"] = cr.upload_token;
-        resp.result["max_size"]     = cr.max_size;
-        return true;
-    });
-    server.on("process.submit.cancel",
-              [&](const IpcRequest& req, IpcResponse& resp, IpcError& err) {
-        auto it = req.params.find("upload_token");
-        if (it == req.params.end()) {
-            err.code = static_cast<int>(IpcErrorCode::InvalidParams);
-            err.message = "missing upload_token"; return false;
-        }
-        if (!mgr.cancel(req.client_id, json_val_as_string(it->second))) {
-            err.code = static_cast<int>(IpcErrorCode::InvalidParams);
-            err.message = "unknown upload_token"; return false;
-        }
-        resp.result["ok"] = true;
-        return true;
-    });
-    server.on("status.get", [&](const IpcRequest&, IpcResponse& resp, IpcError&) {
-        interleaved_cmd_seen.store(true);
-        resp.result["ok"] = true; return true;
-    });
-    // Binary-frame handler — routes 0x01 to the upload manager by client_id.
-    server.on_binary_frame([&](const std::string& client_id,
-                               FrameType type,
-                               const std::string& payload) -> bool {
-        if (type == FrameType::BinaryUpload)
-            return mgr.feed_chunk(client_id, payload);
-        return true;
-    });
-    server.on_client_disconnect([&](const std::string& cid) {
-        mgr.on_client_disconnect(cid);
-    });
-
-    REQUIRE(server.start());
-    ServerGuard sg(server);
-
-    IpcClient client(UPLOAD_SOCK);
-    REQUIRE(client.connect());
+    auto client = harness.make_client();
 
     // Open the upload session: declare 3*1600 samples = 9600 bytes.
     JsonMap p;
@@ -786,38 +751,42 @@ TEST_CASE("UploadSession: 0x01 frames round-trip through IpcServer/IpcClient",
     p["channels"] = static_cast<int64_t>(1);
     p["mode"] = std::string("transcribe");
     IpcResponse resp; IpcError err;
-    REQUIRE(client.call("process.submit", p, resp, err, 5000));
+    REQUIRE(client->call("process.submit", p, resp, err, 5000));
     auto tit = resp.result.find("upload_token");
     REQUIRE(tit != resp.result.end());
     std::string token = json_val_as_string(tit->second);
     REQUIRE(!token.empty());
     auto mit = resp.result.find("max_size");
     REQUIRE(mit != resp.result.end());
-    CHECK(json_val_as_int(mit->second) == (1 << 20));
+    // The harness's ServerConfig leaves max_upload_bytes at default (0);
+    // the production handler treats 0 as "no cap" and reports INT64_MAX
+    // on the wire. Either way the size sent on the wire is positive.
+    CHECK(json_val_as_int(mit->second) > 0);
 
     // First chunk.
-    REQUIRE(client.send_upload_chunk(make_pcm(1600)));
+    REQUIRE(client->send_upload_chunk(make_pcm(1600)));
 
     // NDJSON interleave mid-upload — the C.1 FrameReader assembles this
-    // status.get between two `0x01` frames.
+    // status.get between two `0x01` frames. The production `status.get`
+    // handler is registered via register_daemon_handlers; we just need
+    // to confirm the call succeeds (a successful response proves the
+    // FrameReader interleaved correctly).
     IpcResponse sresp; IpcError serr;
-    REQUIRE(client.call("status.get", {}, sresp, serr, 5000));
+    REQUIRE(client->call("status.get", {}, sresp, serr, 5000));
 
     // Remaining chunks — the final one crosses audio_size and finalizes.
-    REQUIRE(client.send_upload_chunk(make_pcm(1600)));
-    REQUIRE(client.send_upload_chunk(make_pcm(1600)));
+    REQUIRE(client->send_upload_chunk(make_pcm(1600)));
+    REQUIRE(client->send_upload_chunk(make_pcm(1600)));
 
     // Wait for finalize + the pp drain worker to flip the job Done.
     CHECK(wait_until([&]() { return pp.dequeued.load() >= 1; },
                      std::chrono::milliseconds(2000)));
-    CHECK(mgr.active_count() == 0);
-    CHECK(interleaved_cmd_seen.load());
+    CHECK(g_uploads->active_count() == 0);
 
     // Progress sink fired at least 3x (once per chunk).
     CHECK(progress_calls.load() >= 3);
 
-    client.close_connection();
-    ::unlink(UPLOAD_SOCK);
+    client->close_connection();
 }
 
 // ===========================================================================
@@ -826,118 +795,81 @@ TEST_CASE("UploadSession: 0x01 frames round-trip through IpcServer/IpcClient",
 // ===========================================================================
 TEST_CASE("UploadSession: process.submit.cancel + disconnect handler over the wire",
           "[upload-session][upload-wire]") {
-    ::unlink(UPLOAD_SOCK);
-
-    JobQueue q;
-    PpDrainGuard pp(q);
-    fs::path root = test_temp_dir("wirecancel");
-    UploadSessionManager mgr(q, root, null_progress_sink());
-    IpcServer server(UPLOAD_SOCK);
-    std::atomic<int> disconnect_aborts{0};
-
-    server.on("process.submit",
-              [&](const IpcRequest& req, IpcResponse& resp, IpcError& err) {
-        SubmitRequest sr;
-        auto it = req.params.find("audio_size");
-        if (it != req.params.end()) sr.audio_size = json_val_as_int(it->second);
-        sr.format = "s16le";
-        sr.sample_rate = 16000;
-        sr.channels = 1;
-        sr.mode = "transcribe";
-        JobConfig cfg;
-        auto cr = mgr.create(req.client_id, sr, cfg, 1<<20);
-        if (!cr.ok) { err.code = cr.code; err.message = cr.error; return false; }
-        resp.result["job_id"] = cr.job_id;
-        resp.result["upload_token"] = cr.upload_token;
-        resp.result["max_size"] = cr.max_size;
-        return true;
-    });
-    server.on("process.submit.cancel",
-              [&](const IpcRequest& req, IpcResponse& resp, IpcError& err) {
-        auto it = req.params.find("upload_token");
-        if (it == req.params.end()) {
-            err.code = static_cast<int>(IpcErrorCode::InvalidParams);
-            err.message = "missing upload_token"; return false;
-        }
-        if (!mgr.cancel(req.client_id, json_val_as_string(it->second))) {
-            err.code = static_cast<int>(IpcErrorCode::InvalidParams);
-            err.message = "unknown upload_token"; return false;
-        }
-        resp.result["ok"] = true; return true;
-    });
-    server.on_binary_frame([&](const std::string& cid, FrameType type,
-                               const std::string& payload) -> bool {
-        if (type == FrameType::BinaryUpload) return mgr.feed_chunk(cid, payload);
-        return true;
-    });
-    server.on_client_disconnect([&](const std::string& cid) {
-        disconnect_aborts.fetch_add(mgr.on_client_disconnect(cid));
-    });
-
-    REQUIRE(server.start());
-    ServerGuard sg(server);
+    using namespace recmeet::test;
+    DaemonTestHarness harness;
+    harness.start();
+    HarnessPpDrainGuard pp;
+    // The harness's daemon-side on_client_disconnect already invokes
+    // g_uploads->on_client_disconnect (production behavior). The test
+    // observes the cleanup via g_uploads->active_count() and the staging
+    // dir disappearing — no separate counter is required.
 
     // --- Sub-case A: explicit process.submit.cancel after a partial upload.
     {
-        IpcClient client(UPLOAD_SOCK);
-        REQUIRE(client.connect());
+        auto client = harness.make_client();
         JsonMap p;
         p["audio_size"] = static_cast<int64_t>(6400);
         IpcResponse resp; IpcError err;
-        REQUIRE(client.call("process.submit", p, resp, err, 5000));
+        REQUIRE(client->call("process.submit", p, resp, err, 5000));
         std::string token = json_val_as_string(resp.result["upload_token"]);
         REQUIRE(!token.empty());
 
-        REQUIRE(client.send_upload_chunk(make_pcm(800)));  // partial
+        REQUIRE(client->send_upload_chunk(make_pcm(800)));  // partial
 
+        // Locate the staging dir under the harness's tmp_dir. The
+        // production UploadSessionManager places each upload's staging
+        // under `staging_root/recmeet-upload-<job_id>-<token8>/`.
         fs::path dir;
-        for (auto& e : fs::directory_iterator(root))
-            if (e.is_directory()) dir = e.path();
+        for (auto& e : fs::directory_iterator(harness.tmp_dir())) {
+            if (e.is_directory()
+                && e.path().filename().string().find("recmeet-upload-") == 0)
+                dir = e.path();
+        }
+        REQUIRE(!dir.empty());
         REQUIRE(fs::exists(dir));
 
         // Cancel over the wire.
         JsonMap cp; cp["upload_token"] = token;
         IpcResponse cresp; IpcError cerr;
-        REQUIRE(client.call("process.submit.cancel", cp, cresp, cerr, 5000));
-        // Give the server a brief moment to land the cancel (the call's
-        // response arrival is sufficient ordering, but the manager-mutex
-        // release order is observable to the test thread only after the
-        // poll loop progresses one more turn).
-        CHECK(wait_until([&]() { return mgr.active_count() == 0; },
+        REQUIRE(client->call("process.submit.cancel", cp, cresp, cerr, 5000));
+        CHECK(wait_until([&]() { return g_uploads->active_count() == 0; },
                          std::chrono::milliseconds(500)));
         CHECK_FALSE(fs::exists(dir));
 
-        client.close_connection();
+        client->close_connection();
     }
 
     // --- Sub-case B: mid-upload TCP drop fires the disconnect handler.
     {
-        IpcClient client(UPLOAD_SOCK);
-        REQUIRE(client.connect());
+        auto client = harness.make_client();
         JsonMap p;
         p["audio_size"] = static_cast<int64_t>(6400);
         IpcResponse resp; IpcError err;
-        REQUIRE(client.call("process.submit", p, resp, err, 5000));
+        REQUIRE(client->call("process.submit", p, resp, err, 5000));
         std::string token = json_val_as_string(resp.result["upload_token"]);
         REQUIRE(!token.empty());
 
-        REQUIRE(client.send_upload_chunk(make_pcm(800)));   // partial
+        REQUIRE(client->send_upload_chunk(make_pcm(800)));   // partial
 
         fs::path dir;
-        for (auto& e : fs::directory_iterator(root))
-            if (e.is_directory()) dir = e.path();
+        for (auto& e : fs::directory_iterator(harness.tmp_dir())) {
+            if (e.is_directory()
+                && e.path().filename().string().find("recmeet-upload-") == 0)
+                dir = e.path();
+        }
+        REQUIRE(!dir.empty());
         REQUIRE(fs::exists(dir));
-        CHECK(mgr.active_count() == 1);
+        CHECK(g_uploads->active_count() == 1);
 
-        client.close_connection();   // mid-upload drop
+        client->close_connection();   // mid-upload drop
 
-        CHECK(wait_until([&]() { return disconnect_aborts.load() >= 1; },
+        // The production daemon-side on_client_disconnect runs
+        // g_uploads->on_client_disconnect, which unlinks the staging
+        // dir and marks the JobQueue reservation Failed.
+        CHECK(wait_until([&]() { return g_uploads->active_count() == 0; },
                          std::chrono::milliseconds(2000)));
-        CHECK(mgr.active_count() == 0);
         CHECK_FALSE(fs::exists(dir));
     }
-
-    ::unlink(UPLOAD_SOCK);
 }
 
 // ===========================================================================

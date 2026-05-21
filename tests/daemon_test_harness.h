@@ -232,6 +232,36 @@ public:
             *g_jobs, staging_root, std::move(upload_sink),
             g_meeting_index.get(), meetings_dir_);
 
+        // Phase 2b ext — wire the daemon's on_client_disconnect inline
+        // (it lives in daemon.cpp's main(), not in register_daemon_handlers,
+        // so production tests need to install it explicitly). Mirrors
+        // src/daemon.cpp:2029-2047 — abort any in-flight streaming /
+        // upload session owned by the disconnected client.
+        server_->on_client_disconnect([](const std::string& client_id) {
+            if (g_streaming) g_streaming->on_client_disconnect(client_id);
+            if (g_uploads)   g_uploads->on_client_disconnect(client_id);
+        });
+
+        // Phase 2b ext — wire the binary-frame router (also lives in
+        // daemon.cpp's main, not in register_daemon_handlers). Mirrors
+        // src/daemon.cpp:1987-2023 — routes `0x03` to g_streaming and
+        // `0x01` to g_uploads.
+        server_->on_binary_frame(
+            [](const std::string& client_id, FrameType type,
+               const std::string& payload) -> bool {
+                if (type == FrameType::StreamAudio) {
+                    if (!g_streaming) return false;
+                    std::string token = g_streaming->token_for_client(client_id);
+                    if (token.empty()) return false;
+                    return g_streaming->feed_audio(token, payload);
+                }
+                if (type == FrameType::BinaryUpload) {
+                    if (!g_uploads) return false;
+                    return g_uploads->feed_chunk(client_id, payload);
+                }
+                return true;   // other binary frame types discarded silently.
+            });
+
         register_daemon_handlers(*server_);
         if (!server_->start()) {
             throw std::runtime_error(
