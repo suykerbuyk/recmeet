@@ -80,6 +80,7 @@ CliResult parse_cli(int argc, char* argv[]) {
         {"diarize-chunk-minutes",     required_argument, nullptr, 1029},
         {"diarize-chunk-overlap-sec", required_argument, nullptr, 1030},
         {"diarize-stitch-threshold",  required_argument, nullptr, 1031},
+        {"debug-dump-centroids",      required_argument, nullptr, 1038},
         {"reprocess-batch", required_argument, nullptr, 1032},
         {"dry-run",         no_argument,       nullptr, 1033},
         {"caption-model",      required_argument, nullptr, 1034},
@@ -162,6 +163,7 @@ CliResult parse_cli(int argc, char* argv[]) {
             case 1036: result.caption_force_off = true; break;
             case 1037: result.caption_force_on = true;
                        result.caption_show_on_stderr = true; break;
+            case 1038: result.cfg.debug_dump_centroids_path = optarg; break;
             case 'v': result.show_version = true; return result;
             case 'h': result.show_help = true; return result;
             default:  result.show_help = true; return result;

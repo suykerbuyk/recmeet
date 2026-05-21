@@ -87,7 +87,21 @@ struct DiarizeChunkConfig {
     /// global registry. Matches the SherpaOnnxSpeakerEmbeddingManager metric
     /// (Q4 spike): 0.6 on L2-normalized unit vectors.
     float stitch_threshold = 0.6f;
+
+    /// Phase A instrumentation: when non-empty, `stitch_chunks` writes a JSON
+    /// artifact at the end of stitching containing all global centroids, the
+    /// full pairwise cosine-similarity matrix, the per-chunk local→global
+    /// map, and sample-count weights. Auto-suffixed with `meeting_timestamp`
+    /// (M-1). Reusable across this bug class; the empty-string check is
+    /// negligible on the hot path.
+    std::string debug_dump_centroids_path;
+    /// Used to disambiguate concurrent reprocesses (M-1). Inserted into the
+    /// dump filename before the extension, e.g. PATH = `/tmp/x.json` and
+    /// meeting_timestamp = `2026-05-18_09-36` writes `/tmp/x_2026-05-18_09-36.json`.
+    /// Empty timestamp = no suffix (used by the dump-format unit test).
+    std::string meeting_timestamp;
 };
+
 
 /// Result of chunked diarization. `centroids` maps each global speaker ID
 /// (0..N-1 contiguous after compaction) to the **raw** (non-L2-normalized)
@@ -192,5 +206,25 @@ std::vector<TranscriptSegment> merge_speakers(
 
 /// Format a 0-based speaker ID as "Speaker_01", "Speaker_02", etc.
 std::string format_speaker(int speaker_id);
+
+/// Write a centroid-dump JSON artifact at `path` (Phase A instrumentation).
+/// If `path` is empty, no file is written. If `meeting_timestamp` is non-empty
+/// it is inserted before the extension to prevent concurrent-reprocess
+/// collisions (M-1). The dump payload is documented inline in the
+/// implementation; the format is stable enough for
+/// `scripts/diarize_threshold_analysis.py` to consume.
+///
+/// `centroids[i]` is the raw (non-L2-normalized) running-mean embedding for
+/// global ID `i`. `sample_counts[i]` is the cumulative sample-count weight for
+/// global ID `i` (used by the sample-weighted mean update). `local_to_global`
+/// is a per-chunk map `chunk_index → (local_id → global_id)`; pass an empty
+/// vector for the short-audio path (no chunking).
+void dump_centroids_json(
+    const std::string& path,
+    const std::string& meeting_timestamp,
+    const std::vector<std::vector<float>>& centroids,
+    const std::vector<long>& sample_counts,
+    const std::vector<std::map<int, int>>& local_to_global,
+    const std::string& source_label);
 
 } // namespace recmeet

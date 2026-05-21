@@ -7,8 +7,11 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <filesystem>
+#include <fstream>
 #include <limits>
 #include <set>
+#include <sstream>
 
 #if RECMEET_USE_SHERPA
 #include "audio_file.h"
@@ -57,6 +60,198 @@ std::vector<TranscriptSegment> merge_speakers(
     }
 
     return result;
+}
+
+namespace {
+
+// Centroid-dump cosine similarity. Independent of stitch's cosine_sim_raw so
+// that the dump helper compiles even when RECMEET_USE_SHERPA is OFF (the
+// stitch path's cosine_sim_raw lives inside the sherpa-gated anonymous
+// namespace below).
+double dump_cosine_similarity(const std::vector<float>& a,
+                              const std::vector<float>& b) {
+    if (a.size() != b.size() || a.empty()) return 0.0;
+    double dot = 0.0;
+    double norm_a_sq = 0.0;
+    double norm_b_sq = 0.0;
+    for (size_t i = 0; i < a.size(); ++i) {
+        double ai = static_cast<double>(a[i]);
+        double bi = static_cast<double>(b[i]);
+        dot += ai * bi;
+        norm_a_sq += ai * ai;
+        norm_b_sq += bi * bi;
+    }
+    double denom = std::sqrt(norm_a_sq) * std::sqrt(norm_b_sq);
+    if (denom < 1e-12) return 0.0;
+    return dot / denom;
+}
+
+// JSON-escape a string. Minimal — we only emit ASCII labels and timestamps in
+// the dump file so we just escape \, ", control chars.
+std::string dump_json_escape(const std::string& s) {
+    std::string out;
+    out.reserve(s.size() + 2);
+    for (char c : s) {
+        switch (c) {
+            case '"':  out += "\\\""; break;
+            case '\\': out += "\\\\"; break;
+            case '\n': out += "\\n"; break;
+            case '\r': out += "\\r"; break;
+            case '\t': out += "\\t"; break;
+            default:
+                if (static_cast<unsigned char>(c) < 0x20) {
+                    char buf[8];
+                    std::snprintf(buf, sizeof(buf), "\\u%04x",
+                                  static_cast<unsigned int>(static_cast<unsigned char>(c)));
+                    out += buf;
+                } else {
+                    out += c;
+                }
+        }
+    }
+    return out;
+}
+
+// Insert `meeting_timestamp` between the basename stem and the extension. If
+// the timestamp is empty, returns `path` unchanged (used by unit tests). If
+// the path has no extension we append `_<timestamp>` to the full path.
+std::string dump_suffix_path(const std::string& path,
+                             const std::string& meeting_timestamp) {
+    if (meeting_timestamp.empty()) return path;
+    std::filesystem::path p(path);
+    std::filesystem::path stem = p.stem();
+    std::filesystem::path ext = p.extension();
+    std::filesystem::path parent = p.parent_path();
+    std::string new_stem = stem.string() + "_" + meeting_timestamp;
+    std::filesystem::path out = parent / (new_stem + ext.string());
+    return out.string();
+}
+
+} // namespace
+
+void dump_centroids_json(
+    const std::string& path,
+    const std::string& meeting_timestamp,
+    const std::vector<std::vector<float>>& centroids,
+    const std::vector<long>& sample_counts,
+    const std::vector<std::map<int, int>>& local_to_global,
+    const std::string& source_label) {
+
+    if (path.empty()) return;  // no-op when flag absent
+
+    const size_t N = centroids.size();
+    if (sample_counts.size() != N) {
+        log_warn("dump_centroids_json: sample_counts size %zu != centroids size %zu",
+                 sample_counts.size(), N);
+    }
+
+    std::string out_path = dump_suffix_path(path, meeting_timestamp);
+
+    // Ensure parent dir exists (mkdir -p semantics). Best-effort.
+    try {
+        std::filesystem::path parent =
+            std::filesystem::path(out_path).parent_path();
+        if (!parent.empty() && !std::filesystem::exists(parent)) {
+            std::filesystem::create_directories(parent);
+        }
+    } catch (const std::exception& e) {
+        log_warn("dump_centroids_json: failed to create parent dir: %s", e.what());
+    }
+
+    std::ofstream os(out_path, std::ios::out | std::ios::trunc);
+    if (!os) {
+        log_warn("dump_centroids_json: failed to open %s for write", out_path.c_str());
+        return;
+    }
+
+    // Format: JSON object with keys
+    //   "schema":              version tag, currently "diarize-centroid-dump/1"
+    //   "source":              "stitch_chunks" | "diarize_short_audio" | ...
+    //   "meeting_timestamp":   the operator timestamp (informational only)
+    //   "num_globals":         centroids.size()
+    //   "dim":                 centroid dimensionality (0 if N==0)
+    //   "centroids":           [[f, f, ...], ...]  (raw, non-L2-normalized)
+    //   "sample_counts":       [long, long, ...]
+    //   "similarity":          NxN float matrix, computed transiently via
+    //                          L2-normalized dot product. Diagonal is 1.0.
+    //   "local_to_global":     [{"local_id": int, "global_id": int}, ...]
+    //                          per chunk; empty array for short-audio dumps.
+    os << "{\n";
+    os << "  \"schema\": \"diarize-centroid-dump/1\",\n";
+    os << "  \"source\": \"" << dump_json_escape(source_label) << "\",\n";
+    os << "  \"meeting_timestamp\": \""
+       << dump_json_escape(meeting_timestamp) << "\",\n";
+    os << "  \"num_globals\": " << N << ",\n";
+    os << "  \"dim\": " << (N > 0 ? centroids[0].size() : 0) << ",\n";
+
+    // centroids
+    os << "  \"centroids\": [";
+    for (size_t i = 0; i < N; ++i) {
+        if (i) os << ", ";
+        os << "[";
+        const auto& c = centroids[i];
+        for (size_t j = 0; j < c.size(); ++j) {
+            if (j) os << ", ";
+            // 8 significant digits — enough to reconstruct the cosine matrix
+            // to ~7 decimal places and bounded enough that 23 globals at 256-dim
+            // fits in a few hundred KB.
+            char buf[32];
+            std::snprintf(buf, sizeof(buf), "%.8g", c[j]);
+            os << buf;
+        }
+        os << "]";
+    }
+    os << "],\n";
+
+    // sample_counts
+    os << "  \"sample_counts\": [";
+    for (size_t i = 0; i < sample_counts.size(); ++i) {
+        if (i) os << ", ";
+        os << sample_counts[i];
+    }
+    os << "],\n";
+
+    // similarity matrix
+    os << "  \"similarity\": [";
+    for (size_t i = 0; i < N; ++i) {
+        if (i) os << ", ";
+        os << "[";
+        for (size_t j = 0; j < N; ++j) {
+            if (j) os << ", ";
+            double sim = (i == j) ? 1.0
+                       : dump_cosine_similarity(centroids[i], centroids[j]);
+            char buf[32];
+            std::snprintf(buf, sizeof(buf), "%.6f", sim);
+            os << buf;
+        }
+        os << "]";
+    }
+    os << "],\n";
+
+    // local_to_global
+    os << "  \"local_to_global\": [";
+    for (size_t k = 0; k < local_to_global.size(); ++k) {
+        if (k) os << ", ";
+        os << "[";
+        size_t m = 0;
+        for (const auto& [local_id, global_id] : local_to_global[k]) {
+            if (m++) os << ", ";
+            os << "{\"local_id\": " << local_id
+               << ", \"global_id\": " << global_id << "}";
+        }
+        os << "]";
+    }
+    os << "]\n";
+
+    os << "}\n";
+    os.flush();
+    if (!os) {
+        log_warn("dump_centroids_json: write failed for %s", out_path.c_str());
+        return;
+    }
+
+    log_info("dump_centroids_json: wrote %zu globals to %s",
+             N, out_path.c_str());
 }
 
 #if RECMEET_USE_SHERPA
@@ -507,6 +702,52 @@ DiarizeChunkedResult stitch_chunks(
                      [](const DiarizeSegment& x, const DiarizeSegment& y) {
                          return x.start < y.start;
                      });
+
+    // Phase A instrumentation: dump the post-stitch centroid state to JSON
+    // so an offline analysis script can sweep collapse thresholds without
+    // re-running the (~15-min) bench. Reads paths and timestamps from the
+    // already-populated DiarizeChunkConfig.
+    if (!cfg.debug_dump_centroids_path.empty()) {
+        std::vector<std::vector<float>> dump_centroids;
+        std::vector<long> dump_counts;
+        // `sorted_globals` carries the post-merge, pre-compaction order. We
+        // dump in post-compaction (0..N-1) order so the JSON's indices match
+        // the speaker IDs emitted by the pipeline.
+        dump_centroids.reserve(sorted_globals.size());
+        dump_counts.reserve(sorted_globals.size());
+        for (size_t k = 0; k < sorted_globals.size(); ++k) {
+            // out.centroids[k] was moved-from above. Reconstruct from the
+            // emitted segment payload would be expensive; instead read the
+            // (still-populated) `out.centroids` map. NB: we moved
+            // sorted_globals[k].raw INTO out.centroids[k], so dump from that.
+            auto it = out.centroids.find(static_cast<int>(k));
+            if (it != out.centroids.end()) {
+                dump_centroids.push_back(it->second);
+            } else {
+                dump_centroids.emplace_back();
+            }
+            dump_counts.push_back(sorted_globals[k].sample_count);
+        }
+        // Remap per-chunk local→global through the compaction map so the
+        // dumped global IDs match the emitted segment speaker IDs.
+        std::vector<std::map<int, int>> remapped_l2g;
+        remapped_l2g.reserve(local_to_global.size());
+        for (const auto& chunk_map : local_to_global) {
+            std::map<int, int> remapped;
+            for (const auto& [local_id, pre_compaction_gid] : chunk_map) {
+                auto rit = remap.find(pre_compaction_gid);
+                int gid = (rit != remap.end()) ? rit->second : pre_compaction_gid;
+                remapped[local_id] = gid;
+            }
+            remapped_l2g.push_back(std::move(remapped));
+        }
+        dump_centroids_json(cfg.debug_dump_centroids_path,
+                            cfg.meeting_timestamp,
+                            dump_centroids,
+                            dump_counts,
+                            remapped_l2g,
+                            "stitch_chunks");
+    }
 
     return out;
 }

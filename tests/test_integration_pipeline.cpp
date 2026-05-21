@@ -173,6 +173,15 @@ TEST_CASE("Chunked pipeline: long-audio reprocess under memory cap",
     cfg.note_dir = out_dir;
     // Defaults exercise the chunked path (audio > ~17.5 min @ defaults).
 
+    // Phase A instrumentation hook. When the integration test is invoked with
+    // RECMEET_DEBUG_DUMP_CENTROIDS=/some/path.json, the chunked pipeline
+    // writes the centroid dump there (auto-suffixed with the meeting
+    // timestamp). Lets the threshold-sweep run reuse this fixture without
+    // forking the test or changing the gate behavior.
+    if (const char* dump = std::getenv("RECMEET_DEBUG_DUMP_CENTROIDS")) {
+        if (dump[0]) cfg.debug_dump_centroids_path = dump;
+    }
+
     PostprocessInput input;
     input.out_dir = out_dir;
     input.audio_path = audio_path;
