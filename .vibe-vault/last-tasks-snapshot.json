@@ -1,10 +1,12 @@
 {
-  "iter_n": 193,
-  "anchor_sha": "450debc24268ba24a34e8578151fe592c7c8d77a",
+  "iter_n": 194,
+  "anchor_sha": "0404774bfa34a600096ae3301a5c70949a991725",
   "active": [
-    "diarize-overcount-and-context-aware-speaker-hints",
     "full-stack-captions-60min-regression",
+    "sherpa-onnx-1-13-bump",
+    "short-audio-ghost-cluster-min-duration-filter",
     "test-and-verification-hardening",
+    "test-handler-coverage-phase2c",
     "thin-client-recording-server",
     "webui-live-captions",
     "whisper-vocab-hint-bleed"
@@ -26,6 +28,7 @@
     "declarative-moseying-wind",
     "deterministic-logging-framework",
     "diarize-auto-detect-over-segments",
+    "diarize-overcount-and-context-aware-speaker-hints",
     "e6-smoke-gate",
     "e6-tray-bundled-webui",
     "fix-subprocess-live-recording",
