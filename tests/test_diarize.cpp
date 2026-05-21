@@ -221,7 +221,7 @@ TEST_CASE("stitch: identical raw centroid across chunks merges to one global",
     };
 
     DiarizeChunkConfig cfg;
-    auto out = stitch_chunks({c0, c1}, {m0, m1}, ext, cfg, /*num_speakers=*/0);
+    auto out = stitch_chunks({c0, c1}, {m0, m1}, ext, cfg, /*target_speakers=*/0);
 
     REQUIRE(out.diar.num_speakers == 1);
     REQUIRE(out.centroids.size() == 1);
@@ -245,7 +245,7 @@ TEST_CASE("stitch: orthogonal centroids produce distinct globals",
     };
 
     auto out = stitch_chunks({c0, c1}, {m0, m1}, ext,
-                             DiarizeChunkConfig{}, /*num_speakers=*/0);
+                             DiarizeChunkConfig{}, /*target_speakers=*/0);
 
     REQUIRE(out.diar.num_speakers == 2);
     REQUIRE(out.centroids.size() == 2);
@@ -269,7 +269,7 @@ TEST_CASE("stitch: speaker A in chunk 0 and B in chunk 1 produce 2 globals",
     };
 
     auto out = stitch_chunks({c0, c1}, {m0, m1}, ext,
-                             DiarizeChunkConfig{}, /*num_speakers=*/0);
+                             DiarizeChunkConfig{}, /*target_speakers=*/0);
     REQUIRE(out.diar.num_speakers == 2);
 }
 
@@ -291,7 +291,7 @@ TEST_CASE("stitch: weighted-mean update preserves raw (non-unit) centroid format
     };
 
     auto out = stitch_chunks({c0, c1}, {m0, m1}, ext,
-                             DiarizeChunkConfig{}, /*num_speakers=*/0);
+                             DiarizeChunkConfig{}, /*target_speakers=*/0);
     REQUIRE(out.centroids.size() == 1);
     auto stored = out.centroids.begin()->second;
     float n = l2(stored);
@@ -303,6 +303,11 @@ TEST_CASE("stitch: cosine-similarity threshold boundary (0.59 vs 0.61)",
           "[diarize][stitch][t2-1]") {
     DiarizeChunkConfig cfg;
     cfg.stitch_threshold = 0.6f;
+    // Phase B.4 audit: lift `collapse_threshold` above 0.61 so the Phase B
+    // post-stitch unified loop (always-on; default 0.55) does NOT collapse
+    // these pairs and the test still measures `stitch_threshold` behavior
+    // in isolation.
+    cfg.collapse_threshold = 1.0f;
 
     // Below threshold → distinct globals.
     {
@@ -314,7 +319,8 @@ TEST_CASE("stitch: cosine-similarity threshold boundary (0.59 vs 0.61)",
             make_extents(0.0, 30.0, 0.0, 30.0),
             make_extents(30.0, 60.0, 30.0, 60.0),
         };
-        auto out = stitch_chunks({c0, c1}, {{{0, a}}, {{0, b}}}, ext, cfg, 0);
+        auto out = stitch_chunks({c0, c1}, {{{0, a}}, {{0, b}}}, ext, cfg,
+                                 /*target_speakers=*/0);
         CHECK(out.diar.num_speakers == 2);
     }
     // Above threshold → merged.
@@ -327,7 +333,8 @@ TEST_CASE("stitch: cosine-similarity threshold boundary (0.59 vs 0.61)",
             make_extents(0.0, 30.0, 0.0, 30.0),
             make_extents(30.0, 60.0, 30.0, 60.0),
         };
-        auto out = stitch_chunks({c0, c1}, {{{0, a}}, {{0, b}}}, ext, cfg, 0);
+        auto out = stitch_chunks({c0, c1}, {{{0, a}}, {{0, b}}}, ext, cfg,
+                                 /*target_speakers=*/0);
         CHECK(out.diar.num_speakers == 1);
     }
 }
@@ -357,7 +364,7 @@ TEST_CASE("stitch: post-stitch count limit greedy-merges to N globals",
 
     DiarizeChunkConfig cfg;
     cfg.stitch_threshold = 0.99f;  // force distinct globals from stitching
-    auto out = stitch_chunks(chunks, cents, ext, cfg, /*num_speakers=*/3);
+    auto out = stitch_chunks(chunks, cents, ext, cfg, /*target_speakers=*/3);
 
     // First 5 globals collapse to exactly 3 after greedy-merge.
     CHECK(out.diar.num_speakers == 3);
@@ -388,7 +395,7 @@ TEST_CASE("stitch: post-stitch merge uses sample-weighted mean of raw vectors",
     cfg.stitch_threshold = 0.99f;  // orthogonal so no merge during stitch
 
     auto out = stitch_chunks({c0, c1}, {{{0, A}}, {{0, B}}}, ext, cfg,
-                             /*num_speakers=*/1);
+                             /*target_speakers=*/1);
     REQUIRE(out.centroids.size() == 1);
     auto merged = out.centroids.begin()->second;
 
@@ -433,11 +440,11 @@ TEST_CASE("stitch: post-merge ID compaction yields contiguous 0..N-1",
                                    i * 30.0, (i + 1) * 30.0));
     }
     // Pre-condition: stitching produces 4 globals.
-    auto pre = stitch_chunks(chunks, cents, ext, cfg, /*num_speakers=*/0);
+    auto pre = stitch_chunks(chunks, cents, ext, cfg, /*target_speakers=*/0);
     REQUIRE(pre.diar.num_speakers == 4);
 
     // num_speakers=3 forces one merge; result IDs must be {0,1,2} contiguous.
-    auto out = stitch_chunks(chunks, cents, ext, cfg, /*num_speakers=*/3);
+    auto out = stitch_chunks(chunks, cents, ext, cfg, /*target_speakers=*/3);
     REQUIRE(out.diar.num_speakers == 3);
     REQUIRE(out.centroids.size() == 3);
     CHECK(out.centroids.count(0) == 1);
@@ -588,7 +595,7 @@ TEST_CASE("diarize_chunked: invalid config throws RecmeetError",
 
     try {
         diarize_chunked(samples.data(), samples.size(),
-                        /*num_speakers=*/0, /*threads=*/1, /*threshold=*/1.18f,
+                        /*target_speakers=*/0, /*threads=*/1, /*threshold=*/1.18f,
                         bad, nullptr);
         FAIL("expected RecmeetError for invalid chunk config");
     } catch (const RecmeetError& e) {
@@ -597,6 +604,171 @@ TEST_CASE("diarize_chunked: invalid config throws RecmeetError",
         // offending knob (rev 7 line 363, line 479).
         CHECK_THAT(msg, Catch::Matchers::ContainsSubstring("chunk"));
         CHECK_THAT(msg, Catch::Matchers::ContainsSubstring("overlap"));
+    }
+}
+
+// ===========================================================================
+// Phase B.1/B.3 — `apply_collapse` shared helper coverage.
+//
+// These tests exercise the unified greedy-merge loop + 0..N-1 compaction
+// directly with handcrafted GlobalEntry inputs. They cover the four
+// terminating cases of the loop:
+//   1. Two pairs above the threshold floor → collapse to target.
+//   2. Best pair sim < threshold but ceiling forces merge.
+//   3. All pairs sim < threshold and under cap → no merges (loop exits).
+//   4. Short-audio segment-rewrite + compaction round-trip (test #4 in the
+//      orchestrator brief).
+// ===========================================================================
+
+namespace {
+
+// Build a synthetic GlobalEntry quickly. The unified loop reads
+// `id`, `raw`, `sample_count` — all three must be sane.
+GlobalEntry make_global(int id, std::vector<float> raw, long sample_count) {
+    GlobalEntry g;
+    g.id = id;
+    g.raw = std::move(raw);
+    g.sample_count = sample_count;
+    return g;
+}
+
+} // namespace
+
+TEST_CASE("apply_collapse: threshold-driven auto-merge pairs at T=0.55",
+          "[diarize][apply-collapse]") {
+    // Setup: 5 globals where two pairs sit ≥ 0.55 (mergeable by threshold)
+    // and the remaining three are mutually orthogonal. With target_speakers=2
+    // and T=0.55, the loop collapses both pairs and then keeps merging to
+    // reach the cap.
+    //
+    // Pairs: (g0,g1) at sim 1.0, (g2,g3) at sim 1.0. g4 orthogonal.
+    // Expected end state: post-collapse contiguous IDs 0..1, two centroids.
+    std::vector<GlobalEntry> globals;
+    globals.push_back(make_global(0, {1, 0, 0, 0}, 100));
+    globals.push_back(make_global(1, {1, 0, 0, 0}, 100));  // dup of 0
+    globals.push_back(make_global(2, {0, 1, 0, 0}, 100));
+    globals.push_back(make_global(3, {0, 1, 0, 0}, 100));  // dup of 2
+    globals.push_back(make_global(4, {0, 0, 1, 0}, 100));  // orthogonal lone
+
+    DiarizeResult diar;
+    diar.segments = {
+        {0.0, 1.0, 0}, {1.0, 2.0, 1}, {2.0, 3.0, 2},
+        {3.0, 4.0, 3}, {4.0, 5.0, 4},
+    };
+    diar.num_speakers = 5;
+
+    auto out = apply_collapse(diar, globals,
+                              /*target_speakers=*/2,
+                              /*collapse_threshold=*/0.55f);
+
+    CHECK(out.num_speakers == 2);
+    REQUIRE(out.centroids.size() == 2);
+    CHECK(out.centroids.count(0) == 1);
+    CHECK(out.centroids.count(1) == 1);
+    // Every segment's speaker is in {0, 1} — no stale dropped IDs.
+    for (const auto& s : diar.segments) {
+        CHECK(s.speaker >= 0);
+        CHECK(s.speaker <= 1);
+    }
+}
+
+TEST_CASE("apply_collapse: ceiling forces merge below threshold floor",
+          "[diarize][apply-collapse]") {
+    // target_speakers=2 with 3 globals; ALL pair similarities are below the
+    // threshold (orthogonal). The ceiling branch must still force-merge until
+    // count <= 2.
+    std::vector<GlobalEntry> globals;
+    globals.push_back(make_global(0, {1, 0, 0}, 100));
+    globals.push_back(make_global(1, {0, 1, 0}, 100));
+    globals.push_back(make_global(2, {0, 0, 1}, 100));
+
+    DiarizeResult diar;
+    diar.segments = {{0.0, 1.0, 0}, {1.0, 2.0, 1}, {2.0, 3.0, 2}};
+    diar.num_speakers = 3;
+
+    auto out = apply_collapse(diar, globals,
+                              /*target_speakers=*/2,
+                              /*collapse_threshold=*/0.55f);
+
+    // Cap-merge fired despite max pairwise sim being 0.0 (< 0.55 floor).
+    CHECK(out.num_speakers == 2);
+    REQUIRE(out.centroids.size() == 2);
+    for (const auto& s : diar.segments) {
+        CHECK(s.speaker >= 0);
+        CHECK(s.speaker <= 1);
+    }
+}
+
+TEST_CASE("apply_collapse: under-cap and all-below-threshold leaves N intact",
+          "[diarize][apply-collapse]") {
+    // target_speakers=8 with 5 orthogonal globals — neither ceiling nor
+    // threshold gate fires; the loop exits without merging.
+    std::vector<GlobalEntry> globals;
+    globals.push_back(make_global(0, {1, 0, 0, 0, 0}, 100));
+    globals.push_back(make_global(1, {0, 1, 0, 0, 0}, 100));
+    globals.push_back(make_global(2, {0, 0, 1, 0, 0}, 100));
+    globals.push_back(make_global(3, {0, 0, 0, 1, 0}, 100));
+    globals.push_back(make_global(4, {0, 0, 0, 0, 1}, 100));
+
+    DiarizeResult diar;
+    diar.segments = {
+        {0.0, 1.0, 0}, {1.0, 2.0, 1}, {2.0, 3.0, 2},
+        {3.0, 4.0, 3}, {4.0, 5.0, 4},
+    };
+    diar.num_speakers = 5;
+
+    auto out = apply_collapse(diar, globals,
+                              /*target_speakers=*/8,
+                              /*collapse_threshold=*/0.55f);
+
+    CHECK(out.num_speakers == 5);
+    REQUIRE(out.centroids.size() == 5);
+    // Compaction was applied even with no merges → IDs are 0..4.
+    for (int i = 0; i < 5; ++i) CHECK(out.centroids.count(i) == 1);
+}
+
+TEST_CASE("apply_collapse: short-audio segment-rewrite + 0..N-1 compaction",
+          "[diarize][apply-collapse]") {
+    // Plan D's [pipeline][short-audio] case lifted into Phase B since it
+    // directly tests B.3's wiring. Feed `apply_collapse` a DiarizeResult
+    // with 4 clusters where two collapse via threshold → after the call,
+    // segments are rewritten and IDs are 0..2 contiguous.
+    //
+    // Cluster IDs 0..3, centroids:
+    //   id 0 = axis 0
+    //   id 1 = axis 0 (duplicate of 0)
+    //   id 2 = axis 1
+    //   id 3 = axis 2
+    // Expect: 0&1 collapse → 3 globals → contiguous IDs 0,1,2.
+    std::vector<GlobalEntry> globals;
+    globals.push_back(make_global(0, {1, 0, 0}, 5000));
+    globals.push_back(make_global(1, {1, 0, 0}, 3000));  // duplicate of 0
+    globals.push_back(make_global(2, {0, 1, 0}, 4000));
+    globals.push_back(make_global(3, {0, 0, 1}, 2000));
+
+    DiarizeResult diar;
+    diar.segments = {
+        {0.0,  10.0, 0},  // -> survives as merged 0
+        {10.0, 15.0, 1},  // -> rewritten to merged 0 (then compacted)
+        {15.0, 25.0, 2},  // -> 1 after compaction
+        {25.0, 30.0, 3},  // -> 2 after compaction
+    };
+    diar.num_speakers = 4;
+
+    auto out = apply_collapse(diar, globals,
+                              /*target_speakers=*/0,           // no ceiling
+                              /*collapse_threshold=*/0.55f);
+
+    REQUIRE(out.num_speakers == 3);
+    REQUIRE(out.centroids.size() == 3);
+    CHECK(out.centroids.count(0) == 1);
+    CHECK(out.centroids.count(1) == 1);
+    CHECK(out.centroids.count(2) == 1);
+    CHECK(out.centroids.count(3) == 0);
+    // Every segment now uses a contiguous 0..2 ID — no dangling 3.
+    for (const auto& s : diar.segments) {
+        CHECK(s.speaker >= 0);
+        CHECK(s.speaker <= 2);
     }
 }
 
@@ -759,7 +931,7 @@ TEST_CASE("stitch_chunks: dump path emits centroid JSON with compaction IDs",
     DiarizeChunkConfig cfg;
     cfg.debug_dump_centroids_path = tmp.string();
     // no timestamp → no suffix
-    auto out = stitch_chunks({c0, c1}, {m0, m1}, ext, cfg, /*num_speakers=*/0);
+    auto out = stitch_chunks({c0, c1}, {m0, m1}, ext, cfg, /*target_speakers=*/0);
     REQUIRE(out.diar.num_speakers == 2);
     REQUIRE(std::filesystem::exists(tmp));
 
