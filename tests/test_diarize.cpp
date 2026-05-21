@@ -7,6 +7,13 @@
 #include "util.h"
 
 #include <cmath>
+#include <cstdio>
+#include <filesystem>
+#include <fstream>
+#include <map>
+#include <sstream>
+#include <string>
+#include <vector>
 
 using namespace recmeet;
 
@@ -593,4 +600,176 @@ TEST_CASE("diarize_chunked: invalid config throws RecmeetError",
     }
 }
 
+#endif  // RECMEET_USE_SHERPA
+
+// ===========================================================================
+// Phase A — dump_centroids_json format coverage
+//
+// dump_centroids_json is intentionally outside the RECMEET_USE_SHERPA guard
+// (file I/O over plain float vectors). These tests confirm the JSON shape so
+// `scripts/diarize_threshold_analysis.py` doesn't drift from the producer.
+// ===========================================================================
+
+namespace {
+
+// Trivial substring count helper — JSON-key spot-checks below.
+size_t count_substr(const std::string& hay, const std::string& needle) {
+    if (needle.empty()) return 0;
+    size_t n = 0;
+    size_t pos = 0;
+    while ((pos = hay.find(needle, pos)) != std::string::npos) {
+        ++n;
+        pos += needle.size();
+    }
+    return n;
+}
+
+std::string slurp(const std::filesystem::path& p) {
+    std::ifstream f(p);
+    std::stringstream ss;
+    ss << f.rdbuf();
+    return ss.str();
+}
+
+} // namespace
+
+TEST_CASE("dump_centroids_json: empty path is a no-op",
+          "[diarize][dump-centroids]") {
+    // No file should be created. Just confirm we don't crash.
+    std::vector<std::vector<float>> c = {{1.0f, 0.0f}, {0.0f, 1.0f}};
+    std::vector<long> w = {100, 200};
+    dump_centroids_json("", "", c, w, {}, "test");
+    SUCCEED();
+}
+
+TEST_CASE("dump_centroids_json: writes file with expected JSON keys",
+          "[diarize][dump-centroids]") {
+    auto tmp = std::filesystem::temp_directory_path()
+             / "recmeet_dump_centroids_test.json";
+    std::filesystem::remove(tmp);
+
+    // 3 globals in 4-dim space; first two have cosine sim ≈ 0.5, third is
+    // orthogonal so the sim matrix exercises all three nontrivial values.
+    std::vector<std::vector<float>> centroids = {
+        {1.0f, 0.0f, 0.0f, 0.0f},
+        {0.5f, std::sqrt(0.75f), 0.0f, 0.0f},
+        {0.0f, 0.0f, 1.0f, 0.0f},
+    };
+    std::vector<long> counts = {1000, 2000, 500};
+    std::vector<std::map<int, int>> l2g = {
+        {{0, 0}, {1, 2}},
+        {{0, 1}},
+    };
+
+    dump_centroids_json(tmp.string(), /*timestamp=*/"", centroids, counts,
+                        l2g, "stitch_chunks");
+    REQUIRE(std::filesystem::exists(tmp));
+
+    std::string body = slurp(tmp);
+    INFO("dumped body:\n" << body);
+
+    // Required keys — spot-check rather than full JSON parse to keep test
+    // dependency-light. Each key should appear exactly once at the top level.
+    CHECK(count_substr(body, "\"schema\"") == 1);
+    CHECK(count_substr(body, "\"diarize-centroid-dump/1\"") == 1);
+    CHECK(count_substr(body, "\"source\"") == 1);
+    CHECK(count_substr(body, "\"stitch_chunks\"") == 1);
+    CHECK(count_substr(body, "\"num_globals\"") == 1);
+    CHECK(count_substr(body, "\"centroids\"") == 1);
+    CHECK(count_substr(body, "\"similarity\"") == 1);
+    CHECK(count_substr(body, "\"sample_counts\"") == 1);
+    CHECK(count_substr(body, "\"local_to_global\"") == 1);
+
+    // sanity: num_globals: 3 and dim: 4 substrings present
+    CHECK_THAT(body, Catch::Matchers::ContainsSubstring("\"num_globals\": 3"));
+    CHECK_THAT(body, Catch::Matchers::ContainsSubstring("\"dim\": 4"));
+
+    // sample_counts values present (long, exact format)
+    CHECK_THAT(body, Catch::Matchers::ContainsSubstring("1000"));
+    CHECK_THAT(body, Catch::Matchers::ContainsSubstring("2000"));
+    CHECK_THAT(body, Catch::Matchers::ContainsSubstring("500"));
+
+    // local_to_global entries
+    CHECK_THAT(body, Catch::Matchers::ContainsSubstring("\"local_id\": 0"));
+    CHECK_THAT(body, Catch::Matchers::ContainsSubstring("\"global_id\": 2"));
+
+    // Diagonal of similarity matrix must be 1.0 — quick string check.
+    CHECK_THAT(body, Catch::Matchers::ContainsSubstring("1.000000"));
+
+    std::filesystem::remove(tmp);
+}
+
+TEST_CASE("dump_centroids_json: meeting_timestamp suffix prevents collision (M-1)",
+          "[diarize][dump-centroids]") {
+    auto tmp_dir = std::filesystem::temp_directory_path();
+    auto requested = tmp_dir / "recmeet_dump_suffix.json";
+    auto expected  = tmp_dir / "recmeet_dump_suffix_2026-05-18_09-36.json";
+    std::filesystem::remove(requested);
+    std::filesystem::remove(expected);
+
+    std::vector<std::vector<float>> c = {{1.0f, 0.0f}};
+    std::vector<long> w = {10};
+    dump_centroids_json(requested.string(), "2026-05-18_09-36", c, w, {},
+                        "stitch_chunks");
+
+    // The suffixed file is the one that should exist; the unsuffixed input
+    // path must NOT have been created (no collision possible).
+    CHECK_FALSE(std::filesystem::exists(requested));
+    REQUIRE(std::filesystem::exists(expected));
+
+    std::filesystem::remove(expected);
+}
+
+TEST_CASE("dump_centroids_json: empty centroids still produces valid skeleton",
+          "[diarize][dump-centroids]") {
+    auto tmp = std::filesystem::temp_directory_path()
+             / "recmeet_dump_empty.json";
+    std::filesystem::remove(tmp);
+
+    dump_centroids_json(tmp.string(), "", {}, {}, {}, "stitch_chunks");
+    REQUIRE(std::filesystem::exists(tmp));
+    std::string body = slurp(tmp);
+    CHECK_THAT(body, Catch::Matchers::ContainsSubstring("\"num_globals\": 0"));
+    CHECK_THAT(body, Catch::Matchers::ContainsSubstring("\"dim\": 0"));
+    CHECK_THAT(body, Catch::Matchers::ContainsSubstring("\"centroids\": []"));
+    CHECK_THAT(body, Catch::Matchers::ContainsSubstring("\"similarity\": []"));
+
+    std::filesystem::remove(tmp);
+}
+
+#if RECMEET_USE_SHERPA
+TEST_CASE("stitch_chunks: dump path emits centroid JSON with compaction IDs",
+          "[diarize][dump-centroids][t2-1]") {
+    // Two chunks, each with one orthogonal centroid → 2 globals.
+    DiarizeResult c0 = make_chunk({{0.0, 5.0, 0}}, 1);
+    DiarizeResult c1 = make_chunk({{0.0, 5.0, 0}}, 1);
+
+    std::map<int, std::vector<float>> m0{{0, axis_centroid(8, 0)}};
+    std::map<int, std::vector<float>> m1{{0, axis_centroid(8, 1)}};
+
+    std::vector<ChunkExtents> ext = {
+        make_extents(0.0, 30.0, 0.0, 30.0),
+        make_extents(30.0, 60.0, 30.0, 60.0),
+    };
+
+    auto tmp = std::filesystem::temp_directory_path()
+             / "recmeet_stitch_dump.json";
+    std::filesystem::remove(tmp);
+
+    DiarizeChunkConfig cfg;
+    cfg.debug_dump_centroids_path = tmp.string();
+    // no timestamp → no suffix
+    auto out = stitch_chunks({c0, c1}, {m0, m1}, ext, cfg, /*num_speakers=*/0);
+    REQUIRE(out.diar.num_speakers == 2);
+    REQUIRE(std::filesystem::exists(tmp));
+
+    std::string body = slurp(tmp);
+    INFO("dump body:\n" << body);
+    CHECK_THAT(body, Catch::Matchers::ContainsSubstring("\"num_globals\": 2"));
+    // The local→global map should round-trip through the compaction. Each
+    // chunk has local id 0 → some compacted global id (0 or 1).
+    CHECK_THAT(body, Catch::Matchers::ContainsSubstring("\"local_id\": 0"));
+
+    std::filesystem::remove(tmp);
+}
 #endif  // RECMEET_USE_SHERPA

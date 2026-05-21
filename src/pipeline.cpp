@@ -26,6 +26,7 @@
 #include <cstdlib>
 #include <fstream>
 #include <memory>
+#include <set>
 #include <sstream>
 #include <thread>
 #include <unistd.h>
@@ -711,6 +712,11 @@ PipelineResult run_postprocessing(const Config& cfg, const PostprocessInput& inp
                 chunk_cfg.chunk_minutes = cfg.chunk_minutes;
                 chunk_cfg.overlap_seconds = cfg.chunk_overlap_sec;
                 chunk_cfg.stitch_threshold = cfg.stitch_threshold;
+                // Phase A instrumentation: pass dump path + meeting timestamp
+                // into stitch_chunks. Empty path = no-op (hot-path negligible).
+                chunk_cfg.debug_dump_centroids_path =
+                    cfg.debug_dump_centroids_path.string();
+                chunk_cfg.meeting_timestamp = input.timestamp;
                 const size_t chunk_threshold_samples = static_cast<size_t>(
                     (chunk_cfg.chunk_minutes * 60.0f
                      + chunk_cfg.overlap_seconds + 120.0f)
@@ -743,6 +749,55 @@ PipelineResult run_postprocessing(const Config& cfg, const PostprocessInput& inp
                                    diar_progress);
                     log_debug("pipeline: diarization complete (%zu segments)",
                               diar.segments.size());
+
+                    // Phase A instrumentation: when --debug-dump-centroids is
+                    // set, extract per-cluster centroids and dump the same
+                    // JSON shape the long-audio path produces. This runs once
+                    // (no perf cost when the flag is empty). H-2 validation
+                    // (does sherpa's over-split land at sim ≥ 0.55 in our
+                    // space?) needs this matrix on a short-audio fixture.
+                    if (!cfg.debug_dump_centroids_path.empty()
+                        && !diar.segments.empty()) {
+                        try {
+                            auto model_paths = ensure_sherpa_models();
+                            SpeakerEmbeddingSession emb_session(
+                                model_paths.embedding, threads);
+                            std::set<int> uniq_ids;
+                            for (const auto& seg : diar.segments)
+                                uniq_ids.insert(seg.speaker);
+                            std::vector<std::vector<float>> centroids;
+                            std::vector<long> counts;
+                            centroids.reserve(uniq_ids.size());
+                            counts.reserve(uniq_ids.size());
+                            for (int sid : uniq_ids) {
+                                std::vector<float> raw =
+                                    extract_speaker_embedding(
+                                        emb_session,
+                                        samples.data(), samples.size(),
+                                        diar, sid);
+                                centroids.push_back(std::move(raw));
+                                // Sum segment-duration samples as the weight.
+                                double sec = 0.0;
+                                for (const auto& seg : diar.segments)
+                                    if (seg.speaker == sid
+                                        && seg.end > seg.start)
+                                        sec += seg.end - seg.start;
+                                long n = static_cast<long>(
+                                    sec * static_cast<double>(SAMPLE_RATE));
+                                counts.push_back(n > 0 ? n : 1);
+                            }
+                            dump_centroids_json(
+                                cfg.debug_dump_centroids_path.string(),
+                                input.timestamp,
+                                centroids,
+                                counts,
+                                /*local_to_global=*/{},
+                                "diarize_short_audio");
+                        } catch (const std::exception& e) {
+                            log_warn("pipeline: dump-centroids (short-audio) "
+                                     "failed: %s", e.what());
+                        }
+                    }
                 }
 
                 // Speaker identification + embedding extraction

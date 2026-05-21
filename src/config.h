@@ -129,6 +129,16 @@ struct Config {
     fs::path context_file;
     std::string context_inline;  // Inline context from dialog or --context-text CLI
 
+    // Diarize debug instrumentation (Phase A of diarize-overcount task).
+    // When non-empty, the diarization path writes a JSON artifact containing
+    // global centroids, the full pairwise cosine-similarity matrix, per-chunk
+    // local→global mapping (long-audio only), and sample-count weights. The
+    // path is auto-suffixed with the meeting timestamp before the extension
+    // (M-1 — prevents collision when iter-71 concurrent reprocesses fire).
+    // Reusable across this bug class; not #ifdef-gated. Hot-path cost is a
+    // single empty-string check.
+    fs::path debug_dump_centroids_path;
+
     // Reprocess
     fs::path reprocess_dir;
     fs::path reprocess_batch_dir;
