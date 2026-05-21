@@ -32,6 +32,8 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include "daemon_handlers_internal.h"  // g_jobs extern
+#include "daemon_test_harness.h"
 #include "fetch_artifacts.h"
 #include "ipc_client.h"
 #include "ipc_protocol.h"
@@ -97,6 +99,22 @@ struct JqShutdownGuard {
     ~JqShutdownGuard() { q.shutdown(); }
 };
 
+// Phase 2b: FetchHarness wraps DaemonTestHarness so existing TEST_CASE
+// bodies can keep their `q` / `client` shape while driving the production
+// process.fetch handler. The harness wires `g_jobs` to a per-test
+// JobQueue and starts an IpcServer with `register_daemon_handlers()`.
+struct FetchHarness {
+    recmeet::test::DaemonTestHarness harness;
+    std::unique_ptr<IpcClient> client_owned;
+
+    FetchHarness() {
+        harness.start();
+        client_owned = harness.make_client();
+    }
+    JobQueue&  q()      const { return *g_jobs; }
+    IpcClient& client() const { return *client_owned; }
+};
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -159,120 +177,6 @@ int64_t stage_running_job(JobQueue& q,
     return id;
 }
 
-// Register a `process.fetch` handler on `server` whose body mirrors the one
-// in src/daemon.cpp. Captures `q` (the JobQueue) and `server` by reference;
-// `frame_cap` lets a test exercise the oversized-artifact reject branch.
-//
-// Keep this in sync with daemon.cpp's `process.fetch` registration — both
-// hard-code the same wire shape and validation chain (see the comment block
-// in daemon.cpp). If the production handler grows new validation, mirror it
-// here so the tests cover the same surface.
-void register_process_fetch_handler(IpcServer& server, JobQueue& q) {
-    server.on("process.fetch",
-              [&server, &q](const IpcRequest& req, IpcResponse& resp,
-                            IpcError& err) {
-        auto jit = req.params.find("job_id");
-        if (jit == req.params.end()) {
-            err.code = static_cast<int>(IpcErrorCode::InvalidParams);
-            err.message = "process.fetch: missing 'job_id'";
-            return false;
-        }
-        const int64_t job_id = json_val_as_int(jit->second, 0);
-        if (job_id <= 0) {
-            err.code = static_cast<int>(IpcErrorCode::InvalidParams);
-            err.message = "process.fetch: 'job_id' must be a positive integer";
-            return false;
-        }
-        auto snap = q.status(job_id);
-        if (!snap.has_value()) {
-            err.code = static_cast<int>(IpcErrorCode::InvalidParams);
-            err.message = "process.fetch: unknown job_id "
-                        + std::to_string(job_id);
-            return false;
-        }
-        const Job& job = *snap;
-        auto owner = q.client_for_job(job_id);
-        if (!owner.has_value() || *owner != req.client_id) {
-            err.code = static_cast<int>(IpcErrorCode::PermissionDenied);
-            err.message = "process.fetch: job_id "
-                        + std::to_string(job_id)
-                        + " is not owned by this client";
-            return false;
-        }
-        if (job.state != JobState::Done) {
-            err.code = static_cast<int>(IpcErrorCode::JobNotReady);
-            err.message = std::string("process.fetch: fetch is only valid for "
-                                      "Done jobs; current state=")
-                        + job_state_name(job.state);
-            return false;
-        }
-        const fs::path& out_dir = job.input.out_dir;
-        if (out_dir.empty()) {
-            err.code = static_cast<int>(IpcErrorCode::InternalError);
-            err.message = "process.fetch: job has no out_dir on record";
-            return false;
-        }
-        std::string enum_err;
-        auto arts = enumerate_artifacts(out_dir, &enum_err);
-        if (!enum_err.empty()) {
-            err.code = static_cast<int>(IpcErrorCode::InternalError);
-            err.message = "process.fetch: " + enum_err;
-            return false;
-        }
-        const size_t frame_cap = server.max_binary_frame_bytes();
-        for (const auto& a : arts) {
-            if (static_cast<size_t>(a.size) > frame_cap) {
-                err.code = static_cast<int>(IpcErrorCode::InternalError);
-                err.message = "process.fetch: artifact '" + a.name
-                            + "' exceeds max_binary_frame_bytes";
-                return false;
-            }
-        }
-        std::vector<std::string> bodies;
-        bodies.reserve(arts.size());
-        int64_t total_size = 0;
-        for (const auto& a : arts) {
-            std::ifstream in(a.path, std::ios::binary);
-            if (!in) {
-                err.code = static_cast<int>(IpcErrorCode::InternalError);
-                err.message = "process.fetch: cannot open '" + a.name + "'";
-                return false;
-            }
-            std::string body((std::istreambuf_iterator<char>(in)),
-                             std::istreambuf_iterator<char>());
-            total_size += static_cast<int64_t>(body.size());
-            bodies.push_back(std::move(body));
-        }
-        std::string arr = "[";
-        for (size_t i = 0; i < arts.size(); ++i) {
-            if (i > 0) arr += ",";
-            arr += "{\"name\":\"" + arts[i].name + "\""
-                +  ",\"size\":" + std::to_string(arts[i].size)
-                +  ",\"content_type\":\"" + arts[i].content_type + "\"}";
-        }
-        arr += "]";
-        resp.result["job_id"]     = job_id;
-        resp.result["artifacts"]  = arr;
-        resp.result["total_size"] = total_size;
-
-        // Post the binary fan-out so the frames enqueue AFTER the response
-        // on the same per-fd outbound queue. Captures the client_id and the
-        // bodies by shared_ptr so a slow drain on the client does not stall
-        // the handler.
-        std::string client_id = req.client_id;
-        auto bodies_p = std::make_shared<std::vector<std::string>>(std::move(bodies));
-        auto arts_p   = std::make_shared<std::vector<ArtifactInfo>>(std::move(arts));
-        server.post([&server, client_id, bodies_p, arts_p]() {
-            for (size_t i = 0; i < bodies_p->size(); ++i) {
-                server.send_binary_to_client(client_id,
-                                             FrameType::BinaryArtifact,
-                                             (*bodies_p)[i],
-                                             MessageClass::Response);
-            }
-        });
-        return true;
-    });
-}
 
 } // anonymous namespace
 
@@ -370,17 +274,10 @@ TEST_CASE("fetch_artifacts: enumerate_artifacts on empty dir returns empty list"
 
 TEST_CASE("process.fetch: happy path round-trip (note + captions)",
           "[c4][fetch]") {
-    ::unlink(FETCH_SOCK);
-
-    JobQueue q;
-    JqShutdownGuard jqg(q);
-    IpcServer server(FETCH_SOCK);
-    register_process_fetch_handler(server, q);
-    REQUIRE(server.start());
-    ServerGuard sg(server);
-
-    IpcClient client(FETCH_SOCK);
-    REQUIRE(client.connect());
+    FetchHarness h;
+    auto& q = h.q();
+    auto& client = h.client();
+    REQUIRE(!client.client_id().empty());
     REQUIRE(!client.client_id().empty());
 
     // Pre-stage the artifact dir AS THIS CLIENT'S Done job.
@@ -415,23 +312,14 @@ TEST_CASE("process.fetch: happy path round-trip (note + captions)",
     CHECK_FALSE(fs::exists(dst / "audio.wav"));
     CHECK_FALSE(fs::exists(dst / ".hidden"));
 
-    client.close_connection();
-    ::unlink(FETCH_SOCK);
 }
 
 TEST_CASE("process.fetch: rejects fetch on Queued job (not Done)",
           "[c4][fetch]") {
-    ::unlink(FETCH_SOCK);
-
-    JobQueue q;
-    JqShutdownGuard jqg(q);
-    IpcServer server(FETCH_SOCK);
-    register_process_fetch_handler(server, q);
-    REQUIRE(server.start());
-    ServerGuard sg(server);
-
-    IpcClient client(FETCH_SOCK);
-    REQUIRE(client.connect());
+    FetchHarness h;
+    auto& q = h.q();
+    auto& client = h.client();
+    REQUIRE(!client.client_id().empty());
 
     fs::path out_dir = test_temp_dir("not_done_queued");
     write_file(out_dir / "note.md", "n");
@@ -450,22 +338,13 @@ TEST_CASE("process.fetch: rejects fetch on Queued job (not Done)",
     CHECK(err.message.find("Done") != std::string::npos);
     CHECK(err.message.find("queued") != std::string::npos);
 
-    client.close_connection();
-    ::unlink(FETCH_SOCK);
 }
 
 TEST_CASE("process.fetch: rejects fetch on Running job", "[c4][fetch]") {
-    ::unlink(FETCH_SOCK);
-
-    JobQueue q;
-    JqShutdownGuard jqg(q);
-    IpcServer server(FETCH_SOCK);
-    register_process_fetch_handler(server, q);
-    REQUIRE(server.start());
-    ServerGuard sg(server);
-
-    IpcClient client(FETCH_SOCK);
-    REQUIRE(client.connect());
+    FetchHarness h;
+    auto& q = h.q();
+    auto& client = h.client();
+    REQUIRE(!client.client_id().empty());
 
     // Stage one job in Running (dequeued, never finished).
     int64_t running_id = stage_running_job(q, client.client_id(),
@@ -481,24 +360,17 @@ TEST_CASE("process.fetch: rejects fetch on Running job", "[c4][fetch]") {
     // Release the slot so JqShutdownGuard tears down cleanly.
     q.finish(running_id, true);
 
-    client.close_connection();
-    ::unlink(FETCH_SOCK);
 }
 
 TEST_CASE("process.fetch: rejects foreign job with PermissionDenied",
           "[c4][fetch]") {
-    ::unlink(FETCH_SOCK);
-
-    JobQueue q;
-    JqShutdownGuard jqg(q);
-    IpcServer server(FETCH_SOCK);
-    register_process_fetch_handler(server, q);
-    REQUIRE(server.start());
-    ServerGuard sg(server);
-
-    IpcClient a(FETCH_SOCK), b(FETCH_SOCK);
-    REQUIRE(a.connect());
-    REQUIRE(b.connect());
+    recmeet::test::DaemonTestHarness harness;
+    harness.start();
+    auto a_owned = harness.make_client();
+    auto b_owned = harness.make_client();
+    IpcClient& a = *a_owned;
+    IpcClient& b = *b_owned;
+    JobQueue& q = *g_jobs;
     REQUIRE(a.client_id() != b.client_id());
 
     fs::path out_dir = test_temp_dir("foreign");
@@ -519,25 +391,14 @@ TEST_CASE("process.fetch: rejects foreign job with PermissionDenied",
                                         ok_err, 2000);
     CHECK(ok_err.message.empty());
     CHECK(ok_written.size() == 1);
-
-    a.close_connection();
-    b.close_connection();
-    ::unlink(FETCH_SOCK);
 }
 
 TEST_CASE("process.fetch: unknown job_id reports InvalidParams",
           "[c4][fetch]") {
-    ::unlink(FETCH_SOCK);
-
-    JobQueue q;
-    JqShutdownGuard jqg(q);
-    IpcServer server(FETCH_SOCK);
-    register_process_fetch_handler(server, q);
-    REQUIRE(server.start());
-    ServerGuard sg(server);
-
-    IpcClient client(FETCH_SOCK);
-    REQUIRE(client.connect());
+    FetchHarness h;
+    auto& q = h.q();
+    auto& client = h.client();
+    REQUIRE(!client.client_id().empty());
 
     IpcError err;
     auto written = client.fetch_artifacts(/*job_id=*/99999,
@@ -552,23 +413,14 @@ TEST_CASE("process.fetch: unknown job_id reports InvalidParams",
     CHECK(client.fetch_artifacts(0, test_temp_dir("z_dst"), err0, 2000).empty());
     CHECK(err0.code == static_cast<int>(IpcErrorCode::InvalidParams));
 
-    client.close_connection();
-    ::unlink(FETCH_SOCK);
 }
 
 TEST_CASE("process.fetch: missing out_dir reports InternalError",
           "[c4][fetch]") {
-    ::unlink(FETCH_SOCK);
-
-    JobQueue q;
-    JqShutdownGuard jqg(q);
-    IpcServer server(FETCH_SOCK);
-    register_process_fetch_handler(server, q);
-    REQUIRE(server.start());
-    ServerGuard sg(server);
-
-    IpcClient client(FETCH_SOCK);
-    REQUIRE(client.connect());
+    FetchHarness h;
+    auto& q = h.q();
+    auto& client = h.client();
+    REQUIRE(!client.client_id().empty());
 
     fs::path out_dir = test_temp_dir("vanish");
     write_file(out_dir / "note.md", "transient note");
@@ -586,23 +438,14 @@ TEST_CASE("process.fetch: missing out_dir reports InternalError",
     CHECK(err.code == static_cast<int>(IpcErrorCode::InternalError));
     CHECK(err.message.find("does not exist") != std::string::npos);
 
-    client.close_connection();
-    ::unlink(FETCH_SOCK);
 }
 
 TEST_CASE("process.fetch: audio WAV in out_dir is not delivered",
           "[c4][fetch]") {
-    ::unlink(FETCH_SOCK);
-
-    JobQueue q;
-    JqShutdownGuard jqg(q);
-    IpcServer server(FETCH_SOCK);
-    register_process_fetch_handler(server, q);
-    REQUIRE(server.start());
-    ServerGuard sg(server);
-
-    IpcClient client(FETCH_SOCK);
-    REQUIRE(client.connect());
+    FetchHarness h;
+    auto& q = h.q();
+    auto& client = h.client();
+    REQUIRE(!client.client_id().empty());
 
     fs::path out_dir = test_temp_dir("audio_filter");
     write_file(out_dir / "Meeting_test.md", "note");
@@ -624,22 +467,13 @@ TEST_CASE("process.fetch: audio WAV in out_dir is not delivered",
     CHECK_FALSE(fs::exists(dst / "audio.wav"));
     CHECK_FALSE(fs::exists(dst / "mic.wav"));
 
-    client.close_connection();
-    ::unlink(FETCH_SOCK);
 }
 
 TEST_CASE("process.fetch: hidden files are not delivered", "[c4][fetch]") {
-    ::unlink(FETCH_SOCK);
-
-    JobQueue q;
-    JqShutdownGuard jqg(q);
-    IpcServer server(FETCH_SOCK);
-    register_process_fetch_handler(server, q);
-    REQUIRE(server.start());
-    ServerGuard sg(server);
-
-    IpcClient client(FETCH_SOCK);
-    REQUIRE(client.connect());
+    FetchHarness h;
+    auto& q = h.q();
+    auto& client = h.client();
+    REQUIRE(!client.client_id().empty());
 
     fs::path out_dir = test_temp_dir("hidden_filter");
     write_file(out_dir / "note.md", "n");
@@ -656,23 +490,14 @@ TEST_CASE("process.fetch: hidden files are not delivered", "[c4][fetch]") {
     CHECK_FALSE(fs::exists(dst / ".hidden"));
     CHECK_FALSE(fs::exists(dst / ".secret.md"));
 
-    client.close_connection();
-    ::unlink(FETCH_SOCK);
 }
 
 TEST_CASE("process.fetch: multiple artifacts arrive in artifacts[] order",
           "[c4][fetch]") {
-    ::unlink(FETCH_SOCK);
-
-    JobQueue q;
-    JqShutdownGuard jqg(q);
-    IpcServer server(FETCH_SOCK);
-    register_process_fetch_handler(server, q);
-    REQUIRE(server.start());
-    ServerGuard sg(server);
-
-    IpcClient client(FETCH_SOCK);
-    REQUIRE(client.connect());
+    FetchHarness h;
+    auto& q = h.q();
+    auto& client = h.client();
+    REQUIRE(!client.client_id().empty());
 
     fs::path out_dir = test_temp_dir("order");
     // Distinct contents to detect any swap. Names chosen so the
@@ -704,23 +529,14 @@ TEST_CASE("process.fetch: multiple artifacts arrive in artifacts[] order",
     CHECK(read_file_bytes(written[2]) == "second");
     CHECK(read_file_bytes(written[3]) == "third");
 
-    client.close_connection();
-    ::unlink(FETCH_SOCK);
 }
 
 TEST_CASE("process.fetch: single artifact (no captions sidecar)",
           "[c4][fetch]") {
-    ::unlink(FETCH_SOCK);
-
-    JobQueue q;
-    JqShutdownGuard jqg(q);
-    IpcServer server(FETCH_SOCK);
-    register_process_fetch_handler(server, q);
-    REQUIRE(server.start());
-    ServerGuard sg(server);
-
-    IpcClient client(FETCH_SOCK);
-    REQUIRE(client.connect());
+    FetchHarness h;
+    auto& q = h.q();
+    auto& client = h.client();
+    REQUIRE(!client.client_id().empty());
 
     fs::path out_dir = test_temp_dir("single");
     const std::string body = "Solo note body";
@@ -734,23 +550,14 @@ TEST_CASE("process.fetch: single artifact (no captions sidecar)",
     REQUIRE(written.size() == 1);
     CHECK(read_file_bytes(written[0]) == body);
 
-    client.close_connection();
-    ::unlink(FETCH_SOCK);
 }
 
 TEST_CASE("process.fetch: empty artifact set (audio-only out_dir)",
           "[c4][fetch]") {
-    ::unlink(FETCH_SOCK);
-
-    JobQueue q;
-    JqShutdownGuard jqg(q);
-    IpcServer server(FETCH_SOCK);
-    register_process_fetch_handler(server, q);
-    REQUIRE(server.start());
-    ServerGuard sg(server);
-
-    IpcClient client(FETCH_SOCK);
-    REQUIRE(client.connect());
+    FetchHarness h;
+    auto& q = h.q();
+    auto& client = h.client();
+    REQUIRE(!client.client_id().empty());
 
     fs::path out_dir = test_temp_dir("empty_set");
     // Only the staging WAV — should be filtered out. The fetch must still
@@ -766,25 +573,16 @@ TEST_CASE("process.fetch: empty artifact set (audio-only out_dir)",
     REQUIRE(err.message.empty());
     CHECK(written.empty());
 
-    client.close_connection();
-    ::unlink(FETCH_SOCK);
 }
 
 TEST_CASE("process.fetch: byte-exact for binary-ish content",
           "[c4][fetch]") {
     // The note format is markdown today, but the wire is "raw bytes" — verify
     // no transformation happens (no newline normalization, no encoding).
-    ::unlink(FETCH_SOCK);
-
-    JobQueue q;
-    JqShutdownGuard jqg(q);
-    IpcServer server(FETCH_SOCK);
-    register_process_fetch_handler(server, q);
-    REQUIRE(server.start());
-    ServerGuard sg(server);
-
-    IpcClient client(FETCH_SOCK);
-    REQUIRE(client.connect());
+    FetchHarness h;
+    auto& q = h.q();
+    auto& client = h.client();
+    REQUIRE(!client.client_id().empty());
 
     fs::path out_dir = test_temp_dir("binary_exact");
     // Embed CR, LF, NUL-like (use a controlled value), tab, UTF-8.
@@ -803,6 +601,4 @@ TEST_CASE("process.fetch: byte-exact for binary-ish content",
     REQUIRE(written.size() == 1);
     CHECK(read_file_bytes(written[0]) == body);
 
-    client.close_connection();
-    ::unlink(FETCH_SOCK);
 }
