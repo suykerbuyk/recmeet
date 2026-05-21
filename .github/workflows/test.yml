@@ -80,6 +80,13 @@ jobs:
           ccache --version
           ccache --zero-stats
 
+      # Phase 2b — strict invariant: no test file may register a stub
+      # handler for a production IPC verb. Derives the verb list from
+      # src/daemon_handlers.cpp and greps tests/*.cpp for both
+      # `server.on("verb"` and `server->on("verb"`. No allowlist.
+      - name: Check no stubs shadow production handlers
+        run: ./scripts/check-test-stubs.sh
+
       - name: Build (with tests)
         run: make build RECMEET_BUILD_TESTS=ON
 
