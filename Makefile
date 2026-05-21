@@ -89,7 +89,7 @@ build: ensure-submodules
 test: ensure-submodules
 	cmake -B $(BUILD_DIR) -G Ninja $(CMAKE_OPTS) -DRECMEET_BUILD_TESTS=ON
 	ninja -C $(BUILD_DIR)
-	./$(BUILD_DIR)/recmeet_tests "~[integration]~[benchmark]~[full-stack]"
+	./$(BUILD_DIR)/recmeet_tests "~[integration]~[benchmark]~[full-stack]~[slow]~[stress]~[memory-rss]"
 	cd tools && go test ./... -count=1
 
 # `integration` is the umbrella that runs BOTH the C++ Catch2 [integration]

@@ -190,10 +190,19 @@ temp directory via `testutil.BuildBinaryOnce` (called from each test
 package's `TestMain`). No external network is required; the mock
 Anthropic server is an `httptest.Server` constructed in-process per test.
 
-### Subprocess coverage
+### Coverage
 
-The C++ tests run *inside* the test binary so Catch2 reports coverage
-directly. The Go integration tests run the *real* `recmeet-mcp` /
+**C++ source coverage is not currently measured.** No `--coverage` /
+`-fprofile-arcs` / `-ftest-coverage` flags are wired into the CMake
+build; Catch2 reports test execution status (pass/fail counts), NOT
+source-line coverage. The 80% unit-coverage standard stated in
+`agentctx/workflow.md` is therefore unenforceable on the C++ side
+today. This is tracked as Phase 1 of the
+`agentctx/tasks/test-and-verification-hardening.md` task, which will
+introduce a `RECMEET_COVERAGE` CMake option, a `make cxx-coverage`
+Makefile target, and a no-regression coverage gate in CI.
+
+The Go integration tests run the *real* `recmeet-mcp` /
 `recmeet-agent` binaries as subprocesses, so coverage has to be collected
 out-of-band via Go 1.20+'s `GOCOVERDIR` mechanism. `testutil.BuildBinaryOnce`
 automatically appends `-cover -coverpkg=./...` when it observes
