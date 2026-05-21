@@ -26,6 +26,7 @@
 #include <cstdlib>
 #include <fstream>
 #include <memory>
+#include <regex>
 #include <set>
 #include <sstream>
 #include <thread>
@@ -96,12 +97,120 @@ std::string resolve_context_text(const Config& cfg, const fs::path& out_dir) {
     return context_text;
 }
 
-// Phase B.2: stub. The body parses Participants lines and returns a count;
-// implemented in Phase C. For Phase B this returns 0 so the `target_speakers`
-// precedence chain falls through to `max_auto_speakers`, preserving the
-// pre-Phase-B auto-detect behavior.
-int parse_context_participants(const std::string& /*context*/) {
-    return 0;
+// Phase C: parse `Participants:` lines from the resolved context-text.
+//
+// Scan line-by-line and match `^\s*Participants?\s*:\s*(.+)$` (case-insensitive;
+// singular form accepted defensively). Split the captured group on `,`, then
+// each segment on ` and ` / ` & ` (case-insensitive). Trim whitespace; drop
+// empty entries. Multiple matching lines sum (defensive — handles split
+// contexts). Returns 0 if no Participants line is present.
+//
+// No name validation: "Bob (maybe)" and "Carol if she joins" each count as 1.
+// Phase B.1's collapse pass cleans up if listed names don't actually speak.
+//
+// Locale-independence: `std::regex::icase` for case-folding; no `collate`.
+namespace {
+
+// Trim ASCII whitespace from both ends. Locale-independent (matches the
+// behavior of the rest of the parser).
+std::string trim_ws(const std::string& s) {
+    auto is_ws = [](unsigned char c) {
+        return c == ' ' || c == '\t' || c == '\r' || c == '\n' ||
+               c == '\f' || c == '\v';
+    };
+    size_t b = 0;
+    while (b < s.size() && is_ws(static_cast<unsigned char>(s[b]))) ++b;
+    size_t e = s.size();
+    while (e > b && is_ws(static_cast<unsigned char>(s[e - 1]))) --e;
+    return s.substr(b, e - b);
+}
+
+// Split `s` on every occurrence of `delim` (case-insensitive ASCII match).
+// Empty input → single empty segment; that's filtered by the caller.
+std::vector<std::string> split_icase(const std::string& s, const std::string& delim) {
+    std::vector<std::string> out;
+    if (delim.empty()) { out.push_back(s); return out; }
+    auto eq_icase = [](char a, char b) {
+        unsigned char ua = static_cast<unsigned char>(a);
+        unsigned char ub = static_cast<unsigned char>(b);
+        if (ua >= 'A' && ua <= 'Z') ua = ua + ('a' - 'A');
+        if (ub >= 'A' && ub <= 'Z') ub = ub + ('a' - 'A');
+        return ua == ub;
+    };
+    size_t start = 0;
+    for (size_t i = 0; i + delim.size() <= s.size(); ) {
+        bool match = true;
+        for (size_t j = 0; j < delim.size(); ++j) {
+            if (!eq_icase(s[i + j], delim[j])) { match = false; break; }
+        }
+        if (match) {
+            out.push_back(s.substr(start, i - start));
+            i += delim.size();
+            start = i;
+        } else {
+            ++i;
+        }
+    }
+    out.push_back(s.substr(start));
+    return out;
+}
+
+}  // namespace
+
+int parse_context_participants(const std::string& context) {
+    if (context.empty()) return 0;
+
+    // Anchored line regex: leading/trailing whitespace tolerated; singular
+    // "Participant:" matched defensively; capture group is the list payload.
+    // Note: do NOT use std::regex::multiline (C++17-portable but inconsistent
+    // across libstdc++ versions) — we tokenize lines ourselves.
+    static const std::regex line_re(
+        R"(^\s*Participants?\s*:\s*(.+?)\s*$)",
+        std::regex::icase | std::regex::ECMAScript);
+
+    int total = 0;
+
+    // Tokenize on '\n'. The final segment (possibly without a trailing
+    // newline) is still emitted by this loop because we walk past end().
+    size_t pos = 0;
+    const size_t n = context.size();
+    while (pos <= n) {
+        size_t nl = context.find('\n', pos);
+        std::string line = (nl == std::string::npos)
+            ? context.substr(pos)
+            : context.substr(pos, nl - pos);
+        // Strip trailing '\r' to tolerate CRLF input defensively.
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+
+        std::smatch m;
+        if (std::regex_match(line, m, line_re) && m.size() >= 2) {
+            const std::string payload = m[1].str();
+            // First-level split on comma.
+            std::vector<std::string> segs;
+            {
+                std::string cur;
+                for (char c : payload) {
+                    if (c == ',') { segs.push_back(cur); cur.clear(); }
+                    else { cur.push_back(c); }
+                }
+                segs.push_back(cur);
+            }
+            // Second-level: split each segment on " and " then " & ".
+            for (const std::string& seg : segs) {
+                std::vector<std::string> a = split_icase(seg, " and ");
+                for (const std::string& sub_a : a) {
+                    std::vector<std::string> b = split_icase(sub_a, " & ");
+                    for (const std::string& tok : b) {
+                        if (!trim_ws(tok).empty()) ++total;
+                    }
+                }
+            }
+        }
+
+        if (nl == std::string::npos) break;
+        pos = nl + 1;
+    }
+    return total;
 }
 
 int resolve_target_speakers(int cli_num_speakers,
