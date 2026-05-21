@@ -44,6 +44,15 @@ option(RECMEET_USE_LLAMA   "Enable local summarization via llama.cpp" ON)
 option(RECMEET_USE_SHERPA  "Enable speaker diarization via sherpa-onnx" ON)
 option(RECMEET_USE_NOTIFY "Enable desktop notifications via libnotify" ON)
 option(RECMEET_BUILD_TESTS "Build unit tests" ON)
+# Phase 1 — C++ source coverage. When ON, injects `--coverage -O0 -g` into
+# compile + link flags for first-party targets ONLY (recmeet_ipc,
+# recmeet_capture, recmeet_core, recmeet_live_capture, recmeet, recmeet-daemon,
+# recmeet-tray, recmeet_tests). Vendor subbuilds (whisper.cpp, llama.cpp,
+# sherpa-onnx, onnxruntime, cpp-httplib, catch2) are NOT instrumented — the
+# flags are applied via target_compile_options / target_link_options on each
+# first-party target, never globally. See `make cxx-coverage` for the
+# Makefile entry point and `tests/coverage-baseline.txt` for the gate.
+option(RECMEET_COVERAGE    "Instrument first-party C++ targets with --coverage (gcov)" OFF)
 
 # Version header — regenerated at build time from git describe
 # (find_package(Git QUIET) was already called pre-project; GIT_EXECUTABLE is set.)
@@ -680,6 +689,38 @@ if(RECMEET_BUILD_TESTS)
     target_compile_definitions(recmeet_tests PRIVATE
         RECMEET_BUILD_DIR_DEFAULT="${CMAKE_BINARY_DIR}")
     catch_discover_tests(recmeet_tests)
+endif()
+
+# --- Phase 1: C++ source coverage instrumentation (first-party only) ---
+# When RECMEET_COVERAGE=ON, inject `--coverage -O0 -g` into compile + link
+# flags on each first-party target. Applied per-target (NEVER globally) so
+# vendor subbuilds (whisper.cpp, llama.cpp, sherpa-onnx, onnxruntime,
+# cpp-httplib, catch2) are not instrumented — vendor source has no
+# coverage policy and instrumenting it would pollute the report with
+# tens of thousands of lines of third-party code we have no authority to
+# change. `gcovr` then scopes the report to `src/` + `tests/` via
+# --exclude vendor/ --exclude build/. See `make cxx-coverage`.
+if(RECMEET_COVERAGE)
+    message(STATUS "RECMEET_COVERAGE=ON — instrumenting first-party C++ targets")
+    set(_RECMEET_COVERAGE_FLAGS --coverage -O0 -g)
+    set(_RECMEET_COVERAGE_TARGETS
+        recmeet_ipc
+        recmeet_capture
+        recmeet_core
+        recmeet_live_capture
+        recmeet
+        recmeet-daemon
+    )
+    if(RECMEET_BUILD_TRAY)
+        list(APPEND _RECMEET_COVERAGE_TARGETS recmeet-tray)
+    endif()
+    if(RECMEET_BUILD_TESTS)
+        list(APPEND _RECMEET_COVERAGE_TARGETS recmeet_tests)
+    endif()
+    foreach(_tgt ${_RECMEET_COVERAGE_TARGETS})
+        target_compile_options(${_tgt} PRIVATE ${_RECMEET_COVERAGE_FLAGS})
+        target_link_options(${_tgt}    PRIVATE ${_RECMEET_COVERAGE_FLAGS})
+    endforeach()
 endif()
 
 # --- Install rules ---
