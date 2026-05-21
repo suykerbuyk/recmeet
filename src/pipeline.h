@@ -143,12 +143,13 @@ int resolve_target_speakers(int cli_num_speakers,
 /// Parse a count of meeting participants from a resolved context-text blob.
 /// Looks for lines matching `^\s*Participants?\s*:\s*<list>$` (case-insensitive),
 /// splits the list on commas and " and " / " & ", trims whitespace, drops
-/// empties, and returns the count. Returns 0 if no Participants line is found.
-///
-/// Phase B.2 wires this into `run_postprocessing()`'s `target_speakers`
-/// precedence chain; the body is implemented in Phase C. For Phase B the
-/// stub returns 0 so the precedence chain falls through to `max_auto_speakers`,
-/// matching the pre-Phase-B behavior for auto-detect runs.
+/// empties, and returns the count. Multiple matching lines are summed
+/// (defensive — handles split contexts). Returns 0 if no Participants line
+/// is found. No name validation: parenthetical or hedged entries
+/// ("Bob (maybe)", "Carol if she joins") each count as 1; if those people
+/// don't actually speak, the diarize-side collapse pass cleans up via the
+/// post-merge ceiling. Wired into `run_postprocessing()`'s `target_speakers`
+/// precedence chain — see `resolve_target_speakers`.
 int parse_context_participants(const std::string& context);
 
 /// Record audio. Phase: "recording". For --reprocess, resolves paths only.
