@@ -1,9 +1,9 @@
 {
-  "iter_n": 186,
-  "anchor_sha": "e7edc0162073a932ac1ea3aa6824a196469fe05a",
+  "iter_n": 187,
+  "anchor_sha": "0a863ff0192358cb2b2598e052b278b8b91e9989",
   "active": [
-    "component-diagrams-html-auto-regen",
     "diarize-overcount-and-context-aware-speaker-hints",
+    "e6-smoke-gate",
     "e6-tray-bundled-webui",
     "full-stack-captions-60min-regression",
     "thin-client-recording-server",
@@ -16,6 +16,7 @@
     "binary-size",
     "breezy-zooming-ritchie",
     "bright-dreaming-scott",
+    "component-diagrams-html-auto-regen",
     "concurrent-recording",
     "cross-distro-packaging",
     "crystalline-petting-sutton",
