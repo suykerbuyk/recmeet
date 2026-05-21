@@ -1,11 +1,12 @@
 {
-  "iter_n": 184,
-  "anchor_sha": "9d5b71c616798f4c1393131215c0c8bb4c542289",
+  "iter_n": 186,
+  "anchor_sha": "e7edc0162073a932ac1ea3aa6824a196469fe05a",
   "active": [
+    "component-diagrams-html-auto-regen",
     "diarize-overcount-and-context-aware-speaker-hints",
     "e6-tray-bundled-webui",
+    "full-stack-captions-60min-regression",
     "thin-client-recording-server",
-    "v1-doc-review-and-readme-local-ai-positioning",
     "webui-live-captions"
   ],
   "done": [
@@ -90,6 +91,7 @@
     "thread-count-redundant-validation",
     "tray-background-postprocessing",
     "tray-stop-stuck-recording-state",
+    "v1-doc-review-and-readme-local-ai-positioning",
     "v2-absorb-v1.6.0-gpu-bundle",
     "v2-pre-phase-d-stabilization",
     "vad-segmentation",
