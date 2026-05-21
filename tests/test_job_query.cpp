@@ -3,32 +3,15 @@
 //
 // Phase C.6 — `job.status` / `job.list` (read-only registry queries) tests.
 //
-// `job.status` returns a single-job snapshot for re-sync (D.3), `job.list`
-// returns every job owned by the caller (D.5). Both go straight through the
-// existing `JobQueue::status` / `JobQueue::list_by_client` /
-// `JobQueue::client_for_job` API; this file pins the WIRE-LEVEL shape (field
-// set, ordering, secret-field absence, terminal-job inclusion, ownership
-// reject) so a regression in the daemon's response builder is caught by a
-// failing assertion rather than discovered on a live reconnect.
-//
-// Style mirrors test_fetch.cpp:
-//   * The IPC handler body in src/daemon.cpp depends on the global `g_jobs`.
-//     We do NOT exercise that handler directly — we re-implement the same
-//     body against a test-local JobQueue and register it on a test-local
-//     IpcServer. The handler shape MUST stay in sync with daemon.cpp's
-//     job.status / job.list. Any drift is a Phase-D re-sync bug.
-//   * Thread hygiene (orchestrator rule 5): every std::thread spawned here
-//     is owned by a RAII guard (`ServerGuard`, `JqShutdownGuard`) that
-//     joins on destruction so a REQUIRE between thread construction and
-//     `.join()` cannot trigger std::terminate(). These tests do NOT spawn
-//     a per-client reader thread — every IPC operation is a synchronous
-//     `client.call()` request/response. `IpcClient::call` does its own
-//     read pump inline; adding a background reader on the same fd races
-//     with it and was observed to hang test 2 (a second consumer reads
-//     the response frame before `call()` sees it).
+// Phase 2b conversion: the in-test register_job_query_handlers() stub was
+// retired in favor of DaemonTestHarness + register_daemon_handlers(). The
+// JobQueue used by each test is the daemon-global *g_jobs; the wire-shape
+// assertions are unchanged because the stub was originally cloned from
+// daemon.cpp's job.status/job.list registration.
 
 #include <catch2/catch_test_macros.hpp>
 
+#include "daemon_test_harness.h"
 #include "ipc_client.h"
 #include "ipc_protocol.h"
 #include "ipc_server.h"
@@ -50,6 +33,7 @@
 #include <unistd.h>
 
 using namespace recmeet;
+using recmeet::test::DaemonTestHarness;
 namespace fs = std::filesystem;
 
 namespace {
@@ -59,129 +43,6 @@ struct SigpipeIgnorer {
     SigpipeIgnorer() { signal(SIGPIPE, SIG_IGN); }
 } s_ignore_sigpipe;
 
-const char* QUERY_SOCK = "/tmp/recmeet_test_job_query.sock";
-
-// ---------------------------------------------------------------------------
-// RAII thread guards — identical idiom to test_fetch.cpp / test_routed_events.
-// ---------------------------------------------------------------------------
-
-struct ServerGuard {
-    IpcServer& server;
-    std::thread thr;
-    explicit ServerGuard(IpcServer& s) : server(s) {
-        thr = std::thread([this]() { server.run(); });
-    }
-    ~ServerGuard() {
-        server.stop();
-        if (thr.joinable()) thr.join();
-    }
-};
-
-// JqShutdownGuard — these tests stage jobs synchronously (enqueue → dequeue
-// → finish in-test) rather than rely on a background drain worker; we still
-// shutdown the queue on scope exit so any future dequeue (none today) wakes
-// with std::nullopt rather than hanging the suite.
-struct JqShutdownGuard {
-    JobQueue& q;
-    explicit JqShutdownGuard(JobQueue& q_) : q(q_) {}
-    ~JqShutdownGuard() { q.shutdown(); }
-};
-
-// ---------------------------------------------------------------------------
-// register_job_query_handlers — mirrors src/daemon.cpp's `job.status` and
-// `job.list` registration against a test-local JobQueue+IpcServer (since the
-// production handlers consume the global `g_jobs`). Keep in lockstep with
-// daemon.cpp; the test asserts both shapes and field sets — a daemon-side
-// divergence will surface as a failing test rather than a silent re-sync
-// regression downstream (D.3 / D.5).
-//
-// The shared per-job serializer is a stand-alone lambda inside this helper
-// (same code shape as the daemon's `serialize_job_object`) so the array-
-// element path (`job.list`) and the flat-result path (`job.status`) emit
-// the exact same field set in the exact same order.
-// ---------------------------------------------------------------------------
-void register_job_query_handlers(IpcServer& server, JobQueue& q) {
-    server.on("job.status",
-              [&q](const IpcRequest& req, IpcResponse& resp, IpcError& err) {
-        auto jit = req.params.find("job_id");
-        if (jit == req.params.end()) {
-            err.code = static_cast<int>(IpcErrorCode::InvalidParams);
-            err.message = "job.status: missing 'job_id'";
-            return false;
-        }
-        const int64_t job_id = json_val_as_int(jit->second, 0);
-        if (job_id <= 0) {
-            err.code = static_cast<int>(IpcErrorCode::InvalidParams);
-            err.message = "job.status: 'job_id' must be a positive integer";
-            return false;
-        }
-        auto snap = q.status(job_id);
-        if (!snap.has_value()) {
-            err.code = static_cast<int>(IpcErrorCode::InvalidParams);
-            err.message = "job.status: unknown job_id "
-                        + std::to_string(job_id);
-            return false;
-        }
-        auto owner = q.client_for_job(job_id);
-        if (!owner.has_value() || *owner != req.client_id) {
-            err.code = static_cast<int>(IpcErrorCode::PermissionDenied);
-            err.message = "job.status: job_id "
-                        + std::to_string(job_id)
-                        + " is not owned by this client";
-            return false;
-        }
-        resp.result["job_id"]     = static_cast<int64_t>(snap->job_id);
-        resp.result["kind"]       = std::string(job_kind_name(snap->kind));
-        resp.result["state"]      = std::string(job_state_name(snap->state));
-        resp.result["client_id"]  = snap->client_id;
-        resp.result["model_id"]   = snap->model_id;
-        resp.result["error"]      = snap->error;
-        resp.result["meeting_id"] = snap->meeting_id;   // C.11
-        // C.14 — mirror daemon.cpp's job.status handler. Empty cached phase
-        // derives from state; progress emitted unconditionally as int.
-        resp.result["phase"] = snap->phase.empty()
-            ? std::string(default_phase_for_state(snap->state))
-            : snap->phase;
-        resp.result["progress"] = static_cast<int64_t>(snap->progress);
-        return true;
-    });
-
-    server.on("job.list",
-              [&q](const IpcRequest& req, IpcResponse& resp, IpcError& /*err*/) {
-        std::vector<Job> jobs = q.list_by_client(req.client_id);
-        std::string arr = "[";
-        for (size_t i = 0; i < jobs.size(); ++i) {
-            if (i > 0) arr += ",";
-            arr += "{\"job_id\":";
-            arr += std::to_string(jobs[i].job_id);
-            arr += ",\"kind\":\"";
-            arr += job_kind_name(jobs[i].kind);
-            arr += "\",\"state\":\"";
-            arr += job_state_name(jobs[i].state);
-            arr += "\",\"client_id\":\"";
-            arr += json_escape(jobs[i].client_id);
-            arr += "\",\"model_id\":\"";
-            arr += json_escape(jobs[i].model_id);
-            arr += "\",\"error\":\"";
-            arr += json_escape(jobs[i].error);
-            arr += "\",\"meeting_id\":\"";              // C.11
-            arr += json_escape(jobs[i].meeting_id);
-            // C.14 — mirror daemon.cpp's serialize_job_object. Empty cached
-            // phase derives from state; progress always serialized as int.
-            arr += "\",\"phase\":\"";
-            arr += json_escape(jobs[i].phase.empty()
-                                   ? std::string(default_phase_for_state(jobs[i].state))
-                                   : jobs[i].phase);
-            arr += "\",\"progress\":";
-            arr += std::to_string(jobs[i].progress);
-            arr += "}";
-        }
-        arr += "]";
-        resp.result["jobs"]  = arr;
-        resp.result["count"] = static_cast<int64_t>(jobs.size());
-        return true;
-    });
-}
 
 // ---------------------------------------------------------------------------
 // Helpers — small wrappers that drive JobQueue through the synchronous
@@ -301,17 +162,11 @@ std::vector<std::string> split_top_array(const std::string& arr) {
 // ===========================================================================
 TEST_CASE("C.6 job.status: happy path for each JobKind",
           "[c6][query]") {
-    ::unlink(QUERY_SOCK);
-
-    JobQueue q;
-    JqShutdownGuard jqg(q);
-    IpcServer server(QUERY_SOCK);
-    register_job_query_handlers(server, q);
-    REQUIRE(server.start());
-    ServerGuard sg(server);
-
-    IpcClient client(QUERY_SOCK);
-    REQUIRE(client.connect());
+    DaemonTestHarness harness;
+    harness.start();
+    auto client_ptr = harness.make_client();
+    auto& client = *client_ptr;
+    auto& q = *g_jobs;
     REQUIRE(!client.client_id().empty());
 
     int64_t pp  = enqueue_postprocess_queued(q, client.client_id());
@@ -351,8 +206,6 @@ TEST_CASE("C.6 job.status: happy path for each JobKind",
         CHECK(json_val_as_string(resp.result["model_id"]) == "whisper/base.en");
     }
 
-    client.close_connection();
-    ::unlink(QUERY_SOCK);
 }
 
 // ===========================================================================
@@ -362,17 +215,11 @@ TEST_CASE("C.6 job.status: happy path for each JobKind",
 // ===========================================================================
 TEST_CASE("C.6 job.status: per-state wire shape (incl. error only for failed)",
           "[c6][query]") {
-    ::unlink(QUERY_SOCK);
-
-    JobQueue q;
-    JqShutdownGuard jqg(q);
-    IpcServer server(QUERY_SOCK);
-    register_job_query_handlers(server, q);
-    REQUIRE(server.start());
-    ServerGuard sg(server);
-
-    IpcClient client(QUERY_SOCK);
-    REQUIRE(client.connect());
+    DaemonTestHarness harness;
+    harness.start();
+    auto client_ptr = harness.make_client();
+    auto& client = *client_ptr;
+    auto& q = *g_jobs;
 
     // Stage each terminal state in turn, COMPLETING the postprocess slot
     // between transitions. The slot is capacity-1 and `dequeue` pulls
@@ -438,8 +285,6 @@ TEST_CASE("C.6 job.status: per-state wire shape (incl. error only for failed)",
     // Free the slot so JqShutdownGuard tears down cleanly.
     q.finish(running_id, /*ok=*/true);
 
-    client.close_connection();
-    ::unlink(QUERY_SOCK);
 }
 
 // ===========================================================================
@@ -450,17 +295,11 @@ TEST_CASE("C.6 job.status: per-state wire shape (incl. error only for failed)",
 // ===========================================================================
 TEST_CASE("C.6 job.status: unknown / missing job_id → InvalidParams",
           "[c6][query]") {
-    ::unlink(QUERY_SOCK);
-
-    JobQueue q;
-    JqShutdownGuard jqg(q);
-    IpcServer server(QUERY_SOCK);
-    register_job_query_handlers(server, q);
-    REQUIRE(server.start());
-    ServerGuard sg(server);
-
-    IpcClient client(QUERY_SOCK);
-    REQUIRE(client.connect());
+    DaemonTestHarness harness;
+    harness.start();
+    auto client_ptr = harness.make_client();
+    auto& client = *client_ptr;
+    auto& q = *g_jobs;
 
     // Unknown job_id.
     {
@@ -499,8 +338,6 @@ TEST_CASE("C.6 job.status: unknown / missing job_id → InvalidParams",
         CHECK(err.message.find("positive") != std::string::npos);
     }
 
-    client.close_connection();
-    ::unlink(QUERY_SOCK);
 }
 
 // ===========================================================================
@@ -510,18 +347,13 @@ TEST_CASE("C.6 job.status: unknown / missing job_id → InvalidParams",
 // ===========================================================================
 TEST_CASE("C.6 job.status: foreign client's job → PermissionDenied",
           "[c6][query]") {
-    ::unlink(QUERY_SOCK);
-
-    JobQueue q;
-    JqShutdownGuard jqg(q);
-    IpcServer server(QUERY_SOCK);
-    register_job_query_handlers(server, q);
-    REQUIRE(server.start());
-    ServerGuard sg(server);
-
-    IpcClient a(QUERY_SOCK), b(QUERY_SOCK);
-    REQUIRE(a.connect());
-    REQUIRE(b.connect());
+    DaemonTestHarness harness;
+    harness.start();
+    auto a_ptr = harness.make_client();
+    auto b_ptr = harness.make_client();
+    auto& a = *a_ptr;
+    auto& b = *b_ptr;
+    auto& q = *g_jobs;
     REQUIRE(a.client_id() != b.client_id());
 
     int64_t a_jid = enqueue_postprocess_queued(q, a.client_id());
@@ -537,10 +369,6 @@ TEST_CASE("C.6 job.status: foreign client's job → PermissionDenied",
     IpcResponse resp_a; IpcError err_a;
     CHECK(a.call("job.status", params, resp_a, err_a, 2000));
     CHECK(json_val_as_int(resp_a.result["job_id"]) == a_jid);
-
-    a.close_connection();
-    b.close_connection();
-    ::unlink(QUERY_SOCK);
 }
 
 // ===========================================================================
@@ -556,17 +384,11 @@ TEST_CASE("C.6 job.status: foreign client's job → PermissionDenied",
 // ===========================================================================
 TEST_CASE("C.6 job.status / job.list: input/cfg keys are absent from response",
           "[c6][query]") {
-    ::unlink(QUERY_SOCK);
-
-    JobQueue q;
-    JqShutdownGuard jqg(q);
-    IpcServer server(QUERY_SOCK);
-    register_job_query_handlers(server, q);
-    REQUIRE(server.start());
-    ServerGuard sg(server);
-
-    IpcClient client(QUERY_SOCK);
-    REQUIRE(client.connect());
+    DaemonTestHarness harness;
+    harness.start();
+    auto client_ptr = harness.make_client();
+    auto& client = *client_ptr;
+    auto& q = *g_jobs;
 
     // Enqueue a job WITH input + cfg fields filled in (the secrets we are
     // verifying do NOT leak). The handler must not emit any of these keys.
@@ -631,8 +453,6 @@ TEST_CASE("C.6 job.status / job.list: input/cfg keys are absent from response",
         CHECK(jobs_arr.find("\"audio_path\"") == std::string::npos);
     }
 
-    client.close_connection();
-    ::unlink(QUERY_SOCK);
 }
 
 // ===========================================================================
@@ -640,25 +460,17 @@ TEST_CASE("C.6 job.status / job.list: input/cfg keys are absent from response",
 // ===========================================================================
 TEST_CASE("C.6 job.list: empty for a client with no jobs",
           "[c6][query]") {
-    ::unlink(QUERY_SOCK);
-
-    JobQueue q;
-    JqShutdownGuard jqg(q);
-    IpcServer server(QUERY_SOCK);
-    register_job_query_handlers(server, q);
-    REQUIRE(server.start());
-    ServerGuard sg(server);
-
-    IpcClient client(QUERY_SOCK);
-    REQUIRE(client.connect());
+    DaemonTestHarness harness;
+    harness.start();
+    auto client_ptr = harness.make_client();
+    auto& client = *client_ptr;
+    auto& q = *g_jobs;
 
     IpcResponse resp; IpcError err;
     REQUIRE(client.call("job.list", JsonMap{}, resp, err, 2000));
     CHECK(json_val_as_int(resp.result["count"]) == 0);
     CHECK(json_val_as_string(resp.result["jobs"]) == "[]");
 
-    client.close_connection();
-    ::unlink(QUERY_SOCK);
 }
 
 // ===========================================================================
@@ -672,18 +484,13 @@ TEST_CASE("C.6 job.list: empty for a client with no jobs",
 TEST_CASE("C.6 job.list: mixed kinds + states, foreign jobs excluded, "
           "terminal jobs included",
           "[c6][query]") {
-    ::unlink(QUERY_SOCK);
-
-    JobQueue q;
-    JqShutdownGuard jqg(q);
-    IpcServer server(QUERY_SOCK);
-    register_job_query_handlers(server, q);
-    REQUIRE(server.start());
-    ServerGuard sg(server);
-
-    IpcClient a(QUERY_SOCK), b(QUERY_SOCK);
-    REQUIRE(a.connect());
-    REQUIRE(b.connect());
+    DaemonTestHarness harness;
+    harness.start();
+    auto a_ptr = harness.make_client();
+    auto b_ptr = harness.make_client();
+    auto& a = *a_ptr;
+    auto& b = *b_ptr;
+    auto& q = *g_jobs;
     REQUIRE(a.client_id() != b.client_id());
 
     // A: 1 done postprocess, 1 failed postprocess, 1 cancelled streaming
@@ -750,10 +557,6 @@ TEST_CASE("C.6 job.list: mixed kinds + states, foreign jobs excluded, "
     REQUIRE(b_elems.size() == 1);
     CHECK(extract_field(b_elems[0], "client_id") == b.client_id());
     CHECK(std::stoll(extract_field(b_elems[0], "job_id")) == b_q);
-
-    a.close_connection();
-    b.close_connection();
-    ::unlink(QUERY_SOCK);
 }
 
 // ===========================================================================
@@ -765,17 +568,11 @@ TEST_CASE("C.6 job.list: mixed kinds + states, foreign jobs excluded, "
 // ===========================================================================
 TEST_CASE("C.6 job.list: ascending job_id ordering",
           "[c6][query]") {
-    ::unlink(QUERY_SOCK);
-
-    JobQueue q;
-    JqShutdownGuard jqg(q);
-    IpcServer server(QUERY_SOCK);
-    register_job_query_handlers(server, q);
-    REQUIRE(server.start());
-    ServerGuard sg(server);
-
-    IpcClient client(QUERY_SOCK);
-    REQUIRE(client.connect());
+    DaemonTestHarness harness;
+    harness.start();
+    auto client_ptr = harness.make_client();
+    auto& client = *client_ptr;
+    auto& q = *g_jobs;
 
     // Enqueue several jobs interleaving kinds — the registry keys by job_id
     // alone, so order on the wire MUST be ascending regardless of kind.
@@ -811,8 +608,6 @@ TEST_CASE("C.6 job.list: ascending job_id ordering",
         CHECK(ids[i] > ids[i - 1]);
     }
 
-    client.close_connection();
-    ::unlink(QUERY_SOCK);
 }
 
 // ---------------------------------------------------------------------------
@@ -823,17 +618,11 @@ TEST_CASE("C.6 job.list: ascending job_id ordering",
 TEST_CASE("C.11 — job.status response carries meeting_id "
           "(populated and empty round-trips)",
           "[c6][query][c11]") {
-    ::unlink(QUERY_SOCK);
-
-    JobQueue q;
-    JqShutdownGuard jqg(q);
-    IpcServer server(QUERY_SOCK);
-    register_job_query_handlers(server, q);
-    REQUIRE(server.start());
-    ServerGuard sg(server);
-
-    IpcClient client(QUERY_SOCK);
-    REQUIRE(client.connect());
+    DaemonTestHarness harness;
+    harness.start();
+    auto client_ptr = harness.make_client();
+    auto& client = *client_ptr;
+    auto& q = *g_jobs;
 
     // Job WITH meeting_id (mirrors what process.submit will do once C.11.4
     // wires the SubmitRequest field onto the Job at finalize).
@@ -878,6 +667,4 @@ TEST_CASE("C.11 — job.status response carries meeting_id "
         CHECK(hits == 2);
     }
 
-    client.close_connection();
-    ::unlink(QUERY_SOCK);
 }
