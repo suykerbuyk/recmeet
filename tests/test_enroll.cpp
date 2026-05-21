@@ -27,6 +27,8 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include "config.h"
+#include "daemon_handlers_internal.h"  // g_jobs / g_diar_cache externs
+#include "daemon_test_harness.h"
 #include "diarization_cache.h"
 #include "fetch_artifacts.h"
 #include "ipc_client.h"
@@ -52,6 +54,7 @@
 #include <unistd.h>
 
 using namespace recmeet;
+using recmeet::test::DaemonTestHarness;
 namespace fs = std::filesystem;
 
 namespace {
@@ -155,8 +158,13 @@ int64_t stage_running_job(JobQueue& q, const std::string& client_id,
     return id;
 }
 
-// Register the test-local `enroll.finalize` handler. Keeps the test
-// surface in sync with the production handler in src/daemon.cpp.
+// Phase 2b: the prior `register_enroll_finalize_handler` stub was retired
+// in favor of `register_daemon_handlers()` via DaemonTestHarness. The
+// production handler at src/daemon_handlers.cpp:1465 reads `g_jobs`,
+// `g_diar_cache`, `g_server_config.speaker_db` — the harness wires all
+// three. The legacy stub body below is kept under `#if 0` only as
+// reference; do not re-enable.
+#if 0
 void register_enroll_finalize_handler(IpcServer& server,
                                       JobQueue& q,
                                       DiarizationCache& cache,
@@ -272,6 +280,41 @@ void register_enroll_finalize_handler(IpcServer& server,
         }
     });
 }
+#endif  // legacy register_enroll_finalize_handler stub
+
+// Phase 2b: helper that boots a DaemonTestHarness with the speaker-db
+// pointed at a deterministic path and (optionally) installs a clock-
+// injectable DiarizationCache as g_diar_cache so TTL-expiry tests can
+// drive the clock forward. The harness wires g_jobs already.
+//
+// DaemonTestHarness is non-copyable + non-movable, so EnrollHarness must
+// be constructed in-place. The TTL-test variant takes the (ttl, clock)
+// pair via the constructor.
+struct EnrollHarness {
+    DaemonTestHarness harness;
+
+    EnrollHarness() {
+        harness.start();
+    }
+    // Variant for the TTL test — swap in a clock-injectable cache BEFORE
+    // start() so the handler sees it. The default-constructed harness
+    // installs a default `g_diar_cache`; we replace it here before
+    // start() registers handlers + starts the poll thread, so the
+    // handler captures the swapped pointer on first dereference.
+    EnrollHarness(int64_t ttl_secs, DiarizationCache::Clock clock) {
+        g_diar_cache = std::make_unique<DiarizationCache>(ttl_secs,
+                                                          std::move(clock));
+        harness.start();
+    }
+
+    EnrollHarness(const EnrollHarness&)            = delete;
+    EnrollHarness& operator=(const EnrollHarness&) = delete;
+
+    fs::path speaker_db_dir() const { return harness.speaker_db_dir(); }
+    std::unique_ptr<IpcClient> make_client() { return harness.make_client(); }
+    JobQueue& jobs() { return *g_jobs; }
+    DiarizationCache& cache() { return *g_diar_cache; }
+};
 
 } // anonymous namespace
 
@@ -506,25 +549,14 @@ TEST_CASE("process.submit: unknown mode → InvalidParams",
 
 TEST_CASE("enroll.finalize: appends embedding and persists to disk",
           "[c8][enroll]") {
-    ::unlink(ENROLL_SOCK);
-    JobQueue q;
-    JqShutdownGuard jqg(q);
-    DiarizationCache cache(/*ttl=*/0);  // disable TTL for happy-path
-    fs::path db_dir = test_temp_dir("happy_db");
-
-    IpcServer server(ENROLL_SOCK);
-    register_enroll_finalize_handler(server, q, cache, db_dir);
-    REQUIRE(server.start());
-    ServerGuard sg(server);
-
-    IpcClient client(ENROLL_SOCK);
-    REQUIRE(client.connect());
+    EnrollHarness eh;
+    auto client = eh.make_client();
 
     // Stage a Done enroll-mode job and pre-populate the cache.
     fs::path out_dir = test_temp_dir("happy_outdir");
-    int64_t job_id = stage_done_job(q, client.client_id(), out_dir,
+    int64_t job_id = stage_done_job(eh.jobs(), client->client_id(), out_dir,
                                      /*enroll_mode=*/true);
-    cache.put(job_id, make_synthetic_clusters(2));
+    eh.cache().put(job_id, make_synthetic_clusters(2));
 
     // Call enroll.finalize with target_speaker=0, name="Bob".
     JsonMap params;
@@ -534,8 +566,8 @@ TEST_CASE("enroll.finalize: appends embedding and persists to disk",
 
     IpcResponse resp;
     IpcError err;
-    bool ok = client.call("enroll.finalize", params, resp, err,
-                          /*timeout_ms=*/2000);
+    bool ok = client->call("enroll.finalize", params, resp, err,
+                           /*timeout_ms=*/2000);
     INFO("err code=" << err.code << " message=" << err.message);
     REQUIRE(ok);
     CHECK(err.message.empty());
@@ -544,17 +576,14 @@ TEST_CASE("enroll.finalize: appends embedding and persists to disk",
     CHECK(json_val_as_int(resp.result["embedding_count"]) == 1);
 
     // Read back the on-disk speakers DB. The handler wrote
-    // <db_dir>/Bob.json with one embedding matching cluster 0's centroid.
-    auto profiles = load_speaker_db(db_dir);
+    // <speaker_db>/Bob.json with one embedding matching cluster 0's centroid.
+    auto profiles = load_speaker_db(eh.speaker_db_dir());
     REQUIRE(profiles.size() == 1);
     CHECK(profiles[0].name == "Bob");
     REQUIRE(profiles[0].embeddings.size() == 1);
     auto fixture = make_synthetic_clusters(2);
     CHECK(profiles[0].embeddings[0].size()
           == fixture[0].embedding.size());
-
-    client.close_connection();
-    ::unlink(ENROLL_SOCK);
 }
 
 // ===========================================================================
@@ -565,25 +594,14 @@ TEST_CASE("enroll.finalize: appends embedding and persists to disk",
 
 TEST_CASE("enroll.finalize: flow-b reuses a regular postprocess job's cache",
           "[c8][enroll]") {
-    ::unlink(ENROLL_SOCK);
-    JobQueue q;
-    JqShutdownGuard jqg(q);
-    DiarizationCache cache(/*ttl=*/0);
-    fs::path db_dir = test_temp_dir("flowb_db");
-
-    IpcServer server(ENROLL_SOCK);
-    register_enroll_finalize_handler(server, q, cache, db_dir);
-    REQUIRE(server.start());
-    ServerGuard sg(server);
-
-    IpcClient client(ENROLL_SOCK);
-    REQUIRE(client.connect());
+    EnrollHarness eh;
+    auto client = eh.make_client();
 
     // enroll_mode=false on the job, but the cache entry is there.
     fs::path out_dir = test_temp_dir("flowb_outdir");
-    int64_t job_id = stage_done_job(q, client.client_id(), out_dir,
+    int64_t job_id = stage_done_job(eh.jobs(), client->client_id(), out_dir,
                                      /*enroll_mode=*/false);
-    cache.put(job_id, make_synthetic_clusters(3));
+    eh.cache().put(job_id, make_synthetic_clusters(3));
 
     JsonMap params;
     params["job_id"] = static_cast<int64_t>(job_id);
@@ -592,16 +610,13 @@ TEST_CASE("enroll.finalize: flow-b reuses a regular postprocess job's cache",
 
     IpcResponse resp;
     IpcError err;
-    REQUIRE(client.call("enroll.finalize", params, resp, err, 2000));
+    REQUIRE(client->call("enroll.finalize", params, resp, err, 2000));
     CHECK(err.message.empty());
     CHECK(json_val_as_int(resp.result["embedding_count"]) == 1);
 
-    auto profiles = load_speaker_db(db_dir);
+    auto profiles = load_speaker_db(eh.speaker_db_dir());
     REQUIRE(profiles.size() == 1);
     CHECK(profiles[0].name == "Charlie");
-
-    client.close_connection();
-    ::unlink(ENROLL_SOCK);
 }
 
 // ===========================================================================
@@ -611,26 +626,15 @@ TEST_CASE("enroll.finalize: flow-b reuses a regular postprocess job's cache",
 
 TEST_CASE("enroll.finalize: two calls for same name yield 2-embedding profile",
           "[c8][enroll]") {
-    ::unlink(ENROLL_SOCK);
-    JobQueue q;
-    JqShutdownGuard jqg(q);
-    DiarizationCache cache(/*ttl=*/0);
-    fs::path db_dir = test_temp_dir("multisample_db");
+    EnrollHarness eh;
+    auto client = eh.make_client();
 
-    IpcServer server(ENROLL_SOCK);
-    register_enroll_finalize_handler(server, q, cache, db_dir);
-    REQUIRE(server.start());
-    ServerGuard sg(server);
-
-    IpcClient client(ENROLL_SOCK);
-    REQUIRE(client.connect());
-
-    int64_t jid1 = stage_done_job(q, client.client_id(),
+    int64_t jid1 = stage_done_job(eh.jobs(), client->client_id(),
                                   test_temp_dir("ms_a"), true);
-    cache.put(jid1, make_synthetic_clusters(1));
-    int64_t jid2 = stage_done_job(q, client.client_id(),
+    eh.cache().put(jid1, make_synthetic_clusters(1));
+    int64_t jid2 = stage_done_job(eh.jobs(), client->client_id(),
                                   test_temp_dir("ms_b"), true);
-    cache.put(jid2, make_synthetic_clusters(1));
+    eh.cache().put(jid2, make_synthetic_clusters(1));
 
     for (int64_t jid : {jid1, jid2}) {
         JsonMap params;
@@ -639,17 +643,14 @@ TEST_CASE("enroll.finalize: two calls for same name yield 2-embedding profile",
         params["enroll_name"] = std::string("Dana");
         IpcResponse resp;
         IpcError err;
-        REQUIRE(client.call("enroll.finalize", params, resp, err, 2000));
+        REQUIRE(client->call("enroll.finalize", params, resp, err, 2000));
         CHECK(err.message.empty());
     }
 
-    auto profiles = load_speaker_db(db_dir);
+    auto profiles = load_speaker_db(eh.speaker_db_dir());
     REQUIRE(profiles.size() == 1);
     CHECK(profiles[0].name == "Dana");
     CHECK(profiles[0].embeddings.size() == 2);
-
-    client.close_connection();
-    ::unlink(ENROLL_SOCK);
 }
 
 // ===========================================================================
@@ -659,28 +660,17 @@ TEST_CASE("enroll.finalize: two calls for same name yield 2-embedding profile",
 
 TEST_CASE("enroll.finalize: expired cache entry → InvalidParams w/ TTL hint",
           "[c8][enroll]") {
-    ::unlink(ENROLL_SOCK);
-    JobQueue q;
-    JqShutdownGuard jqg(q);
-    FakeClock clk;
-    clk.now.store(1000);
-    DiarizationCache cache(/*ttl=*/60, clk.fn());
-    fs::path db_dir = test_temp_dir("ttl_db");
+    auto clk = std::make_shared<FakeClock>();
+    clk->now.store(1000);
+    EnrollHarness eh(/*ttl=*/60, [clk]() { return clk->now.load(); });
+    auto client = eh.make_client();
 
-    IpcServer server(ENROLL_SOCK);
-    register_enroll_finalize_handler(server, q, cache, db_dir);
-    REQUIRE(server.start());
-    ServerGuard sg(server);
-
-    IpcClient client(ENROLL_SOCK);
-    REQUIRE(client.connect());
-
-    int64_t jid = stage_done_job(q, client.client_id(),
+    int64_t jid = stage_done_job(eh.jobs(), client->client_id(),
                                  test_temp_dir("ttl_outdir"), true);
-    cache.put(jid, make_synthetic_clusters(1));
+    eh.cache().put(jid, make_synthetic_clusters(1));
 
     // Advance the clock past TTL.
-    clk.now.store(1200);
+    clk->now.store(1200);
 
     JsonMap params;
     params["job_id"] = jid;
@@ -689,12 +679,9 @@ TEST_CASE("enroll.finalize: expired cache entry → InvalidParams w/ TTL hint",
     IpcResponse resp;
     IpcError err;
     // The handler returns an error → call() returns false; err is populated.
-    CHECK_FALSE(client.call("enroll.finalize", params, resp, err, 2000));
+    CHECK_FALSE(client->call("enroll.finalize", params, resp, err, 2000));
     CHECK(err.code == static_cast<int>(IpcErrorCode::InvalidParams));
     CHECK(err.message.find("TTL") != std::string::npos);
-
-    client.close_connection();
-    ::unlink(ENROLL_SOCK);
 }
 
 // ===========================================================================
@@ -703,23 +690,12 @@ TEST_CASE("enroll.finalize: expired cache entry → InvalidParams w/ TTL hint",
 
 TEST_CASE("enroll.finalize: target_speaker out of range → InvalidParams",
           "[c8][enroll]") {
-    ::unlink(ENROLL_SOCK);
-    JobQueue q;
-    JqShutdownGuard jqg(q);
-    DiarizationCache cache(/*ttl=*/0);
-    fs::path db_dir = test_temp_dir("oor_db");
+    EnrollHarness eh;
+    auto client = eh.make_client();
 
-    IpcServer server(ENROLL_SOCK);
-    register_enroll_finalize_handler(server, q, cache, db_dir);
-    REQUIRE(server.start());
-    ServerGuard sg(server);
-
-    IpcClient client(ENROLL_SOCK);
-    REQUIRE(client.connect());
-
-    int64_t jid = stage_done_job(q, client.client_id(),
+    int64_t jid = stage_done_job(eh.jobs(), client->client_id(),
                                  test_temp_dir("oor_outdir"), true);
-    cache.put(jid, make_synthetic_clusters(2));
+    eh.cache().put(jid, make_synthetic_clusters(2));
 
     JsonMap params;
     params["job_id"] = jid;
@@ -727,12 +703,9 @@ TEST_CASE("enroll.finalize: target_speaker out of range → InvalidParams",
     params["enroll_name"] = std::string("OOR");
     IpcResponse resp;
     IpcError err;
-    CHECK_FALSE(client.call("enroll.finalize", params, resp, err, 2000));
+    CHECK_FALSE(client->call("enroll.finalize", params, resp, err, 2000));
     CHECK(err.code == static_cast<int>(IpcErrorCode::InvalidParams));
     CHECK(err.message.find("out of range") != std::string::npos);
-
-    client.close_connection();
-    ::unlink(ENROLL_SOCK);
 }
 
 // ===========================================================================
@@ -741,21 +714,10 @@ TEST_CASE("enroll.finalize: target_speaker out of range → InvalidParams",
 
 TEST_CASE("enroll.finalize: Running job → JobNotReady",
           "[c8][enroll]") {
-    ::unlink(ENROLL_SOCK);
-    JobQueue q;
-    JqShutdownGuard jqg(q);
-    DiarizationCache cache(/*ttl=*/0);
-    fs::path db_dir = test_temp_dir("notready_db");
+    EnrollHarness eh;
+    auto client = eh.make_client();
 
-    IpcServer server(ENROLL_SOCK);
-    register_enroll_finalize_handler(server, q, cache, db_dir);
-    REQUIRE(server.start());
-    ServerGuard sg(server);
-
-    IpcClient client(ENROLL_SOCK);
-    REQUIRE(client.connect());
-
-    int64_t jid = stage_running_job(q, client.client_id(),
+    int64_t jid = stage_running_job(eh.jobs(), client->client_id(),
                                     test_temp_dir("notready_outdir"));
     // No cache entry needed — state check fires first.
 
@@ -765,14 +727,11 @@ TEST_CASE("enroll.finalize: Running job → JobNotReady",
     params["enroll_name"] = std::string("Frank");
     IpcResponse resp;
     IpcError err;
-    CHECK_FALSE(client.call("enroll.finalize", params, resp, err, 2000));
+    CHECK_FALSE(client->call("enroll.finalize", params, resp, err, 2000));
     CHECK(err.code == static_cast<int>(IpcErrorCode::JobNotReady));
 
-    // Drain the running job so JqShutdownGuard doesn't leak.
-    q.finish(jid, true);
-
-    client.close_connection();
-    ::unlink(ENROLL_SOCK);
+    // Drain the running job so the harness's job-queue teardown is clean.
+    eh.jobs().finish(jid, true);
 }
 
 // ===========================================================================
@@ -781,26 +740,13 @@ TEST_CASE("enroll.finalize: Running job → JobNotReady",
 
 TEST_CASE("enroll.finalize: other client's job → PermissionDenied",
           "[c8][enroll]") {
-    ::unlink(ENROLL_SOCK);
-    JobQueue q;
-    JqShutdownGuard jqg(q);
-    DiarizationCache cache(/*ttl=*/0);
-    fs::path db_dir = test_temp_dir("perm_db");
+    EnrollHarness eh;
+    auto a = eh.make_client();
+    auto b = eh.make_client();
 
-    IpcServer server(ENROLL_SOCK);
-    register_enroll_finalize_handler(server, q, cache, db_dir);
-    REQUIRE(server.start());
-    ServerGuard sg(server);
-
-    // Two clients on the same socket.
-    IpcClient a(ENROLL_SOCK);
-    REQUIRE(a.connect());
-    IpcClient b(ENROLL_SOCK);
-    REQUIRE(b.connect());
-
-    int64_t a_job = stage_done_job(q, a.client_id(),
+    int64_t a_job = stage_done_job(eh.jobs(), a->client_id(),
                                    test_temp_dir("perm_outdir"), true);
-    cache.put(a_job, make_synthetic_clusters(1));
+    eh.cache().put(a_job, make_synthetic_clusters(1));
 
     JsonMap params;
     params["job_id"] = a_job;
@@ -808,12 +754,8 @@ TEST_CASE("enroll.finalize: other client's job → PermissionDenied",
     params["enroll_name"] = std::string("Foreign");
     IpcResponse resp;
     IpcError err;
-    CHECK_FALSE(b.call("enroll.finalize", params, resp, err, 2000));
+    CHECK_FALSE(b->call("enroll.finalize", params, resp, err, 2000));
     CHECK(err.code == static_cast<int>(IpcErrorCode::PermissionDenied));
-
-    a.close_connection();
-    b.close_connection();
-    ::unlink(ENROLL_SOCK);
 }
 
 // ===========================================================================
@@ -822,23 +764,12 @@ TEST_CASE("enroll.finalize: other client's job → PermissionDenied",
 
 TEST_CASE("enroll.finalize: missing enroll_name → InvalidParams",
           "[c8][enroll]") {
-    ::unlink(ENROLL_SOCK);
-    JobQueue q;
-    JqShutdownGuard jqg(q);
-    DiarizationCache cache(/*ttl=*/0);
-    fs::path db_dir = test_temp_dir("missing_name_db");
+    EnrollHarness eh;
+    auto client = eh.make_client();
 
-    IpcServer server(ENROLL_SOCK);
-    register_enroll_finalize_handler(server, q, cache, db_dir);
-    REQUIRE(server.start());
-    ServerGuard sg(server);
-
-    IpcClient client(ENROLL_SOCK);
-    REQUIRE(client.connect());
-
-    int64_t jid = stage_done_job(q, client.client_id(),
+    int64_t jid = stage_done_job(eh.jobs(), client->client_id(),
                                  test_temp_dir("missing_name_outdir"), true);
-    cache.put(jid, make_synthetic_clusters(1));
+    eh.cache().put(jid, make_synthetic_clusters(1));
 
     JsonMap params;
     params["job_id"] = jid;
@@ -846,12 +777,9 @@ TEST_CASE("enroll.finalize: missing enroll_name → InvalidParams",
     // enroll_name deliberately absent
     IpcResponse resp;
     IpcError err;
-    CHECK_FALSE(client.call("enroll.finalize", params, resp, err, 2000));
+    CHECK_FALSE(client->call("enroll.finalize", params, resp, err, 2000));
     CHECK(err.code == static_cast<int>(IpcErrorCode::InvalidParams));
     CHECK(err.message.find("enroll_name") != std::string::npos);
-
-    client.close_connection();
-    ::unlink(ENROLL_SOCK);
 }
 
 // ===========================================================================
@@ -889,19 +817,8 @@ TEST_CASE("process.fetch on enroll-mode Done job returns empty artifacts",
 
 TEST_CASE("enroll.finalize: N>2 embeddings for one name produce an N-embedding profile",
           "[c8][enroll][multi-embedding]") {
-    ::unlink(ENROLL_SOCK);
-    JobQueue q;
-    JqShutdownGuard jqg(q);
-    DiarizationCache cache(/*ttl=*/0);  // disable TTL
-    fs::path db_dir = test_temp_dir("multi_emb_db");
-
-    IpcServer server(ENROLL_SOCK);
-    register_enroll_finalize_handler(server, q, cache, db_dir);
-    REQUIRE(server.start());
-    ServerGuard sg(server);
-
-    IpcClient client(ENROLL_SOCK);
-    REQUIRE(client.connect());
+    EnrollHarness eh;
+    auto client = eh.make_client();
 
     // Mix the two valid paths for "more embeddings": three SEPARATE
     // cached jobs (covers the typical "user re-enrolled three times in
@@ -912,11 +829,11 @@ TEST_CASE("enroll.finalize: N>2 embeddings for one name produce an N-embedding p
     constexpr int kSeparateJobs = 3;
     std::vector<int64_t> job_ids;
     for (int i = 0; i < kSeparateJobs; ++i) {
-        int64_t jid = stage_done_job(q, client.client_id(),
+        int64_t jid = stage_done_job(eh.jobs(), client->client_id(),
                                      test_temp_dir("multi_emb_job"
                                                    + std::to_string(i)),
                                      /*enroll_mode=*/true);
-        cache.put(jid, make_synthetic_clusters(1));
+        eh.cache().put(jid, make_synthetic_clusters(1));
         job_ids.push_back(jid);
     }
 
@@ -929,12 +846,12 @@ TEST_CASE("enroll.finalize: N>2 embeddings for one name produce an N-embedding p
         IpcResponse resp;
         IpcError err;
         INFO("job_id=" << jid);
-        REQUIRE(client.call("enroll.finalize", params, resp, err, 2000));
+        REQUIRE(client->call("enroll.finalize", params, resp, err, 2000));
         CHECK(err.message.empty());
     }
     // After 3 separate-job appends, the profile has exactly 3 embeddings.
     {
-        auto profiles = load_speaker_db(db_dir);
+        auto profiles = load_speaker_db(eh.speaker_db_dir());
         REQUIRE(profiles.size() == 1);
         CHECK(profiles[0].name == "Alice");
         CHECK(profiles[0].embeddings.size() == 3);
@@ -944,10 +861,10 @@ TEST_CASE("enroll.finalize: N>2 embeddings for one name produce an N-embedding p
     // picking target_speaker=1 (a different cluster than 0). This proves
     // the handler honors per-call target_speaker for an enroll job whose
     // diarization produced >1 speaker.
-    int64_t multi_jid = stage_done_job(q, client.client_id(),
+    int64_t multi_jid = stage_done_job(eh.jobs(), client->client_id(),
                                        test_temp_dir("multi_emb_multitgt"),
                                        /*enroll_mode=*/true);
-    cache.put(multi_jid, make_synthetic_clusters(3));
+    eh.cache().put(multi_jid, make_synthetic_clusters(3));
     {
         JsonMap params;
         params["job_id"] = multi_jid;
@@ -955,13 +872,13 @@ TEST_CASE("enroll.finalize: N>2 embeddings for one name produce an N-embedding p
         params["enroll_name"] = std::string("Alice");
         IpcResponse resp;
         IpcError err;
-        REQUIRE(client.call("enroll.finalize", params, resp, err, 2000));
+        REQUIRE(client->call("enroll.finalize", params, resp, err, 2000));
         CHECK(err.message.empty());
         CHECK(json_val_as_int(resp.result["embedding_count"]) == 4);
     }
     // Final profile has all 4 embeddings under a single "Alice" record.
     {
-        auto profiles = load_speaker_db(db_dir);
+        auto profiles = load_speaker_db(eh.speaker_db_dir());
         REQUIRE(profiles.size() == 1);
         CHECK(profiles[0].name == "Alice");
         CHECK(profiles[0].embeddings.size() == 4);
@@ -972,7 +889,4 @@ TEST_CASE("enroll.finalize: N>2 embeddings for one name produce an N-embedding p
             CHECK(emb.size() == 8);
         }
     }
-
-    client.close_connection();
-    ::unlink(ENROLL_SOCK);
 }
