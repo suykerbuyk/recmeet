@@ -60,6 +60,20 @@ struct Config {
     int num_speakers = 0;  // 0 = auto-detect
     float cluster_threshold = 1.18f;  // clustering distance threshold (lower = more splitting)
 
+    // Phase B (diarize-overcount task):
+    //   max_auto_speakers — default hard cap when neither --num-speakers nor
+    //     a context Participants count provides one. Phase A.4 sized this at
+    //     8 (covers the 99th-percentile routine meeting; large conference
+    //     calls override via context names). Persisted as
+    //     [diarization] max_auto_speakers = N.
+    //   collapse_threshold — cosine-similarity floor for the post-stitch
+    //     unified merge loop's auto-merge gate. Phase A.2 chose 0.55
+    //     empirically (M-4 floor). Production operators don't touch it;
+    //     surfaced as CLI for experimentation. Persisted as
+    //     [diarization] collapse_threshold = F.
+    int max_auto_speakers = 8;
+    float collapse_threshold = 0.55f;
+
     // Chunked diarization (T2.1/T2.2 — engaged when audio length exceeds the
     // pipeline threshold; otherwise the single-call path is used). Defaults
     // sized to keep each chunk's peak working set well under the iter-110

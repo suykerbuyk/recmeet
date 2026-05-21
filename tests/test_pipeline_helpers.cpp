@@ -181,6 +181,136 @@ TEST_CASE("load_meeting_context: returns empty when context key missing", "[pipe
     fs::remove_all(dir);
 }
 
+// ---------------------------------------------------------------------------
+// Phase B.0 — `resolve_context_text` precedence
+// ---------------------------------------------------------------------------
+
+TEST_CASE("resolve_context_text: inline only returns inline",
+          "[pipeline][context-resolve]") {
+    auto dir = tmp_dir();
+    Config cfg;
+    cfg.context_inline = "Participants: Alice, Bob";
+    CHECK(resolve_context_text(cfg, dir) == "Participants: Alice, Bob");
+    fs::remove_all(dir);
+}
+
+TEST_CASE("resolve_context_text: inline + file concatenated with separator",
+          "[pipeline][context-resolve]") {
+    auto dir = tmp_dir();
+    fs::path file = dir / "agenda.txt";
+    {
+        std::ofstream out(file);
+        out << "Agenda:\n- Item 1\n";
+    }
+    Config cfg;
+    cfg.context_inline = "Subject: Standup";
+    cfg.context_file = file;
+    std::string got = resolve_context_text(cfg, dir);
+    // Pre-Phase-B summarizer-prep semantics: file appended with "\n\n"
+    // when inline is non-empty.
+    CHECK(got == "Subject: Standup\n\nAgenda:\n- Item 1\n");
+    fs::remove_all(dir);
+}
+
+TEST_CASE("resolve_context_text: reprocess with saved context.json (no inline)",
+          "[pipeline][context-resolve]") {
+    auto dir = tmp_dir();
+    save_meeting_context(dir, "Saved: Q1 review notes");
+    REQUIRE(fs::exists(dir / "context.json"));
+
+    Config cfg;
+    cfg.reprocess_dir = dir;  // marks this as a reprocess
+
+    CHECK(resolve_context_text(cfg, dir) == "Saved: Q1 review notes");
+    fs::remove_all(dir);
+}
+
+TEST_CASE("resolve_context_text: inline overrides saved context.json",
+          "[pipeline][context-resolve]") {
+    auto dir = tmp_dir();
+    save_meeting_context(dir, "Saved on-disk content");
+    REQUIRE(fs::exists(dir / "context.json"));
+
+    Config cfg;
+    cfg.context_inline = "Fresh inline content";
+    cfg.reprocess_dir = dir;  // reprocess + inline together
+
+    // Inline wins; saved context.json is NOT consulted when inline non-empty.
+    CHECK(resolve_context_text(cfg, dir) == "Fresh inline content");
+    fs::remove_all(dir);
+}
+
+// ---------------------------------------------------------------------------
+// Phase B.2 — `resolve_target_speakers` precedence chain
+// ---------------------------------------------------------------------------
+
+TEST_CASE("resolve_target_speakers: --num-speakers wins over context",
+          "[pipeline][target-speakers]") {
+    const char* source = nullptr;
+    int target = resolve_target_speakers(
+        /*cli_num_speakers=*/3,
+        /*context_speaker_count=*/4,
+        /*max_auto_speakers=*/8,
+        &source);
+    CHECK(target == 3);
+    REQUIRE(source != nullptr);
+    CHECK(std::string(source) == "--num-speakers");
+}
+
+TEST_CASE("resolve_target_speakers: context wins when --num-speakers is 0",
+          "[pipeline][target-speakers]") {
+    const char* source = nullptr;
+    int target = resolve_target_speakers(
+        /*cli_num_speakers=*/0,
+        /*context_speaker_count=*/4,
+        /*max_auto_speakers=*/8,
+        &source);
+    CHECK(target == 4);
+    REQUIRE(source != nullptr);
+    CHECK(std::string(source) == "context");
+}
+
+TEST_CASE("resolve_target_speakers: max_auto fallback when both 0",
+          "[pipeline][target-speakers]") {
+    const char* source = nullptr;
+    int target = resolve_target_speakers(
+        /*cli_num_speakers=*/0,
+        /*context_speaker_count=*/0,
+        /*max_auto_speakers=*/8,
+        &source);
+    CHECK(target == 8);
+    REQUIRE(source != nullptr);
+    CHECK(std::string(source) == "max_auto");
+}
+
+TEST_CASE("resolve_target_speakers: max_auto override honored",
+          "[pipeline][target-speakers]") {
+    const char* source = nullptr;
+    int target = resolve_target_speakers(
+        /*cli_num_speakers=*/0,
+        /*context_speaker_count=*/0,
+        /*max_auto_speakers=*/12,
+        &source);
+    CHECK(target == 12);
+    CHECK(std::string(source) == "max_auto");
+}
+
+TEST_CASE("resolve_target_speakers: source_out can be omitted",
+          "[pipeline][target-speakers]") {
+    CHECK(resolve_target_speakers(3, 4, 8, nullptr) == 3);
+    CHECK(resolve_target_speakers(0, 4, 8, nullptr) == 4);
+    CHECK(resolve_target_speakers(0, 0, 8, nullptr) == 8);
+}
+
+TEST_CASE("parse_context_participants: Phase B stub returns 0",
+          "[pipeline][target-speakers]") {
+    // The Phase C parser body is not yet wired (this brief landed Phase B).
+    // The stub returns 0 so the precedence chain falls through to max_auto.
+    // Phase C's regression coverage will land actual-parse tests.
+    CHECK(parse_context_participants("") == 0);
+    CHECK(parse_context_participants("Participants: Alice, Bob") == 0);
+}
+
 TEST_CASE("run_postprocessing: transcribe minimal WAV with no summary/diarize", "[integration]") {
     ensure_whisper_model("tiny");
 

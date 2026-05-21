@@ -79,6 +79,50 @@ void save_meeting_context(const fs::path& out_dir, const std::string& context_in
 /// Returns empty if file doesn't exist.
 std::string load_meeting_context(const fs::path& out_dir);
 
+/// Resolve the full meeting context string from all sources, in precedence
+/// order:
+///   1. `cfg.context_inline` (highest — operator-typed inline / `--context-text`)
+///   2. `cfg.context_file` contents (appended with blank-line separator if
+///      inline is also set, per the pre-existing summarizer-prep merge)
+///   3. `load_meeting_context(out_dir)` (reprocess-loaded `context.json`,
+///      consulted only when neither inline nor file produced any content —
+///      preserves the reprocess fallback semantics of the previous
+///      summarizer-side merge)
+///
+/// Lifted up from `run_postprocessing()`'s post-diarize summarizer prep
+/// (former site `pipeline.cpp:842-852`) so context-aware diarize features
+/// (Phase C of diarize-overcount: `parse_context_participants`) can read the
+/// resolved text before the diarize block fires. **No behavior change for
+/// the summarizer** — the summarizer reads this same resolved value.
+std::string resolve_context_text(const Config& cfg, const fs::path& out_dir);
+
+/// Resolve `target_speakers` from the precedence chain used by
+/// `run_postprocessing()` before invoking diarize:
+///   1. `cli_num_speakers` if > 0 (explicit operator override)
+///   2. `context_speaker_count` if > 0 (Phase C parser output)
+///   3. `max_auto_speakers` (default cap; Phase B.2 default 8)
+///
+/// `source_out` (if non-null) is set to a stable label
+/// (`"--num-speakers"`, `"context"`, or `"max_auto"`) so callers can emit
+/// the operator-facing `log_info` consistently. Exposed for unit tests so
+/// the precedence formula can be exercised without invoking the full
+/// pipeline; production code calls this with the values it has on hand.
+int resolve_target_speakers(int cli_num_speakers,
+                            int context_speaker_count,
+                            int max_auto_speakers,
+                            const char** source_out = nullptr);
+
+/// Parse a count of meeting participants from a resolved context-text blob.
+/// Looks for lines matching `^\s*Participants?\s*:\s*<list>$` (case-insensitive),
+/// splits the list on commas and " and " / " & ", trims whitespace, drops
+/// empties, and returns the count. Returns 0 if no Participants line is found.
+///
+/// Phase B.2 wires this into `run_postprocessing()`'s `target_speakers`
+/// precedence chain; the body is implemented in Phase C. For Phase B the
+/// stub returns 0 so the precedence chain falls through to `max_auto_speakers`,
+/// matching the pre-Phase-B behavior for auto-detect runs.
+int parse_context_participants(const std::string& context);
+
 /// Record audio. Phase: "recording". For --reprocess, resolves paths only.
 ///
 /// `caption_hooks` (Phase 3) is consulted only when `cfg.captions_enabled`

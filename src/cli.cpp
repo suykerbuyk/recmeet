@@ -81,6 +81,8 @@ CliResult parse_cli(int argc, char* argv[]) {
         {"diarize-chunk-overlap-sec", required_argument, nullptr, 1030},
         {"diarize-stitch-threshold",  required_argument, nullptr, 1031},
         {"debug-dump-centroids",      required_argument, nullptr, 1038},
+        {"max-auto-speakers",         required_argument, nullptr, 1039},
+        {"collapse-threshold",        required_argument, nullptr, 1040},
         {"reprocess-batch", required_argument, nullptr, 1032},
         {"dry-run",         no_argument,       nullptr, 1033},
         {"caption-model",      required_argument, nullptr, 1034},
@@ -164,6 +166,8 @@ CliResult parse_cli(int argc, char* argv[]) {
             case 1037: result.caption_force_on = true;
                        result.caption_show_on_stderr = true; break;
             case 1038: result.cfg.debug_dump_centroids_path = optarg; break;
+            case 1039: result.cfg.max_auto_speakers = std::atoi(optarg); break;
+            case 1040: result.cfg.collapse_threshold = static_cast<float>(std::atof(optarg)); break;
             case 'v': result.show_version = true; return result;
             case 'h': result.show_help = true; return result;
             default:  result.show_help = true; return result;
