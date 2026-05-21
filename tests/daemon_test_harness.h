@@ -29,6 +29,27 @@
 // stream_worker_loop) are NOT started by this harness — Phase 2b only
 // exercises the verb-dispatch path. Tests that want to drive a job
 // through to completion belong in Phase 3 (daemon-spawning harness).
+//
+// Phase 2b extension — sink injection. Tests that need to observe upload
+// progress or streaming caption events from the production handlers can
+// inject their own sinks BEFORE start():
+//
+//   DaemonTestHarness harness;
+//   UploadProgressSink ps;
+//   ps.on_progress = [&](int64_t job_id, const std::string& client_id,
+//                        int64_t bytes_received, int64_t audio_size) {
+//       /* observe */
+//   };
+//   harness.set_upload_progress_sink(std::move(ps));
+//   harness.set_upload_staging_root(my_tmp_dir);
+//   harness.start();
+//
+// The setters must be called before start() — start() constructs
+// `g_uploads` / `g_streaming` with the injected values, and the production
+// session managers read the sinks on the poll thread from then on. Default
+// behavior (no setter call) is identical to pre-extension: no-op sinks,
+// upload staging_root == per-test tmp_dir, streaming meetings_root ==
+// per-test meetings_dir.
 
 #pragma once
 
@@ -103,18 +124,12 @@ public:
         g_sessions      = std::make_unique<SessionManager>(
             static_cast<int64_t>(g_server_config.retain_terminal_hours) * 3600);
 
-        // Streaming + Upload managers need a caption sink / progress sink
-        // and a meetings_root. The sinks are no-op in tests — handlers
-        // that exercise them are Phase 3 scope.
-        StreamingCaptionSink stream_sink;
-        g_streaming = std::make_unique<StreamingSessionManager>(
-            *g_jobs, stream_sink, /*caption_model_dir=*/std::string(),
-            g_meeting_index.get(), meetings_dir_);
-
-        UploadProgressSink upload_sink;
-        g_uploads = std::make_unique<UploadSessionManager>(
-            *g_jobs, /*staging_root=*/fs::path{}, upload_sink,
-            g_meeting_index.get(), meetings_dir_);
+        // Streaming + Upload managers are deferred to start() so tests can
+        // inject custom sinks / staging roots via `set_streaming_caption_sink`
+        // / `set_upload_progress_sink` / `set_upload_staging_root` between
+        // construction and start(). Default sinks are no-op; default upload
+        // staging_root is the per-harness tmp_dir; default streaming
+        // meetings_root is meetings_dir_.
 
         // Wire the resume_token resolver + dispatch hook the same way
         // daemon.cpp's main() does. Tests that need PSK / resume-token
@@ -165,11 +180,58 @@ public:
     DaemonTestHarness(const DaemonTestHarness&)            = delete;
     DaemonTestHarness& operator=(const DaemonTestHarness&) = delete;
 
+    /// Inject a `StreamingCaptionSink` to be used when start() constructs
+    /// `g_streaming`. Must be called BEFORE start() — the production
+    /// `StreamingSessionManager` ctor takes the sink by const-ref and the
+    /// session manager stores a copy internally, so changing it after start()
+    /// would be a race against the IPC poll thread / engine worker thread.
+    /// Default (no setter call) is a no-op sink.
+    void set_streaming_caption_sink(StreamingCaptionSink sink) {
+        stream_sink_   = std::move(sink);
+        stream_sink_set_ = true;
+    }
+
+    /// Inject an `UploadProgressSink` to be used when start() constructs
+    /// `g_uploads`. Must be called BEFORE start() — the production
+    /// `UploadSessionManager` stores the sink by value and the IPC poll
+    /// thread reads it on every `feed_chunk()`. Default (no setter call)
+    /// is a no-op sink.
+    void set_upload_progress_sink(UploadProgressSink sink) {
+        upload_sink_   = std::move(sink);
+        upload_sink_set_ = true;
+    }
+
+    /// Override the staging root the `UploadSessionManager` is constructed
+    /// with. Default is the harness's per-test tmp_dir(). Must be called
+    /// BEFORE start(). The path must remain valid for the harness's
+    /// lifetime (the manager stores it by value).
+    void set_upload_staging_root(fs::path root) {
+        upload_staging_root_       = std::move(root);
+        upload_staging_root_set_   = true;
+    }
+
     /// Register the production handlers + start the IPC server's poll
     /// loop. Must be called exactly once. After this call no further
     /// `server().on(...)` calls or `mutate_config(...)` calls are safe
-    /// from the test thread (the poll thread now reads them).
+    /// from the test thread (the poll thread now reads them). Sink
+    /// injection via `set_*_sink(...)` MUST happen before this call.
     void start() {
+        // Build the streaming + upload managers now, using any test-
+        // injected sinks / staging root. Default sinks are no-op so legacy
+        // tests that don't call the setters behave exactly as before.
+        StreamingCaptionSink stream_sink = stream_sink_;
+        g_streaming = std::make_unique<StreamingSessionManager>(
+            *g_jobs, stream_sink, /*caption_model_dir=*/std::string(),
+            g_meeting_index.get(), meetings_dir_);
+
+        UploadProgressSink upload_sink = upload_sink_;
+        fs::path staging_root = upload_staging_root_set_
+            ? upload_staging_root_
+            : tmp_dir_;
+        g_uploads = std::make_unique<UploadSessionManager>(
+            *g_jobs, staging_root, std::move(upload_sink),
+            g_meeting_index.get(), meetings_dir_);
+
         register_daemon_handlers(*server_);
         if (!server_->start()) {
             throw std::runtime_error(
@@ -251,6 +313,17 @@ private:
     std::string                socket_path_;
     std::unique_ptr<IpcServer> server_;
     std::thread                run_thread_;
+
+    // Injection points for the streaming caption sink, upload progress
+    // sink, and upload staging root. start() consumes these when
+    // constructing `g_streaming` / `g_uploads`. Defaults are no-op sinks
+    // and tmp_dir_ for staging.
+    StreamingCaptionSink stream_sink_{};
+    bool                 stream_sink_set_ = false;
+    UploadProgressSink   upload_sink_{};
+    bool                 upload_sink_set_ = false;
+    fs::path             upload_staging_root_{};
+    bool                 upload_staging_root_set_ = false;
 };
 
 } // namespace test
