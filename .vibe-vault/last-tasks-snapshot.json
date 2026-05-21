@@ -1,11 +1,13 @@
 {
-  "iter_n": 183,
-  "anchor_sha": "07bf266a368808d6b9601776e0b289050b94fdc9",
+  "iter_n": 190,
+  "anchor_sha": "3e3d61b91aa7d6582dcba3eca2d308c3d7ce6a0e",
   "active": [
+    "diarize-overcount-and-context-aware-speaker-hints",
     "e6-tray-bundled-webui",
+    "full-stack-captions-60min-regression",
     "thin-client-recording-server",
-    "v1-doc-review-and-readme-local-ai-positioning",
-    "webui-live-captions"
+    "webui-live-captions",
+    "whisper-vocab-hint-bleed"
   ],
   "done": [
     "audio-buffer-bounds",
@@ -14,6 +16,7 @@
     "binary-size",
     "breezy-zooming-ritchie",
     "bright-dreaming-scott",
+    "component-diagrams-html-auto-regen",
     "concurrent-recording",
     "cross-distro-packaging",
     "crystalline-petting-sutton",
@@ -23,6 +26,7 @@
     "declarative-moseying-wind",
     "deterministic-logging-framework",
     "diarize-auto-detect-over-segments",
+    "e6-smoke-gate",
     "fix-subprocess-live-recording",
     "fix-watchdog-diarization-deadlock",
     "floofy-percolating-dahl",
@@ -89,6 +93,7 @@
     "thread-count-redundant-validation",
     "tray-background-postprocessing",
     "tray-stop-stuck-recording-state",
+    "v1-doc-review-and-readme-local-ai-positioning",
     "v2-absorb-v1.6.0-gpu-bundle",
     "v2-pre-phase-d-stabilization",
     "vad-segmentation",
