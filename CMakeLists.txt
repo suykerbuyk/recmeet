@@ -643,6 +643,10 @@ if(RECMEET_BUILD_TESTS)
         # Phase E.6.1 — IPC round-trip tests for the 8 new speakers.* /
         # meetings.* verbs that back the tray-bundled WebUI.
         tests/test_speakers_meetings_ipc.cpp
+        # Phase 2b — production-handler coverage for config.reload +
+        # models.list + models.update (the 3 admin verbs that had no
+        # real-handler test prior).
+        tests/test_admin_verbs_ipc.cpp
         # Phase E.6.2 — tray_web HTTP→IPC translator tests. Exercises the
         # production translator against an in-process DaemonSim that
         # registers the 11 new + 3 existing speakers/meetings verbs +
@@ -652,6 +656,14 @@ if(RECMEET_BUILD_TESTS)
         # parser tests. Spawns the real recmeet-tray binary to exercise
         # the pre-gtk_init flag pre-parse in main().
         tests/test_tray_cli.cpp
+        # Phase 2b — production IPC verb registrations. Same TU the daemon
+        # binary links via `recmeet-daemon`; pulling it into recmeet_tests
+        # lets the new `DaemonTestHarness` exercise the production code
+        # path instead of stubbing each verb. The `g_*` globals the
+        # handlers reach for (defined in src/daemon.cpp in production) are
+        # provided for the test binary by `tests/daemon_test_globals.cpp`.
+        src/daemon_handlers.cpp
+        tests/daemon_test_globals.cpp
         src/tray_web.cpp
         vendor/cpp-httplib/httplib.cpp
         ${_RECMEET_WEB_ASSETS_HDR}
