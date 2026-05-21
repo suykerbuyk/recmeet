@@ -108,6 +108,45 @@ and reference audio). This is the command you'll use most often.
 Only works when PipeWire is running (i.e., on your desktop, not in a headless
 CI environment).
 
+### Test ↔ daemon integration seam
+
+Phase 2b consolidated the per-test "stub the IPC verb" pattern onto a
+single integration seam:
+
+- `src/daemon_handlers.h` declares `register_daemon_handlers(IpcServer&)`,
+  the canonical registration call for every production IPC verb. The
+  daemon binary calls this once at startup; tests call it via
+  `tests/daemon_test_harness.h` so they exercise the same handler bodies
+  as production.
+- `tests/daemon_test_harness.h` exposes a `DaemonTestHarness` RAII fixture
+  that wires per-test daemon globals (`g_jobs`, `g_meeting_index`,
+  `g_server_config`, `g_streaming`, `g_uploads`, `g_sessions`,
+  `g_diar_cache`) to a temp dir, starts an `IpcServer` on a unix socket,
+  and calls `register_daemon_handlers(server)`. Per-test extern
+  definitions for those globals live in `tests/daemon_test_globals.cpp`
+  (which the test binary links via `recmeet_tests`).
+- `scripts/check-test-stubs.sh` is the strict invariant gate. It greps
+  every `tests/*.cpp` for `server.on("<verb>"` and `server->on("<verb>"`
+  whose verb matches the production-verb list derived from
+  `src/daemon_handlers.cpp`. There is no allowlist: the gate either
+  reports zero offenders or it fails. CI runs the gate before
+  `make build`.
+
+Run the gate locally:
+
+```bash
+./scripts/check-test-stubs.sh
+```
+
+If you need to add a NEW test that drives a production verb, use
+`DaemonTestHarness` — do not stub the handler body in-test. If the verb
+needs preconditions the harness doesn't expose (e.g. clock-injectable
+`g_diar_cache`), construct the global directly before calling
+`harness.start()` — see `tests/test_enroll.cpp::EnrollHarness` for the
+pattern. Plumbing-only round-trip tests (e.g. PSK timeout) that don't
+care about production semantics should register a non-production verb
+name like `test.ack` so the gate doesn't flag them.
+
 ### Run tests for a specific module
 
 Each test file tags its tests. Pass the tag to run just that group:
