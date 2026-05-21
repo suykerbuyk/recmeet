@@ -22,6 +22,8 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include "config.h"
+#include "daemon_handlers_internal.h"  // g_jobs / g_meeting_index externs
+#include "daemon_test_harness.h"
 #include "ipc_client.h"
 #include "ipc_protocol.h"
 #include "ipc_server.h"
@@ -43,6 +45,7 @@
 #include <unistd.h>
 
 using namespace recmeet;
+using recmeet::test::DaemonTestHarness;
 namespace fs = std::filesystem;
 
 namespace {
@@ -102,116 +105,27 @@ fs::path make_meeting(const fs::path& root,
     return dir;
 }
 
-// Test-local mirror of src/daemon.cpp's process.reprocess handler. The
-// production handler reaches g_jobs / g_meeting_index / g_config_mu via
-// file-static globals; this version closes over test-local instances.
-// Keep this body in lockstep with daemon.cpp; the tests below pin
-// validation order + cfg propagation + wire-shape contracts.
-struct ReprocessDeps {
-    JobQueue&     q;
-    MeetingIndex& idx;
-    JobConfig        cfg_snapshot;   // stand-in for g_config under g_config_mu
+// Phase 2b: the test-local process.reprocess stub was retired in favor of
+// `register_daemon_handlers()` via DaemonTestHarness. The production
+// handler reads `g_jobs`, `g_meeting_index`, and `g_server_config` — the
+// harness wires all three. Per-test setup uses harness.mutate_config
+// when a test needs a non-default starting cfg.
+
+// Phase 2b: ReprocessHarness wraps DaemonTestHarness so existing test
+// bodies keep the q/idx/client locals.
+struct ReprocessHarness {
+    DaemonTestHarness harness;
+    std::unique_ptr<IpcClient> client_owned;
+
+    ReprocessHarness() {
+        harness.start();
+        client_owned = harness.make_client();
+    }
+    JobQueue&     q()      const { return *g_jobs; }
+    MeetingIndex& idx()    const { return *g_meeting_index; }
+    IpcClient&    client() const { return *client_owned; }
 };
 
-void register_process_reprocess(IpcServer& server, ReprocessDeps& deps) {
-    server.on("process.reprocess",
-              [&deps](const IpcRequest& req, IpcResponse& resp, IpcError& err) {
-        // (1) meeting_id required.
-        std::string meeting_id;
-        {
-            auto it = req.params.find("meeting_id");
-            if (it != req.params.end())
-                meeting_id = json_val_as_string(it->second);
-        }
-        if (meeting_id.empty()) {
-            err.code = static_cast<int>(IpcErrorCode::InvalidParams);
-            err.message = "process.reprocess: missing 'meeting_id'";
-            return false;
-        }
-        // (2) Format validation.
-        if (!is_valid_meeting_id(meeting_id)) {
-            err.code = static_cast<int>(IpcErrorCode::InvalidParams);
-            err.message = "process.reprocess: 'meeting_id' must be a canonical "
-                          "lowercase UUID v4";
-            return false;
-        }
-        // (3) Lookup.
-        auto hit = deps.idx.find(meeting_id);
-        if (!hit.has_value()) {
-            err.code = static_cast<int>(IpcErrorCode::InvalidParams);
-            err.message = "process.reprocess: unknown meeting_id " + meeting_id;
-            return false;
-        }
-        fs::path meeting_dir = *hit;
-        // (4) Dir must still exist.
-        std::error_code ec;
-        if (!fs::is_directory(meeting_dir, ec)) {
-            err.code = static_cast<int>(IpcErrorCode::InternalError);
-            err.message = "process.reprocess: meeting_id " + meeting_id
-                        + " is indexed at " + meeting_dir.string()
-                        + " but the directory no longer exists";
-            return false;
-        }
-        // (5) Resolve audio.
-        fs::path audio_path = find_audio_file(meeting_dir);
-        if (audio_path.empty()) {
-            err.code = static_cast<int>(IpcErrorCode::InternalError);
-            err.message = "process.reprocess: no audio file found in "
-                        + meeting_dir.string();
-            return false;
-        }
-        // (6) Apply per-stage flag overrides on a snapshot of the live config.
-        JobConfig cfg = deps.cfg_snapshot;
-        cfg.reprocess_dir.clear();
-
-        {
-            auto it = req.params.find("transcribe");
-            if (it != req.params.end())
-                (void)json_val_as_bool(it->second, true);
-        }
-        {
-            auto it = req.params.find("diarize");
-            if (it != req.params.end() && !json_val_as_bool(it->second, true))
-                cfg.diarize = false;
-        }
-        {
-            auto it = req.params.find("identify");
-            if (it != req.params.end() && !json_val_as_bool(it->second, true))
-                cfg.speaker_id = false;
-        }
-        {
-            auto it = req.params.find("summarize");
-            if (it != req.params.end() && !json_val_as_bool(it->second, true))
-                cfg.no_summary = true;
-        }
-        {
-            auto it = req.params.find("vocabulary");
-            if (it != req.params.end())
-                cfg.vocabulary = json_val_as_string(it->second);
-        }
-        {
-            auto it = req.params.find("summary_style");
-            if (it != req.params.end()) (void)json_val_as_string(it->second);
-        }
-
-        // (7) Build + enqueue the job.
-        PostprocessInput input;
-        input.out_dir    = meeting_dir;
-        input.audio_path = audio_path;
-        input.timestamp  = derive_meeting_timestamp(meeting_dir);
-
-        Job job;
-        job.input      = std::move(input);
-        job.cfg        = std::move(cfg);
-        job.meeting_id = meeting_id;
-
-        int64_t job_id = deps.q.enqueue(std::move(job), JobKind::Postprocess,
-                                        req.client_id);
-
-        resp.result["job_id"] = job_id;
-        return true;
-    });
-}
 
 } // namespace
 
@@ -223,20 +137,9 @@ void register_process_reprocess(IpcServer& server, ReprocessDeps& deps) {
 // ============================================================================
 TEST_CASE("C.12 process.reprocess: validation chain rejects bad meeting_id",
           "[c12][reprocess]") {
-    ::unlink(REPROCESS_SOCK);
-
-    JobQueue q;
-    JqShutdownGuard jqg(q);
-    MeetingIndex idx;
-    ReprocessDeps deps{q, idx, JobConfig{}};
-
-    IpcServer server(REPROCESS_SOCK);
-    register_process_reprocess(server, deps);
-    REQUIRE(server.start());
-    ServerGuard sg(server);
-
-    IpcClient client(REPROCESS_SOCK);
-    REQUIRE(client.connect());
+    ReprocessHarness h;
+    auto& q = h.q();
+    auto& client = h.client();
 
     // Missing meeting_id.
     {
@@ -280,8 +183,6 @@ TEST_CASE("C.12 process.reprocess: validation chain rejects bad meeting_id",
     CHECK(q.queued_count(JobKind::Postprocess) == 0);
     CHECK_FALSE(q.slot_busy(JobKind::Postprocess));
 
-    client.close_connection();
-    ::unlink(REPROCESS_SOCK);
 }
 
 // ============================================================================
@@ -292,27 +193,17 @@ TEST_CASE("C.12 process.reprocess: validation chain rejects bad meeting_id",
 TEST_CASE("C.12 process.reprocess: known meeting_id enqueues job pointing at "
           "the indexed dir",
           "[c12][reprocess]") {
-    ::unlink(REPROCESS_SOCK);
-
     auto root = tmp_root("happy");
     const std::string id = "abcdef01-2345-4678-9abc-def012345678";
     fs::path mdir = make_meeting(root, "2026-05-17_12-00", id);
     fs::path expected_audio = mdir / "audio_2026-05-17_12-00.wav";
     REQUIRE(fs::exists(expected_audio));
 
-    JobQueue q;
-    JqShutdownGuard jqg(q);
-    MeetingIndex idx;
+    ReprocessHarness h;
+    auto& q = h.q();
+    auto& idx = h.idx();
+    auto& client = h.client();
     idx.bind(id, mdir);
-    ReprocessDeps deps{q, idx, JobConfig{}};
-
-    IpcServer server(REPROCESS_SOCK);
-    register_process_reprocess(server, deps);
-    REQUIRE(server.start());
-    ServerGuard sg(server);
-
-    IpcClient client(REPROCESS_SOCK);
-    REQUIRE(client.connect());
     REQUIRE(!client.client_id().empty());
 
     IpcResponse resp; IpcError err;
@@ -339,8 +230,6 @@ TEST_CASE("C.12 process.reprocess: known meeting_id enqueues job pointing at "
     REQUIRE(snap.has_value());
     CHECK(snap->meeting_id == id);
 
-    client.close_connection();
-    ::unlink(REPROCESS_SOCK);
     fs::remove_all(root);
 }
 
@@ -358,27 +247,18 @@ TEST_CASE("C.12 process.reprocess: per-stage flag overrides propagate to cfg",
     fs::path mdir = make_meeting(root, "2026-05-17_13-00", id,
                                  "2026-05-17_13-00");
 
-    JobQueue q;
-    JqShutdownGuard jqg(q);
-    MeetingIndex idx;
+    ReprocessHarness h;
+    auto& q = h.q();
+    auto& idx = h.idx();
+    auto& client = h.client();
     idx.bind(id, mdir);
 
-    // Seed the snapshot with the OPPOSITE of what the request will assert,
-    // so a missing override-application would not coincidentally pass.
-    JobConfig snapshot;
-    snapshot.diarize    = true;
-    snapshot.speaker_id = true;
-    snapshot.no_summary = false;
-    snapshot.vocabulary = "stale";
-    ReprocessDeps deps{q, idx, snapshot};
-
-    IpcServer server(REPROCESS_SOCK);
-    register_process_reprocess(server, deps);
-    REQUIRE(server.start());
-    ServerGuard sg(server);
-
-    IpcClient client(REPROCESS_SOCK);
-    REQUIRE(client.connect());
+    // The production handler builds JobConfig from g_server_config + session
+    // creds/prefs. Default ServerConfig has diarize=true; the JobConfig built
+    // from it has speaker_id=true / no_summary=false / vocabulary empty. The
+    // request below sends `diarize=false`, `identify=false`, `summarize=false`,
+    // `vocabulary="contoso..."` — those overrides MUST land on the dequeued
+    // job's cfg regardless of the snapshot starting state.
 
     IpcResponse resp; IpcError err;
     JsonMap params;
@@ -404,8 +284,6 @@ TEST_CASE("C.12 process.reprocess: per-stage flag overrides propagate to cfg",
     // meeting_id stamped from the request.
     CHECK(dq->meeting_id == id);
 
-    client.close_connection();
-    ::unlink(REPROCESS_SOCK);
     fs::remove_all(root);
 }
 
@@ -427,19 +305,11 @@ TEST_CASE("C.12 process.reprocess: indexed dir vanished from disk → "
     fs::path mdir = make_meeting(root, "2026-05-17_14-00", id,
                                  "2026-05-17_14-00");
 
-    JobQueue q;
-    JqShutdownGuard jqg(q);
-    MeetingIndex idx;
+    ReprocessHarness h;
+    auto& q = h.q();
+    auto& idx = h.idx();
+    auto& client = h.client();
     idx.bind(id, mdir);
-    ReprocessDeps deps{q, idx, JobConfig{}};
-
-    IpcServer server(REPROCESS_SOCK);
-    register_process_reprocess(server, deps);
-    REQUIRE(server.start());
-    ServerGuard sg(server);
-
-    IpcClient client(REPROCESS_SOCK);
-    REQUIRE(client.connect());
 
     // Operator (or test) unlinks the directory tree but leaves the binding
     // in place — the classic "stale index" case.
@@ -460,7 +330,5 @@ TEST_CASE("C.12 process.reprocess: indexed dir vanished from disk → "
     // No job enqueued.
     CHECK(q.queued_count(JobKind::Postprocess) == 0);
 
-    client.close_connection();
-    ::unlink(REPROCESS_SOCK);
     fs::remove_all(root);
 }
