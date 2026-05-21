@@ -948,6 +948,16 @@ PipelineResult run_postprocessing(const Config& cfg, const PostprocessInput& inp
                               "(%zu segments, %d speakers pre-collapse)",
                               diar.segments.size(), diar.num_speakers);
 
+                    // Short-audio ghost-cluster defense (Phase A.3 follow-up
+                    // to iter 194). Drop sub-threshold clusters BEFORE
+                    // centroid extraction so `build_short_audio_globals`
+                    // never embeds them and `apply_collapse` never sees
+                    // them. Guarded by `!use_chunked` (this branch already
+                    // is) and a >0 threshold so
+                    // `--min-cluster-duration 0` disables the filter.
+                    apply_short_audio_min_duration_filter(
+                        diar, cfg.min_cluster_duration_sec);
+
                     // Phase B.3: short-audio post-collapse wiring. Build a
                     // synthetic globals vector by extracting one centroid per
                     // unique cluster ID over the cluster's segment audio,

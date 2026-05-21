@@ -3,9 +3,11 @@
 
 #include <catch2/catch_test_macros.hpp>
 #include "config.h"
+#include "config_json.h"
 
 #include <cstdlib>
 #include <fstream>
+#include <sstream>
 #include <sys/stat.h>
 
 using namespace recmeet;
@@ -409,6 +411,87 @@ TEST_CASE("load_config: M-5' boundary equal-to-zero spacing falls back",
     CHECK(cfg.chunk_overlap_sec == 30.0f);
 
     fs::remove_all(dir);
+}
+
+TEST_CASE("min_cluster_duration_sec round-trips through TOML and IPC JSON",
+          "[pipeline][config]") {
+    // Phase A.3 follow-up: short-audio min-cluster-duration filter knob.
+    // Default is 3.0f; both persistence paths (YAML save/load and the
+    // IPC `config_to_map`/`config_from_map` round-trip) must carry a
+    // non-default value end-to-end so the daemon and subprocess agree.
+
+    SECTION("default value preserved") {
+        Config defaults;
+        CHECK(defaults.min_cluster_duration_sec == 3.0f);
+
+        // TOML path: defaults round-trip cleanly and don't emit the key.
+        fs::path dir = fs::temp_directory_path()
+                       / "recmeet_test_min_cluster_default";
+        fs::remove_all(dir);
+        fs::path path = dir / "config.yaml";
+        save_config(defaults, path);
+        REQUIRE(fs::exists(path));
+        std::ifstream in(path);
+        std::ostringstream buf;
+        buf << in.rdbuf();
+        CHECK(buf.str().find("min_cluster_duration_sec") == std::string::npos);
+        Config loaded = load_config(path);
+        CHECK(loaded.min_cluster_duration_sec == 3.0f);
+        fs::remove_all(dir);
+
+        // IPC JSON path: default round-trips through map.
+        Config m_loaded = config_from_map(config_to_map(defaults));
+        CHECK(m_loaded.min_cluster_duration_sec == 3.0f);
+    }
+
+    SECTION("non-default value round-trips via TOML") {
+        fs::path dir = fs::temp_directory_path()
+                       / "recmeet_test_min_cluster_toml";
+        fs::remove_all(dir);
+        fs::path path = dir / "config.yaml";
+
+        Config cfg;
+        cfg.min_cluster_duration_sec = 1.5f;
+        save_config(cfg, path);
+        REQUIRE(fs::exists(path));
+
+        // Verify on-disk YAML places the key under [diarization].
+        std::ifstream in(path);
+        std::ostringstream buf;
+        buf << in.rdbuf();
+        std::string content = buf.str();
+        auto diar_pos = content.find("diarization:");
+        REQUIRE(diar_pos != std::string::npos);
+        CHECK(content.find("min_cluster_duration_sec: 1.5", diar_pos)
+              != std::string::npos);
+
+        Config loaded = load_config(path);
+        CHECK(loaded.min_cluster_duration_sec == 1.5f);
+
+        fs::remove_all(dir);
+    }
+
+    SECTION("zero (filter-disabled) round-trips via TOML") {
+        fs::path dir = fs::temp_directory_path()
+                       / "recmeet_test_min_cluster_zero";
+        fs::remove_all(dir);
+        fs::path path = dir / "config.yaml";
+
+        Config cfg;
+        cfg.min_cluster_duration_sec = 0.0f;
+        save_config(cfg, path);
+        Config loaded = load_config(path);
+        CHECK(loaded.min_cluster_duration_sec == 0.0f);
+
+        fs::remove_all(dir);
+    }
+
+    SECTION("non-default value round-trips via IPC JSON map") {
+        Config cfg;
+        cfg.min_cluster_duration_sec = 4.25f;
+        Config loaded = config_from_map(config_to_map(cfg));
+        CHECK(loaded.min_cluster_duration_sec == 4.25f);
+    }
 }
 
 TEST_CASE("backward compat: legacy api_key in config used as fallback", "[config]") {

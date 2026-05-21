@@ -74,6 +74,23 @@ struct Config {
     int max_auto_speakers = 8;
     float collapse_threshold = 0.55f;
 
+    // Short-audio min-cluster-duration filter (follow-up to iter 194
+    // diarize-overcount Phase A.3). Drops sherpa-clustering output clusters
+    // whose total accumulated audio is below this many seconds before
+    // centroid extraction. Defends against the no-context auto-detect ghost
+    // case where a sub-second outlier survives both `collapse_threshold`
+    // (sim too low to merge) and `ceiling_hit` (count under
+    // `max_auto_speakers`). Applies only on the short-audio (non-chunked)
+    // path; the long-audio chunked path is incidentally insulated by
+    // sample-count-weighted centroid averaging across chunks.
+    //
+    // Default 3.0 s: empirical ghosts at 0.5 s (09-36) and 2.87 s (10-52);
+    // smallest legitimate cluster in the audited bench fixtures was 10.06 s
+    // (Phase 0 audit). `--min-cluster-duration 0` disables the filter for
+    // A/B reprocess experimentation. Persisted as
+    // [diarization] min_cluster_duration_sec = F.
+    float min_cluster_duration_sec = 3.0f;
+
     // Chunked diarization (T2.1/T2.2 — engaged when audio length exceeds the
     // pipeline threshold; otherwise the single-call path is used). Defaults
     // sized to keep each chunk's peak working set well under the iter-110

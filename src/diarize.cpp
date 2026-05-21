@@ -10,6 +10,7 @@
 #include <filesystem>
 #include <fstream>
 #include <limits>
+#include <map>
 #include <set>
 #include <sstream>
 
@@ -26,6 +27,55 @@ std::string format_speaker(int speaker_id) {
     char buf[16];
     snprintf(buf, sizeof(buf), "Speaker_%02d", speaker_id + 1);
     return buf;
+}
+
+// Short-audio min-cluster-duration filter (Phase A.3 follow-up).
+//
+// Sums each cluster's accumulated audio duration (Σ end - start over its
+// segments), then erase-removes every segment whose cluster total is strictly
+// less than `threshold_sec`. `threshold_sec <= 0.0` is a no-op so operators
+// can disable via `--min-cluster-duration 0`. After erasing, `num_speakers`
+// is re-derived from the surviving distinct cluster IDs.
+//
+// Free function (no sherpa dependency) so tests can drive it with synthetic
+// `DiarizeResult` inputs without building the sherpa-backed path.
+size_t apply_short_audio_min_duration_filter(DiarizeResult& diar,
+                                             float threshold_sec) {
+    if (threshold_sec <= 0.0f) return 0;
+    if (diar.segments.empty()) return 0;
+
+    std::map<int, double> cluster_duration_sec;
+    for (const auto& seg : diar.segments) {
+        if (seg.end > seg.start)
+            cluster_duration_sec[seg.speaker] += seg.end - seg.start;
+    }
+    const auto threshold = static_cast<double>(threshold_sec);
+    const size_t before = diar.segments.size();
+    diar.segments.erase(
+        std::remove_if(diar.segments.begin(), diar.segments.end(),
+                       [&](const DiarizeSegment& seg) {
+                           return cluster_duration_sec[seg.speaker] < threshold;
+                       }),
+        diar.segments.end());
+    const size_t dropped = before - diar.segments.size();
+
+    if (dropped > 0) {
+        const auto dropped_clusters = std::count_if(
+            cluster_duration_sec.begin(), cluster_duration_sec.end(),
+            [&](const auto& kv) { return kv.second < threshold; });
+        log_info("Dropped %zu segments from %lld sub-%.1fs clusters "
+                 "(min_cluster_duration_sec=%.2f)",
+                 dropped,
+                 static_cast<long long>(dropped_clusters),
+                 threshold_sec, threshold_sec);
+    }
+
+    // Hygiene: re-derive num_speakers from the surviving distinct IDs.
+    std::set<int> surviving;
+    for (const auto& seg : diar.segments) surviving.insert(seg.speaker);
+    diar.num_speakers = static_cast<int>(surviving.size());
+
+    return dropped;
 }
 
 std::vector<TranscriptSegment> merge_speakers(

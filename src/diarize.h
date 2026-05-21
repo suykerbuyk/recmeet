@@ -29,6 +29,25 @@ struct DiarizeResult {
     int num_speakers = 0;
 };
 
+/// Short-audio min-cluster-duration filter (follow-up to iter 194
+/// diarize-overcount Phase A.3). Drops every segment belonging to a cluster
+/// whose total accumulated audio duration (sum of `end - start` over its
+/// segments) is strictly less than `threshold_sec`, then updates
+/// `diar.num_speakers` to the count of surviving unique cluster IDs.
+///
+/// `threshold_sec <= 0.0` is treated as a no-op so operators can disable the
+/// filter via `--min-cluster-duration 0` (useful for A/B reprocess
+/// experimentation). Returns the number of segments removed (0 if no-op or
+/// nothing dropped). Independent of sherpa — operates purely on
+/// `DiarizeResult` — so unit tests exercise it without RECMEET_USE_SHERPA.
+///
+/// Intended call site: short-audio post-`diarize()` path in `pipeline.cpp`,
+/// between sherpa's cluster output and `build_short_audio_globals()`. Lifted
+/// into a free function so tests can drive it with synthetic
+/// `DiarizeResult` inputs instead of through the full pipeline.
+size_t apply_short_audio_min_duration_filter(DiarizeResult& diar,
+                                             float threshold_sec);
+
 #if RECMEET_USE_SHERPA
 /// Progress callback for diarization: (num_processed_chunks, num_total_chunks).
 using DiarizeProgressCallback = std::function<void(int, int)>;

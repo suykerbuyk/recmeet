@@ -11,6 +11,7 @@
 #include <filesystem>
 #include <fstream>
 #include <map>
+#include <set>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -144,6 +145,108 @@ TEST_CASE("merge_speakers: timestamps preserved through merge", "[diarize]") {
     CHECK(result[0].end == 3.7);
     CHECK(result[1].start == 4.2);
     CHECK(result[1].end == 8.9);
+}
+
+// ===========================================================================
+// Short-audio min-cluster-duration filter (Phase A.3 follow-up to iter 194
+// diarize-overcount). Free-function tests so they run without sherpa.
+// ===========================================================================
+
+TEST_CASE("apply_short_audio_min_duration_filter: drops sub-threshold cluster",
+          "[diarize][short-audio][min-duration]") {
+    // 4 clusters; cluster 3 totals 0.5 s of accumulated audio, well below the
+    // 3.0 s default threshold. The other three are each ≥ 5 s and survive.
+    DiarizeResult diar;
+    diar.segments = {
+        {0.0,  5.0, 0},   // cluster 0: 5.0 s
+        {5.0, 12.0, 1},   // cluster 1: 7.0 s
+        {12.0, 18.0, 2},  // cluster 2: 6.0 s
+        {18.0, 18.3, 3},  // cluster 3: 0.3 s ghost
+        {18.3, 18.5, 3},  // cluster 3: + 0.2 s = 0.5 s total
+    };
+    diar.num_speakers = 4;
+
+    const size_t dropped =
+        apply_short_audio_min_duration_filter(diar, 3.0f);
+
+    CHECK(dropped == 2);  // both ghost segments removed
+    REQUIRE(diar.segments.size() == 3);
+    CHECK(diar.num_speakers == 3);
+
+    // Surviving distinct IDs are exactly {0, 1, 2}.
+    std::set<int> survivors;
+    for (const auto& s : diar.segments) survivors.insert(s.speaker);
+    REQUIRE(survivors.size() == 3);
+    CHECK(survivors.count(0) == 1);
+    CHECK(survivors.count(1) == 1);
+    CHECK(survivors.count(2) == 1);
+    CHECK(survivors.count(3) == 0);
+}
+
+TEST_CASE("apply_short_audio_min_duration_filter: threshold 0.0 is a no-op",
+          "[diarize][short-audio][min-duration]") {
+    // Operator passes --min-cluster-duration 0 → filter must not remove
+    // anything, even when some clusters are short.
+    DiarizeResult diar;
+    diar.segments = {
+        {0.0, 10.0, 0},
+        {10.0, 10.2, 1},   // cluster 1: 0.2 s
+        {10.2, 20.0, 2},
+    };
+    diar.num_speakers = 3;
+    const size_t before = diar.segments.size();
+    const int before_n = diar.num_speakers;
+
+    const size_t dropped =
+        apply_short_audio_min_duration_filter(diar, 0.0f);
+
+    CHECK(dropped == 0);
+    CHECK(diar.segments.size() == before);
+    // num_speakers is also left untouched on the no-op path (no hygiene pass).
+    CHECK(diar.num_speakers == before_n);
+}
+
+TEST_CASE("apply_short_audio_min_duration_filter: boundary is strict less-than",
+          "[diarize][short-audio][min-duration]") {
+    // Cluster totals exactly 3.0 s at the 3.0 s threshold → KEPT (strict <).
+    DiarizeResult diar;
+    diar.segments = {
+        {0.0, 10.0, 0},
+        {10.0, 13.0, 1},  // cluster 1: exactly 3.0 s
+    };
+    diar.num_speakers = 2;
+
+    const size_t dropped =
+        apply_short_audio_min_duration_filter(diar, 3.0f);
+
+    CHECK(dropped == 0);
+    REQUIRE(diar.segments.size() == 2);
+    CHECK(diar.num_speakers == 2);
+}
+
+TEST_CASE("apply_short_audio_min_duration_filter: all clusters below threshold",
+          "[diarize][short-audio][min-duration]") {
+    // Edge: every cluster falls under the threshold → segments empty
+    // post-filter; num_speakers updates to 0. The downstream pipeline guard
+    // at `pipeline.cpp:951` (`if (!diar.segments.empty())`) then skips the
+    // short-audio collapse block cleanly.
+    DiarizeResult diar;
+    diar.segments = {
+        {0.0, 1.0, 0},   // cluster 0: 1.0 s
+        {1.0, 2.5, 1},   // cluster 1: 1.5 s
+        {2.5, 4.0, 2},   // cluster 2: 1.5 s
+    };
+    diar.num_speakers = 3;
+
+    const size_t dropped =
+        apply_short_audio_min_duration_filter(diar, 3.0f);
+
+    CHECK(dropped == 3);
+    CHECK(diar.segments.empty());
+    CHECK(diar.num_speakers == 0);
+    // Mirror the pipeline guard explicitly so the test documents the
+    // contract the production call site relies on.
+    CHECK_FALSE(!diar.segments.empty());
 }
 
 // ===========================================================================
