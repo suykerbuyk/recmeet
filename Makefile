@@ -66,7 +66,7 @@ endif
 endif
 
 # ── Targets ─────────────────────────────────────────────────────────
-.PHONY: build build-onnxruntime test integration integration-cxx integration-go integration-go-coverage integration-t2-1 integration-e2e benchmark full-stack install uninstall package-deb package-rpm package-arch clean coverage help daemon-start daemon-stop daemon-status ensure-submodules smoke
+.PHONY: build build-onnxruntime test integration integration-cxx integration-go integration-go-coverage integration-t2-1 integration-e2e benchmark full-stack install uninstall package-deb package-rpm package-arch clean coverage cxx-coverage help daemon-start daemon-stop daemon-status ensure-submodules smoke
 
 # Idempotent submodule populate. Triggered as a prerequisite of every target
 # that runs CMake, so a fresh `git clone` (without --recurse-submodules) or a
@@ -254,6 +254,46 @@ coverage:
 	cd tools && go test ./... -coverprofile=coverage.out
 	cd tools && go tool cover -func=coverage.out
 
+# Phase 1 — C++ source coverage (first-party only).
+#
+# Reconfigures into $(BUILD_DIR) with RECMEET_COVERAGE=ON, rebuilds (the
+# CMake flag only fires when present at configure time), runs the same
+# test scope as `make test` so the coverage report reflects the routinely-
+# enforced default suite, then drives `gcovr` to produce both an HTML
+# report (build/coverage-html/index.html) and a plain-text per-file
+# summary (build/coverage-summary.txt). `--exclude vendor/ --exclude
+# build/ --exclude tests/` scopes the report to first-party source under
+# `src/` only.
+#
+# gcovr is REQUIRED. If missing we print an actionable install hint and
+# exit nonzero — silent skip is a gate-bypass anti-pattern (see iter-191
+# audit: "verification gate failure modes").
+cxx-coverage: ensure-submodules
+	@if ! command -v gcovr >/dev/null 2>&1; then \
+	    echo "make cxx-coverage: 'gcovr' not found on PATH." >&2; \
+	    echo "  Install:" >&2; \
+	    echo "    Arch:    sudo pacman -S gcovr" >&2; \
+	    echo "    Debian:  sudo apt-get install gcovr" >&2; \
+	    echo "    Fedora:  sudo dnf install gcovr" >&2; \
+	    echo "    pip:     python3 -m venv .venv && .venv/bin/pip install gcovr" >&2; \
+	    echo "             (then add .venv/bin to PATH or invoke .venv/bin/gcovr directly)" >&2; \
+	    exit 1; \
+	fi
+	cmake -B $(BUILD_DIR) -G Ninja $(CMAKE_OPTS) -DRECMEET_BUILD_TESTS=ON -DRECMEET_COVERAGE=ON
+	ninja -C $(BUILD_DIR)
+	./$(BUILD_DIR)/recmeet_tests "~[integration]~[benchmark]~[full-stack]~[slow]~[stress]~[memory-rss]"
+	@mkdir -p $(BUILD_DIR)/coverage-html
+	@echo "--- Generating gcovr coverage report ---"
+	gcovr --root . \
+	      --filter 'src/.*' \
+	      --gcov-ignore-parse-errors \
+	      --print-summary \
+	      --html-details $(BUILD_DIR)/coverage-html/index.html \
+	      --txt $(BUILD_DIR)/coverage-summary.txt \
+	      $(BUILD_DIR)
+	@echo "--- Coverage HTML: $(BUILD_DIR)/coverage-html/index.html"
+	@echo "--- Coverage summary: $(BUILD_DIR)/coverage-summary.txt"
+
 clean:
 	rm -f $(BUILD_DIR)/recmeet-mcp $(BUILD_DIR)/recmeet-agent
 	rm -f tools/coverage.out
@@ -297,6 +337,7 @@ help:
 	@echo "  make package-rpm   Build + create .rpm package"
 	@echo "  make package-arch  Build Arch package via makepkg"
 	@echo "  make coverage      Run Go tests with coverage report"
+	@echo "  make cxx-coverage  Build with --coverage, run default tests, produce gcovr report"
 	@echo "  make clean         Remove build + packaging artifacts (preserves onnxruntime)"
 	@echo "  make clean-ort     Remove locally-built onnxruntime"
 	@echo "  make help          Show this message"
