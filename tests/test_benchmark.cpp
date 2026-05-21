@@ -609,7 +609,7 @@ TEST_CASE("Chunked vs single diarize: 30-min synthetic peak-RSS bench",
     echo("chunked diarize");
     auto [chunked_secs, chunked_peak_kb] = measure_with_rss([&]() {
         chunked = diarize_chunked(samples.data(), samples.size(),
-                                  /*num_speakers=*/0, /*threads=*/0,
+                                  /*target_speakers=*/0, /*threads=*/0,
                                   /*threshold=*/1.18f, chunk_cfg);
     });
     echo("chunked diarize done");
@@ -689,7 +689,7 @@ TEST_CASE("Chunked vs single diarize: iter-110 60-min fixture peak-RSS bench",
     echo("chunked diarize");
     auto [chunked_secs, chunked_peak_kb] = measure_with_rss([&]() {
         chunked = diarize_chunked(samples.data(), samples.size(),
-                                  /*num_speakers=*/0, /*threads=*/0,
+                                  /*target_speakers=*/0, /*threads=*/0,
                                   /*threshold=*/1.18f, chunk_cfg);
     });
     echo("chunked diarize done");

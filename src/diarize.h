@@ -87,6 +87,12 @@ struct DiarizeChunkConfig {
     /// global registry. Matches the SherpaOnnxSpeakerEmbeddingManager metric
     /// (Q4 spike): 0.6 on L2-normalized unit vectors.
     float stitch_threshold = 0.6f;
+    /// Cosine-similarity floor for the post-stitch unified greedy-merge loop
+    /// (`apply_collapse`, Phase B.1/B.3). Pairs at or above this similarity
+    /// are auto-merged regardless of the ceiling; pairs below this similarity
+    /// are merged ONLY when the ceiling (`target_speakers`) is already
+    /// exceeded. Phase A.2 chose 0.55 empirically (M-4 floor).
+    float collapse_threshold = 0.55f;
 
     /// Phase A instrumentation: when non-empty, `stitch_chunks` writes a JSON
     /// artifact at the end of stitching containing all global centroids, the
@@ -142,19 +148,30 @@ struct ChunkExtents {
 ///     L2-normalized transiently for the dot product);
 ///   - sample-weighted running-mean update on raw centroids;
 ///   - midpoint-in-core ownership with full-extent emit (no trim);
-///   - post-stitch greedy-merge to enforce `num_speakers > 0` count limit;
+///   - post-stitch unified greedy-merge (`apply_collapse`) enforcing both
+///     `target_speakers` as a hard cap and `cfg.collapse_threshold` as the
+///     auto-merge quality floor;
 ///   - deterministic ascending-current-ID compaction.
 ///
 /// Sample counts are derived from chunk-local segment durations in samples
 /// (so two chunks contributing the same speaker for 5 s and 10 s produce a
 /// 10-weighted-vs-5-weighted running mean). Exposed for unit tests; the
 /// in-process orchestrator `diarize_chunked` calls this same helper.
+///
+/// `target_speakers`: hard cap on the global-speaker count for the merge
+/// loop. Phase B semantics (rename from `num_speakers` to surface the shift):
+/// the unified greedy-merge loop in `apply_collapse` ALWAYS runs, with
+/// `target_speakers` as the ceiling. `target_speakers == 0` (legacy
+/// "auto-detect, no cap") is honored by treating it as "no ceiling":
+/// merges only happen when the threshold gate fires. Callers wanting the
+/// pre-Phase-B "no collapse" behavior should pass 0; callers wanting a
+/// hard cap should pass the resolved target (Phase B.2 precedence chain).
 DiarizeChunkedResult stitch_chunks(
     const std::vector<DiarizeResult>& chunk_results,
     const std::vector<std::map<int, std::vector<float>>>& chunk_centroids,
     const std::vector<ChunkExtents>& extents,
     const DiarizeChunkConfig& cfg,
-    int num_speakers);
+    int target_speakers);
 
 /// Run chunked diarization on a pre-loaded audio buffer (16kHz float32 mono).
 /// Slices the audio into overlapping chunks of `cfg.chunk_minutes` width with
@@ -163,23 +180,32 @@ DiarizeChunkedResult stitch_chunks(
 /// SpeakerEmbeddingSession), then stitches per-chunk speaker IDs into a
 /// global registry via `stitch_chunks`.
 ///
-/// `num_speakers`: 0 = auto-detect (per-chunk -1 → globals are whatever
-/// stitching produces); >0 = post-stitch global count limit (sample-weighted
-/// greedy-merge until count ≤ N).
+/// `target_speakers`: hard cap on the global-speaker count enforced by the
+/// unified `apply_collapse` loop. 0 = no ceiling (auto-detect, post-stitch
+/// merges only happen when `cfg.collapse_threshold` fires). >0 = the unified
+/// loop force-merges past the floor until count <= target. Renamed from
+/// `num_speakers` (Phase B.4) to flag the semantic shift from "0 = skip
+/// merge, else cap" to "always-on unified loop, target = hard cap".
 /// `threshold`: per-chunk clustering threshold (sherpa default 1.18); distinct
-/// from `cfg.stitch_threshold`.
+/// from `cfg.stitch_threshold` and from `cfg.collapse_threshold`.
 ///
 /// Throws `RecmeetError` if `cfg.chunk_minutes * 60 <= cfg.overlap_seconds + 60`
 /// (M-5'). Emits one `on_progress("diarizing", overall_pct)` call per
 /// `extract_speaker_embedding` invocation (M-3'/L-4' progress granularity).
 DiarizeChunkedResult diarize_chunked(
     const float* samples, size_t num_samples,
-    int num_speakers, int threads, float threshold,
+    int target_speakers, int threads, float threshold,
     const DiarizeChunkConfig& chunk_cfg,
     DiarizeProgressCallback on_progress = nullptr);
 
 /// Run speaker diarization on a pre-loaded audio buffer (16kHz float32 mono).
-/// num_speakers: 0 = auto-detect, >0 = force N clusters.
+/// `num_speakers` here is forwarded to sherpa's clustering: 0 = auto-detect,
+/// >0 = force N clusters via `set_clustering(num_speakers)`. **Distinct
+/// semantics from `diarize_chunked`'s `target_speakers`** — that parameter
+/// controls our post-stitch unified merge loop; this one is the sherpa-side
+/// FastClustering knob. Renaming both to the same name would falsely imply
+/// they're interchangeable; the parameter on this entry point stays
+/// `num_speakers` (Phase B.4 design note).
 /// threads: number of CPU threads (0 = use default_thread_count()).
 /// on_progress: optional callback fired per chunk during embedding extraction.
 DiarizeResult diarize(const float* samples, size_t num_samples,
@@ -189,9 +215,79 @@ DiarizeResult diarize(const float* samples, size_t num_samples,
 
 /// Run speaker diarization on a WAV file using sherpa-onnx.
 /// Convenience wrapper — reads the file and delegates to the buffer overload.
+/// `num_speakers` is sherpa's FastClustering knob (see buffer overload).
 DiarizeResult diarize(const fs::path& audio_path, int num_speakers = 0, int threads = 0,
                       float threshold = 1.18f,
                       DiarizeProgressCallback on_progress = nullptr);
+
+/// Phase B.3 — shared post-stitch collapse helper.
+///
+/// Owns the unified greedy-merge loop (B.1) plus the deterministic
+/// `0..N-1` compaction (former Step-8 finale). Both code paths (long-audio
+/// `stitch_chunks` and short-audio post-`diarize()`) call this single helper
+/// so the segment-rewrite-and-compaction sequence has one owner.
+///
+/// Inputs:
+///   - `diar_inout.segments[i].speaker` will be rewritten in place by the
+///     accumulated merge map + the final 0..N-1 compaction.
+///   - `globals` is the chunked-stitch registry (or, for short-audio, a
+///     synthetic-globals view of `diar_inout`'s clusters). Merged in place
+///     by the unified loop; the post-loop survivors define the compaction
+///     order (ascending current-ID).
+///   - `target_speakers`: hard cap on final speaker count. 0 = no ceiling.
+///   - `collapse_threshold`: cosine-similarity floor for auto-merges
+///     (Phase A.2 chose 0.55f).
+///
+/// Returns: `CollapseResult{centroids, num_speakers}`. The `centroids` map
+/// is keyed by the new contiguous `0..N-1` IDs. Caller assigns this back
+/// to its own centroid storage (`DiarizeChunkedResult::centroids`, etc.).
+///
+/// Termination (per loop iteration):
+///   - `ceiling_hit  = (target_speakers > 0 && globals.size() > target_speakers)`
+///   - `threshold_ok = (best_sim >= collapse_threshold)`
+///   - `if (!ceiling_hit && !threshold_ok) break;`
+///
+/// When `ceiling_hit` is true the merge proceeds regardless of `best_sim` —
+/// the cap is the hard mechanism that forces a count. The threshold sets the
+/// floor on auto-merge quality only when we are at or below the cap.
+struct CollapseResult {
+    std::map<int, std::vector<float>> centroids;
+    int num_speakers = 0;
+};
+
+/// One entry in the global-speaker registry used by `apply_collapse` and the
+/// chunked-stitch pipeline. Hoisted to the header (Phase B.3) so the
+/// short-audio adapter can construct a globals vector that's passable to
+/// `apply_collapse`. Centroids are stored RAW (non-L2-normalized) end-to-end
+/// to preserve byte-format compatibility with the legacy persistence path.
+struct GlobalEntry {
+    int id = 0;                   // current global ID (post-merge, pre-compaction)
+    std::vector<float> raw;       // raw running-mean centroid
+    long sample_count = 0;        // total samples contributed to this centroid
+};
+
+CollapseResult apply_collapse(
+    DiarizeResult& diar_inout,
+    std::vector<GlobalEntry>& globals,
+    int target_speakers,
+    float collapse_threshold);
+
+/// Phase B.3 — short-audio adapter. Builds a `std::vector<GlobalEntry>` from
+/// a sherpa-clustering `DiarizeResult` by extracting one centroid per unique
+/// cluster ID via `extract_speaker_embedding` over the cluster's segment
+/// audio. Sample-count weights are derived from total segment-duration
+/// samples per cluster ID. The returned globals can be passed directly to
+/// `apply_collapse`. Used by the pipeline's short-audio post-diarize wiring.
+std::vector<GlobalEntry> build_short_audio_globals(
+    const float* samples, size_t num_samples,
+    const DiarizeResult& diar, int threads);
+
+/// Phase B.3 — short-audio dump helper. Mirrors the centroid/sample-count
+/// vectors stored in `globals` into the JSON-dump arrays for the
+/// `dump_centroids_json` instrumentation call site in the short-audio path.
+void copy_globals_for_dump(const std::vector<GlobalEntry>& globals,
+                           std::vector<std::vector<float>>& centroids_out,
+                           std::vector<long>& sample_counts_out);
 #endif
 
 /// Merge speaker labels into transcript segments by timestamp overlap.

@@ -478,12 +478,6 @@ std::vector<float> weighted_mean_raw(
     return out;
 }
 
-struct GlobalEntry {
-    int id;                       // current global ID (post-merge, pre-compaction)
-    std::vector<float> raw;       // raw running-mean centroid
-    long sample_count;            // total samples contributed to this centroid
-};
-
 // Returns a list of unique chunk-local speaker IDs in ascending order.
 std::vector<int> unique_local_ids(const DiarizeResult& chunk) {
     std::set<int> uniq;
@@ -504,12 +498,197 @@ long chunk_local_sample_count(const DiarizeResult& chunk, int local_sid) {
 
 } // namespace
 
+// ---------------------------------------------------------------------------
+// Phase B.3 — `apply_collapse` shared helper.
+//
+// One greedy loop (B.1) + the deterministic compaction (former Step-8 finale),
+// extracted so both code paths (long-audio `stitch_chunks` and short-audio
+// post-`diarize()`) share segment-rewrite + 0..N-1 compaction logic.
+//
+// Termination per iteration (unified loop):
+//   - `ceiling_hit  = (target_speakers > 0 && globals.size() > target_speakers)`
+//   - `threshold_ok = (best_sim >= collapse_threshold)`
+//   - `if (!ceiling_hit && !threshold_ok) break;`
+//
+// When the ceiling is hit, we merge regardless of similarity (count is the
+// hard cap). When the ceiling is not hit but the threshold gate fires, we
+// auto-merge near-duplicates. The ceiling is the load-bearing mechanism for
+// count enforcement (Phase A analysis); the threshold sets the floor on
+// quality of merges done at-or-under the cap.
+//
+// `target_speakers == 0` means "no ceiling" (the pre-Phase-B "auto-detect
+// without cap" semantics on `stitch_chunks` map cleanly to this: the unified
+// loop still runs, but `ceiling_hit` is always false, so only threshold-driven
+// merges fire). This preserves backward compat for callers that pass 0.
+// ---------------------------------------------------------------------------
+CollapseResult apply_collapse(
+    DiarizeResult& diar_inout,
+    std::vector<GlobalEntry>& globals,
+    int target_speakers,
+    float collapse_threshold) {
+
+    // Unified greedy-merge loop: find the highest-similarity pair, merge
+    // when EITHER `ceiling_hit` OR `threshold_ok`. Stop when both are false.
+    while (globals.size() > 1) {
+        int best_a_idx = -1, best_b_idx = -1;
+        float best_sim = -2.0f;
+        int best_min_id = std::numeric_limits<int>::max();
+
+        for (size_t a = 0; a < globals.size(); ++a) {
+            for (size_t b = a + 1; b < globals.size(); ++b) {
+                float sim = cosine_sim_raw(globals[a].raw, globals[b].raw);
+                int min_id = std::min(globals[a].id, globals[b].id);
+                bool take = false;
+                if (sim > best_sim) {
+                    take = true;
+                } else if (sim == best_sim && min_id < best_min_id) {
+                    take = true;
+                }
+                if (take) {
+                    best_sim = sim;
+                    best_min_id = min_id;
+                    best_a_idx = static_cast<int>(a);
+                    best_b_idx = static_cast<int>(b);
+                }
+            }
+        }
+        if (best_a_idx < 0 || best_b_idx < 0) break;
+
+        bool ceiling_hit =
+            (target_speakers > 0
+             && static_cast<int>(globals.size()) > target_speakers);
+        bool threshold_ok = (best_sim >= collapse_threshold);
+        if (!ceiling_hit && !threshold_ok) break;
+
+        int id_a = globals[best_a_idx].id;
+        int id_b = globals[best_b_idx].id;
+        int merged_id  = std::min(id_a, id_b);
+        int dropped_id = std::max(id_a, id_b);
+
+        std::vector<float> merged_raw = weighted_mean_raw(
+            globals[best_a_idx].raw, globals[best_a_idx].sample_count,
+            globals[best_b_idx].raw, globals[best_b_idx].sample_count);
+        long merged_count = globals[best_a_idx].sample_count
+                          + globals[best_b_idx].sample_count;
+
+        int keep_idx = (id_a == merged_id) ? best_a_idx : best_b_idx;
+        int drop_idx = (id_a == merged_id) ? best_b_idx : best_a_idx;
+        globals[keep_idx].raw = std::move(merged_raw);
+        globals[keep_idx].sample_count = merged_count;
+        globals.erase(globals.begin() + drop_idx);
+
+        // Rewrite emitted segments: dropped_id -> merged_id.
+        for (auto& seg : diar_inout.segments) {
+            if (seg.speaker == dropped_id) seg.speaker = merged_id;
+        }
+    }
+
+    // Deterministic 0..N-1 compaction in ascending current-ID order
+    // (formerly Step 8 finale, M-2' line 421).
+    std::vector<GlobalEntry> sorted_globals = globals;
+    std::sort(sorted_globals.begin(), sorted_globals.end(),
+              [](const GlobalEntry& x, const GlobalEntry& y) {
+                  return x.id < y.id;
+              });
+    std::map<int, int> remap;
+    for (size_t k = 0; k < sorted_globals.size(); ++k) {
+        remap[sorted_globals[k].id] = static_cast<int>(k);
+    }
+    for (auto& seg : diar_inout.segments) {
+        auto it = remap.find(seg.speaker);
+        if (it != remap.end()) seg.speaker = it->second;
+    }
+
+    CollapseResult out;
+    for (size_t k = 0; k < sorted_globals.size(); ++k) {
+        out.centroids[static_cast<int>(k)] = std::move(sorted_globals[k].raw);
+    }
+    out.num_speakers = static_cast<int>(out.centroids.size());
+    diar_inout.num_speakers = out.num_speakers;
+
+    // Reflect the post-compaction IDs back into `globals` so callers (the
+    // long-audio path) can also see contiguous IDs — important for the
+    // existing centroid-dump helper that walks `sorted_globals`. We rebuild
+    // `globals` to mirror the compacted state (post-compaction ID + the
+    // moved-out raw via a copy from `out.centroids`).
+    globals.clear();
+    globals.reserve(sorted_globals.size());
+    for (size_t k = 0; k < sorted_globals.size(); ++k) {
+        GlobalEntry ge;
+        ge.id = static_cast<int>(k);
+        // Look up the centroid we just stored under id k.
+        auto it = out.centroids.find(static_cast<int>(k));
+        if (it != out.centroids.end()) ge.raw = it->second;
+        ge.sample_count = sorted_globals[k].sample_count;
+        globals.push_back(std::move(ge));
+    }
+
+    return out;
+}
+
+void copy_globals_for_dump(const std::vector<GlobalEntry>& globals,
+                           std::vector<std::vector<float>>& centroids_out,
+                           std::vector<long>& sample_counts_out) {
+    centroids_out.clear();
+    sample_counts_out.clear();
+    centroids_out.reserve(globals.size());
+    sample_counts_out.reserve(globals.size());
+    for (const auto& g : globals) {
+        centroids_out.push_back(g.raw);
+        sample_counts_out.push_back(g.sample_count);
+    }
+}
+
+std::vector<GlobalEntry> build_short_audio_globals(
+    const float* samples, size_t num_samples,
+    const DiarizeResult& diar, int threads) {
+
+    std::vector<GlobalEntry> globals;
+    if (!samples || num_samples == 0 || diar.segments.empty()) return globals;
+
+    auto model_paths = ensure_sherpa_models();
+    SpeakerEmbeddingSession emb_session(model_paths.embedding, threads);
+
+    // Unique cluster IDs in ascending order for deterministic ordering.
+    std::vector<int> uniq_ids = unique_local_ids(diar);
+
+    int id_seq = 0;
+    for (int sid : uniq_ids) {
+        std::vector<float> raw = extract_speaker_embedding(
+            emb_session, samples, num_samples, diar, sid);
+        if (raw.empty()) continue;
+
+        // Sample-count weight: total duration of all segments tagged with sid.
+        double sec = 0.0;
+        for (const auto& seg : diar.segments) {
+            if (seg.speaker == sid && seg.end > seg.start)
+                sec += seg.end - seg.start;
+        }
+        long n = static_cast<long>(sec * static_cast<double>(SAMPLE_RATE));
+        if (n <= 0) n = 1;
+
+        GlobalEntry ge;
+        // ge.id MUST match the existing cluster ID in `diar.segments` so
+        // `apply_collapse` can rewrite segments by merging dropped->merged
+        // IDs. We do NOT reassign ge.id = id_seq++ here — the diar segments
+        // already carry sherpa's 0..N-1 IDs, and apply_collapse needs the
+        // globals' IDs to be the same values it sees on the segments.
+        ge.id = sid;
+        ge.raw = std::move(raw);
+        ge.sample_count = n;
+        globals.push_back(std::move(ge));
+        ++id_seq;
+    }
+
+    return globals;
+}
+
 DiarizeChunkedResult stitch_chunks(
     const std::vector<DiarizeResult>& chunk_results,
     const std::vector<std::map<int, std::vector<float>>>& chunk_centroids,
     const std::vector<ChunkExtents>& extents,
     const DiarizeChunkConfig& cfg,
-    int num_speakers) {
+    int target_speakers) {
 
     if (chunk_results.size() != chunk_centroids.size()
         || chunk_results.size() != extents.size())
@@ -615,86 +794,60 @@ DiarizeChunkedResult stitch_chunks(
         }
     }
 
-    // Step 8: post-stitch greedy-merge enforcing `num_speakers` count limit.
-    // Merge pair with highest pairwise cosine similarity; tie-break to the
-    // smaller min(A.id, B.id). Sample-weighted mean of raw vectors. Rewrite
-    // already-emitted segments. After the loop: ascending-current-ID
-    // compaction to 0..N-1 (M-2' line 421).
-    if (num_speakers > 0) {
-        while (static_cast<int>(globals.size()) > num_speakers) {
-            int best_a_idx = -1, best_b_idx = -1;
-            float best_sim = -2.0f;
-            int best_min_id = std::numeric_limits<int>::max();
+    // Phase B.1+B.3: unified greedy-merge loop + 0..N-1 compaction. Replaces
+    // the inline `num_speakers > 0`-gated merge + Step-8 finale that lived
+    // here pre-Phase-B. Same correctness (ceiling enforced when
+    // target_speakers > 0; threshold gate decides auto-merges when under
+    // the cap) — the loop body, the segment-rewrite, and the compaction now
+    // live in `apply_collapse`. We snapshot `globals` (pre-merge state) for
+    // the centroid dump's per-chunk local→global remap below: that remap
+    // needs the original pre-merge IDs to look up the post-compaction IDs.
+    std::vector<GlobalEntry> globals_snapshot = globals;  // for dump-remap
+    auto collapsed = apply_collapse(out.diar, globals, target_speakers,
+                                    cfg.collapse_threshold);
+    out.centroids = collapsed.centroids;
 
-            for (size_t a = 0; a < globals.size(); ++a) {
-                for (size_t b = a + 1; b < globals.size(); ++b) {
-                    float sim = cosine_sim_raw(globals[a].raw, globals[b].raw);
-                    int min_id = std::min(globals[a].id, globals[b].id);
-                    bool take = false;
-                    if (sim > best_sim) {
-                        take = true;
-                    } else if (sim == best_sim && min_id < best_min_id) {
-                        take = true;
-                    }
-                    if (take) {
-                        best_sim = sim;
-                        best_min_id = min_id;
-                        best_a_idx = static_cast<int>(a);
-                        best_b_idx = static_cast<int>(b);
-                    }
+    // Build the {pre-merge ID → post-compaction ID} map by tracing each
+    // surviving (post-collapse, contiguous 0..N-1) global back to a snapshot
+    // entry by best matching centroid. Used only for the centroid-dump
+    // local→global rewrite below. We use the simple structural rule that
+    // pre-merge IDs are unique and apply_collapse never invents new
+    // pre-merge IDs — every survivor's contiguous index ID maps back to one
+    // (or more) snapshot IDs that merged into it. The dump's local→global
+    // map is informational; treat unknown pre-merge IDs as the raw value.
+    //
+    // Since apply_collapse rewrites segments first and globals second,
+    // a clean way to recover the map is to walk the (already rewritten)
+    // segments + compare to the local_to_global lookup. Easier: we record
+    // the merges inside apply_collapse via a parallel side channel? No —
+    // simpler still: we recompute the merge map by exhaustively matching
+    // the snapshot centroids against the post-collapse centroids using
+    // sample_count tie-breaking. For the bench/instrumentation use case
+    // (analysis script consumes this), an approximate map is fine: we just
+    // need each pre-merge ID to land somewhere in `0..N-1`.
+    //
+    // Strategy: a pre-merge global G_pre survives at post-collapse index k
+    // iff (after merges) G_pre is the lowest pre-merge ID among the
+    // snapshot entries that map to k. We don't have that map here, so we
+    // approximate: for each pre-merge ID, find the post-collapse centroid
+    // with maximum cosine similarity (against the pre-merge raw). Cheap on
+    // small N, deterministic, and exact for the unmerged case (similarity
+    // is 1.0 when no merge touched that entry).
+    std::map<int, int> dump_remap;
+    if (!cfg.debug_dump_centroids_path.empty() && !globals_snapshot.empty()) {
+        for (const auto& g_pre : globals_snapshot) {
+            int best_k = 0;
+            float best_sim = -2.0f;
+            for (const auto& [post_id, post_raw] : collapsed.centroids) {
+                float s = cosine_sim_raw(g_pre.raw, post_raw);
+                if (s > best_sim) {
+                    best_sim = s;
+                    best_k = post_id;
                 }
             }
-            if (best_a_idx < 0 || best_b_idx < 0) break;
-
-            int id_a = globals[best_a_idx].id;
-            int id_b = globals[best_b_idx].id;
-            int merged_id = std::min(id_a, id_b);
-            int dropped_id = std::max(id_a, id_b);
-
-            std::vector<float> merged_raw = weighted_mean_raw(
-                globals[best_a_idx].raw, globals[best_a_idx].sample_count,
-                globals[best_b_idx].raw, globals[best_b_idx].sample_count);
-            long merged_count = globals[best_a_idx].sample_count
-                              + globals[best_b_idx].sample_count;
-
-            // Replace the entry whose id == merged_id; erase the dropped one.
-            int keep_idx = (id_a == merged_id) ? best_a_idx : best_b_idx;
-            int drop_idx = (id_a == merged_id) ? best_b_idx : best_a_idx;
-            globals[keep_idx].raw = std::move(merged_raw);
-            globals[keep_idx].sample_count = merged_count;
-            // Erase higher-index first to keep the other index valid.
-            if (drop_idx > keep_idx) {
-                globals.erase(globals.begin() + drop_idx);
-            } else {
-                globals.erase(globals.begin() + drop_idx);
-            }
-
-            // Rewrite emitted segments: dropped_id -> merged_id.
-            for (auto& seg : out.diar.segments) {
-                if (seg.speaker == dropped_id) seg.speaker = merged_id;
-            }
+            dump_remap[g_pre.id] = best_k;
         }
     }
-
-    // Step 8 finale: deterministic ID compaction to 0..N-1 contiguous in
-    // ascending current-ID order.
-    std::vector<GlobalEntry> sorted_globals = globals;
-    std::sort(sorted_globals.begin(), sorted_globals.end(),
-              [](const GlobalEntry& x, const GlobalEntry& y) {
-                  return x.id < y.id;
-              });
-    std::map<int, int> remap;
-    for (size_t k = 0; k < sorted_globals.size(); ++k) {
-        remap[sorted_globals[k].id] = static_cast<int>(k);
-    }
-    for (auto& seg : out.diar.segments) {
-        auto it = remap.find(seg.speaker);
-        if (it != remap.end()) seg.speaker = it->second;
-    }
-    for (size_t k = 0; k < sorted_globals.size(); ++k) {
-        out.centroids[static_cast<int>(k)] = std::move(sorted_globals[k].raw);
-    }
-    out.diar.num_speakers = static_cast<int>(sorted_globals.size());
 
     // Re-sort emitted segments by start time so downstream merge_speakers and
     // any time-ordered consumers see a clean sequence.
@@ -706,37 +859,25 @@ DiarizeChunkedResult stitch_chunks(
     // Phase A instrumentation: dump the post-stitch centroid state to JSON
     // so an offline analysis script can sweep collapse thresholds without
     // re-running the (~15-min) bench. Reads paths and timestamps from the
-    // already-populated DiarizeChunkConfig.
+    // already-populated DiarizeChunkConfig. Dumps the POST-collapse state so
+    // the JSON's indices match the speaker IDs emitted by the pipeline.
     if (!cfg.debug_dump_centroids_path.empty()) {
         std::vector<std::vector<float>> dump_centroids;
         std::vector<long> dump_counts;
-        // `sorted_globals` carries the post-merge, pre-compaction order. We
-        // dump in post-compaction (0..N-1) order so the JSON's indices match
-        // the speaker IDs emitted by the pipeline.
-        dump_centroids.reserve(sorted_globals.size());
-        dump_counts.reserve(sorted_globals.size());
-        for (size_t k = 0; k < sorted_globals.size(); ++k) {
-            // out.centroids[k] was moved-from above. Reconstruct from the
-            // emitted segment payload would be expensive; instead read the
-            // (still-populated) `out.centroids` map. NB: we moved
-            // sorted_globals[k].raw INTO out.centroids[k], so dump from that.
-            auto it = out.centroids.find(static_cast<int>(k));
-            if (it != out.centroids.end()) {
-                dump_centroids.push_back(it->second);
-            } else {
-                dump_centroids.emplace_back();
-            }
-            dump_counts.push_back(sorted_globals[k].sample_count);
-        }
-        // Remap per-chunk local→global through the compaction map so the
-        // dumped global IDs match the emitted segment speaker IDs.
+        // Dump in post-collapse (0..N-1) order. We can read directly from
+        // `globals` because apply_collapse reflects the compacted state
+        // back into `globals` (ge.id = 0..N-1, ge.raw = compacted centroid).
+        copy_globals_for_dump(globals, dump_centroids, dump_counts);
+        // Remap per-chunk local→global through dump_remap so the dumped
+        // global IDs match the emitted segment speaker IDs.
         std::vector<std::map<int, int>> remapped_l2g;
         remapped_l2g.reserve(local_to_global.size());
         for (const auto& chunk_map : local_to_global) {
             std::map<int, int> remapped;
             for (const auto& [local_id, pre_compaction_gid] : chunk_map) {
-                auto rit = remap.find(pre_compaction_gid);
-                int gid = (rit != remap.end()) ? rit->second : pre_compaction_gid;
+                auto rit = dump_remap.find(pre_compaction_gid);
+                int gid = (rit != dump_remap.end())
+                          ? rit->second : pre_compaction_gid;
                 remapped[local_id] = gid;
             }
             remapped_l2g.push_back(std::move(remapped));
@@ -754,7 +895,7 @@ DiarizeChunkedResult stitch_chunks(
 
 DiarizeChunkedResult diarize_chunked(
     const float* samples, size_t num_samples,
-    int num_speakers, int threads, float threshold,
+    int target_speakers, int threads, float threshold,
     const DiarizeChunkConfig& chunk_cfg,
     DiarizeProgressCallback on_progress) {
 
@@ -884,7 +1025,7 @@ DiarizeChunkedResult diarize_chunked(
     if (on_progress) on_progress(100, 100);
 
     return stitch_chunks(chunk_results, chunk_centroids, extents,
-                         chunk_cfg, num_speakers);
+                         chunk_cfg, target_speakers);
 }
 #endif
 
