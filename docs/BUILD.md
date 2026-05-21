@@ -192,15 +192,90 @@ Anthropic server is an `httptest.Server` constructed in-process per test.
 
 ### Coverage
 
-**C++ source coverage is not currently measured.** No `--coverage` /
-`-fprofile-arcs` / `-ftest-coverage` flags are wired into the CMake
-build; Catch2 reports test execution status (pass/fail counts), NOT
-source-line coverage. The 80% unit-coverage standard stated in
-`agentctx/workflow.md` is therefore unenforceable on the C++ side
-today. This is tracked as Phase 1 of the
-`agentctx/tasks/test-and-verification-hardening.md` task, which will
-introduce a `RECMEET_COVERAGE` CMake option, a `make cxx-coverage`
-Makefile target, and a no-regression coverage gate in CI.
+#### C++ source coverage (`RECMEET_COVERAGE` + `make cxx-coverage`)
+
+C++ source coverage is wired through `gcov` / `gcovr`. A `RECMEET_COVERAGE`
+CMake option (default `OFF`) injects `--coverage -O0 -g` into compile +
+link flags for the **first-party** targets only — `recmeet_ipc`,
+`recmeet_capture`, `recmeet_core`, `recmeet_live_capture`, the three
+binaries (`recmeet`, `recmeet-daemon`, `recmeet-tray`), and
+`recmeet_tests`. Vendor subbuilds (whisper.cpp, llama.cpp, sherpa-onnx,
+onnxruntime, cpp-httplib, Catch2) are deliberately **not** instrumented:
+we have no authority to change vendor source and including it would
+pollute the report with tens of thousands of third-party lines.
+
+**Prerequisite.** `gcovr` (version 5+ is fine; the baseline was captured
+with 8.6).
+
+| Distro | Install |
+|---|---|
+| Arch | `sudo pacman -S gcovr` |
+| Debian / Ubuntu | `sudo apt-get install gcovr` |
+| Fedora / RHEL | `sudo dnf install gcovr` |
+| pip (any) | `python3 -m venv .venv && .venv/bin/pip install gcovr` |
+
+**One-shot run.**
+
+```bash
+make cxx-coverage
+```
+
+The target reconfigures into `build/` with `-DRECMEET_COVERAGE=ON
+-DRECMEET_BUILD_TESTS=ON`, rebuilds, runs the same default test scope
+as `make test` (`~[integration]~[benchmark]~[full-stack]~[slow]~[stress]~[memory-rss]`),
+then drives `gcovr` to produce:
+
+- **HTML report** — `build/coverage-html/index.html`. Open in a browser
+  for the navigable per-file, per-line drill-down. Files are colored
+  green (covered), red (uncovered), and yellow (partially covered
+  branches); the index page sorts by coverage so the lowest-coverage
+  files float to the top.
+- **Plain-text summary** — `build/coverage-summary.txt`. Per-file
+  line/branch counts in fixed-width columns; suitable for grepping or
+  copy-paste into review notes.
+
+If `gcovr` is missing the target prints an actionable install hint and
+exits non-zero — no silent skip.
+
+#### Coverage baseline + no-regression gate
+
+`tests/coverage-baseline.txt` is the committed reference. It records the
+per-file line-coverage percentage observed at the time of capture, plus a
+`TOTAL: NN.N%` line at the bottom. CI runs `scripts/check-coverage.sh`
+after `make cxx-coverage` to compare current vs baseline.
+
+**Phase 1 default: warn-only.** `scripts/check-coverage.sh` (no args)
+always exits 0; if any first-party file's coverage dropped by more than
+0.1 percentage points, the script emits a `::warning::` GitHub Actions
+annotation naming the file. The annotation surfaces in the PR diff view
+so reviewers see the regression even though CI is green.
+
+**Future default: enforce.** A future commit will flip the gate to
+`--enforce` (a flag the script already accepts) so regressions block the
+build. The CI workflow has a `TODO(phase 1.5)` marking the exact line to
+change.
+
+**Updating the baseline (operator action only).**
+
+The baseline is intentionally manual to update. A drop is a signal that
+something we previously exercised is no longer covered; the fix is
+usually a test, not a baseline bump. Bumping the baseline upward is
+welcome and expected as new tests land. To update:
+
+```bash
+make cxx-coverage
+# Copy the new per-file numbers from build/coverage-summary.txt into
+# tests/coverage-baseline.txt (same format: <path>: NN.N%), update the
+# TOTAL line at the bottom, then commit with a message that EXPLAINS
+# why coverage moved (new tests, deleted dead code, refactor, etc.).
+git commit tests/coverage-baseline.txt
+```
+
+The `gcov` instrumentation produces `.gcno` files at compile time and
+`.gcda` files at test runtime; `gcovr` walks `build/` to find both and
+emits the report scoped to `src/.*` via its `--filter` flag.
+
+#### Go-tool coverage
 
 The Go integration tests run the *real* `recmeet-mcp` /
 `recmeet-agent` binaries as subprocesses, so coverage has to be collected
