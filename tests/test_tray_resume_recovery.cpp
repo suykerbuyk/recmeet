@@ -88,7 +88,6 @@ struct TcpServerHarness {
     std::thread thr;
     SessionManager* sm;
     std::string addr;
-    std::atomic<int> job_status_calls{0};
 
     TcpServerHarness(const std::string& tcp_addr, const std::string& psk,
                      SessionManager& sm_)
@@ -108,27 +107,13 @@ struct TcpServerHarness {
             });
         server->set_request_dispatch_hook(
             [this](const std::string& tok) { sm->bump_last_seen(tok); });
-        // job.status stub for the recovery dispatch path. The harness
-        // increments a counter so the test can assert it was reached;
-        // the response shape mirrors the daemon's real handler
-        // sufficiently for the client to parse `status`.
-        server->on("job.status",
-                   [this](const IpcRequest&, IpcResponse& resp, IpcError&) {
-                       resp.result["status"] = std::string("unknown");
-                       job_status_calls.fetch_add(1);
-                       return true;
-                   });
-        // process.submit stub: pretend to allocate an upload session.
-        // The H-D3 retry path expects the same job_id contract as the
-        // real daemon — for the unit-level shape check we only need a
-        // valid response.
-        server->on("process.submit",
-                   [](const IpcRequest&, IpcResponse& resp, IpcError&) {
-                       resp.result["job_id"] = static_cast<int64_t>(42);
-                       resp.result["upload_token"] = std::string("ut-stub");
-                       resp.result["max_size"] = static_cast<int64_t>(1 << 30);
-                       return true;
-                   });
+        // Phase 2b: the D.5 TEST_CASE that uses this harness only
+        // exercises the auth/resume_token round-trip — it does NOT call
+        // job.status or process.submit. The stubs that previously sat
+        // here (and shadowed the production verbs) have been retired;
+        // any future test in this file that needs those handlers should
+        // switch to DaemonTestHarness so it drives the production
+        // bodies, not a hand-rolled clone.
         REQUIRE(server->start());
         thr = std::thread([this]() { server->run(); });
         std::this_thread::sleep_for(50ms);
