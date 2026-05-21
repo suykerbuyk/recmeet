@@ -1985,10 +1985,13 @@ TEST_CASE("TCP reconnect: server restart detected by client", "[ipc][integration
     std::string prev_str = prev ? prev : "";
     setenv("RECMEET_AUTH_TOKEN", "test-token-reconnect", 1);
 
-    // Start server
+    // Start server. Phase 2b: this test exercises TCP reconnect, not
+    // status.get semantics — switched to a non-production verb name
+    // (test.ack) so the check-test-stubs.sh gate doesn't flag plumbing
+    // as a stubbed production handler.
     auto server = std::make_unique<IpcServer>(TCP_ADDR);
     server->set_psk("test-token-reconnect");
-    server->on("status.get", [](const IpcRequest&, IpcResponse& resp, IpcError&) {
+    server->on("test.ack", [](const IpcRequest&, IpcResponse& resp, IpcError&) {
         resp.result["state"] = std::string("idle");
         return true;
     });
@@ -2003,7 +2006,7 @@ TEST_CASE("TCP reconnect: server restart detected by client", "[ipc][integration
 
     IpcResponse resp;
     IpcError err;
-    REQUIRE(client.call("status.get", resp, err, 2000));
+    REQUIRE(client.call("test.ack", resp, err, 2000));
     CHECK(json_val_as_string(resp.result["state"]) == "idle");
 
     // Stop server — client should detect disconnect
@@ -2012,13 +2015,13 @@ TEST_CASE("TCP reconnect: server restart detected by client", "[ipc][integration
     server.reset();
 
     // Client should fail on next call
-    CHECK_FALSE(client.call("status.get", resp, err, 2000));
+    CHECK_FALSE(client.call("test.ack", resp, err, 2000));
     client.close_connection();
 
     // Restart server on same port
     server = std::make_unique<IpcServer>(TCP_ADDR);
     server->set_psk("test-token-reconnect");
-    server->on("status.get", [](const IpcRequest&, IpcResponse& resp, IpcError&) {
+    server->on("test.ack", [](const IpcRequest&, IpcResponse& resp, IpcError&) {
         resp.result["state"] = std::string("recording");
         return true;
     });
@@ -2028,7 +2031,7 @@ TEST_CASE("TCP reconnect: server restart detected by client", "[ipc][integration
 
     // Client reconnects
     REQUIRE(client.connect());
-    REQUIRE(client.call("status.get", resp, err, 2000));
+    REQUIRE(client.call("test.ack", resp, err, 2000));
     CHECK(json_val_as_string(resp.result["state"]) == "recording");
 
     server->stop();
@@ -2287,7 +2290,9 @@ struct PskServerFixture {
     {
         server = std::make_unique<IpcServer>(addr);
         server->set_psk(psk);
-        server->on("status.get", [](const IpcRequest&, IpcResponse& resp, IpcError&) {
+        // Phase 2b: PSK tests exercise the auth handshake, not status.get
+        // semantics — switched to a non-production verb name.
+        server->on("test.ack", [](const IpcRequest&, IpcResponse& resp, IpcError&) {
             resp.result["state"] = std::string("idle");
             return true;
         });
@@ -2318,7 +2323,7 @@ TEST_CASE("PSK happy path: TCP client with correct token clears the gate",
 
     IpcResponse resp;
     IpcError err;
-    REQUIRE(client.call("status.get", resp, err, 2000));
+    REQUIRE(client.call("test.ack", resp, err, 2000));
     CHECK(json_val_as_string(resp.result["state"]) == "idle");
 }
 
@@ -2404,7 +2409,7 @@ TEST_CASE("PSK mid-handshake drop: client connects and closes without sending an
     REQUIRE(client.connect());
     IpcResponse resp;
     IpcError err;
-    REQUIRE(client.call("status.get", resp, err, 2000));
+    REQUIRE(client.call("test.ack", resp, err, 2000));
     CHECK(json_val_as_string(resp.result["state"]) == "idle");
 }
 
@@ -2419,7 +2424,9 @@ TEST_CASE("PSK Unix bypass: Unix-socket clients dispatch immediately with no aut
     IpcServer server(SOCK);
     // Note: we deliberately do NOT call set_psk() — Unix listeners do not
     // require one, so this should still start successfully.
-    server.on("status.get", [](const IpcRequest&, IpcResponse& resp, IpcError&) {
+    // Phase 2b: test asserts Unix-socket auth-bypass, not status.get
+    // semantics — switched to non-production verb name.
+    server.on("test.ack", [](const IpcRequest&, IpcResponse& resp, IpcError&) {
         resp.result["state"] = std::string("idle");
         return true;
     });
@@ -2434,7 +2441,7 @@ TEST_CASE("PSK Unix bypass: Unix-socket clients dispatch immediately with no aut
     // First request — no auth frame ever sent by the client — must succeed.
     IpcResponse resp;
     IpcError err;
-    REQUIRE(client.call("status.get", resp, err, 2000));
+    REQUIRE(client.call("test.ack", resp, err, 2000));
     CHECK(json_val_as_string(resp.result["state"]) == "idle");
 
     server.stop();
