@@ -1,10 +1,11 @@
 {
-  "iter_n": 190,
-  "anchor_sha": "3e3d61b91aa7d6582dcba3eca2d308c3d7ce6a0e",
+  "iter_n": 191,
+  "anchor_sha": "f9527ea8868d44d1a3358a50dbfaf3d90c420227",
   "active": [
     "diarize-overcount-and-context-aware-speaker-hints",
     "e6-tray-bundled-webui",
     "full-stack-captions-60min-regression",
+    "test-and-verification-hardening",
     "thin-client-recording-server",
     "webui-live-captions",
     "whisper-vocab-hint-bleed"
