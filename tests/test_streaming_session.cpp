@@ -31,6 +31,9 @@
 #include "streaming_session.h"
 #include "util.h"
 
+#include "daemon_test_harness.h"   // Phase 2b ext — wire tests drive the
+                                   // real process.stream handler.
+
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -631,22 +634,37 @@ TEST_CASE("StreamingSession: engine-start failure still streams audio to disk",
 //     the streaming session by client_id, AND that an NDJSON command sent
 //     mid-`0x03`-stream is still dispatched (the C.1 FrameReader interleave
 //     contract).
+//
+// Phase 2b extension — the wire tests now drive the PRODUCTION
+// `process.stream` / `process.stream.cancel` / `status.get` handlers via
+// `DaemonTestHarness::start()` + `register_daemon_handlers(server)`. The
+// binary-frame router lives in the harness too (mirroring daemon.cpp's
+// main), so the producer-side seam is the production path end-to-end.
 // ===========================================================================
 namespace {
 
-const char* STREAM_SOCK = "/tmp/recmeet_test_streaming.sock";
-
-// ServerGuard — owns the IpcServer poll thread and joins it on destruction
-// even if a REQUIRE throws mid-test.
-struct ServerGuard {
-    IpcServer& server;
-    std::thread thr;
-    explicit ServerGuard(IpcServer& s) : server(s) {
-        thr = std::thread([this]() { server.run(); });
+// HarnessJqGuard — drives the harness's g_jobs streaming slot the same
+// way JqGuard does for a local JobQueue. Declared AFTER DaemonTestHarness
+// in the test scope so destruction order is:
+//   1. HarnessJqGuard::~  — calls g_jobs->shutdown() + joins worker
+//   2. ~DaemonTestHarness — tears down g_streaming, g_jobs, server
+// That order is critical: the worker thread MUST exit before g_jobs is
+// reset() or it would touch a destroyed JobQueue.
+struct HarnessJqGuard {
+    std::thread worker;
+    HarnessJqGuard() {
+        worker = std::thread([]() {
+            while (g_jobs) {
+                auto dq = g_jobs->dequeue(JobKind::Streaming);
+                if (!dq.has_value()) return;
+                // Slot marker is set; loop back and block until the slot
+                // frees (finish/cancel) and a new job is enqueued.
+            }
+        });
     }
-    ~ServerGuard() {
-        server.stop();
-        if (thr.joinable()) thr.join();
+    ~HarnessJqGuard() {
+        if (g_jobs) g_jobs->shutdown();
+        if (worker.joinable()) worker.join();
     }
 };
 
@@ -654,99 +672,70 @@ struct ServerGuard {
 
 TEST_CASE("StreamingSession: 0x03 frames round-trip through IpcServer/IpcClient",
           "[streaming-session][streaming-wire]") {
-    ::unlink(STREAM_SOCK);
+    using namespace recmeet::test;
+    DaemonTestHarness harness;
+    harness.start();
+    HarnessJqGuard jq;
 
-    JobQueue q;
-    JqGuard jq(q);
-    auto sink = null_sink();
-    StreamingSessionManager mgr(q, sink, "");   // stub engine — disk path only
-    fs::path tmp = test_temp_dir("wire");
+    auto client = harness.make_client();
 
-    IpcServer server(STREAM_SOCK);
-
-    // Track how many `0x03` payloads (and total samples) the handler routed,
-    // plus whether the interleaved NDJSON command was dispatched.
-    std::atomic<int> frames_routed{0};
-    std::atomic<int> samples_routed{0};
-    std::atomic<bool> interleaved_cmd_seen{false};
-
-    // process.stream handler — opens a session via the manager.
-    server.on("process.stream",
-              [&](const IpcRequest& req, IpcResponse& resp, IpcError& err) {
-        StreamRequest sr;  // defaults
-        auto res = mgr.create(req.client_id, sr, tmp);
-        if (!res.ok) { err.code = res.code; err.message = res.error; return false; }
-        resp.result["job_id"] = res.job_id;
-        resp.result["stream_token"] = res.stream_token;
-        return true;
-    });
-    // A trivial NDJSON command we send mid-stream to prove interleaving.
-    server.on("status.get",
-              [&](const IpcRequest&, IpcResponse& resp, IpcError&) {
-        interleaved_cmd_seen.store(true);
-        resp.result["ok"] = true;
-        return true;
-    });
-    // The binary-frame handler — the migrated producer entry point.
-    server.on_binary_frame([&](const std::string& client_id,
-                               FrameType type,
-                               const std::string& payload) -> bool {
-        if (type != FrameType::StreamAudio) return true;
-        std::string token = mgr.token_for_client(client_id);
-        if (token.empty()) return false;     // no session — protocol violation
-        if (!mgr.feed_audio(token, payload)) return false;
-        frames_routed.fetch_add(1);
-        samples_routed.fetch_add(
-            static_cast<int>(payload.size() / sizeof(int16_t)));
-        return true;
-    });
-
-    REQUIRE(server.start());
-    ServerGuard sg(server);
-
-    IpcClient client(STREAM_SOCK);
-    REQUIRE(client.connect());
-
-    // Open the streaming session.
+    // Open the streaming session via the production handler.
     IpcResponse resp; IpcError err;
-    REQUIRE(client.call("process.stream", {}, resp, err, 5000));
+    REQUIRE(client->call("process.stream", {}, resp, err, 5000));
     auto tit = resp.result.find("stream_token");
     REQUIRE(tit != resp.result.end());
     CHECK_FALSE(json_val_as_string(tit->second).empty());
+    int64_t job_id = json_val_as_int(resp.result["job_id"]);
+    REQUIRE(job_id > 0);
+
+    // Resolve the on-disk WAV path so we can observe frame flow as
+    // file growth (libsndfile holds the handle open — file_size() lags
+    // its internal buffering but grows visibly as PCM is appended).
+    fs::path wav = g_streaming->wav_path_for_job(job_id);
+    REQUIRE(!wav.empty());
+    REQUIRE(fs::exists(wav));
 
     // Send several `0x03` streaming-audio frames.
-    for (int i = 0; i < 5; ++i) {
-        std::string pcm = make_pcm(1600, static_cast<int16_t>(i));
-        REQUIRE(client.send_stream_audio(pcm));
+    constexpr int kFramesA      = 5;
+    constexpr size_t kSamplesA  = 1600;
+    for (int i = 0; i < kFramesA; ++i) {
+        std::string pcm = make_pcm(kSamplesA, static_cast<int16_t>(i));
+        REQUIRE(client->send_stream_audio(pcm));
     }
 
     // Interleave an NDJSON command BETWEEN `0x03` frames — the C.1
-    // FrameReader assembles the cancel/status frame in between two audio
-    // frames of the in-flight stream. Send more `0x03` after it.
+    // FrameReader assembles status.get between two audio frames. A
+    // successful response proves the interleave contract holds (status.get
+    // is registered by register_daemon_handlers).
     IpcResponse sresp; IpcError serr;
-    REQUIRE(client.call("status.get", {}, sresp, serr, 5000));
-    for (int i = 5; i < 8; ++i) {
-        std::string pcm = make_pcm(800, static_cast<int16_t>(i));
-        REQUIRE(client.send_stream_audio(pcm));
+    REQUIRE(client->call("status.get", {}, sresp, serr, 5000));
+
+    constexpr int kFramesB      = 3;
+    constexpr size_t kSamplesB  = 800;
+    for (int i = 0; i < kFramesB; ++i) {
+        std::string pcm = make_pcm(kSamplesB, static_cast<int16_t>(i + kFramesA));
+        REQUIRE(client->send_stream_audio(pcm));
     }
 
-    // Give the server poll thread a moment to drain the last frames.
-    CHECK(wait_until([&]() { return frames_routed.load() >= 8; },
-                     std::chrono::milliseconds(1000)));
+    // Wait for the on-disk WAV to grow past the WAV header (44 bytes) —
+    // the disk-backed sink is the production producer seam and the only
+    // observation point we have without re-introducing a stub handler.
+    CHECK(wait_until([&]() {
+        std::error_code ec;
+        auto sz = fs::file_size(wav, ec);
+        return !ec && sz > 100;
+    }, std::chrono::milliseconds(1000)));
 
-    CHECK(frames_routed.load() == 8);
-    CHECK(samples_routed.load() == 5 * 1600 + 3 * 800);
-    CHECK(interleaved_cmd_seen.load());     // NDJSON dispatched mid-stream.
-    CHECK(mgr.active_count() == 1);
+    // The streaming session is still alive — the production binary-frame
+    // router accepted every `0x03` frame (any rejection would have torn
+    // the connection down and erased the session).
+    CHECK(g_streaming->active_count() == 1);
 
-    client.close_connection();
-    // Disconnect aborts the session (the daemon wires on_client_disconnect;
-    // here we drive it directly to verify the cleanup contract end-to-end).
-    // The IpcServer's remove_client would call the handler in the daemon;
-    // this test does not register it, so abort explicitly.
-    mgr.on_client_disconnect(client.client_id());
-    fs::remove_all(tmp);
-    ::unlink(STREAM_SOCK);
+    client->close_connection();
+    // The harness's on_client_disconnect runs g_streaming->on_client_disconnect
+    // when the poll thread observes the EOF — wait for active_count to drop.
+    CHECK(wait_until([&]() { return g_streaming->active_count() == 0; },
+                     std::chrono::milliseconds(2000)));
 }
 
 // ===========================================================================
@@ -845,102 +834,61 @@ TEST_CASE("StreamingSession: RSS does not grow with stream duration",
 
 TEST_CASE("StreamingSession: process.stream.cancel + disconnect handler over the wire",
           "[streaming-session][streaming-wire]") {
-    ::unlink(STREAM_SOCK);
-
-    JobQueue q;
-    JqGuard jq(q);
-    auto sink = null_sink();
-    StreamingSessionManager mgr(q, sink, "");
-    fs::path tmp = test_temp_dir("wirecancel");
-
-    IpcServer server(STREAM_SOCK);
-    std::atomic<int> disconnect_aborts{0};
-
-    server.on("process.stream",
-              [&](const IpcRequest& req, IpcResponse& resp, IpcError& err) {
-        StreamRequest sr;
-        auto res = mgr.create(req.client_id, sr, tmp);
-        if (!res.ok) { err.code = res.code; err.message = res.error; return false; }
-        resp.result["job_id"] = res.job_id;
-        resp.result["stream_token"] = res.stream_token;
-        return true;
-    });
-    server.on("process.stream.cancel",
-              [&](const IpcRequest& req, IpcResponse& resp, IpcError& err) {
-        auto it = req.params.find("stream_token");
-        if (it == req.params.end()) {
-            err.code = static_cast<int>(IpcErrorCode::InvalidParams);
-            err.message = "missing stream_token";
-            return false;
-        }
-        if (!mgr.cancel(req.client_id, json_val_as_string(it->second))) {
-            err.code = static_cast<int>(IpcErrorCode::InvalidParams);
-            err.message = "unknown stream_token";
-            return false;
-        }
-        resp.result["ok"] = true;
-        return true;
-    });
-    server.on_client_disconnect([&](const std::string& client_id) {
-        disconnect_aborts.fetch_add(mgr.on_client_disconnect(client_id));
-    });
-
-    REQUIRE(server.start());
-    ServerGuard sg(server);
+    using namespace recmeet::test;
+    DaemonTestHarness harness;
+    harness.start();
+    HarnessJqGuard jq;
 
     // --- Sub-case A: explicit process.stream.cancel.
     {
-        IpcClient client(STREAM_SOCK);
-        REQUIRE(client.connect());
+        auto client = harness.make_client();
         IpcResponse resp; IpcError err;
-        REQUIRE(client.call("process.stream", {}, resp, err, 5000));
+        REQUIRE(client->call("process.stream", {}, resp, err, 5000));
         std::string token = json_val_as_string(resp.result["stream_token"]);
         REQUIRE(!token.empty());
+        int64_t job_id = json_val_as_int(resp.result["job_id"]);
+        REQUIRE(job_id > 0);
 
-        fs::path wav;
-        for (auto& e : fs::directory_iterator(tmp))
-            if (e.path().extension() == ".wav") wav = e.path();
+        fs::path wav = g_streaming->wav_path_for_job(job_id);
+        REQUIRE(!wav.empty());
         REQUIRE(fs::exists(wav));
-        CHECK(mgr.active_count() == 1);
+        CHECK(g_streaming->active_count() == 1);
 
         JsonMap cp;
         cp["stream_token"] = token;
         IpcResponse cresp; IpcError cerr;
-        REQUIRE(client.call("process.stream.cancel", cp, cresp, cerr, 5000));
-        CHECK(mgr.active_count() == 0);
+        REQUIRE(client->call("process.stream.cancel", cp, cresp, cerr, 5000));
+        CHECK(g_streaming->active_count() == 0);
         CHECK_FALSE(fs::exists(wav));      // temp WAV unlinked by cancel.
 
-        client.close_connection();
+        client->close_connection();
     }
 
     // --- Sub-case B: a TCP/Unix drop mid-stream fires the disconnect
     //     handler, which aborts the session (job failed, WAV unlinked).
     {
-        IpcClient client(STREAM_SOCK);
-        REQUIRE(client.connect());
+        auto client = harness.make_client();
         IpcResponse resp; IpcError err;
-        REQUIRE(client.call("process.stream", {}, resp, err, 5000));
+        REQUIRE(client->call("process.stream", {}, resp, err, 5000));
         std::string token = json_val_as_string(resp.result["stream_token"]);
         REQUIRE(!token.empty());
-        CHECK(mgr.active_count() == 1);
+        int64_t job_id = json_val_as_int(resp.result["job_id"]);
+        REQUIRE(job_id > 0);
+        CHECK(g_streaming->active_count() == 1);
 
-        fs::path wav;
-        for (auto& e : fs::directory_iterator(tmp))
-            if (e.path().extension() == ".wav") wav = e.path();
+        fs::path wav = g_streaming->wav_path_for_job(job_id);
+        REQUIRE(!wav.empty());
         REQUIRE(fs::exists(wav));
 
-        // Drop the connection — the server's poll loop observes EOF, calls
-        // remove_client(), which invokes the disconnect handler.
-        client.close_connection();
+        // Drop the connection — the server's poll loop observes EOF and
+        // calls the harness's on_client_disconnect (production behavior
+        // from daemon.cpp:2029-2047), which aborts the session.
+        client->close_connection();
 
-        CHECK(wait_until([&]() { return disconnect_aborts.load() >= 1; },
+        CHECK(wait_until([&]() { return g_streaming->active_count() == 0; },
                          std::chrono::milliseconds(2000)));
-        CHECK(mgr.active_count() == 0);
         CHECK_FALSE(fs::exists(wav));      // temp WAV unlinked on disconnect.
     }
-
-    fs::remove_all(tmp);
-    ::unlink(STREAM_SOCK);
 }
 
 // ===========================================================================
