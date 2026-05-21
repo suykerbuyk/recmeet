@@ -15,30 +15,28 @@
 // pulling in the rest of the integration suite. Models (whisper base,
 // sherpa diarization, VAD) must be cached locally — the `make
 // integration-e2e` target pre-fetches them via `recmeet --download-models`.
+//
+// Phase 3 refactor (test-and-verification-hardening): the fork+exec
+// `DaemonChild` helper, the daemon-binary discovery, and the
+// minimal-config writer were promoted to `tests/full_stack_helpers.h`
+// so a sibling `[full-stack][speaker-id]` test can drive a Unix-socket
+// daemon through the same harness. This file no longer carries that
+// boilerplate; it uses `full_stack::SpawnedDaemon(... Transport::TCP ...)`
+// instead.
 
 #include <catch2/catch_test_macros.hpp>
 
+#include "full_stack_helpers.h"
 #include "ipc_client.h"
 #include "ipc_protocol.h"
 #include "json_util.h"
 #include "test_helpers.h"
 
-#include <arpa/inet.h>
-#include <fcntl.h>
-#include <netinet/in.h>
-#include <signal.h>
-#include <sys/socket.h>
-#include <sys/wait.h>
-#include <unistd.h>
-
 #include <chrono>
 #include <cstdlib>
-#include <cstring>
 #include <filesystem>
-#include <fstream>
 #include <string>
 #include <thread>
-#include <vector>
 
 namespace recmeet {
 
@@ -46,143 +44,6 @@ namespace fs = std::filesystem;
 using namespace std::chrono_literals;
 
 namespace {
-
-// Forked daemon harness. Spawns `recmeet-daemon --listen <addr>` with the
-// PSK env var and a per-test XDG_CONFIG_HOME so the daemon picks up an
-// isolated config.yaml. Polls the listen port until accept-ready before
-// returning, so the caller can `IpcClient::connect()` immediately. SIGTERM
-// + waitpid on destruction; falls back to SIGKILL after a 5 s grace.
-//
-// XDG_CONFIG_HOME isolation is the important bit: it scopes the config
-// read by `load_legacy_config_as_job_config()` (via `config_dir()` in `src/util.cpp`) without
-// touching HOME, so the daemon still finds the operator's cached
-// `~/.local/share/recmeet/models/` (set via XDG_DATA_HOME / HOME). This
-// keeps the test self-contained without forcing a redundant model
-// re-download per CI run.
-struct DaemonChild {
-    pid_t pid = -1;
-    std::string addr;
-    fs::path xdg_config;
-
-    DaemonChild(const fs::path& daemon_bin,
-                const std::string& tcp_addr,
-                const std::string& psk_token,
-                const fs::path& xdg_config_dir)
-        : addr(tcp_addr)
-        , xdg_config(xdg_config_dir)
-    {
-        pid = fork();
-        REQUIRE(pid >= 0);
-
-        if (pid == 0) {
-            // Child: set up env and exec the daemon.
-            setenv("RECMEET_AUTH_TOKEN", psk_token.c_str(), 1);
-            setenv("XDG_CONFIG_HOME", xdg_config_dir.c_str(), 1);
-            // Quiet the daemon's stderr — the parent runs the test
-            // assertions; log noise from a healthy daemon shouldn't
-            // confuse the test runner output. Logs still land in
-            // ~/.local/share/recmeet/logs/.
-            const char* keep_stderr = std::getenv("RECMEET_E2E_DAEMON_STDERR");
-            if (!keep_stderr || keep_stderr[0] == '\0') {
-                int devnull = ::open("/dev/null", O_WRONLY);
-                if (devnull >= 0) {
-                    ::dup2(devnull, STDERR_FILENO);
-                    ::close(devnull);
-                }
-            }
-            ::execl(daemon_bin.c_str(),
-                    "recmeet-daemon",
-                    "--listen", tcp_addr.c_str(),
-                    static_cast<char*>(nullptr));
-            // exec failed; bail out without running atexit handlers.
-            _exit(127);
-        }
-
-        // Parent: poll-connect the listen socket until the daemon is
-        // accepting. 5 s budget; longer than typical local startup
-        // (~200 ms) and tolerant of CI cold-start (~1-2 s with model
-        // pre-cache lookups).
-        auto deadline = std::chrono::steady_clock::now() + 5s;
-        bool ready = false;
-        while (std::chrono::steady_clock::now() < deadline) {
-            if (probe_tcp(tcp_addr)) { ready = true; break; }
-            std::this_thread::sleep_for(50ms);
-        }
-        if (!ready) {
-            // Surface child status before failing — exec error vs SIGSEGV
-            // vs still-binding tell very different stories.
-            int status = 0;
-            pid_t r = ::waitpid(pid, &status, WNOHANG);
-            if (r == pid && WIFEXITED(status)) {
-                FAIL("daemon child exited code " << WEXITSTATUS(status)
-                     << " before becoming TCP-ready");
-            } else if (r == pid && WIFSIGNALED(status)) {
-                FAIL("daemon child killed by signal " << WTERMSIG(status)
-                     << " before becoming TCP-ready");
-            }
-            FAIL("daemon child did not become TCP-ready within 5s at " << tcp_addr);
-        }
-    }
-
-    ~DaemonChild() {
-        if (pid <= 0) return;
-        // Polite first — postprocess subprocesses get a chance to flush.
-        ::kill(pid, SIGTERM);
-        auto deadline = std::chrono::steady_clock::now() + 5s;
-        while (std::chrono::steady_clock::now() < deadline) {
-            int status = 0;
-            pid_t r = ::waitpid(pid, &status, WNOHANG);
-            if (r == pid) return;
-            std::this_thread::sleep_for(50ms);
-        }
-        // Stuck — escalate.
-        ::kill(pid, SIGKILL);
-        int status = 0;
-        ::waitpid(pid, &status, 0);
-    }
-
-    // Connect-probe — single-shot, sub-second.
-    static bool probe_tcp(const std::string& host_port) {
-        auto colon = host_port.rfind(':');
-        if (colon == std::string::npos) return false;
-        std::string host = host_port.substr(0, colon);
-        int port = std::atoi(host_port.substr(colon + 1).c_str());
-
-        int fd = ::socket(AF_INET, SOCK_STREAM, 0);
-        if (fd < 0) return false;
-        struct sockaddr_in sa{};
-        sa.sin_family = AF_INET;
-        sa.sin_port = htons(static_cast<uint16_t>(port));
-        if (::inet_pton(AF_INET, host.c_str(), &sa.sin_addr) != 1) {
-            ::close(fd); return false;
-        }
-        bool ok = (::connect(fd, reinterpret_cast<struct sockaddr*>(&sa),
-                             sizeof(sa)) == 0);
-        ::close(fd);
-        return ok;
-    }
-};
-
-// Resolve the daemon binary path. Tests run from build/ so the binary
-// sits at build/recmeet-daemon, but the absolute path is more robust
-// against future relocation. Project root walk handles both
-// `build/recmeet_tests` and worktree-build-dir layouts.
-fs::path find_daemon_binary() {
-    fs::path root = test_helpers::find_project_root();
-    REQUIRE(!root.empty());
-    // Default build dir layout.
-    fs::path candidate = root / "build" / "recmeet-daemon";
-    if (fs::exists(candidate)) return candidate;
-    // Worktree-isolated build (`make BUILD_DIR=build-foo`) — scan
-    // siblings of `build/` for a daemon binary.
-    for (const auto& entry : fs::directory_iterator(root)) {
-        if (!entry.is_directory()) continue;
-        fs::path probe = entry.path() / "recmeet-daemon";
-        if (fs::exists(probe)) return probe;
-    }
-    FAIL("recmeet-daemon binary not found under " << root.string());
-    return {};
-}
 
 // Generate `seconds` of S16LE mono silence at `sample_rate`. Returns the
 // raw PCM bytes (no WAV header). Whisper detects "no speech" on silence
@@ -192,23 +53,6 @@ fs::path find_daemon_binary() {
 std::string make_silence_pcm(int sample_rate, int seconds) {
     const std::size_t samples = static_cast<std::size_t>(sample_rate) * seconds;
     return std::string(samples * sizeof(int16_t), '\0');
-}
-
-// Write a minimal daemon config to <xdg>/recmeet/config.yaml that turns
-// off summary (no API key needed in CI) and diarization (sherpa on
-// silence is slow and adds no signal to this test).
-void write_test_config(const fs::path& xdg_config_dir) {
-    fs::path cfg_dir = xdg_config_dir / "recmeet";
-    fs::create_directories(cfg_dir);
-    std::ofstream cfg(cfg_dir / "config.yaml");
-    REQUIRE(cfg.is_open());
-    cfg << "# recmeet e2e test config\n"
-        << "summary:\n"
-        << "  disabled: true\n"
-        << "diarization:\n"
-        << "  enabled: false\n"
-        << "vad:\n"
-        << "  enabled: false\n";
 }
 
 } // anonymous namespace
@@ -231,7 +75,10 @@ TEST_CASE("V2 e2e: real daemon over TCP with PSK accepts process.submit, "
     fs::create_directories(note_dir);
     fs::create_directories(fetch_dst);
     fs::create_directories(out_dir);
-    write_test_config(xdg_config);
+    full_stack::write_minimal_test_config(xdg_config,
+                                          /*disable_summary=*/true,
+                                          /*disable_diarization=*/true,
+                                          /*disable_vad=*/true);
 
     // --------------------------------------------------------------------
     // 2. Locate the daemon binary, spawn it on TCP with a fresh PSK
@@ -239,11 +86,17 @@ TEST_CASE("V2 e2e: real daemon over TCP with PSK accepts process.submit, "
     const std::string TCP_ADDR = "127.0.0.1:29991";
     const std::string PSK      = "e2e-thin-client-psk-token";
 
-    fs::path daemon_bin = find_daemon_binary();
+    fs::path daemon_bin = full_stack::find_daemon_binary();
     // Inform IpcClient::connect() of the PSK to send on the auth.token frame.
     setenv("RECMEET_AUTH_TOKEN", PSK.c_str(), 1);
 
-    DaemonChild daemon(daemon_bin, TCP_ADDR, PSK, xdg_config);
+    full_stack::SpawnedDaemon daemon(
+        daemon_bin,
+        full_stack::SpawnedDaemon::Transport::TCP,
+        TCP_ADDR,
+        PSK,
+        xdg_config,
+        /*unix_socket=*/fs::path{});
 
     // --------------------------------------------------------------------
     // 3. Connect a real IpcClient over TCP and complete the A.x handshake
@@ -367,11 +220,11 @@ TEST_CASE("V2 e2e: real daemon over TCP with PSK accepts process.submit, "
 
     // --------------------------------------------------------------------
     // 8. Cleanup — close client first so the daemon's poll loop sees
-    //    EOF before we SIGTERM in ~DaemonChild. Workdir is removed
+    //    EOF before we SIGTERM in ~SpawnedDaemon. Workdir is removed
     //    even on test failure via the deferred remove_all below.
     // --------------------------------------------------------------------
     client.close_connection();
-    // (DaemonChild dtor SIGTERMs + waits.)
+    // (SpawnedDaemon dtor SIGTERMs + waits.)
 
     // Best-effort workdir cleanup. Leaving on failure helps debugging.
     if (final_state == "done" && !written.empty()) {
