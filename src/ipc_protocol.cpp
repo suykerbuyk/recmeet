@@ -412,4 +412,12 @@ IpcEvent make_caption_degraded_event(int64_t job_id,
     return ev;
 }
 
+IpcEvent make_caption_started_event(int64_t job_id, int64_t ts_ms) {
+    IpcEvent ev;
+    ev.event = "caption.started";
+    ev.data["job_id"]       = job_id;
+    ev.data["timestamp_ms"] = ts_ms;
+    return ev;
+}
+
 } // namespace recmeet

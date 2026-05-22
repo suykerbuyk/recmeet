@@ -37,6 +37,17 @@ struct CaptionHooks {
     using EngineErrorCallback = void(*)(const std::string& message, void* userdata);
     EngineErrorCallback     on_engine_error = nullptr;
     void*                   engine_error_ud = nullptr;
+
+    /// Optional one-shot signal that a CaptionEngine has been successfully
+    /// constructed and wired into the in-flight recording. Fires from the
+    /// recording worker once the engine + audio callback are both live
+    /// (whether at record.start or mid-recording in response to the
+    /// `captions.start_engine` verb). The daemon broadcasts a
+    /// `caption.started` IPC event so the tray can flip its engine-started
+    /// state without depending on the verb response.
+    using CaptionEngineStartedCb = void (*)(void* userdata);
+    CaptionEngineStartedCb  on_engine_started = nullptr;
+    void*                   engine_started_ud = nullptr;
 };
 
 struct PipelineResult {

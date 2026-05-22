@@ -225,6 +225,7 @@ set(IPC_SOURCES
     src/ipc_client.cpp
     src/ipc_server.cpp
     src/caption_format.cpp
+    src/caption_start_channel.cpp
 )
 
 add_library(recmeet_ipc STATIC ${IPC_SOURCES})

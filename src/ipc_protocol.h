@@ -150,4 +150,14 @@ IpcEvent make_caption_degraded_event(int64_t job_id,
                                      const std::string& reason,
                                      int64_t timestamp_ms);
 
+// Emitted by the recording worker once it has successfully wired a
+// CaptionEngine into the in-flight recording (whether at record.start or
+// mid-recording in response to the `captions.start_engine` verb). The
+// tray flips its "engine started" state on this event, NOT on the verb's
+// return value, so a single code path handles both startup-time and
+// mid-recording wiring.
+//
+//   {"event":"caption.started","data":{"job_id":N,"timestamp_ms":N}}
+IpcEvent make_caption_started_event(int64_t job_id, int64_t ts_ms);
+
 } // namespace recmeet

@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 #include "backend_info.h"
+#include "caption_start_channel.h"
 #include "config.h"
 #include "config_json.h"
 #include "device_enum.h"
@@ -1044,6 +1045,7 @@ int main(int argc, char* argv[]) {
             hooks.result_ud = ctx.get();
             hooks.degraded_ud = ctx.get();
             hooks.engine_error_ud = ctx.get();
+            hooks.engine_started_ud = ctx.get();
             hooks.on_result = +[](const CaptionResult& r, void* ud) {
                 auto* c = static_cast<CaptionBroadcastCtx*>(ud);
                 IpcServer* s = c->server;
@@ -1082,6 +1084,16 @@ int main(int argc, char* argv[]) {
                     IpcEvent ev = make_caption_degraded_event(jid, "engine_error", ts);
                     ev.data["error"] = m;
                     s->broadcast(ev);
+                });
+            };
+            hooks.on_engine_started = +[](void* ud) {
+                auto* c = static_cast<CaptionBroadcastCtx*>(ud);
+                IpcServer* s = c->server;
+                int64_t jid = c->job_id;
+                int64_t ts = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now().time_since_epoch()).count();
+                s->post([s, jid, ts]() {
+                    s->broadcast(make_caption_started_event(jid, ts));
                 });
             };
 
@@ -1211,6 +1223,38 @@ int main(int argc, char* argv[]) {
         }
 
         resp.result["ok"] = true;
+        return true;
+    });
+
+    // captions.start_engine — fire-and-forget request to construct a
+    // CaptionEngine mid-recording. The verb handler validates state and
+    // queues the request via the caption-start channel; the recording
+    // worker picks it up on its next 200 ms poll tick and broadcasts a
+    // caption.started event via the on_engine_started hook on success.
+    server.on("captions.start_engine",
+              [](const IpcRequest& req, IpcResponse& resp, IpcError& err) {
+        if (!g_recording.load()) {
+            err.code = static_cast<int>(IpcErrorCode::NotRecording);
+            err.message = "Not recording";
+            return false;
+        }
+        std::string model;
+        auto it = req.params.find("caption_model");
+        if (it != req.params.end()) {
+            // json_val_as_string returns "" for non-string variants, which
+            // we treat as no override (use the per-recording snapshot).
+            model = json_val_as_string(it->second);
+        }
+        auto result = request_caption_engine_start(model);
+        if (result == CaptionStartRequestResult::WorkerNotReady) {
+            err.code = static_cast<int>(IpcErrorCode::NotRecording);
+            err.message = "Recording is ending — captions cannot be started now";
+            return false;
+        }
+        resp.result["ok"] = true;
+        resp.result["status"] = std::string(
+            (result == CaptionStartRequestResult::AlreadyRunning)
+                ? "already_running" : "queued");
         return true;
     });
 

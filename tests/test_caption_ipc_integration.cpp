@@ -20,6 +20,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include "caption_engine.h"
+#include "caption_start_channel.h"
 #include "caption_vtt.h"
 #include "ipc_client.h"
 #include "ipc_protocol.h"
@@ -274,6 +275,33 @@ struct CaptionDaemonSim {
             ctx.reset();
             recording.store(false);
             resp.result["ok"] = true;
+            return true;
+        });
+
+        // captions.start_engine — mirrors daemon.cpp's handler but reads the
+        // sim's `recording` atomic instead of the daemon's g_recording.
+        server.on("captions.start_engine",
+                  [this](const IpcRequest& req, IpcResponse& resp, IpcError& err) {
+            if (!recording.load()) {
+                err.code = static_cast<int>(IpcErrorCode::NotRecording);
+                err.message = "Not recording";
+                return false;
+            }
+            std::string model;
+            auto it = req.params.find("caption_model");
+            if (it != req.params.end()) {
+                model = json_val_as_string(it->second);
+            }
+            auto result = request_caption_engine_start(model);
+            if (result == CaptionStartRequestResult::WorkerNotReady) {
+                err.code = static_cast<int>(IpcErrorCode::NotRecording);
+                err.message = "Recording is ending — captions cannot be started now";
+                return false;
+            }
+            resp.result["ok"] = true;
+            resp.result["status"] = std::string(
+                (result == CaptionStartRequestResult::AlreadyRunning)
+                    ? "already_running" : "queued");
             return true;
         });
     }
@@ -831,4 +859,179 @@ TEST_CASE("captions_enabled=false produces no captions.vtt sidecar",
     REQUIRE_FALSE(fs::exists(vtt_path));
 
     fs::remove_all(meeting_dir);
+}
+
+// ===========================================================================
+// Phase 1 smoke tests for `captions.start_engine` verb + caption_start_channel.
+//
+// These tests verify the channel state machine and the verb-handler glue at
+// the daemon-sim layer, without spinning up a real recording worker. The
+// fixture resets the file-static channel state between TEST_CASEs.
+// ===========================================================================
+
+namespace {
+
+struct CaptionChannelTestFixture {
+    CaptionChannelTestFixture() { reset_caption_start_channel(); }
+    ~CaptionChannelTestFixture() { reset_caption_start_channel(); }
+};
+
+} // anonymous namespace
+
+TEST_CASE_METHOD(CaptionChannelTestFixture,
+                 "captions.start_engine returns NotRecording when idle",
+                 "[caption-ipc]") {
+    CaptionDaemonSim sim;
+    sim.start();
+    // recording=false by default. Worker not active either.
+
+    auto client = caption_client();
+    IpcResponse resp;
+    IpcError err;
+    bool ok = client->call("captions.start_engine", resp, err);
+    CHECK_FALSE(ok);
+    CHECK(err.code == static_cast<int>(IpcErrorCode::NotRecording));
+    CHECK(err.message == "Not recording");
+}
+
+TEST_CASE_METHOD(CaptionChannelTestFixture,
+                 "captions.start_engine returns NotRecording when worker inactive",
+                 "[caption-ipc]") {
+    CaptionDaemonSim sim;
+    sim.start();
+    // Manually flip recording=true to exercise the worker-inactive guard.
+    // No mark_worker_active() call → channel reports WorkerNotReady →
+    // handler maps to NotRecording with the "ending" message.
+    sim.recording.store(true);
+
+    auto client = caption_client();
+    IpcResponse resp;
+    IpcError err;
+    bool ok = client->call("captions.start_engine", resp, err);
+    CHECK_FALSE(ok);
+    CHECK(err.code == static_cast<int>(IpcErrorCode::NotRecording));
+    CHECK(err.message == "Recording is ending — captions cannot be started now");
+
+    sim.recording.store(false);
+}
+
+TEST_CASE_METHOD(CaptionChannelTestFixture,
+                 "captions.start_engine returns queued when worker active",
+                 "[caption-ipc]") {
+    CaptionDaemonSim sim;
+    sim.start();
+    sim.recording.store(true);
+    mark_worker_active();
+
+    auto client = caption_client();
+    IpcResponse resp;
+    IpcError err;
+    bool ok = client->call("captions.start_engine", resp, err);
+    CHECK(ok);
+    CHECK(json_val_as_bool(resp.result["ok"]) == true);
+    CHECK(json_val_as_string(resp.result["status"]) == "queued");
+
+    sim.recording.store(false);
+}
+
+TEST_CASE_METHOD(CaptionChannelTestFixture,
+                 "captions.start_engine returns already_running after mark",
+                 "[caption-ipc]") {
+    CaptionDaemonSim sim;
+    sim.start();
+    sim.recording.store(true);
+    mark_worker_active();
+    mark_caption_engine_running();
+
+    auto client = caption_client();
+    IpcResponse resp;
+    IpcError err;
+    bool ok = client->call("captions.start_engine", resp, err);
+    CHECK(ok);
+    CHECK(json_val_as_bool(resp.result["ok"]) == true);
+    CHECK(json_val_as_string(resp.result["status"]) == "already_running");
+
+    sim.recording.store(false);
+}
+
+TEST_CASE_METHOD(CaptionChannelTestFixture,
+                 "concurrent captions.start_engine calls coalesce",
+                 "[caption-ipc]") {
+    CaptionDaemonSim sim;
+    sim.start();
+    sim.recording.store(true);
+    mark_worker_active();
+
+    auto client = caption_client();
+    IpcResponse resp1, resp2, resp3;
+    IpcError err1, err2, err3;
+
+    // First call: queues a new pending request.
+    REQUIRE(client->call("captions.start_engine", resp1, err1));
+    CHECK(json_val_as_string(resp1.result["status"]) == "queued");
+
+    // Second call without intervening poll: coalesces into the pending
+    // request; still returns Queued.
+    REQUIRE(client->call("captions.start_engine", resp2, err2));
+    CHECK(json_val_as_string(resp2.result["status"]) == "queued");
+
+    // Third call: also still queued — the pending flag is sticky until
+    // a worker tick drains it.
+    REQUIRE(client->call("captions.start_engine", resp3, err3));
+    CHECK(json_val_as_string(resp3.result["status"]) == "queued");
+
+    sim.recording.store(false);
+}
+
+TEST_CASE_METHOD(CaptionChannelTestFixture,
+                 "coalesce drops non-matching override with log_warn",
+                 "[caption-ipc]") {
+    CaptionDaemonSim sim;
+    sim.start();
+    sim.recording.store(true);
+    mark_worker_active();
+
+    auto client = caption_client();
+
+    // First call carries caption_model="A" → pending override is "A".
+    {
+        IpcResponse resp;
+        IpcError err;
+        JsonMap params;
+        params["caption_model"] = std::string("A");
+        REQUIRE(client->call("captions.start_engine", params, resp, err));
+        CHECK(json_val_as_string(resp.result["status"]) == "queued");
+    }
+
+    // Second call carries caption_model="B" → channel keeps "A" as the
+    // override (first request wins). Verb still returns Queued. The
+    // log_warn fires inside request_caption_engine_start; we don't have
+    // log capture wired here, so we verify behaviour by polling the
+    // channel with a stub start_fn that records the override it sees.
+    {
+        IpcResponse resp;
+        IpcError err;
+        JsonMap params;
+        params["caption_model"] = std::string("B");
+        REQUIRE(client->call("captions.start_engine", params, resp, err));
+        CHECK(json_val_as_string(resp.result["status"]) == "queued");
+    }
+
+    // Drain the channel via a stub start_fn that records the override
+    // string. It MUST be "A" (the first caller's value) — the "B"
+    // override from the second call was coalesced away.
+    std::string seen_override;
+    int call_count = 0;
+    poll_and_handle_caption_start_request(
+        [&](const std::string& m) {
+            seen_override = m;
+            ++call_count;
+            return false;  // failure path keeps engine_running=false so
+                           // we can re-verify the channel still accepts
+                           // new requests if needed.
+        });
+    CHECK(call_count == 1);
+    CHECK(seen_override == "A");
+
+    sim.recording.store(false);
 }
