@@ -1035,3 +1035,291 @@ TEST_CASE_METHOD(CaptionChannelTestFixture,
 
     sim.recording.store(false);
 }
+
+// ===========================================================================
+// Phase 2 tests for `captions.start_engine`. These exercise the
+// caption.started event broadcast — both for the recording-started-with-
+// captions path (sim invokes hooks.on_engine_started manually mirroring the
+// production worker entry) and the mid-recording verb path (test thread
+// drains the channel with a stub start_fn that invokes the hook). Tests use
+// CaptionChannelTestFixture to reset the file-static channel state.
+// ===========================================================================
+
+TEST_CASE_METHOD(CaptionChannelTestFixture,
+                 "caption.started fires when engine starts via record.start",
+                 "[caption-ipc]") {
+    CaptionDaemonSim sim;
+    sim.start();
+
+    auto starter = caption_client();
+    auto observer = caption_client();
+    CaptionEventCollector evs;
+    observer->set_event_callback(evs.callback());
+
+    IpcResponse resp;
+    IpcError err;
+    JsonMap params;
+    params["captions_enabled"] = true;
+    REQUIRE(starter->call("record.start", params, resp, err));
+    REQUIRE(sim.captions_enabled_for_active);
+
+    // Simulate the production worker-entry sequence: mark_worker_active()
+    // happens just before the polling loop; mark_caption_engine_running()
+    // is called inside the if (auto eng = ...) success block; and
+    // try_start_caption_engine invokes hooks.on_engine_started on success.
+    // The sim's record.start runs the equivalent of try_start_caption_engine
+    // but doesn't fire on_engine_started — emulate that here so we have a
+    // single canonical event-emission point per recording.
+    mark_worker_active();
+    // Wire the on_engine_started hook the same way daemon.cpp does, so the
+    // sim broadcasts caption.started when invoked. We do this after
+    // record.start has set up the rest of the hook surface.
+    sim.hooks.engine_started_ud = sim.ctx.get();
+    sim.hooks.on_engine_started = +[](void* ud) {
+        auto* c = static_cast<CaptionBroadcastCtx*>(ud);
+        IpcServer* s = c->server;
+        int64_t jid = c->job_id;
+        int64_t ts = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+        s->post([s, jid, ts]() {
+            s->broadcast(make_caption_started_event(jid, ts));
+        });
+    };
+    sim.hooks.on_engine_started(sim.hooks.engine_started_ud);
+    mark_caption_engine_running();
+
+    drain_caption_events(*observer, 300);
+    CHECK(evs.has_event("caption.started"));
+    CHECK(evs.count_event("caption.started") == 1);
+
+    // Subsequent verb call now returns already_running and produces no
+    // additional caption.started event.
+    IpcResponse resp2;
+    IpcError err2;
+    REQUIRE(starter->call("captions.start_engine", resp2, err2));
+    CHECK(json_val_as_string(resp2.result["status"]) == "already_running");
+    drain_caption_events(*observer, 100);
+    CHECK(evs.count_event("caption.started") == 1);
+
+    starter->call("record.stop", params, resp, err);
+}
+
+TEST_CASE_METHOD(CaptionChannelTestFixture,
+                 "caption.started fires when engine starts via verb",
+                 "[caption-ipc]") {
+    CaptionDaemonSim sim;
+    sim.start();
+
+    // Simulate a recording that started WITHOUT captions. The sim's
+    // record.start with captions_enabled=false doesn't populate hooks, so
+    // we build the broadcast ctx + on_engine_started hook directly — this
+    // mirrors the production daemon.cpp where hooks are populated
+    // unconditionally (Phase 2 daemon.cpp:1102 always-&hooks change).
+    sim.recording.store(true);
+    sim.active_job_id = sim.next_job_id.fetch_add(1);
+    sim.ctx = std::make_unique<CaptionBroadcastCtx>(
+        CaptionBroadcastCtx{&sim.server, sim.active_job_id});
+    sim.hooks = {};
+    sim.hooks.engine_started_ud = sim.ctx.get();
+    sim.hooks.on_engine_started = +[](void* ud) {
+        auto* c = static_cast<CaptionBroadcastCtx*>(ud);
+        IpcServer* s = c->server;
+        int64_t jid = c->job_id;
+        int64_t ts = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+        s->post([s, jid, ts]() {
+            s->broadcast(make_caption_started_event(jid, ts));
+        });
+    };
+    mark_worker_active();
+
+    auto client = caption_client();
+    CaptionEventCollector evs;
+    client->set_event_callback(evs.callback());
+
+    // Verb call — captions not yet running.
+    IpcResponse resp;
+    IpcError err;
+    REQUIRE(client->call("captions.start_engine", resp, err));
+    CHECK(json_val_as_string(resp.result["status"]) == "queued");
+
+    // No caption.started event yet — the worker hasn't drained the channel.
+    drain_caption_events(*client, 100);
+    CHECK_FALSE(evs.has_event("caption.started"));
+
+    // Drive the channel from the test thread (substitutes for the worker's
+    // 200ms loop tick). stub_start_fn invokes on_engine_started to mirror
+    // try_start_caption_engine's success path.
+    auto stub_start_fn = [&sim](const std::string& /*model*/) -> bool {
+        sim.hooks.on_engine_started(sim.hooks.engine_started_ud);
+        return true;
+    };
+    poll_and_handle_caption_start_request(stub_start_fn);
+
+    drain_caption_events(*client, 300);
+    CHECK(evs.has_event("caption.started"));
+    CHECK(evs.count_event("caption.started") == 1);
+
+    // After the channel transitions to (T,F,T), a subsequent verb returns
+    // already_running.
+    IpcResponse resp2;
+    IpcError err2;
+    REQUIRE(client->call("captions.start_engine", resp2, err2));
+    CHECK(json_val_as_string(resp2.result["status"]) == "already_running");
+
+    sim.recording.store(false);
+}
+
+TEST_CASE_METHOD(CaptionChannelTestFixture,
+                 "exactly one caption.started per recording (coalesce E2E)",
+                 "[caption-ipc]") {
+    CaptionDaemonSim sim;
+    sim.start();
+
+    sim.recording.store(true);
+    sim.active_job_id = sim.next_job_id.fetch_add(1);
+    sim.ctx = std::make_unique<CaptionBroadcastCtx>(
+        CaptionBroadcastCtx{&sim.server, sim.active_job_id});
+    sim.hooks = {};
+    sim.hooks.engine_started_ud = sim.ctx.get();
+    sim.hooks.on_engine_started = +[](void* ud) {
+        auto* c = static_cast<CaptionBroadcastCtx*>(ud);
+        IpcServer* s = c->server;
+        int64_t jid = c->job_id;
+        int64_t ts = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+        s->post([s, jid, ts]() {
+            s->broadcast(make_caption_started_event(jid, ts));
+        });
+    };
+    mark_worker_active();
+
+    auto client = caption_client();
+    CaptionEventCollector evs;
+    client->set_event_callback(evs.callback());
+
+    // Three verb calls back-to-back — only the first creates a pending
+    // request; the others coalesce. Phase 1 already verified this at the
+    // verb-result level; here we additionally verify the broadcast count.
+    for (int i = 0; i < 3; ++i) {
+        IpcResponse resp;
+        IpcError err;
+        REQUIRE(client->call("captions.start_engine", resp, err));
+        CHECK(json_val_as_string(resp.result["status"]) == "queued");
+    }
+
+    int start_fn_calls = 0;
+    auto stub_start_fn = [&](const std::string& /*model*/) -> bool {
+        ++start_fn_calls;
+        sim.hooks.on_engine_started(sim.hooks.engine_started_ud);
+        return true;
+    };
+    // Single poll drains the single pending request.
+    poll_and_handle_caption_start_request(stub_start_fn);
+    CHECK(start_fn_calls == 1);
+
+    drain_caption_events(*client, 300);
+    CHECK(evs.count_event("caption.started") == 1);
+
+    // Channel is now (T,F,T); fourth verb returns already_running with no
+    // additional event.
+    IpcResponse resp4;
+    IpcError err4;
+    REQUIRE(client->call("captions.start_engine", resp4, err4));
+    CHECK(json_val_as_string(resp4.result["status"]) == "already_running");
+    drain_caption_events(*client, 100);
+    CHECK(evs.count_event("caption.started") == 1);
+
+    sim.recording.store(false);
+}
+
+TEST_CASE_METHOD(CaptionChannelTestFixture,
+                 "captions.start_engine on bad model: caption.degraded engine_error, no caption.started + retry",
+                 "[caption-ipc]") {
+    CaptionDaemonSim sim;
+    sim.start();
+
+    sim.recording.store(true);
+    sim.active_job_id = sim.next_job_id.fetch_add(1);
+    sim.ctx = std::make_unique<CaptionBroadcastCtx>(
+        CaptionBroadcastCtx{&sim.server, sim.active_job_id});
+    sim.hooks = {};
+    sim.hooks.engine_error_ud = sim.ctx.get();
+    sim.hooks.engine_started_ud = sim.ctx.get();
+    sim.hooks.on_engine_error = +[](const std::string& msg, void* ud) {
+        auto* c = static_cast<CaptionBroadcastCtx*>(ud);
+        IpcServer* s = c->server;
+        int64_t jid = c->job_id;
+        int64_t ts = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+        std::string m = msg;
+        s->post([s, jid, m, ts]() {
+            IpcEvent ev = make_caption_degraded_event(jid, "engine_error", ts);
+            ev.data["error"] = m;
+            s->broadcast(ev);
+        });
+    };
+    sim.hooks.on_engine_started = +[](void* ud) {
+        auto* c = static_cast<CaptionBroadcastCtx*>(ud);
+        IpcServer* s = c->server;
+        int64_t jid = c->job_id;
+        int64_t ts = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+        s->post([s, jid, ts]() {
+            s->broadcast(make_caption_started_event(jid, ts));
+        });
+    };
+    mark_worker_active();
+
+    auto client = caption_client();
+    CaptionEventCollector evs;
+    client->set_event_callback(evs.callback());
+
+    // First verb call — queued.
+    {
+        IpcResponse resp;
+        IpcError err;
+        JsonMap params;
+        params["caption_model"] = std::string("bogus-model-dir");
+        REQUIRE(client->call("captions.start_engine", params, resp, err));
+        CHECK(json_val_as_string(resp.result["status"]) == "queued");
+    }
+
+    // Failing stub_start_fn: emits engine_error and returns false. The
+    // channel must leave engine_running=false so a retry can be queued.
+    auto failing_start_fn = [&](const std::string& /*model*/) -> bool {
+        sim.hooks.on_engine_error("model directory missing", sim.hooks.engine_error_ud);
+        return false;
+    };
+    poll_and_handle_caption_start_request(failing_start_fn);
+
+    drain_caption_events(*client, 300);
+    CHECK_FALSE(evs.has_event("caption.started"));
+    bool saw_engine_error = false;
+    for (auto& e : evs.snapshot()) {
+        if (e.event == "caption.degraded" &&
+            json_val_as_string(e.data["reason"]) == "engine_error") {
+            saw_engine_error = true;
+            break;
+        }
+    }
+    CHECK(saw_engine_error);
+
+    // Retry: subsequent verb call returns queued (not already_running) and
+    // a successful start_fn this time drains it.
+    {
+        IpcResponse resp;
+        IpcError err;
+        REQUIRE(client->call("captions.start_engine", resp, err));
+        CHECK(json_val_as_string(resp.result["status"]) == "queued");
+    }
+    auto ok_start_fn = [&](const std::string& /*model*/) -> bool {
+        sim.hooks.on_engine_started(sim.hooks.engine_started_ud);
+        return true;
+    };
+    poll_and_handle_caption_start_request(ok_start_fn);
+    drain_caption_events(*client, 300);
+    CHECK(evs.count_event("caption.started") == 1);
+
+    sim.recording.store(false);
+}

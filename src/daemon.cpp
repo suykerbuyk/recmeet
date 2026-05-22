@@ -1098,8 +1098,15 @@ int main(int argc, char* argv[]) {
             };
 
             try {
-                auto input = run_recording(cfg, g_rec_stop, on_phase,
-                                           cfg.captions_enabled ? &hooks : nullptr);
+                // Phase 2 (captions-mid-recording-ipc-verb rev 4): always pass
+                // &hooks. The `hooks` struct is fully populated regardless of
+                // `cfg.captions_enabled` (see :1044-1098), and post-Phase-2
+                // the recording worker MAY construct a CaptionEngine mid-
+                // recording in response to a `captions.start_engine` verb —
+                // those broadcasts also need this hook surface. The verb
+                // handler + caption_start_channel gate engine startup, not
+                // the hook pointer's presence.
+                auto input = run_recording(cfg, g_rec_stop, on_phase, &hooks);
 
                 // Apply any context sent by tray before stop
                 Config job_cfg = cfg;

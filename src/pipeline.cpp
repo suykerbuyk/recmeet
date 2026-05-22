@@ -3,6 +3,7 @@
 
 #include "pipeline.h"
 #include "caption_engine.h"
+#include "caption_start_channel.h"
 #include "caption_vtt.h"
 #include "config.h"
 #include "diarize.h"
@@ -403,6 +404,13 @@ std::unique_ptr<CaptionEngine> try_start_caption_engine(
     }
     log_info("captions: streaming engine started (model=%s)",
              opts.model_dir.c_str());
+    // Phase 2: notify the daemon that the engine + adapter are constructed so
+    // it can broadcast `caption.started` to all subscribed clients. Mirrors
+    // the on_engine_error null-check pattern above so test harnesses that
+    // omit the hook still build.
+    if (hooks->on_engine_started) {
+        hooks->on_engine_started(hooks->engine_started_ud);
+    }
     out_adapter = std::move(adapter);
     return engine;
 }
@@ -411,6 +419,13 @@ std::unique_ptr<CaptionEngine> try_start_caption_engine(
 
 PostprocessInput run_recording(const Config& cfg, StopToken& stop, PhaseCallback on_phase,
                                const CaptionHooks* caption_hooks) {
+    // Phase 2: belt-and-braces clear of the caption-start channel so any
+    // stale state from a prior recording's race window (between
+    // `g_rec_stop.request()` and `g_recording.store(false)`) cannot leak in.
+    // The matching cleanup at the bottom of this function covers the normal
+    // exit path; this one covers re-entry on the next recording.
+    reset_caption_start_channel();
+
     log_debug("pipeline: run_recording ENTER (mic=%s, monitor=%s)",
               cfg.mic_source.c_str(), cfg.monitor_source.c_str());
 
@@ -500,6 +515,19 @@ PostprocessInput run_recording(const Config& cfg, StopToken& stop, PhaseCallback
         //   cap.stop()  -> ActiveCaptionEngine dtor (unsub + engine.stop())
         //                -> cap.drain()
         // The dtor order is enforced by stack-frame nesting below.
+        //
+        // Phase 2 (captions-mid-recording-ipc-verb rev 4): `want_captions`
+        // is the INITIAL state only — whether to construct the engine at
+        // recording start. It is no longer the only gate on the caption
+        // engine's lifetime within the recording. Post-Phase-2, the tray
+        // can request a mid-recording engine start via the
+        // `captions.start_engine` verb, which queues a request that the
+        // 200ms worker loop drains regardless of `want_captions`. The
+        // authoritative "is an engine running for this recording?" signal
+        // is `engine_running` inside caption_start_channel.cpp; the
+        // `caption_hooks` pointer is now always non-null when the daemon
+        // is in the loop (see daemon.cpp:1102), so callers MUST NOT use
+        // `caption_hooks != nullptr` as a runtime captions-enabled gate.
         const bool want_captions = cfg.captions_enabled && caption_hooks != nullptr;
 
         if (dual_mode) {
@@ -556,17 +584,75 @@ PostprocessInput run_recording(const Config& cfg, StopToken& stop, PhaseCallback
                         caption_pa = std::make_unique<ActiveCaptionEngine<PulseMonitorCapture>>(
                             std::move(eng), mon_pa.get(), std::move(adapter));
                     }
+                    // Phase 2: the channel only reports `engine_running=true`
+                    // once both the engine AND the audio callback are wired
+                    // (ActiveCaptionEngine ctor publishes the callback).
+                    // Placement inside the success branch matters: a failed
+                    // engine init must NOT mark the channel running, or a
+                    // verb caller would see `already_running` while no engine
+                    // exists.
+                    mark_caption_engine_running();
                 }
             }
+
+            // Phase 2: mid-recording engine-start closure. Captures the
+            // monitor-side captures (mon_pw / mon_pa) — the engine wires to
+            // the monitor in dual mode, NOT the mic — plus both
+            // ActiveCaptionEngine slots, the output dir, the hooks pointer,
+            // and the per-recording cfg snapshot. The closure runs on this
+            // worker thread when the 200ms loop drains a pending verb
+            // request. It does NOT call mark_caption_engine_running() —
+            // poll_and_handle_caption_start_request handles the atomic
+            // (F,T,T) → (T,F,T) transition after start_fn returns true.
+            auto start_fn = [&caption_hooks, &cfg, &pp,
+                             &mon_pw, &mon_pa,
+                             &caption_pw, &caption_pa]
+                            (const std::string& model_override) -> bool {
+                Config local_cfg = cfg;
+                if (!model_override.empty()) {
+                    local_cfg.caption_model = model_override;
+                }
+                std::unique_ptr<CaptionFanoutAdapter> adapter;
+                auto eng = try_start_caption_engine(local_cfg, caption_hooks,
+                                                    pp.out_dir, adapter);
+                if (!eng) return false;
+                if (mon_pw) {
+                    caption_pw = std::make_unique<ActiveCaptionEngine<PipeWireCapture>>(
+                        std::move(eng), mon_pw.get(), std::move(adapter));
+                } else {
+                    caption_pa = std::make_unique<ActiveCaptionEngine<PulseMonitorCapture>>(
+                        std::move(eng), mon_pa.get(), std::move(adapter));
+                }
+                return true;
+            };
+
+            // Phase 2: open the verb-side gate IMMEDIATELY before entering
+            // the polling loop. After this, request_caption_engine_start is
+            // willing to return Queued. Paired with clear_worker_active()
+            // on loop exit so the gate closes BEFORE any teardown — closing
+            // the race window between g_rec_stop.request() and g_recording=false.
+            mark_worker_active();
 
             // Display timer and wait for stop
             StopToken timer_stop;
             std::thread timer_thread(display_elapsed, std::ref(timer_stop));
 
-            while (!stop.stop_requested())
+            while (!stop.stop_requested()) {
+                // Phase 2: drain any pending captions.start_engine request
+                // before sleeping. start_fn blocks 1-2 s on engine init;
+                // that's documented as Risk R10 (stop-token check delayed
+                // for the duration of start_fn — same property as the
+                // record.start-time engine init).
+                poll_and_handle_caption_start_request(start_fn);
                 std::this_thread::sleep_for(std::chrono::milliseconds(200));
+            }
 
             log_debug("pipeline: stop requested, draining audio");
+            // Phase 2: close the verb-side gate IMMEDIATELY on loop exit,
+            // BEFORE any teardown. Verb callers arriving during teardown now
+            // see WorkerNotReady and the daemon maps that to NotRecording
+            // with the "Recording is ending..." message.
+            clear_worker_active();
             timer_stop.request();
             timer_thread.join();
             fprintf(stderr, "Recording stopped.\n");
@@ -639,16 +725,46 @@ PostprocessInput run_recording(const Config& cfg, StopToken& stop, PhaseCallback
                                                         pp.out_dir, adapter)) {
                     caption = std::make_unique<ActiveCaptionEngine<PipeWireCapture>>(
                         std::move(eng), &cap, std::move(adapter));
+                    // Phase 2: see dual-mode branch above for the placement
+                    // rationale — only mark running when the audio callback
+                    // is also wired.
+                    mark_caption_engine_running();
                 }
             }
+
+            // Phase 2: mid-recording engine-start closure for mic-only mode.
+            // Wires to the single mic capture (&cap). Same closure contract
+            // as the dual-mode start_fn above.
+            auto start_fn = [&caption_hooks, &cfg, &pp,
+                             &cap, &caption]
+                            (const std::string& model_override) -> bool {
+                Config local_cfg = cfg;
+                if (!model_override.empty()) {
+                    local_cfg.caption_model = model_override;
+                }
+                std::unique_ptr<CaptionFanoutAdapter> adapter;
+                auto eng = try_start_caption_engine(local_cfg, caption_hooks,
+                                                    pp.out_dir, adapter);
+                if (!eng) return false;
+                caption = std::make_unique<ActiveCaptionEngine<PipeWireCapture>>(
+                    std::move(eng), &cap, std::move(adapter));
+                return true;
+            };
+
+            // Phase 2: see dual-mode branch above for the worker-active
+            // gating rationale.
+            mark_worker_active();
 
             StopToken timer_stop;
             std::thread timer_thread(display_elapsed, std::ref(timer_stop));
 
-            while (!stop.stop_requested())
+            while (!stop.stop_requested()) {
+                poll_and_handle_caption_start_request(start_fn);
                 std::this_thread::sleep_for(std::chrono::milliseconds(200));
+            }
 
             log_debug("pipeline: stop requested, draining audio");
+            clear_worker_active();
             timer_stop.request();
             timer_thread.join();
             fprintf(stderr, "Recording stopped.\n");
@@ -666,6 +782,12 @@ PostprocessInput run_recording(const Config& cfg, StopToken& stop, PhaseCallback
         }
 
     }
+
+    // Phase 2: final cleanup of the caption-start channel — matches the
+    // reset at entry. This covers the reprocess path (which never calls
+    // mark_worker_active) and the post-loop cleanup window so the next
+    // recording starts with a known-zeroed channel.
+    reset_caption_start_channel();
 
     log_debug("pipeline: run_recording EXIT (out_dir=%s)", pp.out_dir.c_str());
     return pp;

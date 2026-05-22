@@ -10,6 +10,7 @@
 #include "log.h"
 #include "notify.h"
 #include "api_models.h"
+#include "tray_caption_toggle.h"
 #include "util.h"
 #include "version.h"
 
@@ -113,16 +114,45 @@ struct TrayState {
     // when captions were enabled in the params); destroyed on tray exit. The
     // CaptionRenderState holds the rolling caption buffer; tick_id drives
     // periodic auto-hide checks while a recording is active.
+    //
+    // Phase 3 of captions-mid-recording-ipc-verb (rev 4) splits the original
+    // `captions_enabled_for_recording` bit into three independent flags:
+    //
+    //   engine_started_for_this_recording — daemon emitted caption.started
+    //     for the in-flight recording (so subsequent toggle-ON is local-only).
+    //   window_visible                    — the overlay window is currently
+    //     shown to the operator. Decouples render gating from engine state
+    //     so toggle-OFF locally hides the window without affecting engine.
+    //   start_pending                     — fire-and-forget verb call's
+    //     response said "queued" and the matching caption.started or
+    //     caption.degraded (engine_error) hasn't arrived yet. Clears in
+    //     the event handler.
+    //
+    // The legacy `captions_enabled_for_recording` is retained for backward
+    // compatibility with code paths that haven't been migrated yet; new code
+    // should consult the three split flags directly.
     struct {
         GtkWidget* window = nullptr;
         GtkWidget* label  = nullptr;
         recmeet::CaptionRenderState state;
         guint tick_id = 0;        // GLib timer for auto-hide ticks
         bool captions_enabled_for_recording = false;  // honored at record.start
+        bool engine_started_for_this_recording = false;
+        bool window_visible = false;
+        bool start_pending = false;
     } cap;
 };
 
 static TrayState g_tray;
+
+// Re-entrancy guard for `on_captions_enabled_toggled`. When the
+// caption.degraded (engine_error) handler reverts the menu check via
+// `gtk_check_menu_item_set_active(..., FALSE)`, GTK will re-fire the
+// "toggled" signal — without this guard the callback would re-enter and
+// try to persist / fire another verb. The set/clear is always paired and
+// scoped to the GTK call (no recursion, no threading concerns — GTK is
+// single-threaded).
+static bool g_suppress_captions_toggle = false;
 
 // Forward declarations
 static void build_menu();
@@ -155,6 +185,28 @@ static void setup_ipc_watch();
 static void teardown_ipc_watch();
 static gboolean try_reconnect(gpointer);
 
+// Phase 3 (captions-mid-recording-ipc-verb rev 4): single consolidated reset
+// for everything captions-related on recording-state-leave. Called from
+// update_state() when `recording` transitions from true to false, AND from
+// the daemon-reconnect path where we lose the in-flight session entirely.
+//
+// Closes the rev-3 H1 "stuck Starting… placeholder" bug: a verb fired late
+// in a recording (before caption.started arrives) used to leave the
+// placeholder up forever when the recording ended.
+static void tray_reset_caption_session_state() {
+    g_tray.cap.captions_enabled_for_recording = false;
+    g_tray.cap.engine_started_for_this_recording = false;
+    g_tray.cap.start_pending = false;
+    if (g_tray.cap.window_visible) {
+        if (g_tray.cap.window)
+            gtk_widget_hide(g_tray.cap.window);
+        g_tray.cap.window_visible = false;
+    }
+    g_tray.cap.state.clear();
+    if (g_tray.cap.label)
+        gtk_label_set_markup(GTK_LABEL(g_tray.cap.label), "");
+}
+
 static void update_state(bool rec, bool pp, bool dl, bool reproc = false) {
     bool was_recording = g_tray.recording;
     g_tray.recording = rec;
@@ -166,19 +218,13 @@ static void update_state(bool rec, bool pp, bool dl, bool reproc = false) {
     if (was_recording && !rec)
         close_context_window();
 
-    // Phase 5.1 — hide and reset the captions overlay when recording ends.
-    // (We don't destroy the GtkWindow here; recreating costs more than the
-    // tiny widget retained between recordings. The destroy path runs at
-    // tray exit.)
+    // Phase 3 — recording-state-leave: consolidated reset via the new helper.
+    // Replaces the inline cleanup at this location (legacy was scoped to
+    // captions_enabled_for_recording only; the helper resets the three
+    // rev-4 flags AND hides the overlay, including the "Starting…"
+    // placeholder).
     if (was_recording && !rec) {
-        g_tray.cap.captions_enabled_for_recording = false;
-        if (g_tray.cap.window) {
-            gtk_widget_hide(g_tray.cap.window);
-            g_tray.cap.state.clear();
-            // Re-render to clear out any leftover label content.
-            if (g_tray.cap.label)
-                gtk_label_set_markup(GTK_LABEL(g_tray.cap.label), "");
-        }
+        tray_reset_caption_session_state();
     }
 
     if (!rec && !pp && !dl) {
@@ -372,21 +418,77 @@ static void handle_ipc_event(const IpcEvent& ev) {
             notify("Meeting note ready", note);
         // Don't reset state here — the subsequent state.changed event handles it
     } else if (ev.event == "caption") {
-        // Phase 5.1 — only render captions if this recording was started
-        // with captions_enabled=true. The flag is captured at record.start.
-        // Defensive: if the daemon ever forwards a caption without us
-        // having opted in, drop it silently.
-        if (!g_tray.cap.captions_enabled_for_recording) return;
+        // Phase 3 of captions-mid-recording-ipc-verb (rev 4): ALWAYS update
+        // the renderer state. Window visibility is gated separately so
+        // toggle-back-ON shows the latest caption instantly rather than
+        // waiting 1–2 s for the next ASR endpoint. Defensive: do nothing
+        // if the daemon forwards an event when no recording is active.
+        if (!g_tray.recording) return;
         std::string text = json_val_as_string(ev.data.at("text"));
         bool is_partial = json_val_as_bool(ev.data.at("is_partial"));
         g_tray.cap.state.update(text, is_partial,
                                 g_tray.cfg.caption_normalize_display);
-        caption_overlay_show_with_markup();
+        if (g_tray.cap.window_visible) {
+            caption_overlay_show_with_markup();
+        }
     } else if (ev.event == "caption.degraded") {
-        if (!g_tray.cap.captions_enabled_for_recording) return;
+        if (!g_tray.recording) return;
         std::string reason = json_val_as_string(ev.data.at("reason"));
         g_tray.cap.state.degraded(reason);
-        caption_overlay_show_with_markup();
+        if (g_tray.cap.window_visible) {
+            caption_overlay_show_with_markup();
+        }
+        // Phase 3: failure-revert path for an in-flight verb call. When the
+        // daemon failed to construct the engine, it broadcasts
+        // caption.degraded with reason="engine_error". If we had a verb in
+        // flight (start_pending=true), this is its terminal result.
+        if (g_tray.cap.start_pending && reason == "engine_error") {
+            g_tray.cap.start_pending = false;
+            // Revert the menu check with the re-entrancy guard — otherwise
+            // GTK would re-fire the toggled signal and we'd recurse into
+            // on_captions_enabled_toggled.
+            // Look up the menu item via build_menu's accessor — but the
+            // captions item is a transient widget rebuilt by build_menu().
+            // The persisted state is what matters; the visible check mark
+            // updates the next time build_menu runs (state.changed handler
+            // calls build_menu indirectly via update_state). For safety we
+            // ALSO call build_menu() here so the visible state stays in sync.
+            g_tray.cfg.captions_enabled = false;
+            save_config(g_tray.cfg);
+            g_suppress_captions_toggle = true;
+            build_menu();
+            g_suppress_captions_toggle = false;
+            // Hide overlay (the placeholder is no longer wanted).
+            if (g_tray.cap.window_visible) {
+                if (g_tray.cap.window)
+                    gtk_widget_hide(g_tray.cap.window);
+                g_tray.cap.window_visible = false;
+            }
+            // Capture the operator-facing message before we lose context.
+            auto err_it = ev.data.find("error");
+            std::string err_msg = (err_it != ev.data.end())
+                ? json_val_as_string(err_it->second)
+                : std::string("Engine failed to start");
+            notify("Live captions failed", err_msg);
+        }
+    } else if (ev.event == "caption.started") {
+        // Phase 3 — engine confirmed up for this recording. Clears any
+        // in-flight start_pending placeholder; subsequent toggle-ON
+        // becomes ShowImmediately (no IPC).
+        if (!g_tray.recording) return;
+        g_tray.cap.engine_started_for_this_recording = true;
+        if (g_tray.cap.start_pending) {
+            g_tray.cap.start_pending = false;
+            // Re-render to clear any "Starting captions…" placeholder so
+            // the next real caption event is visible (otherwise the
+            // operator would see the placeholder text persist until the
+            // first ASR endpoint, which is what we just transitioned out
+            // of). The state itself is empty at this point — caption_*
+            // events haven't fired — so the render produces an empty label.
+            if (g_tray.cap.window_visible) {
+                caption_overlay_show_with_markup();
+            }
+        }
     } else if (ev.event == "model.downloading") {
         std::string status = json_val_as_string(ev.data.at("status"));
         if (status == "downloading") {
@@ -732,10 +834,17 @@ static void on_record(GtkMenuItem*, gpointer) {
     }
 
     // Phase 5.1 — captions are bound to the record.start params at recording
-    // start. Toggling the menu mid-recording does NOT take effect until the
-    // next recording. Snapshot the param value here so caption events know
-    // whether to render.
+    // start. Toggling the menu mid-recording starts the engine on demand
+    // (Phase 3 of captions-mid-recording-ipc-verb); the snapshot here only
+    // determines the INITIAL state. The legacy captions_enabled_for_recording
+    // flag is kept for backward compatibility but the rev-4 flags (set by
+    // event handlers) are the authoritative gates from here on.
     g_tray.cap.captions_enabled_for_recording = run_cfg.captions_enabled;
+    // Reset the rev-4 flags so a stale value from a previous recording's
+    // teardown gap doesn't bleed into the new session.
+    g_tray.cap.engine_started_for_this_recording = false;
+    g_tray.cap.start_pending = false;
+    g_tray.cap.window_visible = false;
     if (run_cfg.captions_enabled) {
         // Pre-create AND pre-show the overlay so the WM places the popup
         // ONCE at recording start. Subsequent caption events reach
@@ -751,6 +860,7 @@ static void on_record(GtkMenuItem*, gpointer) {
         // error reason. See live-captions-pivot-to-monitor task M1.
         caption_overlay_create();
         gtk_widget_show_all(g_tray.cap.window);
+        g_tray.cap.window_visible = true;
     }
 
     bool reproc = !g_tray.cfg.reprocess_dir.empty();
@@ -869,29 +979,120 @@ static void on_vad_toggled(GtkCheckMenuItem* item, gpointer) {
     save_config(g_tray.cfg);
 }
 
-// Phase 5.4 — Live captions toggle. Persists to config and applies to the
-// NEXT recording (captions are bound to record.start params; mid-recording
-// toggles do not take effect — the menu's tooltip makes this explicit).
+// Phase 3 of captions-mid-recording-ipc-verb (rev 4) — event-driven captions
+// toggle. The decision logic is extracted to a pure function
+// (decide_caption_toggle_action) for unit-testability. The GTK callback is a
+// thin dispatcher on the enum.
+//
+// State machine:
+//   PersistOnly      — not recording: just persist cfg.captions_enabled.
+//   FireVerb         — recording + ON + engine not started + no in-flight verb:
+//                      send captions.start_engine, pre-show overlay with
+//                      "Starting captions…" placeholder, set start_pending.
+//   ShowImmediately  — recording + ON + engine already running: show overlay.
+//   HideImmediately  — recording + OFF: hide overlay (engine keeps running per
+//                      the monotonic-engine rule).
+//   NoOp             — recording + ON + verb in flight: nothing more to do.
+//
+// The re-entrancy guard short-circuits when the caption.degraded
+// (engine_error) handler reverts the menu via build_menu() — GTK re-fires
+// "toggled" on the new check-menu-item that build_menu just created, and
+// without the guard we would recurse.
 static void on_captions_enabled_toggled(GtkCheckMenuItem* item, gpointer) {
-    const bool new_state = gtk_check_menu_item_get_active(item);
-    g_tray.cfg.captions_enabled = new_state;
-    save_config(g_tray.cfg);
+    if (g_suppress_captions_toggle) return;
 
-    // Toggle-off mid-recording: immediately hide the overlay and stop
-    // rendering caption events. The engine binds at record.start so the
-    // daemon-side engine keeps emitting events to the IPC stream — the
-    // guard at on_caption / on_caption.degraded drops them. Toggle-on
-    // mid-recording remains inert (no way to start the daemon engine
-    // mid-recording without a new IPC verb — out of scope).
-    if (!new_state && g_tray.cap.captions_enabled_for_recording) {
-        g_tray.cap.captions_enabled_for_recording = false;
-        if (g_tray.cap.window) {
-            gtk_widget_hide(g_tray.cap.window);
-            g_tray.cap.state.clear();
-            if (g_tray.cap.label)
-                gtk_label_set_markup(GTK_LABEL(g_tray.cap.label), "");
+    const bool new_state = gtk_check_menu_item_get_active(item);
+    auto action = decide_caption_toggle_action(
+        new_state,
+        g_tray.recording,
+        g_tray.cap.engine_started_for_this_recording,
+        g_tray.cap.start_pending);
+
+    // Persistence is the same in every branch except the failure-revert
+    // path inside FireVerb (which clears the flag back to false on error).
+    g_tray.cfg.captions_enabled = new_state;
+
+    switch (action) {
+    case CaptionToggleAction::PersistOnly:
+        // Not recording: persist new preference, no IPC, no overlay change.
+        save_config(g_tray.cfg);
+        return;
+    case CaptionToggleAction::HideImmediately:
+        // Toggle OFF mid-recording: engine keeps running, only hide the
+        // overlay locally. Don't clear the renderer state — toggle-back-ON
+        // should show the latest caption instantly.
+        if (g_tray.cap.window_visible) {
+            if (g_tray.cap.window)
+                gtk_widget_hide(g_tray.cap.window);
+            g_tray.cap.window_visible = false;
         }
+        save_config(g_tray.cfg);
+        return;
+    case CaptionToggleAction::ShowImmediately:
+        // Toggle ON mid-recording, engine already running (e.g. record.start
+        // with captions_enabled=true, or after a successful mid-recording
+        // start). No IPC traffic — just re-show the overlay with the latest
+        // accumulated state.
+        caption_overlay_show_with_markup();
+        g_tray.cap.window_visible = true;
+        save_config(g_tray.cfg);
+        return;
+    case CaptionToggleAction::NoOp:
+        // Operator clicked while a previous verb is still in flight. GTK has
+        // already flipped the check mark by convention; the resolution will
+        // arrive via caption.started or caption.degraded (engine_error) and
+        // reconcile state. Suppress a second verb fire.
+        save_config(g_tray.cfg);
+        return;
+    case CaptionToggleAction::FireVerb:
+        break;  // fall through below
     }
+
+    // FireVerb path: send captions.start_engine. Timeout is for the verb
+    // RESPONSE only (sub-millisecond on the daemon side); the engine init
+    // itself runs asynchronously and resolves via caption.started or
+    // caption.degraded (engine_error) on the IPC event stream.
+    JsonMap params;
+    IpcResponse resp;
+    IpcError err;
+    bool ok = g_tray.ipc.call("captions.start_engine", params, resp, err, 2000);
+    if (!ok) {
+        // Verb rejected (NotRecording, network, etc.). Revert the menu
+        // check with the re-entrancy guard so GTK doesn't recurse into us.
+        std::string msg = err.message.empty() ? "Unknown error" : err.message;
+        notify("Live captions failed", msg);
+        log_error("[tray] captions.start_engine failed: %s", msg.c_str());
+        g_tray.cfg.captions_enabled = false;
+        save_config(g_tray.cfg);
+        g_suppress_captions_toggle = true;
+        build_menu();
+        g_suppress_captions_toggle = false;
+        return;
+    }
+
+    std::string status = json_val_as_string(resp.result["status"]);
+    if (status == "already_running") {
+        // Defensive: the channel saw the engine as running but the tray
+        // never received caption.started (race? daemon restart with the
+        // engine still alive?). Update local state and show the overlay.
+        g_tray.cap.engine_started_for_this_recording = true;
+        g_tray.cap.start_pending = false;
+        caption_overlay_show_with_markup();
+        g_tray.cap.window_visible = true;
+        save_config(g_tray.cfg);
+        return;
+    }
+
+    // status == "queued" — request accepted; resolution arrives via event.
+    g_tray.cap.start_pending = true;
+    g_tray.cap.window_visible = true;
+    // Pre-show the overlay with a placeholder so the operator gets
+    // immediate feedback. Pipe the placeholder through the renderer's
+    // partial-update path so styling matches the in-progress look.
+    g_tray.cap.state.update("Starting captions…", /*is_partial=*/true,
+                            g_tray.cfg.caption_normalize_display);
+    caption_overlay_show_with_markup();
+    save_config(g_tray.cfg);
 }
 
 // --- Provider / model callbacks ---
@@ -1518,9 +1719,10 @@ static void build_menu() {
         gtk_check_menu_item_set_active(GTK_CHECK_MENU_ITEM(item),
                                        g_tray.cfg.captions_enabled);
         gtk_widget_set_tooltip_text(item,
-            "Live captions appear in a small overlay during recording. "
-            "Toggling this applies to the NEXT recording (captions are "
-            "bound to record.start parameters).");
+            "Live captions. Enabling during a recording starts the "
+            "captioning engine for the rest of this recording. Toggling "
+            "off only hides this overlay — the engine keeps running and "
+            "writing captions to the .vtt sidecar.");
         g_signal_connect(item, "toggled",
                          G_CALLBACK(on_captions_enabled_toggled), nullptr);
         // Always toggleable — even mid-recording, since the change only
