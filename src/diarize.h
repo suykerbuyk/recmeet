@@ -111,7 +111,7 @@ struct DiarizeChunkConfig {
     /// are auto-merged regardless of the ceiling; pairs below this similarity
     /// are merged ONLY when the ceiling (`target_speakers`) is already
     /// exceeded. Phase A.2 chose 0.55 empirically (M-4 floor).
-    float collapse_threshold = 0.55f;
+    float collapse_threshold = 0.65f;
 
     /// Phase A instrumentation: when non-empty, `stitch_chunks` writes a JSON
     /// artifact at the end of stitching containing all global centroids, the

@@ -94,12 +94,12 @@ struct JobConfig {
     //     calls override via context names). Persisted as
     //     [diarization] max_auto_speakers = N.
     //   collapse_threshold — cosine-similarity floor for the post-stitch
-    //     unified merge loop's auto-merge gate. Phase A.2 chose 0.55
-    //     empirically (M-4 floor). Production operators don't touch it;
-    //     surfaced as CLI for experimentation. Persisted as
-    //     [diarization] collapse_threshold = F.
+    //     unified merge loop's auto-merge gate. Phase A.2 chose 0.55;
+    //     iter-200 bumped to 0.65 after debate-fixture analysis (M-4 floor).
+    //     Production operators don't touch it; surfaced as CLI for
+    //     experimentation. Persisted as [diarization] collapse_threshold = F.
     int max_auto_speakers = 8;
-    float collapse_threshold = 0.55f;
+    float collapse_threshold = 0.65f;
 
     // Short-audio min-cluster-duration filter (follow-up to iter 194
     // diarize-overcount Phase A.3). Drops sherpa-clustering output clusters

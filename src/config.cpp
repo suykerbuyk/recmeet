@@ -651,7 +651,7 @@ void save_legacy_config_as_job_config(const JobConfig& cfg, const fs::path& conf
     if (!cfg.diarize || cfg.num_speakers > 0 || cfg.cluster_threshold != 1.18f ||
         cfg.chunk_minutes != 15.0f || cfg.chunk_overlap_sec != 30.0f ||
         cfg.stitch_threshold != 0.6f ||
-        cfg.max_auto_speakers != 8 || cfg.collapse_threshold != 0.55f ||
+        cfg.max_auto_speakers != 8 || cfg.collapse_threshold != 0.65f ||
         cfg.min_cluster_duration_sec != 3.0f) {
         out << "\ndiarization:\n";
         if (!cfg.diarize)
@@ -668,7 +668,7 @@ void save_legacy_config_as_job_config(const JobConfig& cfg, const fs::path& conf
             out << "  stitch_threshold: " << cfg.stitch_threshold << "\n";
         if (cfg.max_auto_speakers != 8)
             out << "  max_auto_speakers: " << cfg.max_auto_speakers << "\n";
-        if (cfg.collapse_threshold != 0.55f)
+        if (cfg.collapse_threshold != 0.65f)
             out << "  collapse_threshold: " << cfg.collapse_threshold << "\n";
         if (cfg.min_cluster_duration_sec != 3.0f)
             out << "  min_cluster_duration_sec: " << cfg.min_cluster_duration_sec << "\n";
