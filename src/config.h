@@ -82,7 +82,9 @@ struct JobConfig {
 
     // Diarization (on by default when built with RECMEET_USE_SHERPA)
     bool diarize = true;
-    int num_speakers = 0;  // 0 = auto-detect
+    int num_speakers = 0;  // 0 = auto-detect; values > 0 act as both ceiling
+                           // AND floor on diarize output (CLI-explicit only;
+                           // context-derived counts remain ceiling-only)
     float cluster_threshold = 1.18f;  // clustering distance threshold (lower = more splitting)
 
     // Phase B (diarize-overcount task):

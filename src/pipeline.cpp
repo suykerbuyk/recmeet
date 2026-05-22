@@ -663,10 +663,17 @@ PipelineResult run_postprocessing(const JobConfig& cfg, const PostprocessInput& 
                               chunk_cfg.stitch_threshold,
                               chunk_cfg.collapse_threshold,
                               cfg.cluster_threshold);
+                    // Phase 1a (diarize-apply-collapse-over-merges): the floor
+                    // branch of `apply_collapse` only fires for CLI-explicit
+                    // `--num-speakers N`. `target_source` was populated by
+                    // `resolve_target_speakers` above; treat its label
+                    // verbatim.
+                    bool enforce_floor = (target_source != nullptr
+                        && std::string(target_source) == "--num-speakers");
                     auto chunked = diarize_chunked(
                         samples.data(), samples.size(),
                         target_speakers, threads, cfg.cluster_threshold,
-                        chunk_cfg, diar_progress);
+                        chunk_cfg, enforce_floor, diar_progress);
                     diar = std::move(chunked.diar);
                     chunked_centroids = std::move(chunked.centroids);
                     log_debug("pipeline: chunked diarization complete "
@@ -739,9 +746,15 @@ PipelineResult run_postprocessing(const JobConfig& cfg, const PostprocessInput& 
                             // (`identify_speakers_with_centroids`,
                             // meeting_speakers loop) see 0..M-1 contiguous
                             // IDs.
+                            // Phase 1a (diarize-apply-collapse-over-merges):
+                            // floor branch fires only for CLI-explicit
+                            // `--num-speakers`. `target_source` came from
+                            // `resolve_target_speakers` above.
+                            bool enforce_floor = (target_source != nullptr
+                                && std::string(target_source) == "--num-speakers");
                             auto collapsed = apply_collapse(
                                 diar, globals, target_speakers,
-                                cfg.collapse_threshold);
+                                cfg.collapse_threshold, enforce_floor);
                             chunked_centroids = collapsed.centroids;
                             log_debug("pipeline: short-audio apply_collapse "
                                       "complete (%d speakers post-collapse, "
