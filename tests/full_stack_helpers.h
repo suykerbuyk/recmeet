@@ -41,6 +41,7 @@
 #include <filesystem>
 #include <fstream>
 #include <string>
+#include <string_view>
 #include <thread>
 
 namespace recmeet::full_stack {
@@ -304,6 +305,239 @@ inline fs::path find_daemon_binary() {
     FAIL("recmeet-daemon binary not found under " << root.string());
     return {};
 }
+
+// ---------------------------------------------------------------------------
+// find_tray_binary — resolve the path to a built `recmeet-tray`. Same
+// sibling-scan fallback as find_daemon_binary; the tray binary is only
+// emitted on a build that has GTK+AppIndicator (RECMEET_BUILD_TRAY=ON),
+// so we surface the missing-binary case as a SKIP via a sentinel return
+// (empty path) so the [full-stack][webui] test can check_skip rather
+// than FAIL on a no-tray build configuration.
+inline fs::path find_tray_binary() {
+    fs::path root = recmeet::test_helpers::find_project_root();
+    if (root.empty()) return {};
+    fs::path candidate = root / "build" / "recmeet-tray";
+    if (fs::exists(candidate)) return candidate;
+    for (const auto& entry : fs::directory_iterator(root)) {
+        if (!entry.is_directory()) continue;
+        fs::path probe = entry.path() / "recmeet-tray";
+        if (fs::exists(probe)) return probe;
+    }
+    return {};
+}
+
+// ---------------------------------------------------------------------------
+// SpawnedTray — fork+exec'd real `recmeet-tray` child harness for the
+// `[full-stack][webui]` real-daemon HTTP path.
+//
+// The tray binary takes `--daemon <addr>` (Unix socket path or host:port,
+// per `src/tray.cpp` argv parser at line ~3673), plus `--listen-now`
+// (bind the embedded WebUI immediately on startup) and `--headless` (no
+// AppIndicator / GTK menu — required for CI hosts without a display).
+// These are the same three flags `scripts/smoke.sh` uses.
+//
+// The embedded HTTP listener binds to a kernel-picked port via
+// `httplib::Server::bind_to_any_port("127.0.0.1")` (src/tray_web.cpp:518).
+// We discover the port by capturing the child's stderr (the tray's
+// `log_init(..., stderr=true)` path emits "[INFO] [tid=...] [tray_web]
+// embedded WebUI listening on http://127.0.0.1:NNN") and parsing the
+// substring.
+//
+// Lifecycle:
+//   ctor — pipe()+fork()+exec(); reads stderr until either the listening-on
+//          line is parsed (success) or the 60s deadline expires / the child
+//          dies first (FAIL with surfaced status).
+//   dtor — SIGTERM, wait 5s with WNOHANG, escalate to SIGKILL.
+//
+// The 60s readiness budget is longer than SpawnedDaemon's 5s because the
+// tray performs its own IPC connect to the daemon before binding the
+// listener; in CI the model-cache cold start plus connect retry can push
+// past 10s. Local steady-state startup is sub-second.
+struct SpawnedTray {
+    // Forking ctor.
+    //
+    //   tray_bin       — absolute path to a built `recmeet-tray` binary.
+    //   daemon_socket  — Unix socket path the tray's IpcClient connects to.
+    //                    Becomes the value of `--daemon <addr>`. Host:port
+    //                    is also accepted by the tray's parser but the
+    //                    full-stack test uses Unix.
+    //   xdg_config_dir — XDG_CONFIG_HOME for the tray child. Should equal
+    //                    the daemon's XDG_CONFIG_HOME so both pick up the
+    //                    same daemon.yaml (meetings_root + speaker_db
+    //                    pinning). The tray itself does not currently
+    //                    require any keys in daemon.yaml, but pointing it
+    //                    at the same dir is the contract scripts/smoke.sh
+    //                    uses (rev-2 C1 in the smoke header).
+    SpawnedTray(const fs::path& tray_bin,
+                const fs::path& daemon_socket,
+                const fs::path& xdg_config_dir)
+        : daemon_socket_(daemon_socket)
+        , xdg_config_(xdg_config_dir)
+    {
+        REQUIRE(fs::exists(tray_bin));
+        REQUIRE(!daemon_socket.empty());
+
+        // Stderr pipe — the tray's log_init writes to stderr; we read the
+        // "embedded WebUI listening on http://127.0.0.1:NNN" line to
+        // discover the kernel-picked port.
+        int err_pipe[2];
+        REQUIRE(::pipe(err_pipe) == 0);
+        // Set the read end non-blocking so the parser loop can poll
+        // without wedging on a hung child.
+        int flags = ::fcntl(err_pipe[0], F_GETFL, 0);
+        ::fcntl(err_pipe[0], F_SETFL, flags | O_NONBLOCK);
+
+        pid_ = fork();
+        REQUIRE(pid_ >= 0);
+
+        if (pid_ == 0) {
+            // Child: redirect stderr → pipe-write; close pipe-read.
+            ::dup2(err_pipe[1], STDERR_FILENO);
+            ::close(err_pipe[0]);
+            ::close(err_pipe[1]);
+            // Stdout to /dev/null — the tray emits no useful stdout, but
+            // we don't want it polluting the test runner.
+            int devnull = ::open("/dev/null", O_WRONLY);
+            if (devnull >= 0) {
+                ::dup2(devnull, STDOUT_FILENO);
+                ::close(devnull);
+            }
+            setenv("XDG_CONFIG_HOME", xdg_config_dir.c_str(), 1);
+            // Force log level to "info" so the "embedded WebUI listening
+            // on http://127.0.0.1:NNN" line shows up on stderr — that
+            // log line is how this harness discovers the kernel-picked
+            // port. The tray default is "error" (see config.h:152), which
+            // would suppress the listening-on line and leave us with no
+            // port-discovery channel. The daemon-side `RECMEET_LOG_LEVEL`
+            // override path (src/config.cpp:378-379) is what we ride here.
+            setenv("RECMEET_LOG_LEVEL", "info", 1);
+            ::execl(tray_bin.c_str(),
+                    "recmeet-tray",
+                    "--daemon", daemon_socket.c_str(),
+                    "--listen-now",
+                    "--headless",
+                    static_cast<char*>(nullptr));
+            _exit(127);
+        }
+
+        // Parent: close write end; poll stderr for the listening-on line.
+        ::close(err_pipe[1]);
+        err_pipe_read_ = err_pipe[0];
+
+        // 60s budget — see header comment. The tray reaches steady state
+        // sub-second on a warm runner but can take 5-10s on a cold one
+        // while the IPC connect retries through the jittered backoff.
+        auto deadline = std::chrono::steady_clock::now() + 60s;
+        std::string buf;
+        constexpr std::string_view kNeedle =
+            "embedded WebUI listening on http://127.0.0.1:";
+        while (std::chrono::steady_clock::now() < deadline) {
+            char tmp[1024];
+            ssize_t n = ::read(err_pipe_read_, tmp, sizeof(tmp));
+            if (n > 0) {
+                buf.append(tmp, static_cast<size_t>(n));
+                auto pos = buf.find(kNeedle);
+                if (pos != std::string::npos) {
+                    auto port_begin = pos + kNeedle.size();
+                    auto port_end = port_begin;
+                    while (port_end < buf.size() &&
+                           buf[port_end] >= '0' && buf[port_end] <= '9') {
+                        ++port_end;
+                    }
+                    if (port_end > port_begin) {
+                        port_ = std::atoi(
+                            buf.substr(port_begin,
+                                       port_end - port_begin).c_str());
+                        if (port_ > 0) break;
+                    }
+                }
+            } else if (n == 0) {
+                // EOF on child stderr — the child closed it (probably
+                // exited). Drop through to the status-check below.
+                break;
+            } else {
+                // EAGAIN/EWOULDBLOCK — no data yet. Has the child died?
+                int status = 0;
+                pid_t r = ::waitpid(pid_, &status, WNOHANG);
+                if (r == pid_) {
+                    if (WIFEXITED(status)) {
+                        FAIL("tray child exited code "
+                             << WEXITSTATUS(status)
+                             << " before binding WebUI listener. "
+                             << "Captured stderr: " << buf);
+                    } else if (WIFSIGNALED(status)) {
+                        FAIL("tray child killed by signal "
+                             << WTERMSIG(status)
+                             << " before binding WebUI listener. "
+                             << "Captured stderr: " << buf);
+                    }
+                    FAIL("tray child reaped (status=" << status
+                         << ") before binding WebUI listener");
+                }
+                std::this_thread::sleep_for(50ms);
+            }
+        }
+        captured_stderr_ = buf;
+        if (port_ <= 0) {
+            int status = 0;
+            pid_t r = ::waitpid(pid_, &status, WNOHANG);
+            if (r == pid_ && WIFEXITED(status)) {
+                FAIL("tray child exited code " << WEXITSTATUS(status)
+                     << " before binding WebUI listener. "
+                     << "Captured stderr: " << buf);
+            } else if (r == pid_ && WIFSIGNALED(status)) {
+                FAIL("tray child killed by signal " << WTERMSIG(status)
+                     << " before binding WebUI listener. "
+                     << "Captured stderr: " << buf);
+            }
+            FAIL("tray did not bind WebUI listener within 60s. "
+                 << "Captured stderr: " << buf);
+        }
+    }
+
+    ~SpawnedTray() {
+        if (pid_ > 0) {
+            ::kill(pid_, SIGTERM);
+            auto deadline = std::chrono::steady_clock::now() + 5s;
+            bool reaped = false;
+            while (std::chrono::steady_clock::now() < deadline) {
+                int status = 0;
+                pid_t r = ::waitpid(pid_, &status, WNOHANG);
+                if (r == pid_) { reaped = true; break; }
+                std::this_thread::sleep_for(50ms);
+            }
+            if (!reaped) {
+                ::kill(pid_, SIGKILL);
+                int status = 0;
+                ::waitpid(pid_, &status, 0);
+            }
+        }
+        if (err_pipe_read_ >= 0) {
+            ::close(err_pipe_read_);
+            err_pipe_read_ = -1;
+        }
+    }
+
+    SpawnedTray(const SpawnedTray&) = delete;
+    SpawnedTray& operator=(const SpawnedTray&) = delete;
+
+    pid_t pid() const noexcept { return pid_; }
+    int port() const noexcept { return port_; }
+    std::string base_url() const {
+        return "http://127.0.0.1:" + std::to_string(port_);
+    }
+    const std::string& captured_stderr() const noexcept {
+        return captured_stderr_;
+    }
+
+private:
+    pid_t pid_ = -1;
+    int port_ = 0;
+    int err_pipe_read_ = -1;
+    fs::path daemon_socket_;
+    fs::path xdg_config_;
+    std::string captured_stderr_;
+};
 
 // ---------------------------------------------------------------------------
 // write_minimal_test_config — write a minimal daemon config.yaml under
