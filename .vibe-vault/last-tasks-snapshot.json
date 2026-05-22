@@ -1,10 +1,10 @@
 {
-  "iter_n": 194,
-  "anchor_sha": "0404774bfa34a600096ae3301a5c70949a991725",
+  "iter_n": 198,
+  "anchor_sha": "11e3895faba212eded73e4fd6d1b15522009a424",
   "active": [
+    "captions-mid-recording-ipc-verb",
     "full-stack-captions-60min-regression",
     "sherpa-onnx-1-13-bump",
-    "short-audio-ghost-cluster-min-duration-filter",
     "test-and-verification-hardening",
     "test-handler-coverage-phase2c",
     "thin-client-recording-server",
@@ -83,6 +83,7 @@
     "sherpa-onnx-hclust-warnings",
     "sherpa-onnx-wstring-convert",
     "shimmering-baking-rossum",
+    "short-audio-ghost-cluster-min-duration-filter",
     "speaker-id",
     "speaker-webui",
     "staged-crunching-breeze",
