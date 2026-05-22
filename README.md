@@ -137,6 +137,8 @@ Participants: Alice, Bob, Carol
 
 recmeet will use the participant count (3 here) as the diarizer's target speaker count. This overrides the auto-detect default (capped at `max_auto_speakers`, default 8) but is itself overridden by explicit `--num-speakers N` on the CLI. Comma, ` and `, and ` & ` separators are all accepted; case is insensitive; multiple `Participants:` lines are summed.
 
+When `--num-speakers N` is passed on the CLI, the count is enforced as **both ceiling and floor** — the diarize merge loop will neither over-create above N nor over-merge below N. Counts derived from the context's `Participants:` line are advisory (ceiling only).
+
 **Embedding model:** sherpa-onnx 3D-Speaker `eres2net_base` — same model already loaded for diarization. No additional download required when speaker ID is enabled.
 
 **Match algorithm:** cosine similarity on averaged speaker centroids. Each enrolled speaker has one or more 192-dimensional float embedding vectors stored as JSON; the in-memory `SpeakerEmbeddingManager` averages them internally. `GetBestMatches(mgr, embedding, threshold, 1)` returns the highest-scoring enrolled name above the threshold (`0.6` default, configurable via `--speaker-threshold`). Conflict resolution prevents two clusters from being assigned the same name — highest score wins.
@@ -691,6 +693,11 @@ Options:
   --no-mmap            Disable mmap for LLM model loading (default, avoids swap thrashing)
   --no-diarize         Disable speaker diarization
   --num-speakers N     Number of speakers (0 = auto-detect, default: 0).
+                       When passed explicitly on the CLI, N is enforced as
+                       both ceiling and floor — the diarize merge loop will
+                       neither over-create above N nor over-merge below N.
+                       Counts derived from the context's `Participants:` line
+                       are advisory (ceiling only).
                        For long audio that runs the chunked path, this is
                        enforced post-stitch as a global count limit via
                        sample-weighted greedy-merge (not per-chunk).

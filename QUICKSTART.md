@@ -639,6 +639,8 @@ recmeet --cluster-threshold 0.9
 recmeet --num-speakers 3
 ```
 
+When `--num-speakers N` is passed on the CLI, the count is enforced as **both ceiling and floor** — the diarize merge loop will neither over-create above N nor over-merge below N. Counts derived from the context's `Participants:` line are advisory (ceiling only).
+
 ## Troubleshooting
 
 **"Daemon: not running"** — Start the daemon: `recmeet-daemon &` or `systemctl --user start recmeet-daemon.service`

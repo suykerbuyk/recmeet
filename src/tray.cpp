@@ -698,7 +698,9 @@ static void show_context_window() {
     gtk_entry_set_placeholder_text(GTK_ENTRY(participants), "Participant names, comma-separated (optional)");
     gtk_widget_set_tooltip_text(participants,
         "Tip: a line like \"Participants: Alice, Bob, Carol\" lets recmeet "
-        "use the participant count as the speaker target during diarization.");
+        "use the participant count as an advisory ceiling for the diarizer "
+        "(it caps the count but won't force a floor). Pass --num-speakers N "
+        "on the CLI to enforce N as both ceiling and floor.");
     gtk_box_pack_start(GTK_BOX(vbox), participants, FALSE, FALSE, 0);
 
     // Notes

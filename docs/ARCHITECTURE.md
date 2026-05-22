@@ -416,7 +416,7 @@ When audio length exceeds `chunk_minutes * 60 + chunk_overlap_sec + 120` seconds
 3. **Runs `diarize_with_session` per chunk**, then extracts one raw embedding centroid per chunk-local speaker via `extract_speaker_embedding(session, ...)`.
 4. **Stitches** chunk-local IDs into a global registry by cosine similarity on L2-normalized centroids (threshold `stitch_threshold`, default `0.6`). Centroids themselves are stored *raw* (non-normalized) so the persisted `MeetingSpeaker.embedding` format is byte-shape compatible with the legacy single-call path.
 5. **Owns segments by midpoint-in-core** with full-extent emit. A boundary segment whose midpoint falls inside chunk[i]'s core is emitted by chunk[i] in full, even if its trailing edge spills into chunk[i+1]. `merge_speakers`'s max-overlap rule absorbs the benign duplicate.
-6. **Compacts global IDs to `0..N-1` contiguous** after the post-stitch greedy-merge that enforces the optional `num_speakers` ceiling. Without this pass `merge(1, 2)` of `{0,1,2,3}` would leave `{0,1,3}`, surfacing as `Speaker_01, Speaker_02, Speaker_04` in transcripts.
+6. **Compacts global IDs to `0..N-1` contiguous** after the post-stitch greedy-merge that enforces the optional `num_speakers` ceiling. When `--num-speakers N` is set explicitly on the CLI the same count is also enforced as a **floor**: the apply-collapse / merge loop will neither over-create above N nor over-merge below N. The floor branch fires only for CLI-supplied counts; context-derived counts (from a `Participants:` line) remain ceiling-only because context is an operator hint, not an assertion. Without the compaction pass `merge(1, 2)` of `{0,1,2,3}` would leave `{0,1,3}`, surfacing as `Speaker_01, Speaker_02, Speaker_04` in transcripts.
 7. **Bypasses re-extraction in identify-speakers.** The chunked diarize already produced one centroid per global cluster; the pipeline calls `identify_speakers_with_centroids(centroids, db, threshold)` instead of `identify_speakers(samples, ...)`. This skips the ~10 GB working-set spike (iter 110 / iter 114 measurements) the second extractor pass would otherwise cost on long audio.
 
 ### Configuration
@@ -426,7 +426,7 @@ When audio length exceeds `chunk_minutes * 60 + chunk_overlap_sec + 120` seconds
 | `diarization.chunk_minutes` | `--diarize-chunk-minutes` | `15.0` | Window width in minutes; threshold = `chunk_minutes*60 + chunk_overlap_sec + 120` s |
 | `diarization.chunk_overlap_sec` | `--diarize-chunk-overlap-sec` | `30.0` | Overlap between adjacent chunks (positive spacing required: `chunk_minutes*60 > chunk_overlap_sec + 60`) |
 | `diarization.stitch_threshold` | `--diarize-stitch-threshold` | `0.6` | Cosine-similarity floor for merging chunk-local centroids into the global registry |
-| `diarization.num_speakers` | `--num-speakers` | `0` (auto) | Post-stitch global count limit; sample-weighted greedy-merge enforces |
+| `diarization.num_speakers` | `--num-speakers` | `0` (auto) | Post-stitch global count; sample-weighted greedy-merge enforces. When passed explicitly on the CLI, enforced as **both ceiling and floor** (no over-create above N, no over-merge below N); context-derived counts (`Participants:` line) remain ceiling-only |
 | `diarization.cluster_threshold` | `--cluster-threshold` | `1.18` | Per-chunk clustering threshold forwarded to `set_clustering()` |
 
 ### Memory + wall-clock budget

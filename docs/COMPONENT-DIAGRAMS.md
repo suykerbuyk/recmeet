@@ -815,7 +815,7 @@ flowchart TD
     REG["Global registry<br/>(raw centroid, sample_count) per global ID"]
     MATCH["Per chunk-local centroid:<br/>L2-normalize transiently → cosine vs registry<br/>≥ stitch_threshold → merge (sample-weighted mean)<br/>else → new global ID"]
     OWN["Midpoint-in-core ownership:<br/>emit segment in full extent, rewrite times to global coords"]
-    CAP["if num_speakers > 0: greedy-merge most-similar pairs<br/>until count ≤ num_speakers"]
+    CAP["if num_speakers > 0: greedy-merge most-similar pairs<br/>until count ≤ num_speakers (ceiling).<br/>If CLI-supplied, also enforce floor:<br/>refuse to merge below num_speakers"]
     COMPACT["ID compaction pass:<br/>renumber globals to 0..N-1 contiguous"]
 
     RESULT["DiarizeChunkedResult {<br/>  diar: DiarizeResult (global coords),<br/>  centroids: map&lt;global_id, raw_vec&gt;<br/>}"]
@@ -835,7 +835,7 @@ flowchart TD
 
 - **Raw centroid storage (T2.1 H1).** Centroids are kept as raw model output throughout — L2-normalization happens transiently for the cosine dot product only. Persisted `MeetingSpeaker.embedding` therefore stays byte-shape compatible with the legacy single-call path; `remove_embedding` and the `--enroll` matcher still work.
 - **Full-extent segment emit (rev 7 M-1').** A boundary segment owned by chunk[i] is emitted with its full duration, not trimmed to the core. Adjacent-chunk benign overlap is handled by `merge_speakers`'s max-overlap rule. Trim-to-core was vulnerable to silent speech loss across chunk boundaries.
-- **Sample-weighted greedy-merge.** The post-stitch count limit merges the most-similar pair using `(count_a*centroid_a + count_b*centroid_b) / (count_a+count_b)`, preserving the relative voice contribution rather than averaging blindly.
+- **Sample-weighted greedy-merge.** The post-stitch count limit merges the most-similar pair using `(count_a*centroid_a + count_b*centroid_b) / (count_a+count_b)`, preserving the relative voice contribution rather than averaging blindly. When `--num-speakers N` is supplied explicitly on the CLI the merge loop also enforces a **floor** at N (no over-merge below the operator-asserted count); context-derived counts (`Participants:` line) remain ceiling-only because context is an operator hint, not an assertion.
 - **ID compaction (rev 7 M-2').** After all merges complete, surviving global IDs are renumbered to `0..N-1` so transcripts never show gaps like `Speaker_01, Speaker_02, Speaker_04`.
 
 The peak-RSS gate `tests/test_benchmark.cpp` ([benchmark][t2-1]) head-to-heads `diarize()` vs `diarize_chunked()` on the same buffer, sampling `recmeet::read_self_rss_kb()` at 1 Hz; pinned thresholds are `< 4 GB` peak on 30-min synthetic and `< 6 GB` on the iter-110 60-min real fixture.
