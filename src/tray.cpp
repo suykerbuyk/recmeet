@@ -1075,8 +1075,14 @@ static void on_captions_enabled_toggled(GtkCheckMenuItem* item, gpointer) {
         // Defensive: the channel saw the engine as running but the tray
         // never received caption.started (race? daemon restart with the
         // engine still alive?). Update local state and show the overlay.
+        // Mirror on_record_start's mapping sequence (create → show_all
+        // with empty markup) bit-for-bit — applying markup before show_all
+        // breaks xdg_popup parenting on Wayland/Sway. Re-apply markup
+        // after via show_with_markup, which is idempotent on a mapped popup.
         g_tray.cap.engine_started_for_this_recording = true;
         g_tray.cap.start_pending = false;
+        caption_overlay_create();
+        gtk_widget_show_all(g_tray.cap.window);
         caption_overlay_show_with_markup();
         g_tray.cap.window_visible = true;
         save_config(g_tray.cfg);
@@ -1084,11 +1090,16 @@ static void on_captions_enabled_toggled(GtkCheckMenuItem* item, gpointer) {
     }
 
     // status == "queued" — request accepted; resolution arrives via event.
+    // Map the popup the SAME way on_record_start does (create → show_all,
+    // empty markup). Applying markup before show_all causes the
+    // "temporary window without parent" GDK warning on Wayland/Sway and
+    // the popup never appears. After the popup is mapped, pushing the
+    // placeholder via state.update + caption_overlay_show_with_markup is
+    // safe (show_with_markup is idempotent on a mapped popup).
     g_tray.cap.start_pending = true;
     g_tray.cap.window_visible = true;
-    // Pre-show the overlay with a placeholder so the operator gets
-    // immediate feedback. Pipe the placeholder through the renderer's
-    // partial-update path so styling matches the in-progress look.
+    caption_overlay_create();
+    gtk_widget_show_all(g_tray.cap.window);
     g_tray.cap.state.update("Starting captions…", /*is_partial=*/true,
                             g_tray.cfg.caption_normalize_display);
     caption_overlay_show_with_markup();
