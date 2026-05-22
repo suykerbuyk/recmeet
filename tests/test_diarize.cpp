@@ -324,7 +324,8 @@ TEST_CASE("stitch: identical raw centroid across chunks merges to one global",
     };
 
     DiarizeChunkConfig cfg;
-    auto out = stitch_chunks({c0, c1}, {m0, m1}, ext, cfg, /*target_speakers=*/0);
+    auto out = stitch_chunks({c0, c1}, {m0, m1}, ext, cfg,
+                             /*target_speakers=*/0, /*enforce_floor=*/false);
 
     REQUIRE(out.diar.num_speakers == 1);
     REQUIRE(out.centroids.size() == 1);
@@ -348,7 +349,8 @@ TEST_CASE("stitch: orthogonal centroids produce distinct globals",
     };
 
     auto out = stitch_chunks({c0, c1}, {m0, m1}, ext,
-                             DiarizeChunkConfig{}, /*target_speakers=*/0);
+                             DiarizeChunkConfig{}, /*target_speakers=*/0,
+                             /*enforce_floor=*/false);
 
     REQUIRE(out.diar.num_speakers == 2);
     REQUIRE(out.centroids.size() == 2);
@@ -372,7 +374,8 @@ TEST_CASE("stitch: speaker A in chunk 0 and B in chunk 1 produce 2 globals",
     };
 
     auto out = stitch_chunks({c0, c1}, {m0, m1}, ext,
-                             DiarizeChunkConfig{}, /*target_speakers=*/0);
+                             DiarizeChunkConfig{}, /*target_speakers=*/0,
+                             /*enforce_floor=*/false);
     REQUIRE(out.diar.num_speakers == 2);
 }
 
@@ -394,7 +397,8 @@ TEST_CASE("stitch: weighted-mean update preserves raw (non-unit) centroid format
     };
 
     auto out = stitch_chunks({c0, c1}, {m0, m1}, ext,
-                             DiarizeChunkConfig{}, /*target_speakers=*/0);
+                             DiarizeChunkConfig{}, /*target_speakers=*/0,
+                             /*enforce_floor=*/false);
     REQUIRE(out.centroids.size() == 1);
     auto stored = out.centroids.begin()->second;
     float n = l2(stored);
@@ -423,7 +427,7 @@ TEST_CASE("stitch: cosine-similarity threshold boundary (0.59 vs 0.61)",
             make_extents(30.0, 60.0, 30.0, 60.0),
         };
         auto out = stitch_chunks({c0, c1}, {{{0, a}}, {{0, b}}}, ext, cfg,
-                                 /*target_speakers=*/0);
+                                 /*target_speakers=*/0, /*enforce_floor=*/false);
         CHECK(out.diar.num_speakers == 2);
     }
     // Above threshold → merged.
@@ -437,7 +441,7 @@ TEST_CASE("stitch: cosine-similarity threshold boundary (0.59 vs 0.61)",
             make_extents(30.0, 60.0, 30.0, 60.0),
         };
         auto out = stitch_chunks({c0, c1}, {{{0, a}}, {{0, b}}}, ext, cfg,
-                                 /*target_speakers=*/0);
+                                 /*target_speakers=*/0, /*enforce_floor=*/false);
         CHECK(out.diar.num_speakers == 1);
     }
 }
@@ -467,7 +471,8 @@ TEST_CASE("stitch: post-stitch count limit greedy-merges to N globals",
 
     DiarizeChunkConfig cfg;
     cfg.stitch_threshold = 0.99f;  // force distinct globals from stitching
-    auto out = stitch_chunks(chunks, cents, ext, cfg, /*target_speakers=*/3);
+    auto out = stitch_chunks(chunks, cents, ext, cfg, /*target_speakers=*/3,
+                             /*enforce_floor=*/false);
 
     // First 5 globals collapse to exactly 3 after greedy-merge.
     CHECK(out.diar.num_speakers == 3);
@@ -498,7 +503,7 @@ TEST_CASE("stitch: post-stitch merge uses sample-weighted mean of raw vectors",
     cfg.stitch_threshold = 0.99f;  // orthogonal so no merge during stitch
 
     auto out = stitch_chunks({c0, c1}, {{{0, A}}, {{0, B}}}, ext, cfg,
-                             /*target_speakers=*/1);
+                             /*target_speakers=*/1, /*enforce_floor=*/false);
     REQUIRE(out.centroids.size() == 1);
     auto merged = out.centroids.begin()->second;
 
@@ -543,11 +548,13 @@ TEST_CASE("stitch: post-merge ID compaction yields contiguous 0..N-1",
                                    i * 30.0, (i + 1) * 30.0));
     }
     // Pre-condition: stitching produces 4 globals.
-    auto pre = stitch_chunks(chunks, cents, ext, cfg, /*target_speakers=*/0);
+    auto pre = stitch_chunks(chunks, cents, ext, cfg, /*target_speakers=*/0,
+                             /*enforce_floor=*/false);
     REQUIRE(pre.diar.num_speakers == 4);
 
     // num_speakers=3 forces one merge; result IDs must be {0,1,2} contiguous.
-    auto out = stitch_chunks(chunks, cents, ext, cfg, /*target_speakers=*/3);
+    auto out = stitch_chunks(chunks, cents, ext, cfg, /*target_speakers=*/3,
+                             /*enforce_floor=*/false);
     REQUIRE(out.diar.num_speakers == 3);
     REQUIRE(out.centroids.size() == 3);
     CHECK(out.centroids.count(0) == 1);
@@ -582,7 +589,8 @@ TEST_CASE("diarize_chunked: core ownership emits each segment exactly once",
         // so we just test the chunk-0-owned case here directly.
         DiarizeResult c0 = make_chunk({{15.0, 25.0, 0}}, 1);
         DiarizeResult c1 = make_chunk({}, 0);
-        auto out = stitch_chunks({c0, c1}, {{{0, cent}}, {}}, ext, cfg, 0);
+        auto out = stitch_chunks({c0, c1}, {{{0, cent}}, {}}, ext, cfg, 0,
+                                 /*enforce_floor=*/false);
         REQUIRE(out.diar.segments.size() == 1);
         CHECK(out.diar.segments[0].start == 15.0);
         CHECK(out.diar.segments[0].end   == 25.0);
@@ -595,7 +603,7 @@ TEST_CASE("diarize_chunked: core ownership emits each segment exactly once",
         auto out = stitch_chunks({c0, c1},
                                  {std::map<int, std::vector<float>>{},
                                   std::map<int, std::vector<float>>{{0, cent}}},
-                                 ext, cfg, 0);
+                                 ext, cfg, 0, /*enforce_floor=*/false);
         REQUIRE(out.diar.segments.size() == 1);
         CHECK(out.diar.segments[0].start == 35.0);
         CHECK(out.diar.segments[0].end   == 45.0);
@@ -611,7 +619,8 @@ TEST_CASE("diarize_chunked: core ownership emits each segment exactly once",
         // [30, 60) under the upper-bound-half-open rule.
         DiarizeResult c0 = make_chunk({{29.0, 31.0, 0}}, 1);  // mid=30 in [0,30)? false
         DiarizeResult c1 = make_chunk({{4.0, 6.0, 0}}, 1);    // mid=30 in [30,60)? true
-        auto out = stitch_chunks({c0, c1}, {{{0, cent}}, {{0, cent}}}, ext, cfg, 0);
+        auto out = stitch_chunks({c0, c1}, {{{0, cent}}, {{0, cent}}}, ext, cfg, 0,
+                                 /*enforce_floor=*/false);
         // Exactly one chunk owns this midpoint — never both, never neither.
         REQUIRE(out.diar.segments.size() == 1);
     }
@@ -636,7 +645,8 @@ TEST_CASE("diarize_chunked: emitted segments use global timestamps for chunks i>
 
     auto out = stitch_chunks({c0, c1, c2},
                              {{{0, cent}}, {{0, cent}}, {{0, cent}}},
-                             ext, DiarizeChunkConfig{}, 0);
+                             ext, DiarizeChunkConfig{}, 0,
+                             /*enforce_floor=*/false);
 
     REQUIRE(out.diar.segments.size() == 3);
     // Segments are sorted by start; check the chunks-1+ ones meet their
@@ -676,7 +686,8 @@ TEST_CASE("diarize_chunked: boundary segment emitted at full extent (no trim)",
     DiarizeResult c1 = make_chunk({{1.0, 2.0, 0}}, 1);
 
     auto out = stitch_chunks({c0, c1}, {{{0, cent}}, {{0, cent}}},
-                             ext, DiarizeChunkConfig{}, 0);
+                             ext, DiarizeChunkConfig{}, 0,
+                             /*enforce_floor=*/false);
 
     REQUIRE(out.diar.segments.size() == 1);
     // Full-extent emit means start == 25.0 and end == 28.0, NOT trim-to-core
@@ -699,7 +710,7 @@ TEST_CASE("diarize_chunked: invalid config throws RecmeetError",
     try {
         diarize_chunked(samples.data(), samples.size(),
                         /*target_speakers=*/0, /*threads=*/1, /*threshold=*/1.18f,
-                        bad, nullptr);
+                        bad, /*enforce_floor=*/false, nullptr);
         FAIL("expected RecmeetError for invalid chunk config");
     } catch (const RecmeetError& e) {
         std::string msg = e.what();
@@ -762,7 +773,8 @@ TEST_CASE("apply_collapse: threshold-driven auto-merge pairs at T=0.55",
 
     auto out = apply_collapse(diar, globals,
                               /*target_speakers=*/2,
-                              /*collapse_threshold=*/0.55f);
+                              /*collapse_threshold=*/0.55f,
+                              /*enforce_floor=*/false);
 
     CHECK(out.num_speakers == 2);
     REQUIRE(out.centroids.size() == 2);
@@ -791,7 +803,8 @@ TEST_CASE("apply_collapse: ceiling forces merge below threshold floor",
 
     auto out = apply_collapse(diar, globals,
                               /*target_speakers=*/2,
-                              /*collapse_threshold=*/0.55f);
+                              /*collapse_threshold=*/0.55f,
+                              /*enforce_floor=*/false);
 
     // Cap-merge fired despite max pairwise sim being 0.0 (< 0.55 floor).
     CHECK(out.num_speakers == 2);
@@ -822,7 +835,8 @@ TEST_CASE("apply_collapse: under-cap and all-below-threshold leaves N intact",
 
     auto out = apply_collapse(diar, globals,
                               /*target_speakers=*/8,
-                              /*collapse_threshold=*/0.55f);
+                              /*collapse_threshold=*/0.55f,
+                              /*enforce_floor=*/false);
 
     CHECK(out.num_speakers == 5);
     REQUIRE(out.centroids.size() == 5);
@@ -860,7 +874,8 @@ TEST_CASE("apply_collapse: short-audio segment-rewrite + 0..N-1 compaction",
 
     auto out = apply_collapse(diar, globals,
                               /*target_speakers=*/0,           // no ceiling
-                              /*collapse_threshold=*/0.55f);
+                              /*collapse_threshold=*/0.55f,
+                              /*enforce_floor=*/false);
 
     REQUIRE(out.num_speakers == 3);
     REQUIRE(out.centroids.size() == 3);
@@ -1034,7 +1049,8 @@ TEST_CASE("stitch_chunks: dump path emits centroid JSON with compaction IDs",
     DiarizeChunkConfig cfg;
     cfg.debug_dump_centroids_path = tmp.string();
     // no timestamp → no suffix
-    auto out = stitch_chunks({c0, c1}, {m0, m1}, ext, cfg, /*target_speakers=*/0);
+    auto out = stitch_chunks({c0, c1}, {m0, m1}, ext, cfg, /*target_speakers=*/0,
+                             /*enforce_floor=*/false);
     REQUIRE(out.diar.num_speakers == 2);
     REQUIRE(std::filesystem::exists(tmp));
 

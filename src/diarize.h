@@ -167,8 +167,9 @@ struct ChunkExtents {
 ///     L2-normalized transiently for the dot product);
 ///   - sample-weighted running-mean update on raw centroids;
 ///   - midpoint-in-core ownership with full-extent emit (no trim);
-///   - post-stitch unified greedy-merge (`apply_collapse`) enforcing both
-///     `target_speakers` as a hard cap and `cfg.collapse_threshold` as the
+///   - post-stitch unified greedy-merge (`apply_collapse`) enforcing
+///     `target_speakers` as a ceiling (always), as a floor when
+///     `enforce_floor` is true, and `cfg.collapse_threshold` as the
 ///     auto-merge quality floor;
 ///   - deterministic ascending-current-ID compaction.
 ///
@@ -177,20 +178,28 @@ struct ChunkExtents {
 /// 10-weighted-vs-5-weighted running mean). Exposed for unit tests; the
 /// in-process orchestrator `diarize_chunked` calls this same helper.
 ///
-/// `target_speakers`: hard cap on the global-speaker count for the merge
-/// loop. Phase B semantics (rename from `num_speakers` to surface the shift):
-/// the unified greedy-merge loop in `apply_collapse` ALWAYS runs, with
-/// `target_speakers` as the ceiling. `target_speakers == 0` (legacy
-/// "auto-detect, no cap") is honored by treating it as "no ceiling":
-/// merges only happen when the threshold gate fires. Callers wanting the
-/// pre-Phase-B "no collapse" behavior should pass 0; callers wanting a
-/// hard cap should pass the resolved target (Phase B.2 precedence chain).
+/// `target_speakers`: target global-speaker count for the merge loop. Phase B
+/// semantics (rename from `num_speakers` to surface the shift): the unified
+/// greedy-merge loop in `apply_collapse` ALWAYS runs, with `target_speakers`
+/// as the ceiling. When `enforce_floor` is true (CLI-explicit `--num-speakers`
+/// source), `target_speakers` is ALSO a hard FLOOR — once `globals.size() <=
+/// target_speakers` the loop exits regardless of similarity. When false
+/// (context-derived or default), legacy ceiling-only behavior is preserved.
+/// `target_speakers == 0` (legacy "auto-detect, no cap") is honored by
+/// treating it as "no ceiling/floor": merges only happen when the threshold
+/// gate fires. Callers wanting the pre-Phase-B "no collapse" behavior should
+/// pass 0; callers wanting a hard cap should pass the resolved target
+/// (Phase B.2 precedence chain).
+///
+/// `enforce_floor`: when true, `target_speakers > 0` acts as both ceiling
+/// and floor — see `apply_collapse` for the full semantics matrix.
 DiarizeChunkedResult stitch_chunks(
     const std::vector<DiarizeResult>& chunk_results,
     const std::vector<std::map<int, std::vector<float>>>& chunk_centroids,
     const std::vector<ChunkExtents>& extents,
     const DiarizeChunkConfig& cfg,
-    int target_speakers);
+    int target_speakers,
+    bool enforce_floor);
 
 /// Run chunked diarization on a pre-loaded audio buffer (16kHz float32 mono).
 /// Slices the audio into overlapping chunks of `cfg.chunk_minutes` width with
@@ -199,12 +208,19 @@ DiarizeChunkedResult stitch_chunks(
 /// SpeakerEmbeddingSession), then stitches per-chunk speaker IDs into a
 /// global registry via `stitch_chunks`.
 ///
-/// `target_speakers`: hard cap on the global-speaker count enforced by the
-/// unified `apply_collapse` loop. 0 = no ceiling (auto-detect, post-stitch
-/// merges only happen when `cfg.collapse_threshold` fires). >0 = the unified
-/// loop force-merges past the floor until count <= target. Renamed from
+/// `target_speakers`: target global-speaker count enforced by the unified
+/// `apply_collapse` loop. 0 = no ceiling (auto-detect, post-stitch merges
+/// only happen when `cfg.collapse_threshold` fires). >0 = the unified loop
+/// force-merges down to `target_speakers` (ceiling). When `enforce_floor`
+/// is true, `target_speakers > 0` ALSO acts as a hard FLOOR — the loop
+/// exits once `globals.size() <= target_speakers`, even if surviving pairs
+/// remain above `cfg.collapse_threshold`. The floor branch is intended for
+/// CLI-explicit `--num-speakers N` (operator assertion); pass false for
+/// context-derived or default-resolved counts (operator hint). Renamed from
 /// `num_speakers` (Phase B.4) to flag the semantic shift from "0 = skip
-/// merge, else cap" to "always-on unified loop, target = hard cap".
+/// merge, else cap" to "always-on unified loop, target = ceiling (+ floor
+/// when enforce_floor)".
+/// `enforce_floor`: see semantics matrix on `apply_collapse`.
 /// `threshold`: per-chunk clustering threshold (sherpa default 1.18); distinct
 /// from `cfg.stitch_threshold` and from `cfg.collapse_threshold`.
 ///
@@ -215,6 +231,7 @@ DiarizeChunkedResult diarize_chunked(
     const float* samples, size_t num_samples,
     int target_speakers, int threads, float threshold,
     const DiarizeChunkConfig& chunk_cfg,
+    bool enforce_floor,
     DiarizeProgressCallback on_progress = nullptr);
 
 /// Run speaker diarization on a pre-loaded audio buffer (16kHz float32 mono).
@@ -253,9 +270,17 @@ DiarizeResult diarize(const fs::path& audio_path, int num_speakers = 0, int thre
 ///     synthetic-globals view of `diar_inout`'s clusters). Merged in place
 ///     by the unified loop; the post-loop survivors define the compaction
 ///     order (ascending current-ID).
-///   - `target_speakers`: hard cap on final speaker count. 0 = no ceiling.
+///   - `target_speakers`: target speaker count. 0 = no ceiling/floor.
 ///   - `collapse_threshold`: cosine-similarity floor for auto-merges
 ///     (Phase A.2 chose 0.55f).
+///   - `enforce_floor`: when true AND `target_speakers > 0`, treat
+///     `target_speakers` as a hard FLOOR — once the global count is at or
+///     below the target, no further merges fire regardless of similarity.
+///     When false, legacy ceiling-only behavior is preserved (threshold
+///     clause keeps merging if pairs sit above `collapse_threshold`).
+///     Phase 1a: CLI-explicit `--num-speakers` passes true; context-derived
+///     and default-resolved counts pass false (context is operator hint,
+///     not assertion).
 ///
 /// Returns: `CollapseResult{centroids, num_speakers}`. The `centroids` map
 /// is keyed by the new contiguous `0..N-1` IDs. Caller assigns this back
@@ -264,11 +289,26 @@ DiarizeResult diarize(const fs::path& audio_path, int num_speakers = 0, int thre
 /// Termination (per loop iteration):
 ///   - `ceiling_hit  = (target_speakers > 0 && globals.size() > target_speakers)`
 ///   - `threshold_ok = (best_sim >= collapse_threshold)`
-///   - `if (!ceiling_hit && !threshold_ok) break;`
+///   - `at_floor     = (enforce_floor && target_speakers > 0
+///                       && globals.size() <= target_speakers)`
+///   - `if (at_floor || (!ceiling_hit && !threshold_ok)) break;`
 ///
 /// When `ceiling_hit` is true the merge proceeds regardless of `best_sim` —
-/// the cap is the hard mechanism that forces a count. The threshold sets the
-/// floor on auto-merge quality only when we are at or below the cap.
+/// the cap is the hard mechanism that forces a count. The threshold sets
+/// the floor on auto-merge quality only when we are at or below the cap.
+/// When `at_floor` is true, no further merges fire (the floor short-circuits
+/// even the threshold gate).
+///
+/// Semantics matrix:
+///
+///   | enforce_floor | target_speakers | size vs target | behavior                       |
+///   | ------------- | --------------- | -------------- | ------------------------------ |
+///   | true          | >0              | > target       | ceiling merges down            |
+///   | true          | >0              | == target      | at_floor → break               |
+///   | true          | >0              | < target       | at_floor → break (no synthesis)|
+///   | false         | >0              | > target       | ceiling merges down (unchanged)|
+///   | false         | >0              | <= target      | threshold clause may still fire|
+///   | any           | 0               | any            | auto-detect (threshold-only)   |
 struct CollapseResult {
     std::map<int, std::vector<float>> centroids;
     int num_speakers = 0;
@@ -289,7 +329,8 @@ CollapseResult apply_collapse(
     DiarizeResult& diar_inout,
     std::vector<GlobalEntry>& globals,
     int target_speakers,
-    float collapse_threshold);
+    float collapse_threshold,
+    bool enforce_floor);
 
 /// Phase B.3 — short-audio adapter. Builds a `std::vector<GlobalEntry>` from
 /// a sherpa-clustering `DiarizeResult` by extracting one centroid per unique

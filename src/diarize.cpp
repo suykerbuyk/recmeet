@@ -558,7 +558,9 @@ long chunk_local_sample_count(const DiarizeResult& chunk, int local_sid) {
 // Termination per iteration (unified loop):
 //   - `ceiling_hit  = (target_speakers > 0 && globals.size() > target_speakers)`
 //   - `threshold_ok = (best_sim >= collapse_threshold)`
-//   - `if (!ceiling_hit && !threshold_ok) break;`
+//   - `at_floor     = (enforce_floor && target_speakers > 0
+//                       && globals.size() <= target_speakers)`
+//   - `if (at_floor || (!ceiling_hit && !threshold_ok)) break;`
 //
 // When the ceiling is hit, we merge regardless of similarity (count is the
 // hard cap). When the ceiling is not hit but the threshold gate fires, we
@@ -566,19 +568,33 @@ long chunk_local_sample_count(const DiarizeResult& chunk, int local_sid) {
 // count enforcement (Phase A analysis); the threshold sets the floor on
 // quality of merges done at-or-under the cap.
 //
-// `target_speakers == 0` means "no ceiling" (the pre-Phase-B "auto-detect
-// without cap" semantics on `stitch_chunks` map cleanly to this: the unified
-// loop still runs, but `ceiling_hit` is always false, so only threshold-driven
-// merges fire). This preserves backward compat for callers that pass 0.
+// Phase 1a (diarize-apply-collapse-over-merges task): when `enforce_floor`
+// is true, `target_speakers > 0` ALSO acts as a hard FLOOR — once the
+// global count is at or below the target, no further merges fire regardless
+// of similarity. This closes the operator-intent gap exposed by the debate
+// fixture where three real speakers were over-merged below the named
+// `--num-speakers 3` target. Floor branch is CLI-only: callers pass
+// `enforce_floor = true` only when `target_speakers` came from explicit
+// `--num-speakers N` (operator assertion); context-derived and
+// default-resolved counts pass false because context is operator hint,
+// not assertion.
+//
+// `target_speakers == 0` means "no ceiling/floor" (the pre-Phase-B
+// "auto-detect without cap" semantics on `stitch_chunks` map cleanly to
+// this: the unified loop still runs, but `ceiling_hit` and `at_floor` are
+// always false, so only threshold-driven merges fire). This preserves
+// backward compat for callers that pass 0.
 // ---------------------------------------------------------------------------
 CollapseResult apply_collapse(
     DiarizeResult& diar_inout,
     std::vector<GlobalEntry>& globals,
     int target_speakers,
-    float collapse_threshold) {
+    float collapse_threshold,
+    bool enforce_floor) {
 
     // Unified greedy-merge loop: find the highest-similarity pair, merge
-    // when EITHER `ceiling_hit` OR `threshold_ok`. Stop when both are false.
+    // when EITHER `ceiling_hit` OR `threshold_ok`. Stop when both are false
+    // OR when `at_floor` short-circuits (Phase 1a floor branch).
     while (globals.size() > 1) {
         int best_a_idx = -1, best_b_idx = -1;
         float best_sim = -2.0f;
@@ -608,7 +624,15 @@ CollapseResult apply_collapse(
             (target_speakers > 0
              && static_cast<int>(globals.size()) > target_speakers);
         bool threshold_ok = (best_sim >= collapse_threshold);
-        if (!ceiling_hit && !threshold_ok) break;
+        // Floor semantics: explicit CLI target_speakers is a hard FLOOR. Once
+        // at or below the named count, no further merges fire regardless of
+        // similarity. Context-derived target_speakers (enforce_floor=false)
+        // preserves legacy ceiling-only behavior because context is operator
+        // hint, not assertion.
+        bool at_floor =
+            (enforce_floor && target_speakers > 0
+             && static_cast<int>(globals.size()) <= target_speakers);
+        if (at_floor || (!ceiling_hit && !threshold_ok)) break;
 
         int id_a = globals[best_a_idx].id;
         int id_b = globals[best_b_idx].id;
@@ -738,7 +762,8 @@ DiarizeChunkedResult stitch_chunks(
     const std::vector<std::map<int, std::vector<float>>>& chunk_centroids,
     const std::vector<ChunkExtents>& extents,
     const DiarizeChunkConfig& cfg,
-    int target_speakers) {
+    int target_speakers,
+    bool enforce_floor) {
 
     if (chunk_results.size() != chunk_centroids.size()
         || chunk_results.size() != extents.size())
@@ -854,7 +879,7 @@ DiarizeChunkedResult stitch_chunks(
     // needs the original pre-merge IDs to look up the post-compaction IDs.
     std::vector<GlobalEntry> globals_snapshot = globals;  // for dump-remap
     auto collapsed = apply_collapse(out.diar, globals, target_speakers,
-                                    cfg.collapse_threshold);
+                                    cfg.collapse_threshold, enforce_floor);
     out.centroids = collapsed.centroids;
 
     // Build the {pre-merge ID → post-compaction ID} map by tracing each
@@ -947,6 +972,7 @@ DiarizeChunkedResult diarize_chunked(
     const float* samples, size_t num_samples,
     int target_speakers, int threads, float threshold,
     const DiarizeChunkConfig& chunk_cfg,
+    bool enforce_floor,
     DiarizeProgressCallback on_progress) {
 
     if (!samples || num_samples == 0)
@@ -1075,7 +1101,7 @@ DiarizeChunkedResult diarize_chunked(
     if (on_progress) on_progress(100, 100);
 
     return stitch_chunks(chunk_results, chunk_centroids, extents,
-                         chunk_cfg, target_speakers);
+                         chunk_cfg, target_speakers, enforce_floor);
 }
 #endif
 
