@@ -272,7 +272,7 @@ DiarizeResult diarize(const fs::path& audio_path, int num_speakers = 0, int thre
 ///     order (ascending current-ID).
 ///   - `target_speakers`: target speaker count. 0 = no ceiling/floor.
 ///   - `collapse_threshold`: cosine-similarity floor for auto-merges
-///     (Phase A.2 chose 0.55f).
+///     (Phase A.2 chose 0.55f; iter-200 bumped to 0.65f).
 ///   - `enforce_floor`: when true AND `target_speakers > 0`, treat
 ///     `target_speakers` as a hard FLOOR — once the global count is at or
 ///     below the target, no further merges fire regardless of similarity.
