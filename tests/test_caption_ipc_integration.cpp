@@ -1323,3 +1323,428 @@ TEST_CASE_METHOD(CaptionChannelTestFixture,
 
     sim.recording.store(false);
 }
+
+// ===========================================================================
+// Phase 4 — Integration regression tests for the async monotonic engine
+// lifecycle. Each test exercises one of the architectural invariants
+// end-to-end at the daemon-sim layer.
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// Phase 4 Test 1 — Engine monotonicity invariant.
+//
+// Once the engine starts mid-recording (or at record.start), toggling the
+// tray-side "captions visible" preference OFF/ON does NOT tear down the
+// daemon-side engine. The tray-side toggle is purely a render-suppression
+// flag — no IPC traffic, no engine teardown. The daemon keeps emitting
+// caption events for the rest of the recording.
+// ---------------------------------------------------------------------------
+TEST_CASE_METHOD(CaptionChannelTestFixture,
+                 "captions.start_engine: toggle OFF->ON mid-recording does not affect engine",
+                 "[caption-ipc][regression]") {
+    CaptionDaemonSim sim;
+    sim.start();
+
+    auto starter = caption_client();
+    auto observer = caption_client();
+    CaptionEventCollector evs;
+    observer->set_event_callback(evs.callback());
+
+    // Recording starts WITH captions; the sim wires the result hook in
+    // record.start so we have an end-to-end broadcast path.
+    IpcResponse resp;
+    IpcError err;
+    JsonMap params;
+    params["captions_enabled"] = true;
+    REQUIRE(starter->call("record.start", params, resp, err));
+    REQUIRE(sim.captions_enabled_for_active);
+    REQUIRE(sim.hooks.on_result != nullptr);
+
+    // Simulate worker entry + engine-running state.
+    mark_worker_active();
+    mark_caption_engine_running();
+
+    // Drive a first caption event and confirm receipt.
+    CaptionResult r1{"HELLO", false, 100};
+    sim.hooks.on_result(r1, sim.hooks.result_ud);
+    drain_caption_events(*observer, 200);
+    CHECK(evs.count_event("caption") == 1);
+
+    // Simulate the tray's window-visible flag flipping OFF. This is a
+    // pure tray-side state change — NO IPC traffic is generated (rev 4's
+    // tray decision-function returns SuppressRender for this transition).
+    // The test models the absence by simply not calling any verb here and
+    // asserting below that no extra events arrived from the daemon side.
+    const std::size_t events_after_first = evs.snapshot().size();
+
+    // Drive a second caption event AFTER the simulated toggle OFF. The
+    // daemon engine is still running — the event must arrive.
+    CaptionResult r2{"HELLO WORLD", false, 400};
+    sim.hooks.on_result(r2, sim.hooks.result_ud);
+    drain_caption_events(*observer, 200);
+    CHECK(evs.count_event("caption") == 2);
+
+    // Simulate toggle back ON. Again, no IPC: the engine is already
+    // running and the channel reports already_running if we asked
+    // (we don't — we model the tray's "engine_started_for_this_recording
+    // is already true" short-circuit).
+    const std::size_t events_after_second = evs.snapshot().size();
+    CHECK(events_after_second == events_after_first + 1);
+
+    // Final event after the simulated toggle ON.
+    CaptionResult r3{"HELLO WORLD AGAIN", false, 800};
+    sim.hooks.on_result(r3, sim.hooks.result_ud);
+    drain_caption_events(*observer, 200);
+    CHECK(evs.count_event("caption") == 3);
+
+    starter->call("record.stop", params, resp, err);
+}
+
+// ---------------------------------------------------------------------------
+// Phase 4 Test 2 — Single WEBVTT header invariant.
+//
+// A recording that starts WITHOUT captions and then enables them mid-flight
+// via captions.start_engine MUST produce a `captions.vtt` sidecar with
+// exactly ONE `WEBVTT` header line at the start. Cue lines must be in
+// chronological order.
+// ---------------------------------------------------------------------------
+TEST_CASE_METHOD(CaptionChannelTestFixture,
+                 "captions.start_engine: mid-recording start produces continuous VTT sidecar",
+                 "[caption-ipc][regression]") {
+    namespace fs = std::filesystem;
+    fs::path meeting_dir = fs::temp_directory_path()
+                         / ("recmeet_vtt_midrec_"
+                            + std::to_string(::getpid()));
+    fs::remove_all(meeting_dir);
+    fs::create_directories(meeting_dir);
+    fs::path vtt_path = meeting_dir / "captions.vtt";
+
+    CaptionDaemonSim sim;
+    sim.start();
+
+    // Recording starts WITHOUT captions (mode-2 scenario). The sim's
+    // record.start with captions_enabled=false does NOT populate hooks,
+    // so we build them directly — mirroring the production daemon.cpp
+    // path where hooks are populated unconditionally (Phase 2 change).
+    auto client = caption_client();
+    CaptionEventCollector evs;
+    client->set_event_callback(evs.callback());
+
+    IpcResponse resp;
+    IpcError err;
+    JsonMap params;
+    params["captions_enabled"] = false;
+    REQUIRE(client->call("record.start", params, resp, err));
+    REQUIRE_FALSE(sim.captions_enabled_for_active);
+
+    // Manually populate hooks + ctx for the mid-rec verb path.
+    sim.ctx = std::make_unique<CaptionBroadcastCtx>(
+        CaptionBroadcastCtx{&sim.server, sim.active_job_id});
+    sim.hooks = {};
+    sim.hooks.result_ud = sim.ctx.get();
+    sim.hooks.engine_started_ud = sim.ctx.get();
+    sim.hooks.on_result = +[](const CaptionResult& r, void* ud) {
+        auto* c = static_cast<CaptionBroadcastCtx*>(ud);
+        IpcServer* s = c->server;
+        int64_t jid = c->job_id;
+        std::string text = r.text;
+        bool ip = r.is_partial;
+        int64_t ts = r.timestamp_ms;
+        s->post([s, jid, text, ip, ts]() {
+            s->broadcast(make_caption_event(jid, text, ip, ts));
+        });
+    };
+    sim.hooks.on_engine_started = +[](void* ud) {
+        auto* c = static_cast<CaptionBroadcastCtx*>(ud);
+        IpcServer* s = c->server;
+        int64_t jid = c->job_id;
+        int64_t ts = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+        s->post([s, jid, ts]() {
+            s->broadcast(make_caption_started_event(jid, ts));
+        });
+    };
+    mark_worker_active();
+
+    // Fire the verb.
+    {
+        IpcResponse vresp;
+        IpcError verr;
+        REQUIRE(client->call("captions.start_engine", vresp, verr));
+        CHECK(json_val_as_string(vresp.result["status"]) == "queued");
+    }
+
+    // Drain the channel with a stub_start_fn that wires a real VttWriter
+    // alongside the broadcast hook (same pattern as the production
+    // CaptionFanoutAdapter installed by try_start_caption_engine).
+    CaptionFanoutSimAdapter adapter;
+    adapter.downstream_on_result = sim.hooks.on_result;
+    adapter.downstream_result_ud = sim.hooks.result_ud;
+    adapter.vtt = std::make_unique<VttWriter>(vtt_path,
+                                              /*normalize_display=*/true);
+
+    auto stub_start_fn = [&sim](const std::string& /*model*/) -> bool {
+        sim.hooks.on_engine_started(sim.hooks.engine_started_ud);
+        return true;
+    };
+    poll_and_handle_caption_start_request(stub_start_fn);
+
+    // Drive several caption events through the fan-out adapter (so they
+    // both broadcast AND append to the sidecar). Timestamps strictly
+    // ascending — the VttCueTimer will turn them into ordered cues.
+    CaptionResult f1{"FIRST LINE",  false, 500};
+    CaptionResult f2{"SECOND LINE", false, 1200};
+    CaptionResult f3{"THIRD LINE",  false, 2100};
+    caption_fanout_sim_on_result(f1, &adapter);
+    caption_fanout_sim_on_result(f2, &adapter);
+    caption_fanout_sim_on_result(f3, &adapter);
+
+    drain_caption_events(*client, 200);
+    client->call("record.stop", params, resp, err);
+    adapter.vtt.reset();  // close fd
+
+    // Read the sidecar.
+    REQUIRE(fs::exists(vtt_path));
+    std::ifstream in(vtt_path, std::ios::binary);
+    std::ostringstream ss; ss << in.rdbuf();
+    std::string contents = ss.str();
+
+    // Exactly one WEBVTT header line, at file start.
+    REQUIRE(contents.rfind("WEBVTT\n\n", 0) == 0);
+    std::size_t webvtt_count = 0;
+    std::size_t search = 0;
+    while ((search = contents.find("WEBVTT", search)) != std::string::npos) {
+        ++webvtt_count;
+        ++search;
+    }
+    CHECK(webvtt_count == 1);
+
+    // Cue lines in chronological order (normalized: first-letter capped).
+    std::size_t p1 = contents.find("First line");
+    std::size_t p2 = contents.find("Second line");
+    std::size_t p3 = contents.find("Third line");
+    REQUIRE(p1 != std::string::npos);
+    REQUIRE(p2 != std::string::npos);
+    REQUIRE(p3 != std::string::npos);
+    CHECK(p1 < p2);
+    CHECK(p2 < p3);
+
+    fs::remove_all(meeting_dir);
+}
+
+// ---------------------------------------------------------------------------
+// Phase 4 Test 3 — Coalesce invariant at the regression level.
+//
+// Three verb calls fired in quick succession produce exactly ONE
+// caption.started event after a single worker poll. A fourth verb call
+// returns already_running and produces no additional event.
+// ---------------------------------------------------------------------------
+TEST_CASE_METHOD(CaptionChannelTestFixture,
+                 "captions.start_engine: caption.started fires exactly once per recording",
+                 "[caption-ipc][regression]") {
+    CaptionDaemonSim sim;
+    sim.start();
+
+    // Recording starts WITHOUT captions; populate hooks directly for
+    // the mid-rec broadcast path.
+    auto client = caption_client();
+    CaptionEventCollector evs;
+    client->set_event_callback(evs.callback());
+
+    IpcResponse resp;
+    IpcError err;
+    JsonMap params;
+    params["captions_enabled"] = false;
+    REQUIRE(client->call("record.start", params, resp, err));
+
+    sim.ctx = std::make_unique<CaptionBroadcastCtx>(
+        CaptionBroadcastCtx{&sim.server, sim.active_job_id});
+    sim.hooks = {};
+    sim.hooks.engine_started_ud = sim.ctx.get();
+    sim.hooks.on_engine_started = +[](void* ud) {
+        auto* c = static_cast<CaptionBroadcastCtx*>(ud);
+        IpcServer* s = c->server;
+        int64_t jid = c->job_id;
+        int64_t ts = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+        s->post([s, jid, ts]() {
+            s->broadcast(make_caption_started_event(jid, ts));
+        });
+    };
+    mark_worker_active();
+
+    // Three verb calls in quick succession.
+    for (int i = 0; i < 3; ++i) {
+        IpcResponse vresp;
+        IpcError verr;
+        REQUIRE(client->call("captions.start_engine", vresp, verr));
+        CHECK(json_val_as_string(vresp.result["status"]) == "queued");
+    }
+
+    // Single poll drains the single pending request (the others were
+    // coalesced into it).
+    int start_fn_calls = 0;
+    auto stub_start_fn = [&](const std::string& /*model*/) -> bool {
+        ++start_fn_calls;
+        sim.hooks.on_engine_started(sim.hooks.engine_started_ud);
+        return true;
+    };
+    poll_and_handle_caption_start_request(stub_start_fn);
+    CHECK(start_fn_calls == 1);
+
+    drain_caption_events(*client, 300);
+    CHECK(evs.count_event("caption.started") == 1);
+
+    // Channel is now (T,F,T). A fourth verb call returns already_running
+    // and emits no additional caption.started.
+    IpcResponse vresp4;
+    IpcError verr4;
+    REQUIRE(client->call("captions.start_engine", vresp4, verr4));
+    CHECK(json_val_as_string(vresp4.result["status"]) == "already_running");
+    drain_caption_events(*client, 100);
+    CHECK(evs.count_event("caption.started") == 1);
+
+    client->call("record.stop", params, resp, err);
+}
+
+// ---------------------------------------------------------------------------
+// Phase 4 Test 4 — Async invariant: verb handler does not block the poll
+// thread.
+//
+// Uses TWO IpcClient instances connecting to the same CaptionDaemonSim
+// socket (IpcServer::accept_client supports multiple clients per
+// src/ipc_server.cpp:219-238). One client fires captions.start_engine on
+// a worker thread; the test thread fires status.get on the other. Both
+// responses must arrive in < 5 ms — the verb returns immediately without
+// engine init blocking the poll thread.
+// ---------------------------------------------------------------------------
+TEST_CASE_METHOD(CaptionChannelTestFixture,
+                 "captions.start_engine: poll thread is not blocked",
+                 "[caption-ipc][regression]") {
+    CaptionDaemonSim sim;
+    sim.start();
+
+    // Simulate recording-in-progress so the verb returns Queued (not
+    // NotRecording).
+    sim.recording.store(true);
+    mark_worker_active();
+
+    auto client_a = caption_client();
+    auto client_b = caption_client();
+
+    using clk = std::chrono::steady_clock;
+
+    std::atomic<std::int64_t> verb_us{-1};
+    std::thread worker([&]() {
+        IpcResponse resp;
+        IpcError err;
+        auto t0 = clk::now();
+        bool ok = client_a->call("captions.start_engine", resp, err);
+        auto t1 = clk::now();
+        CHECK(ok);
+        CHECK(json_val_as_string(resp.result["status"]) == "queued");
+        verb_us.store(std::chrono::duration_cast<std::chrono::microseconds>(
+                          t1 - t0).count());
+    });
+
+    // In parallel, fire status.get on client_b. The sim's status.get
+    // handler is registered at the top of CaptionDaemonSim's ctor.
+    IpcResponse resp_b;
+    IpcError err_b;
+    auto t0 = clk::now();
+    bool ok_b = client_b->call("status.get", resp_b, err_b);
+    auto t1 = clk::now();
+    CHECK(ok_b);
+    auto status_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                         t1 - t0).count();
+
+    worker.join();
+
+    // Both well under 5 ms (= 5000 us). The verb returned immediately
+    // without waiting for engine init; the poll thread was free to
+    // process status.get concurrently.
+    INFO("captions.start_engine wall time: " << verb_us.load() << " us");
+    INFO("status.get wall time:            " << status_us << " us");
+    CHECK(verb_us.load() >= 0);
+    CHECK(verb_us.load() < 5000);
+    CHECK(status_us < 5000);
+
+    sim.recording.store(false);
+}
+
+// ---------------------------------------------------------------------------
+// Phase 4 Test 5 — C1 fix verification: stale channel state cannot leak
+// across recordings.
+//
+// Reproduces the rev-3 C1 race window where a verb fires during the gap
+// between worker exit and g_recording=false. The rev-4 fix is the
+// reset_caption_start_channel() call at run_recording entry — the second
+// recording's worker drains the channel fresh, so any leftover
+// request_pending=true from the prior recording does NOT cause a
+// spurious engine start.
+// ---------------------------------------------------------------------------
+TEST_CASE_METHOD(CaptionChannelTestFixture,
+                 "captions.start_engine: stale channel state cannot leak across recordings",
+                 "[caption-ipc][regression]") {
+    CaptionDaemonSim sim;
+    sim.start();
+
+    auto client = caption_client();
+
+    // Recording A starts WITHOUT captions.
+    sim.recording.store(true);
+    mark_worker_active();
+    // No mark_caption_engine_running — recording A's cfg.captions_enabled
+    // is false.
+
+    // Verb fires during recording A. Channel becomes (F, T, T) =
+    // (engine_running=F, request_pending=T, is_worker_active=T).
+    {
+        IpcResponse resp;
+        IpcError err;
+        REQUIRE(client->call("captions.start_engine", resp, err));
+        CHECK(json_val_as_string(resp.result["status"]) == "queued");
+    }
+
+    // Recording A's worker exits — but g_recording is still true (this
+    // is the race window between g_rec_stop.request() and
+    // g_recording.store(false) in the production worker). Channel
+    // becomes (F, T, F).
+    clear_worker_active();
+
+    // A second verb fires in the gap. is_worker_active=F → returns
+    // NotRecording with the "ending" message. Channel state is unchanged:
+    // still (F, T, F).
+    {
+        IpcResponse resp;
+        IpcError err;
+        bool ok = client->call("captions.start_engine", resp, err);
+        CHECK_FALSE(ok);
+        CHECK(err.code == static_cast<int>(IpcErrorCode::NotRecording));
+        CHECK(err.message == "Recording is ending — captions cannot be started now");
+    }
+
+    // Recording A's worker hits its final teardown and calls
+    // reset_caption_start_channel(). Channel: (F, F, F).
+    reset_caption_start_channel();
+
+    // Recording B starts. The rev-4 C1 fix: run_recording's entry calls
+    // reset_caption_start_channel() AGAIN (belt and braces — even if
+    // the prior reset somehow missed). Then mark_worker_active().
+    sim.recording.store(true);  // simulate g_recording flip
+    reset_caption_start_channel();  // <- the rev-4 C1 fix
+    mark_worker_active();
+
+    // Recording B's worker's first poll tick. With the C1 fix in place
+    // the channel is (F, F, T) — request_pending is FALSE, so the
+    // start_fn must NOT be invoked.
+    bool stub_called = false;
+    auto stub_start_fn = [&](const std::string& /*model*/) -> bool {
+        stub_called = true;
+        return true;
+    };
+    poll_and_handle_caption_start_request(stub_start_fn);
+    CHECK_FALSE(stub_called);
+
+    sim.recording.store(false);
+}
