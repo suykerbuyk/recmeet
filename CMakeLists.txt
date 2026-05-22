@@ -573,6 +573,14 @@ if(RECMEET_BUILD_TESTS)
         tests/test_full_stack.cpp
         tests/test_full_stack_captions.cpp
         tests/test_full_stack_speaker_id.cpp
+        # Phase 3 (test-and-verification-hardening) Subagent 2 —
+        # [full-stack][webui] real-daemon HTTP write-path coverage. Drives
+        # POST /api/speakers/enroll, /api/meetings/<id>/speakers/relabel,
+        # /api/meetings/<id>/reprocess against the live tray binary +
+        # daemon binary; verifies on-disk state mutations via a direct
+        # IPC client. Closes the gap test_tray_web.cpp leaves (it uses a
+        # DaemonSim mock by design for translator unit-test isolation).
+        tests/test_full_stack_webui.cpp
         tests/test_integration_pipeline.cpp
         tests/streaming_capture_tests.cpp
         tests/streaming_engine_tests.cpp
