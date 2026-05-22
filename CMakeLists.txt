@@ -572,6 +572,7 @@ if(RECMEET_BUILD_TESTS)
         tests/test_ndjson_parse.cpp
         tests/test_full_stack.cpp
         tests/test_full_stack_captions.cpp
+        tests/test_full_stack_speaker_id.cpp
         tests/test_integration_pipeline.cpp
         tests/streaming_capture_tests.cpp
         tests/streaming_engine_tests.cpp
