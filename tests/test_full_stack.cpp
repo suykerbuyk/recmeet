@@ -198,8 +198,13 @@ TEST_CASE("Full pipeline: debate audio with API summary", "[full-stack][benchmar
     // --- 2. Diarization ---
     INFO("Checking diarization results");
     auto speakers = load_meeting_speakers(dr.out_dir);
-    CHECK(speakers.size() >= 2);
-    CHECK(speakers.size() <= 5);
+    // Floor semantics: --num-speakers=3 is enforced as both ceiling and floor.
+    // Realistic sherpa output range with the 3-participant hint is 2-3; floor
+    // blocks merges below sherpa's count. Primary expectation is exactly 3.
+    CHECK(speakers.size() >= 2);                          // headline regression guard (current bug allows 1)
+    CHECK(speakers.size() <= 3);                          // tighten from <= 5
+    INFO("speakers.size() == " << speakers.size() << " (expected 3 by floor semantics)");
+    CHECK(speakers.size() == 3);                          // primary; allows the rare sherpa-returns-2 edge to flag
     for (const auto& s : speakers) {
         INFO("Speaker: " << s.label << " duration=" << s.duration_sec);
         CHECK(s.duration_sec > 0.0f);
@@ -332,8 +337,13 @@ TEST_CASE("Full pipeline: debate audio with local LLM summary", "[full-stack][be
     CHECK(wer < 0.45);
 
     auto speakers = load_meeting_speakers(dr.out_dir);
-    CHECK(speakers.size() >= 2);
-    CHECK(speakers.size() <= 5);
+    // Floor semantics: --num-speakers=3 is enforced as both ceiling and floor.
+    // Realistic sherpa output range with the 3-participant hint is 2-3; floor
+    // blocks merges below sherpa's count. Primary expectation is exactly 3.
+    CHECK(speakers.size() >= 2);                          // headline regression guard (current bug allows 1)
+    CHECK(speakers.size() <= 3);                          // tighten from <= 5
+    INFO("speakers.size() == " << speakers.size() << " (expected 3 by floor semantics)");
+    CHECK(speakers.size() == 3);                          // primary; allows the rare sherpa-returns-2 edge to flag
 
     CHECK(dr.note_content.find("## Overview") != std::string::npos);
     CHECK(fs::exists(dr.pipeline.note_path));
