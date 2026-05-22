@@ -137,6 +137,7 @@ full-stack: ensure-submodules
 	cmake -B $(BUILD_DIR) -G Ninja $(CMAKE_OPTS) -DRECMEET_BUILD_TESTS=ON
 	ninja -C $(BUILD_DIR)
 	./$(BUILD_DIR)/recmeet --download-models --model base
+	./$(BUILD_DIR)/recmeet --caption-model en-2023-06-26 --download-models
 	./$(BUILD_DIR)/recmeet_tests "[full-stack]"
 
 install: build
