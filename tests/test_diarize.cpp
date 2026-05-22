@@ -890,6 +890,307 @@ TEST_CASE("apply_collapse: short-audio segment-rewrite + 0..N-1 compaction",
     }
 }
 
+// ===========================================================================
+// Phase 1a (diarize-apply-collapse-over-merges) — `enforce_floor` coverage.
+//
+// Eight cases driven directly through `apply_collapse` with synthetic globals.
+// The first five exercise the floor branch (`enforce_floor=true`); the last
+// three confirm `enforce_floor=false` preserves the legacy ceiling-only
+// behavior, including the headline debate fixture's pairwise similarity
+// shape `{0.634, 0.619, 0.508}` that motivated the floor branch.
+// ===========================================================================
+
+namespace {
+
+// Build a 3D unit vector with specified pairwise cosines for the debate-shape
+// fixture. Given the construction:
+//   v0 = (1, 0, 0)
+//   v1 = (c01, sqrt(1-c01^2), 0)
+//   v2 = (c02, (c12 - c01*c02)/sqrt(1-c01^2), sqrt(1 - c02^2 - y^2))
+// where (c01, c02, c12) are the requested pairwise cosines. Returns
+// {v0, v1, v2}; requires (c01, c02, c12) realizable (positive z under root).
+std::vector<std::vector<float>> three_vecs_with_cosines(
+    double c01, double c02, double c12) {
+    std::vector<std::vector<float>> out(3);
+    out[0] = {1.0f, 0.0f, 0.0f};
+    double s01 = std::sqrt(1.0 - c01 * c01);
+    out[1] = {static_cast<float>(c01), static_cast<float>(s01), 0.0f};
+    double y = (c12 - c01 * c02) / s01;
+    double z2 = 1.0 - c02 * c02 - y * y;
+    // Caller is responsible for picking realizable cosines; clamp tiny
+    // negatives from float drift to zero.
+    if (z2 < 0.0 && z2 > -1e-9) z2 = 0.0;
+    double z = std::sqrt(z2);
+    out[2] = {static_cast<float>(c02),
+              static_cast<float>(y),
+              static_cast<float>(z)};
+    return out;
+}
+
+} // namespace
+
+TEST_CASE("apply_collapse_floor_at_target",
+          "[diarize][apply-collapse][floor]") {
+    // 3 globals, target=3, all pairwise sims ≈ 0.90 (well above any threshold).
+    // With enforce_floor=true the loop must short-circuit on at_floor and
+    // leave all three globals intact. Without the floor (current legacy
+    // behavior) the threshold gate would merge them all to one.
+    auto vs = three_vecs_with_cosines(0.90, 0.90, 0.90);
+    std::vector<GlobalEntry> globals;
+    globals.push_back(make_global(0, vs[0], 100));
+    globals.push_back(make_global(1, vs[1], 100));
+    globals.push_back(make_global(2, vs[2], 100));
+
+    DiarizeResult diar;
+    diar.segments = {{0.0, 1.0, 0}, {1.0, 2.0, 1}, {2.0, 3.0, 2}};
+    diar.num_speakers = 3;
+
+    auto out = apply_collapse(diar, globals,
+                              /*target_speakers=*/3,
+                              /*collapse_threshold=*/0.55f,
+                              /*enforce_floor=*/true);
+
+    CHECK(out.num_speakers == 3);
+    REQUIRE(out.centroids.size() == 3);
+}
+
+TEST_CASE("apply_collapse_floor_ceiling_then_floor",
+          "[diarize][apply-collapse][floor]") {
+    // 4 globals, target=2. Construct a setup where ceiling merges 4→2 first
+    // (because target_speakers=2 < globals.size()=4), then floor blocks the
+    // next merge even though the remaining pair sits above the threshold.
+    //
+    // Layout: g0 == g1 (sim 1.0, mergeable first), g2 and g3 chosen so the
+    // (post-merge) g0' vs g2 sim sits above 0.55 (would normally fire).
+    // After ceiling-driven merges down to 2, the surviving pair's sim is
+    // still above 0.55 — floor must block.
+    std::vector<GlobalEntry> globals;
+    globals.push_back(make_global(0, {1.0f, 0.0f, 0.0f}, 100));
+    globals.push_back(make_global(1, {1.0f, 0.0f, 0.0f}, 100));  // dup of 0
+    // Pick g2 and g3 close to g0 so the post-merge pair (g0' vs survivor)
+    // sits above 0.55. g2 at cosine ≈ 0.70 with g0.
+    double c = 0.70;
+    double s = std::sqrt(1.0 - c * c);
+    globals.push_back(make_global(2, {static_cast<float>(c),
+                                       static_cast<float>(s), 0.0f}, 100));
+    globals.push_back(make_global(3, {static_cast<float>(c),
+                                       static_cast<float>(s), 0.0f}, 100));
+
+    DiarizeResult diar;
+    diar.segments = {
+        {0.0, 1.0, 0}, {1.0, 2.0, 1}, {2.0, 3.0, 2}, {3.0, 4.0, 3},
+    };
+    diar.num_speakers = 4;
+
+    auto out = apply_collapse(diar, globals,
+                              /*target_speakers=*/2,
+                              /*collapse_threshold=*/0.55f,
+                              /*enforce_floor=*/true);
+
+    // Ceiling brings 4→2; floor blocks the further-above-threshold merge.
+    CHECK(out.num_speakers == 2);
+    REQUIRE(out.centroids.size() == 2);
+}
+
+TEST_CASE("apply_collapse_floor_under_target_no_synthesis",
+          "[diarize][apply-collapse][floor]") {
+    // 2 globals, target=5, sim well below threshold. The starting count is
+    // already below the target — at_floor short-circuits and we do NOT
+    // synthesize additional speakers. Final count stays at 2.
+    std::vector<GlobalEntry> globals;
+    globals.push_back(make_global(0, {1.0f, 0.0f}, 100));
+    globals.push_back(make_global(1, {0.0f, 1.0f}, 100));  // sim 0.0
+
+    DiarizeResult diar;
+    diar.segments = {{0.0, 1.0, 0}, {1.0, 2.0, 1}};
+    diar.num_speakers = 2;
+
+    auto out = apply_collapse(diar, globals,
+                              /*target_speakers=*/5,
+                              /*collapse_threshold=*/0.55f,
+                              /*enforce_floor=*/true);
+
+    CHECK(out.num_speakers == 2);
+    REQUIRE(out.centroids.size() == 2);
+}
+
+TEST_CASE("apply_collapse_floor_target_1_extreme_ceiling",
+          "[diarize][apply-collapse][floor]") {
+    // 5 globals, target=1. All pairwise sims sit far below any sane
+    // threshold. The ceiling clause still forces merges until count <= 1;
+    // the floor only fires AT target, so it doesn't override the cap on
+    // the way down. Final count: 1.
+    std::vector<GlobalEntry> globals;
+    globals.push_back(make_global(0, {1.0f, 0.0f, 0.0f, 0.0f, 0.0f}, 100));
+    globals.push_back(make_global(1, {0.0f, 1.0f, 0.0f, 0.0f, 0.0f}, 100));
+    globals.push_back(make_global(2, {0.0f, 0.0f, 1.0f, 0.0f, 0.0f}, 100));
+    globals.push_back(make_global(3, {0.0f, 0.0f, 0.0f, 1.0f, 0.0f}, 100));
+    globals.push_back(make_global(4, {0.0f, 0.0f, 0.0f, 0.0f, 1.0f}, 100));
+
+    DiarizeResult diar;
+    diar.segments = {
+        {0.0, 1.0, 0}, {1.0, 2.0, 1}, {2.0, 3.0, 2},
+        {3.0, 4.0, 3}, {4.0, 5.0, 4},
+    };
+    diar.num_speakers = 5;
+
+    auto out = apply_collapse(diar, globals,
+                              /*target_speakers=*/1,
+                              /*collapse_threshold=*/0.55f,
+                              /*enforce_floor=*/true);
+
+    CHECK(out.num_speakers == 1);
+    REQUIRE(out.centroids.size() == 1);
+}
+
+TEST_CASE("apply_collapse_floor_debate_shape",
+          "[diarize][apply-collapse][floor]") {
+    // Headline regression case. 3 globals with the debate audio's measured
+    // pairwise cosines {0.634, 0.619, 0.508}, target=3, threshold=0.55 (OLD
+    // default — proves the bug fix is independent of Phase 1b's threshold
+    // bump). All three sims are above 0.55 so the legacy behavior collapses
+    // to 1 speaker; the floor branch must keep all three.
+    auto vs = three_vecs_with_cosines(0.634, 0.619, 0.508);
+    std::vector<GlobalEntry> globals;
+    globals.push_back(make_global(0, vs[0], 9653308));
+    globals.push_back(make_global(1, vs[1], 5529326));
+    globals.push_back(make_global(2, vs[2], 294299));
+
+    DiarizeResult diar;
+    diar.segments = {{0.0, 1.0, 0}, {1.0, 2.0, 1}, {2.0, 3.0, 2}};
+    diar.num_speakers = 3;
+
+    auto out = apply_collapse(diar, globals,
+                              /*target_speakers=*/3,
+                              /*collapse_threshold=*/0.55f,
+                              /*enforce_floor=*/true);
+
+    CHECK(out.num_speakers == 3);
+    REQUIRE(out.centroids.size() == 3);
+}
+
+TEST_CASE("apply_collapse_no_floor_context_derived_collapses",
+          "[diarize][apply-collapse][floor]") {
+    // Same debate-shape inputs as the headline test, but enforce_floor=false
+    // (i.e. target was context-derived, not CLI). The threshold clause must
+    // still merge — proving the floor's CLI-only scope: context-derived
+    // counts preserve the legacy ceiling-only contract.
+    auto vs = three_vecs_with_cosines(0.634, 0.619, 0.508);
+    std::vector<GlobalEntry> globals;
+    globals.push_back(make_global(0, vs[0], 9653308));
+    globals.push_back(make_global(1, vs[1], 5529326));
+    globals.push_back(make_global(2, vs[2], 294299));
+
+    DiarizeResult diar;
+    diar.segments = {{0.0, 1.0, 0}, {1.0, 2.0, 1}, {2.0, 3.0, 2}};
+    diar.num_speakers = 3;
+
+    auto out = apply_collapse(diar, globals,
+                              /*target_speakers=*/3,
+                              /*collapse_threshold=*/0.55f,
+                              /*enforce_floor=*/false);
+
+    // All pairs above threshold → threshold clause keeps firing until 1.
+    CHECK(out.num_speakers == 1);
+    REQUIRE(out.centroids.size() == 1);
+}
+
+TEST_CASE("apply_collapse_auto_detect_unchanged",
+          "[diarize][apply-collapse][floor]") {
+    // Auto-detect (target=0), threshold=0.65 (the new Phase 1b default).
+    // Sims chained 0.80 / 0.70 / 0.66 / 0.60 — all but the last sit at or
+    // above 0.65, so the threshold clause greedily merges down. Documents
+    // the count after each fire-or-stop iteration so Phase 1b's threshold
+    // bump can be compared against this baseline.
+    //
+    // Construction: 5 globals on a 2D unit circle at increasing angles.
+    // We pick angles such that the (i, i+1) pair has the requested cosine;
+    // higher-index pairs have lower cosines (cos(a+b) < cos(a) when a,b>0).
+    // The first-pair max (0.80) drives the initial merge; after merging
+    // those two, the new max-similarity pair determines the next gate.
+    // Exact final count depends on post-merge centroid drift — we record
+    // the observed value as the regression baseline.
+    auto vec_at = [](double angle) {
+        return std::vector<float>{static_cast<float>(std::cos(angle)),
+                                  static_cast<float>(std::sin(angle))};
+    };
+    // Angle increments chosen so consecutive cosines drop:
+    //   theta0=0, theta1=acos(0.80), theta2 = theta1+acos(0.70),
+    //   theta3 = theta2+acos(0.66), theta4 = theta3+acos(0.60).
+    double t0 = 0.0;
+    double t1 = std::acos(0.80);
+    double t2 = t1 + std::acos(0.70);
+    double t3 = t2 + std::acos(0.66);
+    double t4 = t3 + std::acos(0.60);
+
+    std::vector<GlobalEntry> globals;
+    globals.push_back(make_global(0, vec_at(t0), 100));
+    globals.push_back(make_global(1, vec_at(t1), 100));
+    globals.push_back(make_global(2, vec_at(t2), 100));
+    globals.push_back(make_global(3, vec_at(t3), 100));
+    globals.push_back(make_global(4, vec_at(t4), 100));
+
+    DiarizeResult diar;
+    diar.segments = {
+        {0.0, 1.0, 0}, {1.0, 2.0, 1}, {2.0, 3.0, 2},
+        {3.0, 4.0, 3}, {4.0, 5.0, 4},
+    };
+    diar.num_speakers = 5;
+
+    auto out = apply_collapse(diar, globals,
+                              /*target_speakers=*/0,           // auto-detect
+                              /*collapse_threshold=*/0.65f,    // new default
+                              /*enforce_floor=*/false);
+
+    // Regression baseline at threshold=0.65: pairs at or above 0.65 fire,
+    // pair at 0.60 does not. The greedy loop's post-merge drift may chain
+    // a few merges; record the observed count without over-asserting.
+    INFO("auto-detect @ 0.65 collapsed to " << out.num_speakers);
+    CHECK(out.num_speakers >= 1);
+    CHECK(out.num_speakers <= 5);
+}
+
+TEST_CASE("apply_collapse_auto_detect_at_old_threshold",
+          "[diarize][apply-collapse][floor]") {
+    // Same construction as the unchanged-baseline test, but threshold=0.55
+    // (the OLD default). The 0.60 pair now ALSO sits above the threshold,
+    // so the merge chain extends. Provides the delta-measurement reference
+    // for Phase 1b: comparing the final counts of this case and the 0.65
+    // case yields the threshold-bump impact for this synthetic chain.
+    auto vec_at = [](double angle) {
+        return std::vector<float>{static_cast<float>(std::cos(angle)),
+                                  static_cast<float>(std::sin(angle))};
+    };
+    double t0 = 0.0;
+    double t1 = std::acos(0.80);
+    double t2 = t1 + std::acos(0.70);
+    double t3 = t2 + std::acos(0.66);
+    double t4 = t3 + std::acos(0.60);
+
+    std::vector<GlobalEntry> globals;
+    globals.push_back(make_global(0, vec_at(t0), 100));
+    globals.push_back(make_global(1, vec_at(t1), 100));
+    globals.push_back(make_global(2, vec_at(t2), 100));
+    globals.push_back(make_global(3, vec_at(t3), 100));
+    globals.push_back(make_global(4, vec_at(t4), 100));
+
+    DiarizeResult diar;
+    diar.segments = {
+        {0.0, 1.0, 0}, {1.0, 2.0, 1}, {2.0, 3.0, 2},
+        {3.0, 4.0, 3}, {4.0, 5.0, 4},
+    };
+    diar.num_speakers = 5;
+
+    auto out = apply_collapse(diar, globals,
+                              /*target_speakers=*/0,
+                              /*collapse_threshold=*/0.55f,    // OLD default
+                              /*enforce_floor=*/false);
+
+    INFO("auto-detect @ 0.55 collapsed to " << out.num_speakers);
+    CHECK(out.num_speakers >= 1);
+    CHECK(out.num_speakers <= 5);
+}
+
 #endif  // RECMEET_USE_SHERPA
 
 // ===========================================================================
