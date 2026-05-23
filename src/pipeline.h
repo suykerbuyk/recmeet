@@ -62,6 +62,13 @@ struct PostprocessInput {
     fs::path audio_path;
     std::string transcript_text;  ///< If empty, postprocessing will transcribe from audio_path.
     std::string timestamp;  ///< YYYY-MM-DD_HH-MM form. Empty if dir/audio doesn't match the canonical pattern.
+    /// True if the recording was cancelled (via `record.cancel`) rather than
+    /// stopped normally. When true, the rec_worker MUST skip enqueueing a
+    /// PostprocessJob — the output directory has already been discarded by
+    /// `cleanup_cancelled_recording_dir` inside `run_recording`, and `out_dir`
+    /// is intentionally left empty. Defaults to false so existing callers
+    /// (cli/full-stack/reprocess) need no construction-site updates.
+    bool cancelled = false;
 };
 
 /// Phase callback — called with phase name: "recording", "transcribing", "diarizing", "summarizing", "complete".
@@ -140,7 +147,20 @@ int parse_context_participants(const std::string& context);
 /// `caption_hooks` (Phase 3) is consulted only when `cfg.captions_enabled`
 /// is true and a real recording is being performed (i.e. not reprocess).
 /// Pass nullptr (default) for the existing pre-Phase-3 behaviour.
-PostprocessInput run_recording(const Config& cfg, StopToken& stop,
+///
+/// `cancel` is observed alongside `stop` inside the recording loop. When
+/// `cancel.stop_requested()` is true on loop exit (or both tokens are set
+/// — cancel wins), the function stops captures, resets the caption slots,
+/// SKIPS drain/write/validate, calls `cleanup_cancelled_recording_dir`
+/// to discard the freshly-minted output directory, and returns
+/// `PostprocessInput{ .cancelled = true }` (out_dir intentionally empty).
+/// Reprocess paths never observe `cancel` because they never enter the
+/// recording loop; in-process callers (`run_pipeline`, `subprocess_main`)
+/// construct a dummy never-signalled cancel token — signalling from those
+/// contexts would delete operator reprocess data.
+PostprocessInput run_recording(const Config& cfg,
+                               StopToken& stop,
+                               StopToken& cancel,
                                PhaseCallback on_phase = nullptr,
                                const CaptionHooks* caption_hooks = nullptr);
 

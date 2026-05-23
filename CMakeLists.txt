@@ -256,6 +256,7 @@ set(CORE_SOURCES
     src/summarize.cpp
     src/note.cpp
     src/pipeline.cpp
+    src/pipeline_cleanup.cpp
     src/cli.cpp
     src/reprocess_batch.cpp
     src/diarize.cpp

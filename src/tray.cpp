@@ -385,6 +385,14 @@ static void handle_ipc_event(const IpcEvent& ev) {
             if (!error.empty())
                 notify("Pipeline error", error);
         }
+        // cancel-recording-and-discard (Phase 1): the daemon emits a one-tick
+        // `cancelled:true` field on the state.changed broadcast immediately
+        // after run_recording's cancel branch discards the output dir. Fires
+        // the operator-facing toast; menu-item UI revert lands in Phase 2.
+        auto cancel_it = ev.data.find("cancelled");
+        if (cancel_it != ev.data.end() && json_val_as_bool(cancel_it->second)) {
+            notify("Recording cancelled", "Discarded.");
+        }
         // Prefer boolean fields if present; fall back to state string
         auto rec_it = ev.data.find("recording");
         if (rec_it != ev.data.end()) {

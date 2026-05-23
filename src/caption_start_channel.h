@@ -98,4 +98,15 @@ void clear_worker_active();
 /// channel has no waiters.
 void reset_caption_start_channel();
 
+/// Returns true between mark_worker_active() and clear_worker_active().
+/// Used by verb handlers that need to refuse during the post-loop drain
+/// window (captions.start_engine, record.cancel).
+///
+/// Generic name (`..._recording_loop_active`, not `..._captions...`)
+/// reflects the semantics for outside consumers — the flag has always
+/// been a generic worker-liveness signal; captioning was just the first
+/// consumer. If a third consumer arrives, refactor the flag into its
+/// own `pipeline_loop_state.h` module.
+bool is_recording_loop_active();
+
 } // namespace recmeet

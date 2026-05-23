@@ -120,4 +120,9 @@ void reset_caption_start_channel() {
     g_chan.pending_model_override.clear();
 }
 
+bool is_recording_loop_active() {
+    std::lock_guard<std::mutex> lk(g_chan.mu);
+    return g_chan.is_worker_active;
+}
+
 } // namespace recmeet
