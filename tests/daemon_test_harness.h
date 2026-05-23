@@ -65,6 +65,7 @@
 #include "session_manager.h"
 #include "speaker_id.h"
 #include "streaming_session.h"
+#include "test_tmpdir.h"
 #include "upload_session.h"
 
 #include <atomic>
@@ -324,7 +325,7 @@ private:
                                     .count()));
         std::ostringstream oss;
         oss << "recmeet_phase2b_" << ::getpid() << "_" << rng();
-        fs::path p = fs::temp_directory_path() / oss.str();
+        fs::path p = recmeet::test::tmp_path(oss.str());
         std::error_code ec;
         fs::remove_all(p, ec);
         fs::create_directories(p);
