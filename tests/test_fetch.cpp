@@ -39,6 +39,7 @@
 #include "ipc_protocol.h"
 #include "ipc_server.h"
 #include "job_queue.h"
+#include "test_tmpdir.h"
 
 #include <atomic>
 #include <chrono>
@@ -66,7 +67,8 @@ struct SigpipeIgnorer {
     SigpipeIgnorer() { signal(SIGPIPE, SIG_IGN); }
 } s_ignore_sigpipe;
 
-const char* FETCH_SOCK = "/tmp/recmeet_test_fetch.sock";
+const std::string FETCH_SOCK =
+    recmeet::test::tmp_path("recmeet_test_fetch.sock").string();
 
 // ---------------------------------------------------------------------------
 // ServerGuard / JqGuard — RAII thread owners. Same idea as test_routed_events.
@@ -121,7 +123,7 @@ struct FetchHarness {
 
 // A clean per-test temp dir.
 fs::path test_temp_dir(const std::string& tag) {
-    fs::path d = fs::temp_directory_path() / ("recmeet_fetch_test_" + tag);
+    fs::path d = recmeet::test::tmp_path("recmeet_fetch_test_" + tag);
     std::error_code ec;
     fs::remove_all(d, ec);
     fs::create_directories(d);
