@@ -42,6 +42,7 @@
 #include "ipc_server.h"
 #include "pipeline.h"
 #include "session_merge.h"
+#include "test_tmpdir.h"
 
 #include <unistd.h>
 
@@ -341,8 +342,8 @@ bool perms_are_0600(const fs::path& path) {
 }
 
 fs::path make_tmp_dir(const std::string& prefix) {
-    fs::path dir = fs::temp_directory_path()
-                 / (prefix + "_" + std::to_string(::getpid()));
+    fs::path dir = recmeet::test::tmp_path(
+        prefix + "_" + std::to_string(::getpid()));
     fs::remove_all(dir);
     fs::create_directories(dir);
     return dir;
