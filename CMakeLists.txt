@@ -581,6 +581,19 @@ if(RECMEET_BUILD_TESTS)
         # IPC client. Closes the gap test_tray_web.cpp leaves (it uses a
         # DaemonSim mock by design for translator unit-test isolation).
         tests/test_full_stack_webui.cpp
+        # Phase 3 (test-and-verification-hardening) #4 —
+        # [full-stack][live] real PipeWire frames → process.submit.
+        # Loads a PipeWire/Pulse module-null-sink, plays the debate
+        # fixture into it via paplay (pw-cat fallback), captures 15 s
+        # off the sink's .monitor source via the production
+        # PipeWireCapture class, wraps as WAV, and drives it through
+        # process.submit + 0x01 upload chunks against a SpawnedDaemon
+        # over Unix. Closes the "real PipeWire frames into
+        # process.submit" gap the other three [full-stack] tests
+        # leave open (they all feed synthetic in-memory bytes).
+        # SKIPs cleanly on hosts without an audio server / playback
+        # CLI; `make full-stack` runs it locally, CI does not.
+        tests/test_full_stack_live.cpp
         tests/test_integration_pipeline.cpp
         tests/streaming_capture_tests.cpp
         tests/streaming_engine_tests.cpp
