@@ -10,6 +10,7 @@
 #include "log.h"
 #include "notify.h"
 #include "api_models.h"
+#include "tray_cancel_confirm.h"
 #include "tray_caption_toggle.h"
 #include "util.h"
 #include "version.h"
@@ -87,6 +88,16 @@ struct TrayState {
     int progress_percent = -1;
     std::string current_phase;
     GtkWidget* status_menu_item = nullptr;
+
+    // cancel-recording-and-discard (Phase 2): tray "Cancel & Discard" menu
+    // item, placed directly below "Stop Recording" when recording (not
+    // reprocess). Click-to-confirm UX: first click flips the label and arms
+    // for 3000ms; second click within that window fires record.cancel IPC.
+    // The widget is transient — rebuilt by build_menu() — but we cache a
+    // pointer to the current instance so the click + timeout callbacks can
+    // flip its label. cancel_armed_until_ms is monotonic-time-ms, 0 = Idle.
+    GtkWidget* m_cancel_discard = nullptr;
+    int64_t cancel_armed_until_ms = 0;
 
     // Cached sources
     std::vector<AudioSource> mics;
@@ -384,6 +395,25 @@ static void handle_ipc_event(const IpcEvent& ev) {
             std::string error = json_val_as_string(err_it->second);
             if (!error.empty())
                 notify("Pipeline error", error);
+        }
+        // cancel-recording-and-discard (Phase 1): the daemon emits a one-tick
+        // `cancelled:true` field on the state.changed broadcast immediately
+        // after run_recording's cancel branch discards the output dir. Fires
+        // the operator-facing toast; menu-item UI revert lands in Phase 2.
+        auto cancel_it = ev.data.find("cancelled");
+        if (cancel_it != ev.data.end() && json_val_as_bool(cancel_it->second)) {
+            notify("Recording cancelled", "Discarded.");
+            // Phase 2: clear any half-armed Cancel & Discard state in case
+            // the cancel completed via some other path while the operator
+            // was mid-click. Label revert is best-effort — the subsequent
+            // update_state → build_menu rebuild will hide the menu item
+            // entirely (recording=false), but resetting here keeps the
+            // cached widget consistent if the rebuild order is observed.
+            g_tray.cancel_armed_until_ms = 0;
+            if (g_tray.m_cancel_discard) {
+                gtk_menu_item_set_label(GTK_MENU_ITEM(g_tray.m_cancel_discard),
+                                        "Cancel & Discard");
+            }
         }
         // Prefer boolean fields if present; fall back to state string
         auto rec_it = ev.data.find("recording");
@@ -920,6 +950,87 @@ static void on_cancel_pp(GtkMenuItem*, gpointer) {
     if (!g_tray.ipc.call("record.stop", params, resp, err, 5000)) {
         log_error("[tray] cancel postprocessing failed: %s", err.message.c_str());
     }
+}
+
+// cancel-recording-and-discard (Phase 2): one-shot GLib timeout that fires
+// 3100ms after the cancel menu item is armed (100ms past the strict 3000ms
+// armed-window expiry). If the operator never clicked the confirm, revert
+// the label back to "Cancel & Discard". If the operator already confirmed
+// (cancel_armed_until_ms was reset to 0 by on_cancel_discard_clicked) or
+// the menu was rebuilt with the item now hidden (m_cancel_discard reset),
+// no-op. Always returns G_SOURCE_REMOVE — one-shot.
+static gboolean on_cancel_armed_timeout(gpointer) {
+    int64_t now = g_get_monotonic_time() / 1000;
+    if (decide_cancel_button_state(now, g_tray.cancel_armed_until_ms)
+            == CancelButtonState::Idle
+        && g_tray.m_cancel_discard) {
+        gtk_menu_item_set_label(GTK_MENU_ITEM(g_tray.m_cancel_discard),
+                                "Cancel & Discard");
+        g_tray.cancel_armed_until_ms = 0;
+    }
+    return G_SOURCE_REMOVE;
+}
+
+// cancel-recording-and-discard (Phase 2): click handler for the tray
+// "Cancel & Discard" menu item. Click-to-confirm UX:
+//   - First click (Idle): flip label to a confirmation prompt, arm for
+//     3000ms, schedule revert at +3100ms.
+//   - Second click within window (Armed): flip label to "Cancelling…",
+//     fire-and-forget record.cancel IPC with a short response timeout
+//     (the response is sub-millisecond — the actual cleanup happens
+//     asynchronously inside run_recording). On verb refusal (NotRecording
+//     / reprocess / drain-window), revert label and surface the daemon's
+//     message. On success, leave "Cancelling…" in place; the eventual
+//     state.changed cancelled:true event fires the toast and the menu
+//     item naturally hides when recording=false → build_menu rebuild.
+static void on_cancel_discard_clicked(GtkMenuItem*, gpointer) {
+    int64_t now = g_get_monotonic_time() / 1000;  // monotonic ms
+    auto state = decide_cancel_button_state(now, g_tray.cancel_armed_until_ms);
+
+    if (state == CancelButtonState::Idle) {
+        // First click: arm.
+        g_tray.cancel_armed_until_ms = now + 3000;
+        if (g_tray.m_cancel_discard) {
+            gtk_menu_item_set_label(
+                GTK_MENU_ITEM(g_tray.m_cancel_discard),
+                "Discard recording? click again to confirm");
+        }
+        // Schedule revert 100ms past the strict expiry boundary.
+        g_timeout_add(3100, on_cancel_armed_timeout, nullptr);
+        return;
+    }
+
+    // Armed: confirm. Disarm immediately, flip label to placeholder, fire IPC.
+    g_tray.cancel_armed_until_ms = 0;
+    if (g_tray.m_cancel_discard) {
+        gtk_menu_item_set_label(GTK_MENU_ITEM(g_tray.m_cancel_discard),
+                                "Cancelling…");
+    }
+
+    // Fire-and-forget IPC. 500ms response timeout — the daemon's verb
+    // handler returns sub-millisecond; the actual cleanup happens
+    // asynchronously inside run_recording's cancel branch.
+    JsonMap params;
+    IpcResponse resp;
+    IpcError err;
+    bool ok = g_tray.ipc.call("record.cancel", params, resp, err, 500);
+    if (!ok) {
+        // Verb refused (NotRecording / reprocess / Recording is ending…).
+        // Revert label + notify with the daemon's message so the operator
+        // sees the actual rejection reason rather than a silent no-op.
+        if (g_tray.m_cancel_discard) {
+            gtk_menu_item_set_label(GTK_MENU_ITEM(g_tray.m_cancel_discard),
+                                    "Cancel & Discard");
+        }
+        std::string msg = err.message.empty() ? "Cancel failed" : err.message;
+        log_error("[tray] record.cancel failed: %s", msg.c_str());
+        notify("Cancel failed", msg.c_str());
+        return;
+    }
+    // On success: leave "Cancelling…" in place. The state.changed
+    // cancelled:true event (Phase 1 handler) fires the success toast,
+    // and the menu item naturally hides when state.recording=false →
+    // build_menu rebuild.
 }
 
 // --- Radio / checkbox callbacks ---
@@ -1588,6 +1699,10 @@ static void build_menu() {
     gtk_menu_shell_append(GTK_MENU_SHELL(menu), gtk_separator_menu_item_new());
 
     // --- Record / Stop / Cancel ---
+    // Reset the cached Cancel & Discard widget pointer — build_menu rebuilds
+    // every menu item from scratch, so the previous pointer would dangle.
+    // It is re-set below only on the recording && !is_reprocess branch.
+    g_tray.m_cancel_discard = nullptr;
     if (g_tray.recording) {
         const char* label = g_tray.is_reprocess ? "Cancel" : "Stop Recording";
         auto* item = gtk_menu_item_new_with_label(label);
@@ -1595,6 +1710,24 @@ static void build_menu() {
         gtk_menu_shell_append(GTK_MENU_SHELL(menu), item);
 
         if (!g_tray.is_reprocess) {
+            // cancel-recording-and-discard (Phase 2): "Cancel & Discard"
+            // menu item placed directly below "Stop Recording", visible
+            // only when recording && !is_reprocess (verb-level rejection
+            // during reprocess provides defense-in-depth). Label reflects
+            // the current arm state so a stale armed-window survives a
+            // menu rebuild (e.g. an unrelated state.changed event mid-arm).
+            const char* cd_label =
+                (decide_cancel_button_state(g_get_monotonic_time() / 1000,
+                                            g_tray.cancel_armed_until_ms)
+                 == CancelButtonState::Armed)
+                ? "Discard recording? click again to confirm"
+                : "Cancel & Discard";
+            auto* cd_item = gtk_menu_item_new_with_label(cd_label);
+            g_signal_connect(cd_item, "activate",
+                             G_CALLBACK(on_cancel_discard_clicked), nullptr);
+            gtk_menu_shell_append(GTK_MENU_SHELL(menu), cd_item);
+            g_tray.m_cancel_discard = cd_item;
+
             auto* ctx_item = gtk_menu_item_new_with_label("Edit Context...");
             g_signal_connect(ctx_item, "activate",
                              G_CALLBACK(+[](GtkMenuItem*, gpointer) { show_context_window(); }),

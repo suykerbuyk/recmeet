@@ -812,7 +812,14 @@ static int subprocess_main(CliResult& cli) {
     };
 
     try {
-        auto input = run_recording(cfg, g_stop, on_phase);
+        // subprocess_main is reached only with cfg.reprocess_dir set (the
+        // daemon writes a pp-*.json config). run_recording enters the
+        // reprocess branch and never observes the cancel token, but we
+        // still must satisfy the updated signature. Cancel-with-cleanup
+        // is daemon-attached only — signalling this token from the
+        // reprocess context would delete the operator's source data.
+        StopToken dummy_cancel;
+        auto input = run_recording(cfg, g_stop, dummy_cancel, on_phase);
         auto result = run_postprocessing(cfg, input, on_phase, on_progress, &g_stop);
 
         // Emit job.complete

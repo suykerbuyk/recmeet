@@ -257,6 +257,8 @@ stateDiagram-v2
 
     Recording --> RecPP : run_recording() returns
 
+    Recording --> Idle : record.cancel (cleanup dir, skip PP,\nbroadcast cancelled:true)
+
     Recording --> Idle : pipeline error (clear g_recording)
 
     RecPP --> Postprocessing : rec_worker exits
@@ -607,7 +609,8 @@ flowchart TD
         D_MON_PA --> D_TIMER
 
         D_TIMER["Spawn timer_thread<br/>(display_elapsed on stderr)"]
-        D_LOOP["while !stop.stop_requested()<br/>  sleep_for(200ms)"]
+        D_LOOP["while !stop.stop_requested()<br/>      && !cancel.stop_requested()<br/>  sleep_for(200ms)"]
+        D_EXIT{"decide_recording_exit<br/>(stop, cancel)"}
         D_STOP["timer_stop → join timer<br/>mic.stop() → mon.stop()"]
         D_DRAIN["mic_samples = mic.drain()<br/>mon_samples = mon.drain()"]
         D_WRITE["Write mic.wav + monitor.wav"]
@@ -619,19 +622,27 @@ flowchart TD
         D_MIC_ONLY --> D_CLEANUP
         D_CLEANUP["if !keep_sources: remove raw WAVs"]
 
+        D_CANCEL["mic.stop() → mon.stop()<br/>(skip drain/write/validate)<br/>cleanup_cancelled_recording_dir(out_dir)<br/>return PostprocessInput{cancelled=true}"]
+
         D_NOTIFY --> D_MIC --> D_MON_CHECK
-        D_TIMER --> D_LOOP --> D_STOP --> D_DRAIN
+        D_TIMER --> D_LOOP --> D_EXIT
+        D_EXIT -->|"NormalDrain"| D_STOP --> D_DRAIN
+        D_EXIT -->|"CancelCleanup"| D_CANCEL
         D_DRAIN --> D_WRITE --> D_VAL_MIC --> D_VAL_MON
     end
 
     subgraph SINGLE["Single Mic Mode"]
         S_MIC["PipeWireCapture(mic_source)<br/>start()"]
         S_TIMER["Spawn timer_thread"]
-        S_LOOP["while !stop.stop_requested()<br/>  sleep_for(200ms)"]
+        S_LOOP["while !stop.stop_requested()<br/>      && !cancel.stop_requested()<br/>  sleep_for(200ms)"]
+        S_EXIT{"decide_recording_exit<br/>(stop, cancel)"}
         S_STOP["stop() → drain()"]
         S_WRITE["Write audio_YYYY-MM-DD_HH-MM.wav"]
+        S_CANCEL["stop() (skip drain/write)<br/>cleanup_cancelled_recording_dir(out_dir)<br/>return PostprocessInput{cancelled=true}"]
 
-        S_MIC --> S_TIMER --> S_LOOP --> S_STOP --> S_WRITE
+        S_MIC --> S_TIMER --> S_LOOP --> S_EXIT
+        S_EXIT -->|"NormalDrain"| S_STOP --> S_WRITE
+        S_EXIT -->|"CancelCleanup"| S_CANCEL
     end
 
     DUAL --> RETURN

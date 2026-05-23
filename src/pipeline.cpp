@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 #include "pipeline.h"
+#include "pipeline_cleanup.h"
+#include "pipeline_exit.h"
 #include "caption_engine.h"
 #include "caption_start_channel.h"
 #include "caption_vtt.h"
@@ -417,7 +419,10 @@ std::unique_ptr<CaptionEngine> try_start_caption_engine(
 
 } // anonymous namespace
 
-PostprocessInput run_recording(const Config& cfg, StopToken& stop, PhaseCallback on_phase,
+PostprocessInput run_recording(const Config& cfg,
+                               StopToken& stop,
+                               StopToken& cancel,
+                               PhaseCallback on_phase,
                                const CaptionHooks* caption_hooks) {
     // Phase 2: belt-and-braces clear of the caption-start channel so any
     // stale state from a prior recording's race window (between
@@ -637,7 +642,7 @@ PostprocessInput run_recording(const Config& cfg, StopToken& stop, PhaseCallback
             StopToken timer_stop;
             std::thread timer_thread(display_elapsed, std::ref(timer_stop));
 
-            while (!stop.stop_requested()) {
+            while (!stop.stop_requested() && !cancel.stop_requested()) {
                 // Phase 2: drain any pending captions.start_engine request
                 // before sleeping. start_fn blocks 1-2 s on engine init;
                 // that's documented as Risk R10 (stop-token check delayed
@@ -656,6 +661,26 @@ PostprocessInput run_recording(const Config& cfg, StopToken& stop, PhaseCallback
             timer_stop.request();
             timer_thread.join();
             fprintf(stderr, "Recording stopped.\n");
+
+            // Cancel branch (rev 4 — see pipeline_exit.h): if the operator
+            // issued `record.cancel`, stop captures + reset caption slots
+            // (mirrors the normal teardown order), then discard the
+            // freshly-minted output directory and return early. Skips
+            // drain/write/validate entirely — buffers are released by
+            // capture destructors when this function returns.
+            if (decide_recording_exit(stop.stop_requested(),
+                                       cancel.stop_requested())
+                    == RecordingExitAction::CancelCleanup) {
+                mic_cap.stop();
+                if (mon_pw) mon_pw->stop();
+                if (mon_pa) mon_pa->stop();
+                caption_pw.reset();
+                caption_pa.reset();
+                cleanup_cancelled_recording_dir(pp.out_dir);
+                reset_caption_start_channel();
+                log_debug("pipeline: run_recording EXIT cancelled");
+                return PostprocessInput{ .cancelled = true };
+            }
 
             // Stop captures. After capture.stop() returns, the capture-thread
             // callback no longer fires, so it is safe to tear down the
@@ -758,7 +783,7 @@ PostprocessInput run_recording(const Config& cfg, StopToken& stop, PhaseCallback
             StopToken timer_stop;
             std::thread timer_thread(display_elapsed, std::ref(timer_stop));
 
-            while (!stop.stop_requested()) {
+            while (!stop.stop_requested() && !cancel.stop_requested()) {
                 poll_and_handle_caption_start_request(start_fn);
                 std::this_thread::sleep_for(std::chrono::milliseconds(200));
             }
@@ -768,6 +793,18 @@ PostprocessInput run_recording(const Config& cfg, StopToken& stop, PhaseCallback
             timer_stop.request();
             timer_thread.join();
             fprintf(stderr, "Recording stopped.\n");
+
+            // Cancel branch — see dual_mode above for rationale.
+            if (decide_recording_exit(stop.stop_requested(),
+                                       cancel.stop_requested())
+                    == RecordingExitAction::CancelCleanup) {
+                cap.stop();
+                caption.reset();
+                cleanup_cancelled_recording_dir(pp.out_dir);
+                reset_caption_start_channel();
+                log_debug("pipeline: run_recording EXIT cancelled");
+                return PostprocessInput{ .cancelled = true };
+            }
 
             cap.stop();
             // Phase 3 teardown ordering: cap.stop() -> engine teardown ->
@@ -1359,7 +1396,17 @@ PipelineResult run_postprocessing(const Config& cfg, const PostprocessInput& inp
 }
 
 PipelineResult run_pipeline(const Config& cfg, StopToken& stop, PhaseCallback on_phase) {
-    auto input = run_recording(cfg, stop, on_phase);
+    // Cancel-with-cleanup is daemon-attached only. In-process callers
+    // (CLI legacy path, reprocess_batch, full-stack tests) get a dummy
+    // never-signalled token; signalling it from a reprocess context would
+    // delete the operator's source data.
+    StopToken dummy_cancel;
+    auto input = run_recording(cfg, stop, dummy_cancel, on_phase);
+    if (input.cancelled) {
+        // Cannot occur — dummy_cancel is never signalled. Defensive log.
+        log_error("run_pipeline: unexpected cancelled=true from run_recording");
+        return PipelineResult{};
+    }
     if (cfg.reprocess_dir.empty()) {
         save_meeting_context(input.out_dir, cfg.context_inline, cfg.context_file, input.timestamp);
     }

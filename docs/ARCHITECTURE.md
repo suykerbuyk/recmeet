@@ -197,6 +197,7 @@ Values are `string | int64 | double | bool | null`. Nested objects/arrays are st
 | `config.update` | config key/values | `{ok}` | Merge into running config |
 | `record.start` | config overrides | `{ok}` | Idle → Recording; error if busy |
 | `record.stop` | — | `{ok}` | Signal stop; error if not recording |
+| `record.cancel` | — | `{ok}` | Stop the recording loop AND discard the freshly-minted output directory. Refused during reprocess, after the recording loop's drain window opens, and when not recording. |
 | `models.list` | — | `{models}` | JSON array of cached model info |
 | `models.ensure` | `{whisper_model?}` | `{ok}` | Download missing models; Idle → Downloading |
 | `models.update` | — | `{ok}` | Re-download all cached models |
@@ -237,6 +238,8 @@ The pipeline has two phases, split at the point where audio capture completes:
 2. **`run_postprocessing()`** — transcription, diarization, speaker identification, summarization, note output.
 
 In standalone mode, `run_pipeline()` calls both sequentially. In daemon mode, the worker thread calls them separately so it can broadcast `state.changed` between phases.
+
+`run_recording()` watches two stop tokens — `g_rec_stop` (normal stop) and `g_rec_cancel` (the `record.cancel` verb). The cancel branch is parallel to the stop branch in both dual-mode and mic-only captures: it stops the capture threads, skips drain/write_wav/validate, calls `cleanup_cancelled_recording_dir(pp.out_dir)` to remove the freshly-minted output directory, and returns `PostprocessInput{ .cancelled = true }`. The rec_worker observes `input.cancelled`, skips the postprocess enqueue, and emits a `state.changed` event carrying `cancelled: true` (consumed by the tray to flash a "Recording cancelled — discarded" notification). The verb handler shares the worker-active gate (`is_recording_loop_active()` in `caption_start_channel.{h,cpp}`) with `captions.start_engine` to close the post-loop drain-window race — between loop exit and `run_recording` return, both verbs refuse with `NotRecording`.
 
 ```mermaid
 flowchart TD

@@ -56,6 +56,10 @@ static std::mutex g_config_mu;
 // Stop tokens — separate for independent cancellation
 static StopToken g_rec_stop;
 static StopToken g_pp_stop;
+// Operator-issued cancel signal (record.cancel verb). Observed inside
+// run_recording's loop; on signalling the cancel branch discards the
+// freshly-minted output directory and returns PostprocessInput{cancelled=true}.
+static StopToken g_rec_cancel;
 
 // Worker threads
 static std::thread g_rec_worker;
@@ -114,13 +118,22 @@ static void fill_state_fields(JsonMap& data) {
     data["downloading"] = g_downloading.load();
 }
 
-// For worker threads — schedules broadcast on the poll thread
-static void broadcast_state(IpcServer& server, const std::string& error = "") {
-    server.post([&server, error]() {
+// For worker threads — schedules broadcast on the poll thread.
+//
+// `cancelled` (rev 4) is a one-tick marker — appears on exactly one
+// state.changed event (the one immediately after a cancelled run_recording
+// returns) and is not persisted. Tray consumes it to fire the
+// "Recording cancelled — discarded" toast. Default false so all existing
+// callers keep their current payload shape (field is omitted entirely).
+static void broadcast_state(IpcServer& server,
+                            const std::string& error = "",
+                            bool cancelled = false) {
+    server.post([&server, error, cancelled]() {
         IpcEvent ev;
         ev.event = "state.changed";
         fill_state_fields(ev.data);
         if (!error.empty()) ev.data["error"] = error;
+        if (cancelled) ev.data["cancelled"] = true;
         server.broadcast(ev);
     });
 }
@@ -1012,6 +1025,7 @@ int main(int argc, char* argv[]) {
         broadcast_state_inline(server);
 
         g_rec_stop.reset();
+        g_rec_cancel.reset();
 
         // Join any previous recording worker
         if (g_rec_worker.joinable()) g_rec_worker.join();
@@ -1106,7 +1120,28 @@ int main(int argc, char* argv[]) {
                 // those broadcasts also need this hook surface. The verb
                 // handler + caption_start_channel gate engine startup, not
                 // the hook pointer's presence.
-                auto input = run_recording(cfg, g_rec_stop, on_phase, &hooks);
+                auto input = run_recording(cfg, g_rec_stop, g_rec_cancel,
+                                           on_phase, &hooks);
+
+                // Cancel branch (rev 4 / cancel-recording-and-discard): the
+                // operator issued `record.cancel`, run_recording stopped
+                // captures, discarded the output dir via
+                // cleanup_cancelled_recording_dir, and returned cancelled=true.
+                // Skip the postprocess handoff entirely — there is no audio
+                // to process and no out_dir to enqueue.
+                if (input.cancelled) {
+                    {
+                        std::lock_guard<std::mutex> lock(g_state_mu);
+                        g_recording.store(false);
+                    }
+                    server.post([&server]() {
+                        g_is_reprocess = false;
+                    });
+                    broadcast_state(server, /*error=*/"", /*cancelled=*/true);
+                    log_debug("daemon: rec_worker EXIT cancelled (job=%ld)",
+                              (long)job_id);
+                    return;
+                }
 
                 // Apply any context sent by tray before stop
                 Config job_cfg = cfg;
@@ -1229,6 +1264,38 @@ int main(int argc, char* argv[]) {
             }
         }
 
+        resp.result["ok"] = true;
+        return true;
+    });
+
+    // record.cancel — operator-issued "stop AND discard" signal. Fires
+    // g_rec_cancel which run_recording's loop watches alongside g_rec_stop.
+    // Three-gate refusal pattern (cancel-recording-and-discard rev 4):
+    //   1. !g_recording          → NotRecording "Not recording"
+    //   2. g_is_reprocess        → NotRecording with reprocess-specific msg
+    //   3. !is_recording_loop_active() (post-loop drain window)
+    //                             → NotRecording "Recording is ending..."
+    // Returns ok on the happy path; the actual cleanup + state.changed
+    // with cancelled:true fires asynchronously from rec_worker.
+    server.on("record.cancel",
+              [](const IpcRequest&, IpcResponse& resp, IpcError& err) {
+        if (!g_recording.load()) {
+            err.code = static_cast<int>(IpcErrorCode::NotRecording);
+            err.message = "Not recording";
+            return false;
+        }
+        if (g_is_reprocess) {
+            err.code = static_cast<int>(IpcErrorCode::NotRecording);
+            err.message = "Cancel does not apply to reprocess; "
+                          "use record.stop target=postprocessing instead";
+            return false;
+        }
+        if (!is_recording_loop_active()) {
+            err.code = static_cast<int>(IpcErrorCode::NotRecording);
+            err.message = "Recording is ending — cannot cancel";
+            return false;
+        }
+        g_rec_cancel.request();
         resp.result["ok"] = true;
         return true;
     });

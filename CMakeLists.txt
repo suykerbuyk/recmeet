@@ -256,6 +256,7 @@ set(CORE_SOURCES
     src/summarize.cpp
     src/note.cpp
     src/pipeline.cpp
+    src/pipeline_cleanup.cpp
     src/cli.cpp
     src/reprocess_batch.cpp
     src/diarize.cpp
@@ -399,6 +400,9 @@ if(RECMEET_BUILD_TESTS)
         tests/test_model_manager.cpp
         tests/test_summarize_prompt.cpp
         tests/test_pipeline_helpers.cpp
+        tests/test_pipeline_exit.cpp
+        tests/test_pipeline_cleanup.cpp
+        tests/test_tray_cancel_confirm.cpp
         tests/test_cli.cpp
         tests/test_reprocess_batch.cpp
         tests/test_benchmark.cpp

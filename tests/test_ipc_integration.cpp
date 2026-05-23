@@ -58,6 +58,15 @@ struct DaemonSim {
     std::atomic<bool> pp_stop{false};
     std::atomic<bool> inject_error{false};
 
+    // cancel-recording-and-discard rev 4 plumbing. `rec_cancel` mirrors the
+    // production g_rec_cancel token (request_caption_engine_start-style
+    // worker-active gate). `worker_active` defaults to true so the cancel
+    // verb's third gate is open during the "recording" state; tests that
+    // need to exercise the post-loop drain window flip it to false manually.
+    // No-cancel tests don't touch either field — defaults preserve behavior.
+    std::atomic<bool> rec_cancel{false};
+    std::atomic<bool> worker_active{true};
+
     bool is_reprocess = false;  // poll-thread only
 
     std::thread rec_worker;
@@ -112,17 +121,20 @@ struct DaemonSim {
         return "idle";
     }
 
-    void broadcast_state_inline(const std::string& error = "") {
+    void broadcast_state_inline(const std::string& error = "",
+                                 bool cancelled = false) {
         IpcEvent ev;
         ev.event = "state.changed";
         fill_state(ev.data);
         if (!error.empty()) ev.data["error"] = error;
+        if (cancelled) ev.data["cancelled"] = true;
         server.broadcast(ev);
     }
 
-    void broadcast_state_post(const std::string& error = "") {
-        server.post([this, error]() {
-            broadcast_state_inline(error);
+    void broadcast_state_post(const std::string& error = "",
+                               bool cancelled = false) {
+        server.post([this, error, cancelled]() {
+            broadcast_state_inline(error, cancelled);
         });
     }
 
@@ -249,15 +261,22 @@ struct DaemonSim {
 
             if (rec_worker.joinable()) rec_worker.join();
             rec_stop.store(false);
+            rec_cancel.store(false);
+            worker_active.store(true);
 
             int delay = pp_delay_ms;
             rec_worker = std::thread([this, reprocess, job_id, delay]() {
                 if (!reprocess) {
                     std::unique_lock<std::mutex> lk(rec_mu);
                     rec_cv.wait_for(lk, std::chrono::seconds(5), [this]() {
-                        return rec_stop.load() || inject_error.load();
+                        return rec_stop.load() || rec_cancel.load() ||
+                               inject_error.load();
                     });
                 }
+
+                // Loop exited — close the worker-active gate immediately,
+                // mirroring production caption_start_channel::clear_worker_active().
+                worker_active.store(false);
 
                 if (inject_error.load()) {
                     {
@@ -269,6 +288,22 @@ struct DaemonSim {
                         is_reprocess = false;
                         broadcast_state_inline("simulated pipeline error");
                     });
+                    return;
+                }
+
+                // cancel-recording-and-discard rev 4: cancel branch mirrors
+                // the production rec_worker — skip postprocess enqueue,
+                // broadcast state.changed with cancelled:true.
+                if (rec_cancel.load()) {
+                    {
+                        std::lock_guard<std::mutex> lock(state_mu);
+                        recording.store(false);
+                        update_legacy_state();
+                    }
+                    server.post([this]() {
+                        is_reprocess = false;
+                    });
+                    broadcast_state_post(/*error=*/"", /*cancelled=*/true);
                     return;
                 }
 
@@ -364,6 +399,34 @@ struct DaemonSim {
             return true;
         });
 
+        // record.cancel — mirrors production daemon verb. Three-gate
+        // refusal (cancel-recording-and-discard rev 4):
+        //   1. !recording          → NotRecording "Not recording"
+        //   2. is_reprocess        → NotRecording with reprocess message
+        //   3. !worker_active      → NotRecording "Recording is ending..."
+        server.on("record.cancel", [this](const IpcRequest&, IpcResponse& resp, IpcError& err) {
+            if (!recording.load()) {
+                err.code = static_cast<int>(IpcErrorCode::NotRecording);
+                err.message = "Not recording";
+                return false;
+            }
+            if (is_reprocess) {
+                err.code = static_cast<int>(IpcErrorCode::NotRecording);
+                err.message = "Cancel does not apply to reprocess; "
+                              "use record.stop target=postprocessing instead";
+                return false;
+            }
+            if (!worker_active.load()) {
+                err.code = static_cast<int>(IpcErrorCode::NotRecording);
+                err.message = "Recording is ending — cannot cancel";
+                return false;
+            }
+            rec_cancel.store(true);
+            rec_cv.notify_all();
+            resp.result["ok"] = true;
+            return true;
+        });
+
         server.on("job.context", [this](const IpcRequest& req, IpcResponse& resp, IpcError& err) {
             if (!recording.load()) {
                 err.code = static_cast<int>(IpcErrorCode::NotRecording);
@@ -420,6 +483,7 @@ struct DaemonSim {
 
     void shutdown() {
         rec_stop.store(true);
+        rec_cancel.store(true);
         pp_stop.store(true);
         rec_cv.notify_all();
 
@@ -2153,4 +2217,125 @@ TEST_CASE("record.start -> job.context (empty string) -> record.stop writes no c
     CHECK_FALSE(fs::exists(stamped));
     CHECK_FALSE(fs::exists(tmp.path / LEGACY_CONTEXT_NAME));
     CHECK(find_context_file(tmp.path).empty());
+}
+
+// ===========================================================================
+// cancel-recording-and-discard rev 4: record.cancel verb behavior
+// ===========================================================================
+
+TEST_CASE("record.cancel while not recording returns NotRecording",
+          "[ipc][integration]") {
+    DaemonSim sim;
+    sim.start();
+
+    auto client = make_client();
+    IpcResponse resp;
+    IpcError err;
+
+    // No prior record.start — verb's first gate fires.
+    bool ok = client->call("record.cancel", resp, err);
+    CHECK_FALSE(ok);
+    CHECK(err.code == static_cast<int>(IpcErrorCode::NotRecording));
+    CHECK(err.message == "Not recording");
+}
+
+TEST_CASE("record.cancel while recording returns ok and broadcasts cancelled:true",
+          "[ipc][integration]") {
+    DaemonSim sim;
+    sim.start();
+
+    auto observer = make_client();
+    EventCollector events;
+    observer->set_event_callback(events.callback());
+
+    auto client = make_client();
+    IpcResponse resp;
+    IpcError err;
+    REQUIRE(client->call("record.start", resp, err));
+    REQUIRE(sim.recording.load());
+
+    // Drain the record.start state event first.
+    drain_events(*observer, 100);
+
+    REQUIRE(client->call("record.cancel", resp, err));
+    CHECK(json_val_as_bool(resp.result["ok"]));
+
+    // Wait for the rec_worker to wake up, hit the cancel branch, and
+    // broadcast state.changed with cancelled:true.
+    drain_events(*observer, 500);
+
+    auto snap = events.snapshot();
+    bool found_cancelled = false;
+    for (auto& e : snap) {
+        if (e.event != "state.changed") continue;
+        auto it = e.data.find("cancelled");
+        if (it != e.data.end() && json_val_as_bool(it->second)) {
+            found_cancelled = true;
+            // Per plan: cancelled is paired with idle state (recording=false,
+            // postprocessing=false).
+            CHECK(json_val_as_string(e.data.at("state")) == "idle");
+            CHECK_FALSE(json_val_as_bool(e.data.at("recording")));
+            CHECK_FALSE(json_val_as_bool(e.data.at("postprocessing")));
+        }
+    }
+    CHECK(found_cancelled);
+}
+
+TEST_CASE("record.cancel during reprocess returns NotRecording with reprocess message",
+          "[ipc][integration]") {
+    DaemonSim sim;
+    sim.start();
+
+    auto client = make_client();
+    IpcResponse resp;
+    IpcError err;
+
+    // Force the (recording=true, is_reprocess=true, worker_active=true)
+    // state directly — DaemonSim's reprocess rec_worker doesn't wait so
+    // driving it via record.start would race the cleanup. The verb handler
+    // reads the three flags independently, so flipping them directly
+    // exercises gate-2 (reprocess rejection) deterministically.
+    sim.recording.store(true);
+    sim.is_reprocess = true;
+    sim.worker_active.store(true);
+
+    bool ok = client->call("record.cancel", resp, err);
+    CHECK_FALSE(ok);
+    CHECK(err.code == static_cast<int>(IpcErrorCode::NotRecording));
+    // Substring match on "reprocess" — exact wording is verified in the
+    // plan/code but tests assert intent, not phrasing.
+    CHECK(err.message.find("reprocess") != std::string::npos);
+
+    // Tear down: clear the flags so shutdown is clean.
+    sim.recording.store(false);
+    sim.is_reprocess = false;
+}
+
+TEST_CASE("record.cancel after worker-active gate cleared returns NotRecording with ending message",
+          "[ipc][integration]") {
+    DaemonSim sim;
+    sim.start();
+
+    auto client = make_client();
+    IpcResponse resp;
+    IpcError err;
+    REQUIRE(client->call("record.start", resp, err));
+    REQUIRE(sim.recording.load());
+    REQUIRE(sim.worker_active.load());
+
+    // Simulate end-of-loop teardown: production calls clear_worker_active()
+    // immediately on loop exit, BEFORE setting g_recording=false. During
+    // that drain window, recording=true but worker_active=false. The verb
+    // must refuse rather than silently drop intent (rev 4 / H2).
+    sim.worker_active.store(false);
+
+    bool ok = client->call("record.cancel", resp, err);
+    CHECK_FALSE(ok);
+    CHECK(err.code == static_cast<int>(IpcErrorCode::NotRecording));
+    CHECK(err.message.find("ending") != std::string::npos);
+
+    // Tear down cleanly: re-open the gate and stop normally so DaemonSim's
+    // rec_worker can exit.
+    sim.worker_active.store(true);
+    REQUIRE(client->call("record.stop", resp, err));
 }

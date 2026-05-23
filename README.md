@@ -486,6 +486,26 @@ When speakers are enrolled via `--enroll`, their real names replace generic `Spe
 
 Filename includes an AI-derived title (e.g. `Meeting_2026-02-20_14-30_Project_Kickoff.md`). Contains YAML frontmatter with enriched metadata (date, time, type, domain, status, tags, participants, duration), a summary callout, action item checkboxes, and a foldable transcript section. Compatible with Obsidian Dataview.
 
+## Cancelling a recording
+
+For the common case where a recording was started but the meeting didn't happen (call not answered, test clip, wrong audio source), the tray exposes a **Cancel & Discard** action that stops the recording AND deletes its on-disk artifacts in one step. Normal **Stop Recording** is unchanged — it ends the capture and proceeds through transcription/diarization/summarization to a finished meeting note.
+
+**How to invoke (tray).** While a recording is in progress the tray menu shows a **Cancel & Discard** item directly below **Stop Recording**. Click-to-confirm:
+
+1. First click arms the item — the label flips to `Discard recording? click again to confirm` for 3 seconds.
+2. Second click within that window sends the cancel verb to the daemon.
+3. If you don't click again within 3 seconds, the label reverts to **Cancel & Discard** and nothing is sent.
+
+On success, the tray fires a `Recording cancelled — discarded` notification and returns to idle.
+
+**What gets deleted.** The entire `~/meetings/<timestamp>/` directory that the recording created — both raw captures (`mic.wav`, `monitor.wav`), the mixed `audio_<ts>.wav`, the live-captions `captions.vtt` if present, and any `context_<ts>.json` written by the daemon. The cancel branch in `run_recording` skips drain/write/validate entirely, so on-disk waste is minimal — only what the capture threads already flushed.
+
+**Reprocess.** Cancel does not apply to reprocess: a `--reprocess` job has no live capture to abort, and signalling cancel from that context would point at the operator's source audio. The daemon refuses `record.cancel` during reprocess with `Cancel does not apply to reprocess; use record.stop target=postprocessing instead`. The tray hides the menu item during reprocess as defense-in-depth.
+
+**Postprocessing.** To discard a job that has already left the recording loop and is in postprocessing, use the existing `record.stop` with `target=postprocessing` (existing behavior, unchanged). The tray's **Stop Recording** routes there automatically when the daemon is in the postprocessing phase.
+
+**In-process CLI limitation.** `recmeet --mic-only` and similar standalone-mode invocations (no daemon) have no cancel surface — there is no IPC peer to receive `record.cancel`, and Ctrl-C fires the normal stop semantics. To discard a standalone recording, stop it with Ctrl-C and `rm -rf ~/meetings/<dir>/` the output directory manually. A CLI cancel surface (e.g. double-Ctrl-C or a `--cancel-on-interrupt` flag) is filed as a follow-up.
+
 ## Reprocess
 
 Re-run the postprocessing pipeline (transcription, diarization, summarization, note generation) on an existing recording without re-recording. The audio file stays untouched; everything downstream is regenerated from the current model + config.

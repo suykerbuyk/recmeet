@@ -157,6 +157,8 @@ recmeet-tray                          # or: systemctl --user start recmeet-tray.
 
 Click the tray icon, select **Record** to start, **Stop Recording** to finish. The tray connects to the daemon and shows status updates in real time.
 
+To abort a recording AND delete its on-disk artifacts (call not answered, test clip), use **Cancel & Discard** in the tray menu — click once to arm, click again within 3 seconds to confirm.
+
 ### Force standalone mode (no daemon)
 
 ```bash
