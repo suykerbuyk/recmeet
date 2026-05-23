@@ -36,6 +36,7 @@
 #include "ipc_server.h"
 #include "job_queue.h"
 #include "speaker_id.h"
+#include "test_tmpdir.h"
 #include "upload_session.h"
 
 #include <atomic>
@@ -65,7 +66,8 @@ struct SigpipeIgnorer {
     SigpipeIgnorer() { signal(SIGPIPE, SIG_IGN); }
 } s_ignore_sigpipe;
 
-const char* ENROLL_SOCK = "/tmp/recmeet_test_enroll.sock";
+const std::string ENROLL_SOCK =
+    recmeet::test::tmp_path("recmeet_test_enroll.sock").string();
 
 // ---------------------------------------------------------------------------
 // RAII guards (same pattern as test_fetch.cpp / test_cancel.cpp)
@@ -105,7 +107,7 @@ struct FakeClock {
 // ---------------------------------------------------------------------------
 
 fs::path test_temp_dir(const std::string& tag) {
-    fs::path d = fs::temp_directory_path() / ("recmeet_enroll_test_" + tag);
+    fs::path d = recmeet::test::tmp_path("recmeet_enroll_test_" + tag);
     std::error_code ec;
     fs::remove_all(d, ec);
     fs::create_directories(d);
