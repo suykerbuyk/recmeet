@@ -26,6 +26,7 @@
 
 #include "pending_jobs_journal.h"
 #include "slot_queue.h"
+#include "test_tmpdir.h"
 
 #include <unistd.h>
 
@@ -44,8 +45,8 @@ namespace {
 fs::path make_scratch(const char* prefix) {
     std::random_device rd;
     std::ostringstream oss;
-    oss << "/tmp/recmeet_" << prefix << "_" << ::getpid() << "_" << rd();
-    fs::path p = oss.str();
+    oss << "recmeet_" << prefix << "_" << ::getpid() << "_" << rd();
+    fs::path p = recmeet::test::tmp_path(oss.str());
     std::error_code ec;
     fs::create_directories(p, ec);
     REQUIRE_FALSE(ec);
