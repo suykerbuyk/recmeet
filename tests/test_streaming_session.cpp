@@ -29,6 +29,7 @@
 #include "meeting_index.h"
 #include "pipeline.h"          // load_meeting_id
 #include "streaming_session.h"
+#include "test_tmpdir.h"
 #include "util.h"
 
 #include "daemon_test_harness.h"   // Phase 2b ext — wire tests drive the
@@ -164,7 +165,7 @@ sf_count_t wav_frames(const fs::path& p) {
 
 // A unique temp dir for a test's streaming WAVs.
 fs::path test_temp_dir(const std::string& tag) {
-    fs::path d = fs::temp_directory_path() / ("recmeet_stream_test_" + tag);
+    fs::path d = recmeet::test::tmp_path("recmeet_stream_test_" + tag);
     fs::create_directories(d);
     return d;
 }
@@ -906,7 +907,7 @@ TEST_CASE("StreamingSession: process.stream.cancel + disconnect handler over the
 namespace {
 
 fs::path test_meetings_root_stream(const std::string& tag) {
-    fs::path d = fs::temp_directory_path() / ("recmeet_stream_meetings_" + tag);
+    fs::path d = recmeet::test::tmp_path("recmeet_stream_meetings_" + tag);
     std::error_code ec;
     fs::remove_all(d, ec);
     fs::create_directories(d);
