@@ -108,6 +108,42 @@ and reference audio). This is the command you'll use most often.
 Only works when PipeWire is running (i.e., on your desktop, not in a headless
 CI environment).
 
+### Per-process tmp-dir isolation
+
+Every `recmeet_tests` invocation routes its filesystem artifacts through a
+per-process root of the form `<temp_dir>/recmeet/<pid>_<epoch_ms>/` (see
+`tests/test_tmpdir.h`). On a successful run a Catch2 event listener
+`fs::remove_all`s the root in `testRunEnded`; failed runs always preserve
+the root so artifacts are available for inspection. Two operator overrides
+are wired up:
+
+- **`RECMEET_TEST_ROOT`** — replaces the default `<temp_dir>/recmeet/<pid>_<epoch_ms>/`
+  root with an explicit path. Useful for CI to pin a known cleanup location
+  outside `/tmp`.
+- **`RECMEET_TEST_KEEP=1`** — preserves artifacts under the root even on a
+  successful run. Default behavior is to clean up only when every assertion
+  and test case passes.
+
+```bash
+# CI: pin a known cleanup location
+RECMEET_TEST_ROOT=/tmp/ci-recmeet-test make test
+
+# Debugging: keep artifacts on a passing run
+RECMEET_TEST_KEEP=1 ./build/recmeet_tests "[captions]"
+```
+
+Because each invocation derives its own `<pid>_<epoch_ms>/` subdir, two
+concurrent `recmeet_tests` processes (V1 + V2 worktrees, two V2 worktrees,
+dev + CI on the same host) compete only over hardware — CPU, memory,
+disk-I/O, model cache — never over filesystem paths. Daemon-spawning
+full-stack tests (`test_full_stack_live`, `test_full_stack_webui`,
+`test_full_stack_speaker_id`, `test_v2_thin_client_e2e`,
+`test_full_stack_captions_paced`) inherit isolation transparently: each
+spawns its `recmeet-daemon` (and sometimes `recmeet-tray`) child with
+`XDG_CONFIG_HOME=<parent_workdir>/config`, so all child artifacts —
+meeting notes, captions VTT, journals, IPC sockets — land under the
+parent test's per-process root without any separate env propagation.
+
 ### Test ↔ daemon integration seam
 
 Phase 2b consolidated the per-test "stub the IPC verb" pattern onto a
