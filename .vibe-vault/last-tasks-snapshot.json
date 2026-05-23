@@ -1,7 +1,8 @@
 {
-  "iter_n": 202,
-  "anchor_sha": "5ee593bf419ba855d61c2b0e07d937c243091950",
+  "iter_n": 203,
+  "anchor_sha": "eb39893c30d46a2796379a9128e89f949779b0d4",
   "active": [
+    "cancel-recording-and-discard",
     "full-stack-captions-60min-regression",
     "sherpa-onnx-1-13-bump",
     "test-and-verification-hardening",
