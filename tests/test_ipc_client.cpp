@@ -4,6 +4,7 @@
 #include <catch2/catch_test_macros.hpp>
 #include "ipc_client.h"
 #include "ipc_server.h"
+#include "test_tmpdir.h"
 
 #include <thread>
 #include <chrono>
@@ -12,7 +13,8 @@
 using namespace recmeet;
 
 namespace {
-const char* TEST_SOCK = "/tmp/recmeet_test_client.sock";
+const std::string TEST_SOCK_STR = recmeet::test::tmp_path("recmeet_test_client.sock").string();
+const char* TEST_SOCK = TEST_SOCK_STR.c_str();
 }
 
 TEST_CASE("IpcClient: call() round-trip", "[ipc_client]") {
@@ -105,7 +107,8 @@ TEST_CASE("IpcClient: connect fails without server", "[ipc_client]") {
 }
 
 TEST_CASE("IpcClient: call() without connect returns error", "[ipc_client]") {
-    IpcClient client("/tmp/recmeet_test_noexist.sock");
+    auto noexist_sock = recmeet::test::tmp_path("recmeet_test_noexist.sock").string();
+    IpcClient client(noexist_sock.c_str());
     IpcResponse resp;
     IpcError err;
     CHECK_FALSE(client.call("status.get", resp, err));
