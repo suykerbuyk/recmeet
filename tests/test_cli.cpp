@@ -4,6 +4,7 @@
 #include <catch2/catch_test_macros.hpp>
 #include "cli.h"
 #include "config_json.h"
+#include "test_tmpdir.h"
 
 #include <cstdlib>
 #include <getopt.h>
@@ -25,7 +26,8 @@ static CliResult run_cli(std::initializer_list<const char*> args) {
 
     // Isolate from host config
     const char* old_xdg = std::getenv("XDG_CONFIG_HOME");
-    setenv("XDG_CONFIG_HOME", "/tmp/recmeet_test_cli_no_config", 1);
+    auto xdg = recmeet::test::tmp_path("recmeet_test_cli_no_config");
+    setenv("XDG_CONFIG_HOME", xdg.c_str(), 1);
 
     auto result = parse_cli(static_cast<int>(argv.size() - 1), argv.data());
 
