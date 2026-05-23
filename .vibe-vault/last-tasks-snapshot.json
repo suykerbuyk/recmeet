@@ -1,8 +1,7 @@
 {
-  "iter_n": 199,
-  "anchor_sha": "22dfa70d9fe400ca4b312d380e6e0675bbe3988c",
+  "iter_n": 202,
+  "anchor_sha": "5ee593bf419ba855d61c2b0e07d937c243091950",
   "active": [
-    "diarize-apply-collapse-over-merges",
     "full-stack-captions-60min-regression",
     "sherpa-onnx-1-13-bump",
     "test-and-verification-hardening",
@@ -28,6 +27,7 @@
     "debian-build-prerequisites",
     "declarative-moseying-wind",
     "deterministic-logging-framework",
+    "diarize-apply-collapse-over-merges",
     "diarize-auto-detect-over-segments",
     "diarize-overcount-and-context-aware-speaker-hints",
     "e6-smoke-gate",
