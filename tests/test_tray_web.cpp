@@ -35,6 +35,7 @@
 #include "ipc_protocol.h"
 #include "ipc_server.h"
 #include "json_util.h"
+#include "test_tmpdir.h"
 #include "tray_web.h"
 
 #include <atomic>
@@ -74,7 +75,7 @@ struct DaemonSim {
     std::atomic<bool> force_internal_error{false};
 
     explicit DaemonSim(const std::string& name)
-        : sock_path("/tmp/recmeet_e62_" + name + ".sock") {
+        : sock_path(recmeet::test::tmp_path("recmeet_e62_" + name + ".sock").string()) {
         unlink(sock_path.c_str());
         server = std::make_unique<IpcServer>(sock_path);
         register_handlers();
