@@ -171,6 +171,15 @@ Config load_config(const fs::path& config_path) {
     cfg.num_speakers = std::atoi(ns.c_str());
     std::string ct = get_val(entries, "diarization", "cluster_threshold", "");
     if (!ct.empty()) cfg.cluster_threshold = std::atof(ct.c_str());
+    // Phase B (diarize-overcount): max_auto_speakers cap + collapse_threshold
+    // floor. Both live in the same [diarization] section.
+    std::string mas = get_val(entries, "diarization", "max_auto_speakers", "");
+    if (!mas.empty()) cfg.max_auto_speakers = std::atoi(mas.c_str());
+    std::string colt = get_val(entries, "diarization", "collapse_threshold", "");
+    if (!colt.empty()) cfg.collapse_threshold = std::atof(colt.c_str());
+    // Short-audio min-cluster-duration filter (follow-up to Phase A.3).
+    std::string mcd = get_val(entries, "diarization", "min_cluster_duration_sec", "");
+    if (!mcd.empty()) cfg.min_cluster_duration_sec = std::atof(mcd.c_str());
 
     // Chunked diarization parameters (T2.1/T2.2 — same [diarization] section,
     // single source of truth per M-3'). Validate `chunk_minutes * 60 >
@@ -332,7 +341,9 @@ void save_config(const Config& cfg, const fs::path& config_path) {
 
     if (!cfg.diarize || cfg.num_speakers > 0 || cfg.cluster_threshold != 1.18f ||
         cfg.chunk_minutes != 15.0f || cfg.chunk_overlap_sec != 30.0f ||
-        cfg.stitch_threshold != 0.6f) {
+        cfg.stitch_threshold != 0.6f ||
+        cfg.max_auto_speakers != 8 || cfg.collapse_threshold != 0.65f ||
+        cfg.min_cluster_duration_sec != 3.0f) {
         out << "\ndiarization:\n";
         if (!cfg.diarize)
             out << "  enabled: false\n";
@@ -346,6 +357,12 @@ void save_config(const Config& cfg, const fs::path& config_path) {
             out << "  chunk_overlap_sec: " << cfg.chunk_overlap_sec << "\n";
         if (cfg.stitch_threshold != 0.6f)
             out << "  stitch_threshold: " << cfg.stitch_threshold << "\n";
+        if (cfg.max_auto_speakers != 8)
+            out << "  max_auto_speakers: " << cfg.max_auto_speakers << "\n";
+        if (cfg.collapse_threshold != 0.65f)
+            out << "  collapse_threshold: " << cfg.collapse_threshold << "\n";
+        if (cfg.min_cluster_duration_sec != 3.0f)
+            out << "  min_cluster_duration_sec: " << cfg.min_cluster_duration_sec << "\n";
     }
 
     if (!cfg.speaker_id || cfg.speaker_threshold != 0.6f || !cfg.speaker_db.empty()) {

@@ -1,0 +1,19 @@
+=== bench-with-telemetry: phase-d-postfix ===
+    hwmon=/sys/class/hwmon/hwmon2
+    card=/sys/class/drm/card1
+    output=/home/johns/code/recmeet-v1/.claude/worktrees/agent-a85737f53c5294ba2/bench-results/phase-d-postfix
+    cmd=./build/recmeet_tests [integration][slow][t2-1]
+
+--- phase-d-postfix summary ---
+name=phase-d-postfix
+exit_code=0
+wall_clock_seconds=1271
+samples=1257
+gpu_busy_mean_pct=57.2
+gpu_busy_peak_pct=99
+vram_mean_mb=3769
+vram_peak_mb=4920
+power_mean_w=44.46
+power_peak_w=111.00
+temp_peak_c=95.0
+

@@ -6,6 +6,7 @@ require (
 	github.com/anthropics/anthropic-sdk-go v1.27.1
 	github.com/mark3labs/mcp-go v0.46.0
 	github.com/spf13/cobra v1.10.2
+	github.com/yuin/goldmark v1.8.2
 	golang.org/x/net v0.52.0
 )
 

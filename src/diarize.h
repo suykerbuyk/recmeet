@@ -29,6 +29,25 @@ struct DiarizeResult {
     int num_speakers = 0;
 };
 
+/// Short-audio min-cluster-duration filter (follow-up to iter 194
+/// diarize-overcount Phase A.3). Drops every segment belonging to a cluster
+/// whose total accumulated audio duration (sum of `end - start` over its
+/// segments) is strictly less than `threshold_sec`, then updates
+/// `diar.num_speakers` to the count of surviving unique cluster IDs.
+///
+/// `threshold_sec <= 0.0` is treated as a no-op so operators can disable the
+/// filter via `--min-cluster-duration 0` (useful for A/B reprocess
+/// experimentation). Returns the number of segments removed (0 if no-op or
+/// nothing dropped). Independent of sherpa — operates purely on
+/// `DiarizeResult` — so unit tests exercise it without RECMEET_USE_SHERPA.
+///
+/// Intended call site: short-audio post-`diarize()` path in `pipeline.cpp`,
+/// between sherpa's cluster output and `build_short_audio_globals()`. Lifted
+/// into a free function so tests can drive it with synthetic
+/// `DiarizeResult` inputs instead of through the full pipeline.
+size_t apply_short_audio_min_duration_filter(DiarizeResult& diar,
+                                             float threshold_sec);
+
 #if RECMEET_USE_SHERPA
 /// Progress callback for diarization: (num_processed_chunks, num_total_chunks).
 using DiarizeProgressCallback = std::function<void(int, int)>;
@@ -87,7 +106,27 @@ struct DiarizeChunkConfig {
     /// global registry. Matches the SherpaOnnxSpeakerEmbeddingManager metric
     /// (Q4 spike): 0.6 on L2-normalized unit vectors.
     float stitch_threshold = 0.6f;
+    /// Cosine-similarity floor for the post-stitch unified greedy-merge loop
+    /// (`apply_collapse`, Phase B.1/B.3). Pairs at or above this similarity
+    /// are auto-merged regardless of the ceiling; pairs below this similarity
+    /// are merged ONLY when the ceiling (`target_speakers`) is already
+    /// exceeded. Phase A.2 chose 0.55 empirically (M-4 floor).
+    float collapse_threshold = 0.65f;
+
+    /// Phase A instrumentation: when non-empty, `stitch_chunks` writes a JSON
+    /// artifact at the end of stitching containing all global centroids, the
+    /// full pairwise cosine-similarity matrix, the per-chunk local→global
+    /// map, and sample-count weights. Auto-suffixed with `meeting_timestamp`
+    /// (M-1). Reusable across this bug class; the empty-string check is
+    /// negligible on the hot path.
+    std::string debug_dump_centroids_path;
+    /// Used to disambiguate concurrent reprocesses (M-1). Inserted into the
+    /// dump filename before the extension, e.g. PATH = `/tmp/x.json` and
+    /// meeting_timestamp = `2026-05-18_09-36` writes `/tmp/x_2026-05-18_09-36.json`.
+    /// Empty timestamp = no suffix (used by the dump-format unit test).
+    std::string meeting_timestamp;
 };
+
 
 /// Result of chunked diarization. `centroids` maps each global speaker ID
 /// (0..N-1 contiguous after compaction) to the **raw** (non-L2-normalized)
@@ -128,19 +167,39 @@ struct ChunkExtents {
 ///     L2-normalized transiently for the dot product);
 ///   - sample-weighted running-mean update on raw centroids;
 ///   - midpoint-in-core ownership with full-extent emit (no trim);
-///   - post-stitch greedy-merge to enforce `num_speakers > 0` count limit;
+///   - post-stitch unified greedy-merge (`apply_collapse`) enforcing
+///     `target_speakers` as a ceiling (always), as a floor when
+///     `enforce_floor` is true, and `cfg.collapse_threshold` as the
+///     auto-merge quality floor;
 ///   - deterministic ascending-current-ID compaction.
 ///
 /// Sample counts are derived from chunk-local segment durations in samples
 /// (so two chunks contributing the same speaker for 5 s and 10 s produce a
 /// 10-weighted-vs-5-weighted running mean). Exposed for unit tests; the
 /// in-process orchestrator `diarize_chunked` calls this same helper.
+///
+/// `target_speakers`: target global-speaker count for the merge loop. Phase B
+/// semantics (rename from `num_speakers` to surface the shift): the unified
+/// greedy-merge loop in `apply_collapse` ALWAYS runs, with `target_speakers`
+/// as the ceiling. When `enforce_floor` is true (CLI-explicit `--num-speakers`
+/// source), `target_speakers` is ALSO a hard FLOOR — once `globals.size() <=
+/// target_speakers` the loop exits regardless of similarity. When false
+/// (context-derived or default), legacy ceiling-only behavior is preserved.
+/// `target_speakers == 0` (legacy "auto-detect, no cap") is honored by
+/// treating it as "no ceiling/floor": merges only happen when the threshold
+/// gate fires. Callers wanting the pre-Phase-B "no collapse" behavior should
+/// pass 0; callers wanting a hard cap should pass the resolved target
+/// (Phase B.2 precedence chain).
+///
+/// `enforce_floor`: when true, `target_speakers > 0` acts as both ceiling
+/// and floor — see `apply_collapse` for the full semantics matrix.
 DiarizeChunkedResult stitch_chunks(
     const std::vector<DiarizeResult>& chunk_results,
     const std::vector<std::map<int, std::vector<float>>>& chunk_centroids,
     const std::vector<ChunkExtents>& extents,
     const DiarizeChunkConfig& cfg,
-    int num_speakers);
+    int target_speakers,
+    bool enforce_floor);
 
 /// Run chunked diarization on a pre-loaded audio buffer (16kHz float32 mono).
 /// Slices the audio into overlapping chunks of `cfg.chunk_minutes` width with
@@ -149,23 +208,40 @@ DiarizeChunkedResult stitch_chunks(
 /// SpeakerEmbeddingSession), then stitches per-chunk speaker IDs into a
 /// global registry via `stitch_chunks`.
 ///
-/// `num_speakers`: 0 = auto-detect (per-chunk -1 → globals are whatever
-/// stitching produces); >0 = post-stitch global count limit (sample-weighted
-/// greedy-merge until count ≤ N).
+/// `target_speakers`: target global-speaker count enforced by the unified
+/// `apply_collapse` loop. 0 = no ceiling (auto-detect, post-stitch merges
+/// only happen when `cfg.collapse_threshold` fires). >0 = the unified loop
+/// force-merges down to `target_speakers` (ceiling). When `enforce_floor`
+/// is true, `target_speakers > 0` ALSO acts as a hard FLOOR — the loop
+/// exits once `globals.size() <= target_speakers`, even if surviving pairs
+/// remain above `cfg.collapse_threshold`. The floor branch is intended for
+/// CLI-explicit `--num-speakers N` (operator assertion); pass false for
+/// context-derived or default-resolved counts (operator hint). Renamed from
+/// `num_speakers` (Phase B.4) to flag the semantic shift from "0 = skip
+/// merge, else cap" to "always-on unified loop, target = ceiling (+ floor
+/// when enforce_floor)".
+/// `enforce_floor`: see semantics matrix on `apply_collapse`.
 /// `threshold`: per-chunk clustering threshold (sherpa default 1.18); distinct
-/// from `cfg.stitch_threshold`.
+/// from `cfg.stitch_threshold` and from `cfg.collapse_threshold`.
 ///
 /// Throws `RecmeetError` if `cfg.chunk_minutes * 60 <= cfg.overlap_seconds + 60`
 /// (M-5'). Emits one `on_progress("diarizing", overall_pct)` call per
 /// `extract_speaker_embedding` invocation (M-3'/L-4' progress granularity).
 DiarizeChunkedResult diarize_chunked(
     const float* samples, size_t num_samples,
-    int num_speakers, int threads, float threshold,
+    int target_speakers, int threads, float threshold,
     const DiarizeChunkConfig& chunk_cfg,
+    bool enforce_floor,
     DiarizeProgressCallback on_progress = nullptr);
 
 /// Run speaker diarization on a pre-loaded audio buffer (16kHz float32 mono).
-/// num_speakers: 0 = auto-detect, >0 = force N clusters.
+/// `num_speakers` here is forwarded to sherpa's clustering: 0 = auto-detect,
+/// >0 = force N clusters via `set_clustering(num_speakers)`. **Distinct
+/// semantics from `diarize_chunked`'s `target_speakers`** — that parameter
+/// controls our post-stitch unified merge loop; this one is the sherpa-side
+/// FastClustering knob. Renaming both to the same name would falsely imply
+/// they're interchangeable; the parameter on this entry point stays
+/// `num_speakers` (Phase B.4 design note).
 /// threads: number of CPU threads (0 = use default_thread_count()).
 /// on_progress: optional callback fired per chunk during embedding extraction.
 DiarizeResult diarize(const float* samples, size_t num_samples,
@@ -175,9 +251,103 @@ DiarizeResult diarize(const float* samples, size_t num_samples,
 
 /// Run speaker diarization on a WAV file using sherpa-onnx.
 /// Convenience wrapper — reads the file and delegates to the buffer overload.
+/// `num_speakers` is sherpa's FastClustering knob (see buffer overload).
 DiarizeResult diarize(const fs::path& audio_path, int num_speakers = 0, int threads = 0,
                       float threshold = 1.18f,
                       DiarizeProgressCallback on_progress = nullptr);
+
+/// Phase B.3 — shared post-stitch collapse helper.
+///
+/// Owns the unified greedy-merge loop (B.1) plus the deterministic
+/// `0..N-1` compaction (former Step-8 finale). Both code paths (long-audio
+/// `stitch_chunks` and short-audio post-`diarize()`) call this single helper
+/// so the segment-rewrite-and-compaction sequence has one owner.
+///
+/// Inputs:
+///   - `diar_inout.segments[i].speaker` will be rewritten in place by the
+///     accumulated merge map + the final 0..N-1 compaction.
+///   - `globals` is the chunked-stitch registry (or, for short-audio, a
+///     synthetic-globals view of `diar_inout`'s clusters). Merged in place
+///     by the unified loop; the post-loop survivors define the compaction
+///     order (ascending current-ID).
+///   - `target_speakers`: target speaker count. 0 = no ceiling/floor.
+///   - `collapse_threshold`: cosine-similarity floor for auto-merges
+///     (Phase A.2 chose 0.55f; iter-200 bumped to 0.65f).
+///   - `enforce_floor`: when true AND `target_speakers > 0`, treat
+///     `target_speakers` as a hard FLOOR — once the global count is at or
+///     below the target, no further merges fire regardless of similarity.
+///     When false, legacy ceiling-only behavior is preserved (threshold
+///     clause keeps merging if pairs sit above `collapse_threshold`).
+///     Phase 1a: CLI-explicit `--num-speakers` passes true; context-derived
+///     and default-resolved counts pass false (context is operator hint,
+///     not assertion).
+///
+/// Returns: `CollapseResult{centroids, num_speakers}`. The `centroids` map
+/// is keyed by the new contiguous `0..N-1` IDs. Caller assigns this back
+/// to its own centroid storage (`DiarizeChunkedResult::centroids`, etc.).
+///
+/// Termination (per loop iteration):
+///   - `ceiling_hit  = (target_speakers > 0 && globals.size() > target_speakers)`
+///   - `threshold_ok = (best_sim >= collapse_threshold)`
+///   - `at_floor     = (enforce_floor && target_speakers > 0
+///                       && globals.size() <= target_speakers)`
+///   - `if (at_floor || (!ceiling_hit && !threshold_ok)) break;`
+///
+/// When `ceiling_hit` is true the merge proceeds regardless of `best_sim` —
+/// the cap is the hard mechanism that forces a count. The threshold sets
+/// the floor on auto-merge quality only when we are at or below the cap.
+/// When `at_floor` is true, no further merges fire (the floor short-circuits
+/// even the threshold gate).
+///
+/// Semantics matrix:
+///
+///   | enforce_floor | target_speakers | size vs target | behavior                       |
+///   | ------------- | --------------- | -------------- | ------------------------------ |
+///   | true          | >0              | > target       | ceiling merges down            |
+///   | true          | >0              | == target      | at_floor → break               |
+///   | true          | >0              | < target       | at_floor → break (no synthesis)|
+///   | false         | >0              | > target       | ceiling merges down (unchanged)|
+///   | false         | >0              | <= target      | threshold clause may still fire|
+///   | any           | 0               | any            | auto-detect (threshold-only)   |
+struct CollapseResult {
+    std::map<int, std::vector<float>> centroids;
+    int num_speakers = 0;
+};
+
+/// One entry in the global-speaker registry used by `apply_collapse` and the
+/// chunked-stitch pipeline. Hoisted to the header (Phase B.3) so the
+/// short-audio adapter can construct a globals vector that's passable to
+/// `apply_collapse`. Centroids are stored RAW (non-L2-normalized) end-to-end
+/// to preserve byte-format compatibility with the legacy persistence path.
+struct GlobalEntry {
+    int id = 0;                   // current global ID (post-merge, pre-compaction)
+    std::vector<float> raw;       // raw running-mean centroid
+    long sample_count = 0;        // total samples contributed to this centroid
+};
+
+CollapseResult apply_collapse(
+    DiarizeResult& diar_inout,
+    std::vector<GlobalEntry>& globals,
+    int target_speakers,
+    float collapse_threshold,
+    bool enforce_floor);
+
+/// Phase B.3 — short-audio adapter. Builds a `std::vector<GlobalEntry>` from
+/// a sherpa-clustering `DiarizeResult` by extracting one centroid per unique
+/// cluster ID via `extract_speaker_embedding` over the cluster's segment
+/// audio. Sample-count weights are derived from total segment-duration
+/// samples per cluster ID. The returned globals can be passed directly to
+/// `apply_collapse`. Used by the pipeline's short-audio post-diarize wiring.
+std::vector<GlobalEntry> build_short_audio_globals(
+    const float* samples, size_t num_samples,
+    const DiarizeResult& diar, int threads);
+
+/// Phase B.3 — short-audio dump helper. Mirrors the centroid/sample-count
+/// vectors stored in `globals` into the JSON-dump arrays for the
+/// `dump_centroids_json` instrumentation call site in the short-audio path.
+void copy_globals_for_dump(const std::vector<GlobalEntry>& globals,
+                           std::vector<std::vector<float>>& centroids_out,
+                           std::vector<long>& sample_counts_out);
 #endif
 
 /// Merge speaker labels into transcript segments by timestamp overlap.
@@ -192,5 +362,25 @@ std::vector<TranscriptSegment> merge_speakers(
 
 /// Format a 0-based speaker ID as "Speaker_01", "Speaker_02", etc.
 std::string format_speaker(int speaker_id);
+
+/// Write a centroid-dump JSON artifact at `path` (Phase A instrumentation).
+/// If `path` is empty, no file is written. If `meeting_timestamp` is non-empty
+/// it is inserted before the extension to prevent concurrent-reprocess
+/// collisions (M-1). The dump payload is documented inline in the
+/// implementation; the format is stable enough for
+/// `scripts/diarize_threshold_analysis.py` to consume.
+///
+/// `centroids[i]` is the raw (non-L2-normalized) running-mean embedding for
+/// global ID `i`. `sample_counts[i]` is the cumulative sample-count weight for
+/// global ID `i` (used by the sample-weighted mean update). `local_to_global`
+/// is a per-chunk map `chunk_index → (local_id → global_id)`; pass an empty
+/// vector for the short-audio path (no chunking).
+void dump_centroids_json(
+    const std::string& path,
+    const std::string& meeting_timestamp,
+    const std::vector<std::vector<float>>& centroids,
+    const std::vector<long>& sample_counts,
+    const std::vector<std::map<int, int>>& local_to_global,
+    const std::string& source_label);
 
 } // namespace recmeet

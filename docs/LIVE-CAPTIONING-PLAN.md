@@ -1,5 +1,16 @@
 # Live Captioning Feasibility Study
 
+> **Status: SHIPPED — preserved as historical.** Live captioning landed as
+> the V1 capstone at `v1.5.0` (2026-05-09). Approach A (sherpa-onnx
+> streaming Zipformer) was chosen. This document is the pre-implementation
+> feasibility study and is preserved verbatim as a record of the design
+> reasoning. The post-iter-148 monitor-source pivot is appended at
+> "Live captions: source policy" below. For current behavior consult
+> `README.md` § Live Captioning, `docs/ARCHITECTURE.md` § Live Captioning,
+> and the `CaptionEngine` implementation in `src/caption_engine.{h,cpp}`.
+
+---
+
 An exploration of real-time closed captioning for recmeet, targeting systems
 without GPU acceleration and with no more than 16 GB of RAM.
 

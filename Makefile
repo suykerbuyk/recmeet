@@ -66,7 +66,7 @@ endif
 endif
 
 # ── Targets ─────────────────────────────────────────────────────────
-.PHONY: build build-onnxruntime test integration integration-cxx integration-go integration-go-coverage integration-t2-1 benchmark full-stack install uninstall package-deb package-rpm package-arch clean coverage help daemon-start daemon-stop daemon-status ensure-submodules
+.PHONY: build build-onnxruntime test integration integration-cxx integration-go integration-go-coverage integration-t2-1 benchmark full-stack install uninstall package-deb package-rpm package-arch clean coverage help daemon-start daemon-stop daemon-status ensure-submodules docs-html
 
 # Idempotent submodule populate. Triggered as a prerequisite of every target
 # that runs CMake, so a fresh `git clone` (without --recurse-submodules) or a
@@ -137,6 +137,7 @@ full-stack: ensure-submodules
 	cmake -B $(BUILD_DIR) -G Ninja $(CMAKE_OPTS) -DRECMEET_BUILD_TESTS=ON
 	ninja -C $(BUILD_DIR)
 	./$(BUILD_DIR)/recmeet --download-models --model base
+	./$(BUILD_DIR)/recmeet --caption-model en-2023-06-26 --download-models
 	./$(BUILD_DIR)/recmeet_tests "[full-stack]"
 
 install: build
@@ -222,6 +223,18 @@ daemon-stop:
 daemon-status:
 	@./$(BUILD_DIR)/recmeet --status
 
+# Regenerate docs/COMPONENT-DIAGRAMS.html from the .md source. The .md is the
+# source of truth; the .html is the rendered artifact checked into the tree
+# for offline / pretty-print viewing. Mermaid diagrams render client-side via
+# the CDN script in the embedded template — no mmdc/node toolchain required.
+# The renderer is a small Go tool under tools/cmd/recmeet-docs-html; built
+# fresh each invocation since it's a few-second compile.
+docs-html:
+	mkdir -p $(BUILD_DIR)
+	cd tools && go build -o $(CURDIR)/$(BUILD_DIR)/recmeet-docs-html ./cmd/recmeet-docs-html
+	./$(BUILD_DIR)/recmeet-docs-html docs/COMPONENT-DIAGRAMS.md docs/COMPONENT-DIAGRAMS.html
+	@echo "regenerated: docs/COMPONENT-DIAGRAMS.html"
+
 coverage:
 	cd tools && go test ./... -coverprofile=coverage.out
 	cd tools && go tool cover -func=coverage.out
@@ -267,6 +280,7 @@ help:
 	@echo "  make package-rpm   Build + create .rpm package"
 	@echo "  make package-arch  Build Arch package via makepkg"
 	@echo "  make coverage      Run Go tests with coverage report"
+	@echo "  make docs-html     Regenerate docs/COMPONENT-DIAGRAMS.html from the .md"
 	@echo "  make clean         Remove build + packaging artifacts (preserves onnxruntime)"
 	@echo "  make clean-ort     Remove locally-built onnxruntime"
 	@echo "  make help          Show this message"

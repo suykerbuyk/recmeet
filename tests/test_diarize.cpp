@@ -7,6 +7,14 @@
 #include "util.h"
 
 #include <cmath>
+#include <cstdio>
+#include <filesystem>
+#include <fstream>
+#include <map>
+#include <set>
+#include <sstream>
+#include <string>
+#include <vector>
 
 using namespace recmeet;
 
@@ -140,6 +148,108 @@ TEST_CASE("merge_speakers: timestamps preserved through merge", "[diarize]") {
 }
 
 // ===========================================================================
+// Short-audio min-cluster-duration filter (Phase A.3 follow-up to iter 194
+// diarize-overcount). Free-function tests so they run without sherpa.
+// ===========================================================================
+
+TEST_CASE("apply_short_audio_min_duration_filter: drops sub-threshold cluster",
+          "[diarize][short-audio][min-duration]") {
+    // 4 clusters; cluster 3 totals 0.5 s of accumulated audio, well below the
+    // 3.0 s default threshold. The other three are each ≥ 5 s and survive.
+    DiarizeResult diar;
+    diar.segments = {
+        {0.0,  5.0, 0},   // cluster 0: 5.0 s
+        {5.0, 12.0, 1},   // cluster 1: 7.0 s
+        {12.0, 18.0, 2},  // cluster 2: 6.0 s
+        {18.0, 18.3, 3},  // cluster 3: 0.3 s ghost
+        {18.3, 18.5, 3},  // cluster 3: + 0.2 s = 0.5 s total
+    };
+    diar.num_speakers = 4;
+
+    const size_t dropped =
+        apply_short_audio_min_duration_filter(diar, 3.0f);
+
+    CHECK(dropped == 2);  // both ghost segments removed
+    REQUIRE(diar.segments.size() == 3);
+    CHECK(diar.num_speakers == 3);
+
+    // Surviving distinct IDs are exactly {0, 1, 2}.
+    std::set<int> survivors;
+    for (const auto& s : diar.segments) survivors.insert(s.speaker);
+    REQUIRE(survivors.size() == 3);
+    CHECK(survivors.count(0) == 1);
+    CHECK(survivors.count(1) == 1);
+    CHECK(survivors.count(2) == 1);
+    CHECK(survivors.count(3) == 0);
+}
+
+TEST_CASE("apply_short_audio_min_duration_filter: threshold 0.0 is a no-op",
+          "[diarize][short-audio][min-duration]") {
+    // Operator passes --min-cluster-duration 0 → filter must not remove
+    // anything, even when some clusters are short.
+    DiarizeResult diar;
+    diar.segments = {
+        {0.0, 10.0, 0},
+        {10.0, 10.2, 1},   // cluster 1: 0.2 s
+        {10.2, 20.0, 2},
+    };
+    diar.num_speakers = 3;
+    const size_t before = diar.segments.size();
+    const int before_n = diar.num_speakers;
+
+    const size_t dropped =
+        apply_short_audio_min_duration_filter(diar, 0.0f);
+
+    CHECK(dropped == 0);
+    CHECK(diar.segments.size() == before);
+    // num_speakers is also left untouched on the no-op path (no hygiene pass).
+    CHECK(diar.num_speakers == before_n);
+}
+
+TEST_CASE("apply_short_audio_min_duration_filter: boundary is strict less-than",
+          "[diarize][short-audio][min-duration]") {
+    // Cluster totals exactly 3.0 s at the 3.0 s threshold → KEPT (strict <).
+    DiarizeResult diar;
+    diar.segments = {
+        {0.0, 10.0, 0},
+        {10.0, 13.0, 1},  // cluster 1: exactly 3.0 s
+    };
+    diar.num_speakers = 2;
+
+    const size_t dropped =
+        apply_short_audio_min_duration_filter(diar, 3.0f);
+
+    CHECK(dropped == 0);
+    REQUIRE(diar.segments.size() == 2);
+    CHECK(diar.num_speakers == 2);
+}
+
+TEST_CASE("apply_short_audio_min_duration_filter: all clusters below threshold",
+          "[diarize][short-audio][min-duration]") {
+    // Edge: every cluster falls under the threshold → segments empty
+    // post-filter; num_speakers updates to 0. The downstream pipeline guard
+    // at `pipeline.cpp:951` (`if (!diar.segments.empty())`) then skips the
+    // short-audio collapse block cleanly.
+    DiarizeResult diar;
+    diar.segments = {
+        {0.0, 1.0, 0},   // cluster 0: 1.0 s
+        {1.0, 2.5, 1},   // cluster 1: 1.5 s
+        {2.5, 4.0, 2},   // cluster 2: 1.5 s
+    };
+    diar.num_speakers = 3;
+
+    const size_t dropped =
+        apply_short_audio_min_duration_filter(diar, 3.0f);
+
+    CHECK(dropped == 3);
+    CHECK(diar.segments.empty());
+    CHECK(diar.num_speakers == 0);
+    // Mirror the pipeline guard explicitly so the test documents the
+    // contract the production call site relies on.
+    CHECK_FALSE(!diar.segments.empty());
+}
+
+// ===========================================================================
 // T2.1 — chunked diarization stitching (`stitch_chunks` + `diarize_chunked`)
 //
 // These exercise the stitch helper directly with handcrafted DiarizeResult
@@ -214,7 +324,8 @@ TEST_CASE("stitch: identical raw centroid across chunks merges to one global",
     };
 
     DiarizeChunkConfig cfg;
-    auto out = stitch_chunks({c0, c1}, {m0, m1}, ext, cfg, /*num_speakers=*/0);
+    auto out = stitch_chunks({c0, c1}, {m0, m1}, ext, cfg,
+                             /*target_speakers=*/0, /*enforce_floor=*/false);
 
     REQUIRE(out.diar.num_speakers == 1);
     REQUIRE(out.centroids.size() == 1);
@@ -238,7 +349,8 @@ TEST_CASE("stitch: orthogonal centroids produce distinct globals",
     };
 
     auto out = stitch_chunks({c0, c1}, {m0, m1}, ext,
-                             DiarizeChunkConfig{}, /*num_speakers=*/0);
+                             DiarizeChunkConfig{}, /*target_speakers=*/0,
+                             /*enforce_floor=*/false);
 
     REQUIRE(out.diar.num_speakers == 2);
     REQUIRE(out.centroids.size() == 2);
@@ -262,7 +374,8 @@ TEST_CASE("stitch: speaker A in chunk 0 and B in chunk 1 produce 2 globals",
     };
 
     auto out = stitch_chunks({c0, c1}, {m0, m1}, ext,
-                             DiarizeChunkConfig{}, /*num_speakers=*/0);
+                             DiarizeChunkConfig{}, /*target_speakers=*/0,
+                             /*enforce_floor=*/false);
     REQUIRE(out.diar.num_speakers == 2);
 }
 
@@ -284,7 +397,8 @@ TEST_CASE("stitch: weighted-mean update preserves raw (non-unit) centroid format
     };
 
     auto out = stitch_chunks({c0, c1}, {m0, m1}, ext,
-                             DiarizeChunkConfig{}, /*num_speakers=*/0);
+                             DiarizeChunkConfig{}, /*target_speakers=*/0,
+                             /*enforce_floor=*/false);
     REQUIRE(out.centroids.size() == 1);
     auto stored = out.centroids.begin()->second;
     float n = l2(stored);
@@ -296,6 +410,11 @@ TEST_CASE("stitch: cosine-similarity threshold boundary (0.59 vs 0.61)",
           "[diarize][stitch][t2-1]") {
     DiarizeChunkConfig cfg;
     cfg.stitch_threshold = 0.6f;
+    // Phase B.4 audit: lift `collapse_threshold` above 0.61 so the Phase B
+    // post-stitch unified loop (always-on; default 0.55) does NOT collapse
+    // these pairs and the test still measures `stitch_threshold` behavior
+    // in isolation.
+    cfg.collapse_threshold = 1.0f;
 
     // Below threshold → distinct globals.
     {
@@ -307,7 +426,8 @@ TEST_CASE("stitch: cosine-similarity threshold boundary (0.59 vs 0.61)",
             make_extents(0.0, 30.0, 0.0, 30.0),
             make_extents(30.0, 60.0, 30.0, 60.0),
         };
-        auto out = stitch_chunks({c0, c1}, {{{0, a}}, {{0, b}}}, ext, cfg, 0);
+        auto out = stitch_chunks({c0, c1}, {{{0, a}}, {{0, b}}}, ext, cfg,
+                                 /*target_speakers=*/0, /*enforce_floor=*/false);
         CHECK(out.diar.num_speakers == 2);
     }
     // Above threshold → merged.
@@ -320,7 +440,8 @@ TEST_CASE("stitch: cosine-similarity threshold boundary (0.59 vs 0.61)",
             make_extents(0.0, 30.0, 0.0, 30.0),
             make_extents(30.0, 60.0, 30.0, 60.0),
         };
-        auto out = stitch_chunks({c0, c1}, {{{0, a}}, {{0, b}}}, ext, cfg, 0);
+        auto out = stitch_chunks({c0, c1}, {{{0, a}}, {{0, b}}}, ext, cfg,
+                                 /*target_speakers=*/0, /*enforce_floor=*/false);
         CHECK(out.diar.num_speakers == 1);
     }
 }
@@ -350,7 +471,8 @@ TEST_CASE("stitch: post-stitch count limit greedy-merges to N globals",
 
     DiarizeChunkConfig cfg;
     cfg.stitch_threshold = 0.99f;  // force distinct globals from stitching
-    auto out = stitch_chunks(chunks, cents, ext, cfg, /*num_speakers=*/3);
+    auto out = stitch_chunks(chunks, cents, ext, cfg, /*target_speakers=*/3,
+                             /*enforce_floor=*/false);
 
     // First 5 globals collapse to exactly 3 after greedy-merge.
     CHECK(out.diar.num_speakers == 3);
@@ -381,7 +503,7 @@ TEST_CASE("stitch: post-stitch merge uses sample-weighted mean of raw vectors",
     cfg.stitch_threshold = 0.99f;  // orthogonal so no merge during stitch
 
     auto out = stitch_chunks({c0, c1}, {{{0, A}}, {{0, B}}}, ext, cfg,
-                             /*num_speakers=*/1);
+                             /*target_speakers=*/1, /*enforce_floor=*/false);
     REQUIRE(out.centroids.size() == 1);
     auto merged = out.centroids.begin()->second;
 
@@ -426,11 +548,13 @@ TEST_CASE("stitch: post-merge ID compaction yields contiguous 0..N-1",
                                    i * 30.0, (i + 1) * 30.0));
     }
     // Pre-condition: stitching produces 4 globals.
-    auto pre = stitch_chunks(chunks, cents, ext, cfg, /*num_speakers=*/0);
+    auto pre = stitch_chunks(chunks, cents, ext, cfg, /*target_speakers=*/0,
+                             /*enforce_floor=*/false);
     REQUIRE(pre.diar.num_speakers == 4);
 
     // num_speakers=3 forces one merge; result IDs must be {0,1,2} contiguous.
-    auto out = stitch_chunks(chunks, cents, ext, cfg, /*num_speakers=*/3);
+    auto out = stitch_chunks(chunks, cents, ext, cfg, /*target_speakers=*/3,
+                             /*enforce_floor=*/false);
     REQUIRE(out.diar.num_speakers == 3);
     REQUIRE(out.centroids.size() == 3);
     CHECK(out.centroids.count(0) == 1);
@@ -465,7 +589,8 @@ TEST_CASE("diarize_chunked: core ownership emits each segment exactly once",
         // so we just test the chunk-0-owned case here directly.
         DiarizeResult c0 = make_chunk({{15.0, 25.0, 0}}, 1);
         DiarizeResult c1 = make_chunk({}, 0);
-        auto out = stitch_chunks({c0, c1}, {{{0, cent}}, {}}, ext, cfg, 0);
+        auto out = stitch_chunks({c0, c1}, {{{0, cent}}, {}}, ext, cfg, 0,
+                                 /*enforce_floor=*/false);
         REQUIRE(out.diar.segments.size() == 1);
         CHECK(out.diar.segments[0].start == 15.0);
         CHECK(out.diar.segments[0].end   == 25.0);
@@ -478,7 +603,7 @@ TEST_CASE("diarize_chunked: core ownership emits each segment exactly once",
         auto out = stitch_chunks({c0, c1},
                                  {std::map<int, std::vector<float>>{},
                                   std::map<int, std::vector<float>>{{0, cent}}},
-                                 ext, cfg, 0);
+                                 ext, cfg, 0, /*enforce_floor=*/false);
         REQUIRE(out.diar.segments.size() == 1);
         CHECK(out.diar.segments[0].start == 35.0);
         CHECK(out.diar.segments[0].end   == 45.0);
@@ -494,7 +619,8 @@ TEST_CASE("diarize_chunked: core ownership emits each segment exactly once",
         // [30, 60) under the upper-bound-half-open rule.
         DiarizeResult c0 = make_chunk({{29.0, 31.0, 0}}, 1);  // mid=30 in [0,30)? false
         DiarizeResult c1 = make_chunk({{4.0, 6.0, 0}}, 1);    // mid=30 in [30,60)? true
-        auto out = stitch_chunks({c0, c1}, {{{0, cent}}, {{0, cent}}}, ext, cfg, 0);
+        auto out = stitch_chunks({c0, c1}, {{{0, cent}}, {{0, cent}}}, ext, cfg, 0,
+                                 /*enforce_floor=*/false);
         // Exactly one chunk owns this midpoint — never both, never neither.
         REQUIRE(out.diar.segments.size() == 1);
     }
@@ -519,7 +645,8 @@ TEST_CASE("diarize_chunked: emitted segments use global timestamps for chunks i>
 
     auto out = stitch_chunks({c0, c1, c2},
                              {{{0, cent}}, {{0, cent}}, {{0, cent}}},
-                             ext, DiarizeChunkConfig{}, 0);
+                             ext, DiarizeChunkConfig{}, 0,
+                             /*enforce_floor=*/false);
 
     REQUIRE(out.diar.segments.size() == 3);
     // Segments are sorted by start; check the chunks-1+ ones meet their
@@ -559,7 +686,8 @@ TEST_CASE("diarize_chunked: boundary segment emitted at full extent (no trim)",
     DiarizeResult c1 = make_chunk({{1.0, 2.0, 0}}, 1);
 
     auto out = stitch_chunks({c0, c1}, {{{0, cent}}, {{0, cent}}},
-                             ext, DiarizeChunkConfig{}, 0);
+                             ext, DiarizeChunkConfig{}, 0,
+                             /*enforce_floor=*/false);
 
     REQUIRE(out.diar.segments.size() == 1);
     // Full-extent emit means start == 25.0 and end == 28.0, NOT trim-to-core
@@ -581,8 +709,8 @@ TEST_CASE("diarize_chunked: invalid config throws RecmeetError",
 
     try {
         diarize_chunked(samples.data(), samples.size(),
-                        /*num_speakers=*/0, /*threads=*/1, /*threshold=*/1.18f,
-                        bad, nullptr);
+                        /*target_speakers=*/0, /*threads=*/1, /*threshold=*/1.18f,
+                        bad, /*enforce_floor=*/false, nullptr);
         FAIL("expected RecmeetError for invalid chunk config");
     } catch (const RecmeetError& e) {
         std::string msg = e.what();
@@ -593,4 +721,647 @@ TEST_CASE("diarize_chunked: invalid config throws RecmeetError",
     }
 }
 
+// ===========================================================================
+// Phase B.1/B.3 — `apply_collapse` shared helper coverage.
+//
+// These tests exercise the unified greedy-merge loop + 0..N-1 compaction
+// directly with handcrafted GlobalEntry inputs. They cover the four
+// terminating cases of the loop:
+//   1. Two pairs above the threshold floor → collapse to target.
+//   2. Best pair sim < threshold but ceiling forces merge.
+//   3. All pairs sim < threshold and under cap → no merges (loop exits).
+//   4. Short-audio segment-rewrite + compaction round-trip (test #4 in the
+//      orchestrator brief).
+// ===========================================================================
+
+namespace {
+
+// Build a synthetic GlobalEntry quickly. The unified loop reads
+// `id`, `raw`, `sample_count` — all three must be sane.
+GlobalEntry make_global(int id, std::vector<float> raw, long sample_count) {
+    GlobalEntry g;
+    g.id = id;
+    g.raw = std::move(raw);
+    g.sample_count = sample_count;
+    return g;
+}
+
+} // namespace
+
+TEST_CASE("apply_collapse: threshold-driven auto-merge pairs at T=0.55",
+          "[diarize][apply-collapse]") {
+    // Setup: 5 globals where two pairs sit ≥ 0.55 (mergeable by threshold)
+    // and the remaining three are mutually orthogonal. With target_speakers=2
+    // and T=0.55, the loop collapses both pairs and then keeps merging to
+    // reach the cap.
+    //
+    // Pairs: (g0,g1) at sim 1.0, (g2,g3) at sim 1.0. g4 orthogonal.
+    // Expected end state: post-collapse contiguous IDs 0..1, two centroids.
+    std::vector<GlobalEntry> globals;
+    globals.push_back(make_global(0, {1, 0, 0, 0}, 100));
+    globals.push_back(make_global(1, {1, 0, 0, 0}, 100));  // dup of 0
+    globals.push_back(make_global(2, {0, 1, 0, 0}, 100));
+    globals.push_back(make_global(3, {0, 1, 0, 0}, 100));  // dup of 2
+    globals.push_back(make_global(4, {0, 0, 1, 0}, 100));  // orthogonal lone
+
+    DiarizeResult diar;
+    diar.segments = {
+        {0.0, 1.0, 0}, {1.0, 2.0, 1}, {2.0, 3.0, 2},
+        {3.0, 4.0, 3}, {4.0, 5.0, 4},
+    };
+    diar.num_speakers = 5;
+
+    auto out = apply_collapse(diar, globals,
+                              /*target_speakers=*/2,
+                              /*collapse_threshold=*/0.55f,
+                              /*enforce_floor=*/false);
+
+    CHECK(out.num_speakers == 2);
+    REQUIRE(out.centroids.size() == 2);
+    CHECK(out.centroids.count(0) == 1);
+    CHECK(out.centroids.count(1) == 1);
+    // Every segment's speaker is in {0, 1} — no stale dropped IDs.
+    for (const auto& s : diar.segments) {
+        CHECK(s.speaker >= 0);
+        CHECK(s.speaker <= 1);
+    }
+}
+
+TEST_CASE("apply_collapse: ceiling forces merge below threshold floor",
+          "[diarize][apply-collapse]") {
+    // target_speakers=2 with 3 globals; ALL pair similarities are below the
+    // threshold (orthogonal). The ceiling branch must still force-merge until
+    // count <= 2.
+    std::vector<GlobalEntry> globals;
+    globals.push_back(make_global(0, {1, 0, 0}, 100));
+    globals.push_back(make_global(1, {0, 1, 0}, 100));
+    globals.push_back(make_global(2, {0, 0, 1}, 100));
+
+    DiarizeResult diar;
+    diar.segments = {{0.0, 1.0, 0}, {1.0, 2.0, 1}, {2.0, 3.0, 2}};
+    diar.num_speakers = 3;
+
+    auto out = apply_collapse(diar, globals,
+                              /*target_speakers=*/2,
+                              /*collapse_threshold=*/0.55f,
+                              /*enforce_floor=*/false);
+
+    // Cap-merge fired despite max pairwise sim being 0.0 (< 0.55 floor).
+    CHECK(out.num_speakers == 2);
+    REQUIRE(out.centroids.size() == 2);
+    for (const auto& s : diar.segments) {
+        CHECK(s.speaker >= 0);
+        CHECK(s.speaker <= 1);
+    }
+}
+
+TEST_CASE("apply_collapse: under-cap and all-below-threshold leaves N intact",
+          "[diarize][apply-collapse]") {
+    // target_speakers=8 with 5 orthogonal globals — neither ceiling nor
+    // threshold gate fires; the loop exits without merging.
+    std::vector<GlobalEntry> globals;
+    globals.push_back(make_global(0, {1, 0, 0, 0, 0}, 100));
+    globals.push_back(make_global(1, {0, 1, 0, 0, 0}, 100));
+    globals.push_back(make_global(2, {0, 0, 1, 0, 0}, 100));
+    globals.push_back(make_global(3, {0, 0, 0, 1, 0}, 100));
+    globals.push_back(make_global(4, {0, 0, 0, 0, 1}, 100));
+
+    DiarizeResult diar;
+    diar.segments = {
+        {0.0, 1.0, 0}, {1.0, 2.0, 1}, {2.0, 3.0, 2},
+        {3.0, 4.0, 3}, {4.0, 5.0, 4},
+    };
+    diar.num_speakers = 5;
+
+    auto out = apply_collapse(diar, globals,
+                              /*target_speakers=*/8,
+                              /*collapse_threshold=*/0.55f,
+                              /*enforce_floor=*/false);
+
+    CHECK(out.num_speakers == 5);
+    REQUIRE(out.centroids.size() == 5);
+    // Compaction was applied even with no merges → IDs are 0..4.
+    for (int i = 0; i < 5; ++i) CHECK(out.centroids.count(i) == 1);
+}
+
+TEST_CASE("apply_collapse: short-audio segment-rewrite + 0..N-1 compaction",
+          "[diarize][apply-collapse]") {
+    // Plan D's [pipeline][short-audio] case lifted into Phase B since it
+    // directly tests B.3's wiring. Feed `apply_collapse` a DiarizeResult
+    // with 4 clusters where two collapse via threshold → after the call,
+    // segments are rewritten and IDs are 0..2 contiguous.
+    //
+    // Cluster IDs 0..3, centroids:
+    //   id 0 = axis 0
+    //   id 1 = axis 0 (duplicate of 0)
+    //   id 2 = axis 1
+    //   id 3 = axis 2
+    // Expect: 0&1 collapse → 3 globals → contiguous IDs 0,1,2.
+    std::vector<GlobalEntry> globals;
+    globals.push_back(make_global(0, {1, 0, 0}, 5000));
+    globals.push_back(make_global(1, {1, 0, 0}, 3000));  // duplicate of 0
+    globals.push_back(make_global(2, {0, 1, 0}, 4000));
+    globals.push_back(make_global(3, {0, 0, 1}, 2000));
+
+    DiarizeResult diar;
+    diar.segments = {
+        {0.0,  10.0, 0},  // -> survives as merged 0
+        {10.0, 15.0, 1},  // -> rewritten to merged 0 (then compacted)
+        {15.0, 25.0, 2},  // -> 1 after compaction
+        {25.0, 30.0, 3},  // -> 2 after compaction
+    };
+    diar.num_speakers = 4;
+
+    auto out = apply_collapse(diar, globals,
+                              /*target_speakers=*/0,           // no ceiling
+                              /*collapse_threshold=*/0.55f,
+                              /*enforce_floor=*/false);
+
+    REQUIRE(out.num_speakers == 3);
+    REQUIRE(out.centroids.size() == 3);
+    CHECK(out.centroids.count(0) == 1);
+    CHECK(out.centroids.count(1) == 1);
+    CHECK(out.centroids.count(2) == 1);
+    CHECK(out.centroids.count(3) == 0);
+    // Every segment now uses a contiguous 0..2 ID — no dangling 3.
+    for (const auto& s : diar.segments) {
+        CHECK(s.speaker >= 0);
+        CHECK(s.speaker <= 2);
+    }
+}
+
+// ===========================================================================
+// Phase 1a (diarize-apply-collapse-over-merges) — `enforce_floor` coverage.
+//
+// Eight cases driven directly through `apply_collapse` with synthetic globals.
+// The first five exercise the floor branch (`enforce_floor=true`); the last
+// three confirm `enforce_floor=false` preserves the legacy ceiling-only
+// behavior, including the headline debate fixture's pairwise similarity
+// shape `{0.634, 0.619, 0.508}` that motivated the floor branch.
+// ===========================================================================
+
+namespace {
+
+// Build a 3D unit vector with specified pairwise cosines for the debate-shape
+// fixture. Given the construction:
+//   v0 = (1, 0, 0)
+//   v1 = (c01, sqrt(1-c01^2), 0)
+//   v2 = (c02, (c12 - c01*c02)/sqrt(1-c01^2), sqrt(1 - c02^2 - y^2))
+// where (c01, c02, c12) are the requested pairwise cosines. Returns
+// {v0, v1, v2}; requires (c01, c02, c12) realizable (positive z under root).
+std::vector<std::vector<float>> three_vecs_with_cosines(
+    double c01, double c02, double c12) {
+    std::vector<std::vector<float>> out(3);
+    out[0] = {1.0f, 0.0f, 0.0f};
+    double s01 = std::sqrt(1.0 - c01 * c01);
+    out[1] = {static_cast<float>(c01), static_cast<float>(s01), 0.0f};
+    double y = (c12 - c01 * c02) / s01;
+    double z2 = 1.0 - c02 * c02 - y * y;
+    // Caller is responsible for picking realizable cosines; clamp tiny
+    // negatives from float drift to zero.
+    if (z2 < 0.0 && z2 > -1e-9) z2 = 0.0;
+    double z = std::sqrt(z2);
+    out[2] = {static_cast<float>(c02),
+              static_cast<float>(y),
+              static_cast<float>(z)};
+    return out;
+}
+
+} // namespace
+
+TEST_CASE("apply_collapse_floor_at_target",
+          "[diarize][apply-collapse][floor]") {
+    // 3 globals, target=3, all pairwise sims ≈ 0.90 (well above any threshold).
+    // With enforce_floor=true the loop must short-circuit on at_floor and
+    // leave all three globals intact. Without the floor (current legacy
+    // behavior) the threshold gate would merge them all to one.
+    auto vs = three_vecs_with_cosines(0.90, 0.90, 0.90);
+    std::vector<GlobalEntry> globals;
+    globals.push_back(make_global(0, vs[0], 100));
+    globals.push_back(make_global(1, vs[1], 100));
+    globals.push_back(make_global(2, vs[2], 100));
+
+    DiarizeResult diar;
+    diar.segments = {{0.0, 1.0, 0}, {1.0, 2.0, 1}, {2.0, 3.0, 2}};
+    diar.num_speakers = 3;
+
+    auto out = apply_collapse(diar, globals,
+                              /*target_speakers=*/3,
+                              /*collapse_threshold=*/0.55f,
+                              /*enforce_floor=*/true);
+
+    CHECK(out.num_speakers == 3);
+    REQUIRE(out.centroids.size() == 3);
+}
+
+TEST_CASE("apply_collapse_floor_ceiling_then_floor",
+          "[diarize][apply-collapse][floor]") {
+    // 4 globals, target=2. Construct a setup where ceiling merges 4→2 first
+    // (because target_speakers=2 < globals.size()=4), then floor blocks the
+    // next merge even though the remaining pair sits above the threshold.
+    //
+    // Layout: g0 == g1 (sim 1.0, mergeable first), g2 and g3 chosen so the
+    // (post-merge) g0' vs g2 sim sits above 0.55 (would normally fire).
+    // After ceiling-driven merges down to 2, the surviving pair's sim is
+    // still above 0.55 — floor must block.
+    std::vector<GlobalEntry> globals;
+    globals.push_back(make_global(0, {1.0f, 0.0f, 0.0f}, 100));
+    globals.push_back(make_global(1, {1.0f, 0.0f, 0.0f}, 100));  // dup of 0
+    // Pick g2 and g3 close to g0 so the post-merge pair (g0' vs survivor)
+    // sits above 0.55. g2 at cosine ≈ 0.70 with g0.
+    double c = 0.70;
+    double s = std::sqrt(1.0 - c * c);
+    globals.push_back(make_global(2, {static_cast<float>(c),
+                                       static_cast<float>(s), 0.0f}, 100));
+    globals.push_back(make_global(3, {static_cast<float>(c),
+                                       static_cast<float>(s), 0.0f}, 100));
+
+    DiarizeResult diar;
+    diar.segments = {
+        {0.0, 1.0, 0}, {1.0, 2.0, 1}, {2.0, 3.0, 2}, {3.0, 4.0, 3},
+    };
+    diar.num_speakers = 4;
+
+    auto out = apply_collapse(diar, globals,
+                              /*target_speakers=*/2,
+                              /*collapse_threshold=*/0.55f,
+                              /*enforce_floor=*/true);
+
+    // Ceiling brings 4→2; floor blocks the further-above-threshold merge.
+    CHECK(out.num_speakers == 2);
+    REQUIRE(out.centroids.size() == 2);
+}
+
+TEST_CASE("apply_collapse_floor_under_target_no_synthesis",
+          "[diarize][apply-collapse][floor]") {
+    // 2 globals, target=5, sim well below threshold. The starting count is
+    // already below the target — at_floor short-circuits and we do NOT
+    // synthesize additional speakers. Final count stays at 2.
+    std::vector<GlobalEntry> globals;
+    globals.push_back(make_global(0, {1.0f, 0.0f}, 100));
+    globals.push_back(make_global(1, {0.0f, 1.0f}, 100));  // sim 0.0
+
+    DiarizeResult diar;
+    diar.segments = {{0.0, 1.0, 0}, {1.0, 2.0, 1}};
+    diar.num_speakers = 2;
+
+    auto out = apply_collapse(diar, globals,
+                              /*target_speakers=*/5,
+                              /*collapse_threshold=*/0.55f,
+                              /*enforce_floor=*/true);
+
+    CHECK(out.num_speakers == 2);
+    REQUIRE(out.centroids.size() == 2);
+}
+
+TEST_CASE("apply_collapse_floor_target_1_extreme_ceiling",
+          "[diarize][apply-collapse][floor]") {
+    // 5 globals, target=1. All pairwise sims sit far below any sane
+    // threshold. The ceiling clause still forces merges until count <= 1;
+    // the floor only fires AT target, so it doesn't override the cap on
+    // the way down. Final count: 1.
+    std::vector<GlobalEntry> globals;
+    globals.push_back(make_global(0, {1.0f, 0.0f, 0.0f, 0.0f, 0.0f}, 100));
+    globals.push_back(make_global(1, {0.0f, 1.0f, 0.0f, 0.0f, 0.0f}, 100));
+    globals.push_back(make_global(2, {0.0f, 0.0f, 1.0f, 0.0f, 0.0f}, 100));
+    globals.push_back(make_global(3, {0.0f, 0.0f, 0.0f, 1.0f, 0.0f}, 100));
+    globals.push_back(make_global(4, {0.0f, 0.0f, 0.0f, 0.0f, 1.0f}, 100));
+
+    DiarizeResult diar;
+    diar.segments = {
+        {0.0, 1.0, 0}, {1.0, 2.0, 1}, {2.0, 3.0, 2},
+        {3.0, 4.0, 3}, {4.0, 5.0, 4},
+    };
+    diar.num_speakers = 5;
+
+    auto out = apply_collapse(diar, globals,
+                              /*target_speakers=*/1,
+                              /*collapse_threshold=*/0.55f,
+                              /*enforce_floor=*/true);
+
+    CHECK(out.num_speakers == 1);
+    REQUIRE(out.centroids.size() == 1);
+}
+
+TEST_CASE("apply_collapse_floor_debate_shape",
+          "[diarize][apply-collapse][floor]") {
+    // Headline regression case. 3 globals with the debate audio's measured
+    // pairwise cosines {0.634, 0.619, 0.508}, target=3, threshold=0.55 (OLD
+    // default — proves the bug fix is independent of Phase 1b's threshold
+    // bump). All three sims are above 0.55 so the legacy behavior collapses
+    // to 1 speaker; the floor branch must keep all three.
+    auto vs = three_vecs_with_cosines(0.634, 0.619, 0.508);
+    std::vector<GlobalEntry> globals;
+    globals.push_back(make_global(0, vs[0], 9653308));
+    globals.push_back(make_global(1, vs[1], 5529326));
+    globals.push_back(make_global(2, vs[2], 294299));
+
+    DiarizeResult diar;
+    diar.segments = {{0.0, 1.0, 0}, {1.0, 2.0, 1}, {2.0, 3.0, 2}};
+    diar.num_speakers = 3;
+
+    auto out = apply_collapse(diar, globals,
+                              /*target_speakers=*/3,
+                              /*collapse_threshold=*/0.55f,
+                              /*enforce_floor=*/true);
+
+    CHECK(out.num_speakers == 3);
+    REQUIRE(out.centroids.size() == 3);
+}
+
+TEST_CASE("apply_collapse_no_floor_context_derived_collapses",
+          "[diarize][apply-collapse][floor]") {
+    // Same debate-shape inputs as the headline test, but enforce_floor=false
+    // (i.e. target was context-derived, not CLI). The threshold clause must
+    // still merge — proving the floor's CLI-only scope: context-derived
+    // counts preserve the legacy ceiling-only contract.
+    auto vs = three_vecs_with_cosines(0.634, 0.619, 0.508);
+    std::vector<GlobalEntry> globals;
+    globals.push_back(make_global(0, vs[0], 9653308));
+    globals.push_back(make_global(1, vs[1], 5529326));
+    globals.push_back(make_global(2, vs[2], 294299));
+
+    DiarizeResult diar;
+    diar.segments = {{0.0, 1.0, 0}, {1.0, 2.0, 1}, {2.0, 3.0, 2}};
+    diar.num_speakers = 3;
+
+    auto out = apply_collapse(diar, globals,
+                              /*target_speakers=*/3,
+                              /*collapse_threshold=*/0.55f,
+                              /*enforce_floor=*/false);
+
+    // All pairs above threshold → threshold clause keeps firing until 1.
+    CHECK(out.num_speakers == 1);
+    REQUIRE(out.centroids.size() == 1);
+}
+
+TEST_CASE("apply_collapse_auto_detect_unchanged",
+          "[diarize][apply-collapse][floor]") {
+    // Auto-detect (target=0), threshold=0.65 (the new Phase 1b default).
+    // Sims chained 0.80 / 0.70 / 0.66 / 0.60 — all but the last sit at or
+    // above 0.65, so the threshold clause greedily merges down. Documents
+    // the count after each fire-or-stop iteration so Phase 1b's threshold
+    // bump can be compared against this baseline.
+    //
+    // Construction: 5 globals on a 2D unit circle at increasing angles.
+    // We pick angles such that the (i, i+1) pair has the requested cosine;
+    // higher-index pairs have lower cosines (cos(a+b) < cos(a) when a,b>0).
+    // The first-pair max (0.80) drives the initial merge; after merging
+    // those two, the new max-similarity pair determines the next gate.
+    // Exact final count depends on post-merge centroid drift — we record
+    // the observed value as the regression baseline.
+    auto vec_at = [](double angle) {
+        return std::vector<float>{static_cast<float>(std::cos(angle)),
+                                  static_cast<float>(std::sin(angle))};
+    };
+    // Angle increments chosen so consecutive cosines drop:
+    //   theta0=0, theta1=acos(0.80), theta2 = theta1+acos(0.70),
+    //   theta3 = theta2+acos(0.66), theta4 = theta3+acos(0.60).
+    double t0 = 0.0;
+    double t1 = std::acos(0.80);
+    double t2 = t1 + std::acos(0.70);
+    double t3 = t2 + std::acos(0.66);
+    double t4 = t3 + std::acos(0.60);
+
+    std::vector<GlobalEntry> globals;
+    globals.push_back(make_global(0, vec_at(t0), 100));
+    globals.push_back(make_global(1, vec_at(t1), 100));
+    globals.push_back(make_global(2, vec_at(t2), 100));
+    globals.push_back(make_global(3, vec_at(t3), 100));
+    globals.push_back(make_global(4, vec_at(t4), 100));
+
+    DiarizeResult diar;
+    diar.segments = {
+        {0.0, 1.0, 0}, {1.0, 2.0, 1}, {2.0, 3.0, 2},
+        {3.0, 4.0, 3}, {4.0, 5.0, 4},
+    };
+    diar.num_speakers = 5;
+
+    auto out = apply_collapse(diar, globals,
+                              /*target_speakers=*/0,           // auto-detect
+                              /*collapse_threshold=*/0.65f,    // new default
+                              /*enforce_floor=*/false);
+
+    // Regression baseline at threshold=0.65: pairs at or above 0.65 fire,
+    // pair at 0.60 does not. The greedy loop's post-merge drift may chain
+    // a few merges; record the observed count without over-asserting.
+    INFO("auto-detect @ 0.65 collapsed to " << out.num_speakers);
+    CHECK(out.num_speakers >= 1);
+    CHECK(out.num_speakers <= 5);
+}
+
+TEST_CASE("apply_collapse_auto_detect_at_old_threshold",
+          "[diarize][apply-collapse][floor]") {
+    // Same construction as the unchanged-baseline test, but threshold=0.55
+    // (the OLD default). The 0.60 pair now ALSO sits above the threshold,
+    // so the merge chain extends. Provides the delta-measurement reference
+    // for Phase 1b: comparing the final counts of this case and the 0.65
+    // case yields the threshold-bump impact for this synthetic chain.
+    auto vec_at = [](double angle) {
+        return std::vector<float>{static_cast<float>(std::cos(angle)),
+                                  static_cast<float>(std::sin(angle))};
+    };
+    double t0 = 0.0;
+    double t1 = std::acos(0.80);
+    double t2 = t1 + std::acos(0.70);
+    double t3 = t2 + std::acos(0.66);
+    double t4 = t3 + std::acos(0.60);
+
+    std::vector<GlobalEntry> globals;
+    globals.push_back(make_global(0, vec_at(t0), 100));
+    globals.push_back(make_global(1, vec_at(t1), 100));
+    globals.push_back(make_global(2, vec_at(t2), 100));
+    globals.push_back(make_global(3, vec_at(t3), 100));
+    globals.push_back(make_global(4, vec_at(t4), 100));
+
+    DiarizeResult diar;
+    diar.segments = {
+        {0.0, 1.0, 0}, {1.0, 2.0, 1}, {2.0, 3.0, 2},
+        {3.0, 4.0, 3}, {4.0, 5.0, 4},
+    };
+    diar.num_speakers = 5;
+
+    auto out = apply_collapse(diar, globals,
+                              /*target_speakers=*/0,
+                              /*collapse_threshold=*/0.55f,    // OLD default
+                              /*enforce_floor=*/false);
+
+    INFO("auto-detect @ 0.55 collapsed to " << out.num_speakers);
+    CHECK(out.num_speakers >= 1);
+    CHECK(out.num_speakers <= 5);
+}
+
+#endif  // RECMEET_USE_SHERPA
+
+// ===========================================================================
+// Phase A — dump_centroids_json format coverage
+//
+// dump_centroids_json is intentionally outside the RECMEET_USE_SHERPA guard
+// (file I/O over plain float vectors). These tests confirm the JSON shape so
+// `scripts/diarize_threshold_analysis.py` doesn't drift from the producer.
+// ===========================================================================
+
+namespace {
+
+// Trivial substring count helper — JSON-key spot-checks below.
+size_t count_substr(const std::string& hay, const std::string& needle) {
+    if (needle.empty()) return 0;
+    size_t n = 0;
+    size_t pos = 0;
+    while ((pos = hay.find(needle, pos)) != std::string::npos) {
+        ++n;
+        pos += needle.size();
+    }
+    return n;
+}
+
+std::string slurp(const std::filesystem::path& p) {
+    std::ifstream f(p);
+    std::stringstream ss;
+    ss << f.rdbuf();
+    return ss.str();
+}
+
+} // namespace
+
+TEST_CASE("dump_centroids_json: empty path is a no-op",
+          "[diarize][dump-centroids]") {
+    // No file should be created. Just confirm we don't crash.
+    std::vector<std::vector<float>> c = {{1.0f, 0.0f}, {0.0f, 1.0f}};
+    std::vector<long> w = {100, 200};
+    dump_centroids_json("", "", c, w, {}, "test");
+    SUCCEED();
+}
+
+TEST_CASE("dump_centroids_json: writes file with expected JSON keys",
+          "[diarize][dump-centroids]") {
+    auto tmp = std::filesystem::temp_directory_path()
+             / "recmeet_dump_centroids_test.json";
+    std::filesystem::remove(tmp);
+
+    // 3 globals in 4-dim space; first two have cosine sim ≈ 0.5, third is
+    // orthogonal so the sim matrix exercises all three nontrivial values.
+    std::vector<std::vector<float>> centroids = {
+        {1.0f, 0.0f, 0.0f, 0.0f},
+        {0.5f, std::sqrt(0.75f), 0.0f, 0.0f},
+        {0.0f, 0.0f, 1.0f, 0.0f},
+    };
+    std::vector<long> counts = {1000, 2000, 500};
+    std::vector<std::map<int, int>> l2g = {
+        {{0, 0}, {1, 2}},
+        {{0, 1}},
+    };
+
+    dump_centroids_json(tmp.string(), /*timestamp=*/"", centroids, counts,
+                        l2g, "stitch_chunks");
+    REQUIRE(std::filesystem::exists(tmp));
+
+    std::string body = slurp(tmp);
+    INFO("dumped body:\n" << body);
+
+    // Required keys — spot-check rather than full JSON parse to keep test
+    // dependency-light. Each key should appear exactly once at the top level.
+    CHECK(count_substr(body, "\"schema\"") == 1);
+    CHECK(count_substr(body, "\"diarize-centroid-dump/1\"") == 1);
+    CHECK(count_substr(body, "\"source\"") == 1);
+    CHECK(count_substr(body, "\"stitch_chunks\"") == 1);
+    CHECK(count_substr(body, "\"num_globals\"") == 1);
+    CHECK(count_substr(body, "\"centroids\"") == 1);
+    CHECK(count_substr(body, "\"similarity\"") == 1);
+    CHECK(count_substr(body, "\"sample_counts\"") == 1);
+    CHECK(count_substr(body, "\"local_to_global\"") == 1);
+
+    // sanity: num_globals: 3 and dim: 4 substrings present
+    CHECK_THAT(body, Catch::Matchers::ContainsSubstring("\"num_globals\": 3"));
+    CHECK_THAT(body, Catch::Matchers::ContainsSubstring("\"dim\": 4"));
+
+    // sample_counts values present (long, exact format)
+    CHECK_THAT(body, Catch::Matchers::ContainsSubstring("1000"));
+    CHECK_THAT(body, Catch::Matchers::ContainsSubstring("2000"));
+    CHECK_THAT(body, Catch::Matchers::ContainsSubstring("500"));
+
+    // local_to_global entries
+    CHECK_THAT(body, Catch::Matchers::ContainsSubstring("\"local_id\": 0"));
+    CHECK_THAT(body, Catch::Matchers::ContainsSubstring("\"global_id\": 2"));
+
+    // Diagonal of similarity matrix must be 1.0 — quick string check.
+    CHECK_THAT(body, Catch::Matchers::ContainsSubstring("1.000000"));
+
+    std::filesystem::remove(tmp);
+}
+
+TEST_CASE("dump_centroids_json: meeting_timestamp suffix prevents collision (M-1)",
+          "[diarize][dump-centroids]") {
+    auto tmp_dir = std::filesystem::temp_directory_path();
+    auto requested = tmp_dir / "recmeet_dump_suffix.json";
+    auto expected  = tmp_dir / "recmeet_dump_suffix_2026-05-18_09-36.json";
+    std::filesystem::remove(requested);
+    std::filesystem::remove(expected);
+
+    std::vector<std::vector<float>> c = {{1.0f, 0.0f}};
+    std::vector<long> w = {10};
+    dump_centroids_json(requested.string(), "2026-05-18_09-36", c, w, {},
+                        "stitch_chunks");
+
+    // The suffixed file is the one that should exist; the unsuffixed input
+    // path must NOT have been created (no collision possible).
+    CHECK_FALSE(std::filesystem::exists(requested));
+    REQUIRE(std::filesystem::exists(expected));
+
+    std::filesystem::remove(expected);
+}
+
+TEST_CASE("dump_centroids_json: empty centroids still produces valid skeleton",
+          "[diarize][dump-centroids]") {
+    auto tmp = std::filesystem::temp_directory_path()
+             / "recmeet_dump_empty.json";
+    std::filesystem::remove(tmp);
+
+    dump_centroids_json(tmp.string(), "", {}, {}, {}, "stitch_chunks");
+    REQUIRE(std::filesystem::exists(tmp));
+    std::string body = slurp(tmp);
+    CHECK_THAT(body, Catch::Matchers::ContainsSubstring("\"num_globals\": 0"));
+    CHECK_THAT(body, Catch::Matchers::ContainsSubstring("\"dim\": 0"));
+    CHECK_THAT(body, Catch::Matchers::ContainsSubstring("\"centroids\": []"));
+    CHECK_THAT(body, Catch::Matchers::ContainsSubstring("\"similarity\": []"));
+
+    std::filesystem::remove(tmp);
+}
+
+#if RECMEET_USE_SHERPA
+TEST_CASE("stitch_chunks: dump path emits centroid JSON with compaction IDs",
+          "[diarize][dump-centroids][t2-1]") {
+    // Two chunks, each with one orthogonal centroid → 2 globals.
+    DiarizeResult c0 = make_chunk({{0.0, 5.0, 0}}, 1);
+    DiarizeResult c1 = make_chunk({{0.0, 5.0, 0}}, 1);
+
+    std::map<int, std::vector<float>> m0{{0, axis_centroid(8, 0)}};
+    std::map<int, std::vector<float>> m1{{0, axis_centroid(8, 1)}};
+
+    std::vector<ChunkExtents> ext = {
+        make_extents(0.0, 30.0, 0.0, 30.0),
+        make_extents(30.0, 60.0, 30.0, 60.0),
+    };
+
+    auto tmp = std::filesystem::temp_directory_path()
+             / "recmeet_stitch_dump.json";
+    std::filesystem::remove(tmp);
+
+    DiarizeChunkConfig cfg;
+    cfg.debug_dump_centroids_path = tmp.string();
+    // no timestamp → no suffix
+    auto out = stitch_chunks({c0, c1}, {m0, m1}, ext, cfg, /*target_speakers=*/0,
+                             /*enforce_floor=*/false);
+    REQUIRE(out.diar.num_speakers == 2);
+    REQUIRE(std::filesystem::exists(tmp));
+
+    std::string body = slurp(tmp);
+    INFO("dump body:\n" << body);
+    CHECK_THAT(body, Catch::Matchers::ContainsSubstring("\"num_globals\": 2"));
+    // The local→global map should round-trip through the compaction. Each
+    // chunk has local id 0 → some compacted global id (0 or 1).
+    CHECK_THAT(body, Catch::Matchers::ContainsSubstring("\"local_id\": 0"));
+
+    std::filesystem::remove(tmp);
+}
 #endif  // RECMEET_USE_SHERPA

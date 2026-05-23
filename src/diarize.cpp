@@ -7,8 +7,12 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <filesystem>
+#include <fstream>
 #include <limits>
+#include <map>
 #include <set>
+#include <sstream>
 
 #if RECMEET_USE_SHERPA
 #include "audio_file.h"
@@ -23,6 +27,55 @@ std::string format_speaker(int speaker_id) {
     char buf[16];
     snprintf(buf, sizeof(buf), "Speaker_%02d", speaker_id + 1);
     return buf;
+}
+
+// Short-audio min-cluster-duration filter (Phase A.3 follow-up).
+//
+// Sums each cluster's accumulated audio duration (Σ end - start over its
+// segments), then erase-removes every segment whose cluster total is strictly
+// less than `threshold_sec`. `threshold_sec <= 0.0` is a no-op so operators
+// can disable via `--min-cluster-duration 0`. After erasing, `num_speakers`
+// is re-derived from the surviving distinct cluster IDs.
+//
+// Free function (no sherpa dependency) so tests can drive it with synthetic
+// `DiarizeResult` inputs without building the sherpa-backed path.
+size_t apply_short_audio_min_duration_filter(DiarizeResult& diar,
+                                             float threshold_sec) {
+    if (threshold_sec <= 0.0f) return 0;
+    if (diar.segments.empty()) return 0;
+
+    std::map<int, double> cluster_duration_sec;
+    for (const auto& seg : diar.segments) {
+        if (seg.end > seg.start)
+            cluster_duration_sec[seg.speaker] += seg.end - seg.start;
+    }
+    const auto threshold = static_cast<double>(threshold_sec);
+    const size_t before = diar.segments.size();
+    diar.segments.erase(
+        std::remove_if(diar.segments.begin(), diar.segments.end(),
+                       [&](const DiarizeSegment& seg) {
+                           return cluster_duration_sec[seg.speaker] < threshold;
+                       }),
+        diar.segments.end());
+    const size_t dropped = before - diar.segments.size();
+
+    if (dropped > 0) {
+        const auto dropped_clusters = std::count_if(
+            cluster_duration_sec.begin(), cluster_duration_sec.end(),
+            [&](const auto& kv) { return kv.second < threshold; });
+        log_info("Dropped %zu segments from %lld sub-%.1fs clusters "
+                 "(min_cluster_duration_sec=%.2f)",
+                 dropped,
+                 static_cast<long long>(dropped_clusters),
+                 threshold_sec, threshold_sec);
+    }
+
+    // Hygiene: re-derive num_speakers from the surviving distinct IDs.
+    std::set<int> surviving;
+    for (const auto& seg : diar.segments) surviving.insert(seg.speaker);
+    diar.num_speakers = static_cast<int>(surviving.size());
+
+    return dropped;
 }
 
 std::vector<TranscriptSegment> merge_speakers(
@@ -57,6 +110,198 @@ std::vector<TranscriptSegment> merge_speakers(
     }
 
     return result;
+}
+
+namespace {
+
+// Centroid-dump cosine similarity. Independent of stitch's cosine_sim_raw so
+// that the dump helper compiles even when RECMEET_USE_SHERPA is OFF (the
+// stitch path's cosine_sim_raw lives inside the sherpa-gated anonymous
+// namespace below).
+double dump_cosine_similarity(const std::vector<float>& a,
+                              const std::vector<float>& b) {
+    if (a.size() != b.size() || a.empty()) return 0.0;
+    double dot = 0.0;
+    double norm_a_sq = 0.0;
+    double norm_b_sq = 0.0;
+    for (size_t i = 0; i < a.size(); ++i) {
+        double ai = static_cast<double>(a[i]);
+        double bi = static_cast<double>(b[i]);
+        dot += ai * bi;
+        norm_a_sq += ai * ai;
+        norm_b_sq += bi * bi;
+    }
+    double denom = std::sqrt(norm_a_sq) * std::sqrt(norm_b_sq);
+    if (denom < 1e-12) return 0.0;
+    return dot / denom;
+}
+
+// JSON-escape a string. Minimal — we only emit ASCII labels and timestamps in
+// the dump file so we just escape \, ", control chars.
+std::string dump_json_escape(const std::string& s) {
+    std::string out;
+    out.reserve(s.size() + 2);
+    for (char c : s) {
+        switch (c) {
+            case '"':  out += "\\\""; break;
+            case '\\': out += "\\\\"; break;
+            case '\n': out += "\\n"; break;
+            case '\r': out += "\\r"; break;
+            case '\t': out += "\\t"; break;
+            default:
+                if (static_cast<unsigned char>(c) < 0x20) {
+                    char buf[8];
+                    std::snprintf(buf, sizeof(buf), "\\u%04x",
+                                  static_cast<unsigned int>(static_cast<unsigned char>(c)));
+                    out += buf;
+                } else {
+                    out += c;
+                }
+        }
+    }
+    return out;
+}
+
+// Insert `meeting_timestamp` between the basename stem and the extension. If
+// the timestamp is empty, returns `path` unchanged (used by unit tests). If
+// the path has no extension we append `_<timestamp>` to the full path.
+std::string dump_suffix_path(const std::string& path,
+                             const std::string& meeting_timestamp) {
+    if (meeting_timestamp.empty()) return path;
+    std::filesystem::path p(path);
+    std::filesystem::path stem = p.stem();
+    std::filesystem::path ext = p.extension();
+    std::filesystem::path parent = p.parent_path();
+    std::string new_stem = stem.string() + "_" + meeting_timestamp;
+    std::filesystem::path out = parent / (new_stem + ext.string());
+    return out.string();
+}
+
+} // namespace
+
+void dump_centroids_json(
+    const std::string& path,
+    const std::string& meeting_timestamp,
+    const std::vector<std::vector<float>>& centroids,
+    const std::vector<long>& sample_counts,
+    const std::vector<std::map<int, int>>& local_to_global,
+    const std::string& source_label) {
+
+    if (path.empty()) return;  // no-op when flag absent
+
+    const size_t N = centroids.size();
+    if (sample_counts.size() != N) {
+        log_warn("dump_centroids_json: sample_counts size %zu != centroids size %zu",
+                 sample_counts.size(), N);
+    }
+
+    std::string out_path = dump_suffix_path(path, meeting_timestamp);
+
+    // Ensure parent dir exists (mkdir -p semantics). Best-effort.
+    try {
+        std::filesystem::path parent =
+            std::filesystem::path(out_path).parent_path();
+        if (!parent.empty() && !std::filesystem::exists(parent)) {
+            std::filesystem::create_directories(parent);
+        }
+    } catch (const std::exception& e) {
+        log_warn("dump_centroids_json: failed to create parent dir: %s", e.what());
+    }
+
+    std::ofstream os(out_path, std::ios::out | std::ios::trunc);
+    if (!os) {
+        log_warn("dump_centroids_json: failed to open %s for write", out_path.c_str());
+        return;
+    }
+
+    // Format: JSON object with keys
+    //   "schema":              version tag, currently "diarize-centroid-dump/1"
+    //   "source":              "stitch_chunks" | "diarize_short_audio" | ...
+    //   "meeting_timestamp":   the operator timestamp (informational only)
+    //   "num_globals":         centroids.size()
+    //   "dim":                 centroid dimensionality (0 if N==0)
+    //   "centroids":           [[f, f, ...], ...]  (raw, non-L2-normalized)
+    //   "sample_counts":       [long, long, ...]
+    //   "similarity":          NxN float matrix, computed transiently via
+    //                          L2-normalized dot product. Diagonal is 1.0.
+    //   "local_to_global":     [{"local_id": int, "global_id": int}, ...]
+    //                          per chunk; empty array for short-audio dumps.
+    os << "{\n";
+    os << "  \"schema\": \"diarize-centroid-dump/1\",\n";
+    os << "  \"source\": \"" << dump_json_escape(source_label) << "\",\n";
+    os << "  \"meeting_timestamp\": \""
+       << dump_json_escape(meeting_timestamp) << "\",\n";
+    os << "  \"num_globals\": " << N << ",\n";
+    os << "  \"dim\": " << (N > 0 ? centroids[0].size() : 0) << ",\n";
+
+    // centroids
+    os << "  \"centroids\": [";
+    for (size_t i = 0; i < N; ++i) {
+        if (i) os << ", ";
+        os << "[";
+        const auto& c = centroids[i];
+        for (size_t j = 0; j < c.size(); ++j) {
+            if (j) os << ", ";
+            // 8 significant digits — enough to reconstruct the cosine matrix
+            // to ~7 decimal places and bounded enough that 23 globals at 256-dim
+            // fits in a few hundred KB.
+            char buf[32];
+            std::snprintf(buf, sizeof(buf), "%.8g", c[j]);
+            os << buf;
+        }
+        os << "]";
+    }
+    os << "],\n";
+
+    // sample_counts
+    os << "  \"sample_counts\": [";
+    for (size_t i = 0; i < sample_counts.size(); ++i) {
+        if (i) os << ", ";
+        os << sample_counts[i];
+    }
+    os << "],\n";
+
+    // similarity matrix
+    os << "  \"similarity\": [";
+    for (size_t i = 0; i < N; ++i) {
+        if (i) os << ", ";
+        os << "[";
+        for (size_t j = 0; j < N; ++j) {
+            if (j) os << ", ";
+            double sim = (i == j) ? 1.0
+                       : dump_cosine_similarity(centroids[i], centroids[j]);
+            char buf[32];
+            std::snprintf(buf, sizeof(buf), "%.6f", sim);
+            os << buf;
+        }
+        os << "]";
+    }
+    os << "],\n";
+
+    // local_to_global
+    os << "  \"local_to_global\": [";
+    for (size_t k = 0; k < local_to_global.size(); ++k) {
+        if (k) os << ", ";
+        os << "[";
+        size_t m = 0;
+        for (const auto& [local_id, global_id] : local_to_global[k]) {
+            if (m++) os << ", ";
+            os << "{\"local_id\": " << local_id
+               << ", \"global_id\": " << global_id << "}";
+        }
+        os << "]";
+    }
+    os << "]\n";
+
+    os << "}\n";
+    os.flush();
+    if (!os) {
+        log_warn("dump_centroids_json: write failed for %s", out_path.c_str());
+        return;
+    }
+
+    log_info("dump_centroids_json: wrote %zu globals to %s",
+             N, out_path.c_str());
 }
 
 #if RECMEET_USE_SHERPA
@@ -283,12 +528,6 @@ std::vector<float> weighted_mean_raw(
     return out;
 }
 
-struct GlobalEntry {
-    int id;                       // current global ID (post-merge, pre-compaction)
-    std::vector<float> raw;       // raw running-mean centroid
-    long sample_count;            // total samples contributed to this centroid
-};
-
 // Returns a list of unique chunk-local speaker IDs in ascending order.
 std::vector<int> unique_local_ids(const DiarizeResult& chunk) {
     std::set<int> uniq;
@@ -309,12 +548,222 @@ long chunk_local_sample_count(const DiarizeResult& chunk, int local_sid) {
 
 } // namespace
 
+// ---------------------------------------------------------------------------
+// Phase B.3 — `apply_collapse` shared helper.
+//
+// One greedy loop (B.1) + the deterministic compaction (former Step-8 finale),
+// extracted so both code paths (long-audio `stitch_chunks` and short-audio
+// post-`diarize()`) share segment-rewrite + 0..N-1 compaction logic.
+//
+// Termination per iteration (unified loop):
+//   - `ceiling_hit  = (target_speakers > 0 && globals.size() > target_speakers)`
+//   - `threshold_ok = (best_sim >= collapse_threshold)`
+//   - `at_floor     = (enforce_floor && target_speakers > 0
+//                       && globals.size() <= target_speakers)`
+//   - `if (at_floor || (!ceiling_hit && !threshold_ok)) break;`
+//
+// When the ceiling is hit, we merge regardless of similarity (count is the
+// hard cap). When the ceiling is not hit but the threshold gate fires, we
+// auto-merge near-duplicates. The ceiling is the load-bearing mechanism for
+// count enforcement (Phase A analysis); the threshold sets the floor on
+// quality of merges done at-or-under the cap.
+//
+// Phase 1a (diarize-apply-collapse-over-merges task): when `enforce_floor`
+// is true, `target_speakers > 0` ALSO acts as a hard FLOOR — once the
+// global count is at or below the target, no further merges fire regardless
+// of similarity. This closes the operator-intent gap exposed by the debate
+// fixture where three real speakers were over-merged below the named
+// `--num-speakers 3` target. Floor branch is CLI-only: callers pass
+// `enforce_floor = true` only when `target_speakers` came from explicit
+// `--num-speakers N` (operator assertion); context-derived and
+// default-resolved counts pass false because context is operator hint,
+// not assertion.
+//
+// `target_speakers == 0` means "no ceiling/floor" (the pre-Phase-B
+// "auto-detect without cap" semantics on `stitch_chunks` map cleanly to
+// this: the unified loop still runs, but `ceiling_hit` and `at_floor` are
+// always false, so only threshold-driven merges fire). This preserves
+// backward compat for callers that pass 0.
+// ---------------------------------------------------------------------------
+CollapseResult apply_collapse(
+    DiarizeResult& diar_inout,
+    std::vector<GlobalEntry>& globals,
+    int target_speakers,
+    float collapse_threshold,
+    bool enforce_floor) {
+
+    // Unified greedy-merge loop: find the highest-similarity pair, merge
+    // when EITHER `ceiling_hit` OR `threshold_ok`. Stop when both are false
+    // OR when `at_floor` short-circuits (Phase 1a floor branch).
+    while (globals.size() > 1) {
+        int best_a_idx = -1, best_b_idx = -1;
+        float best_sim = -2.0f;
+        int best_min_id = std::numeric_limits<int>::max();
+
+        for (size_t a = 0; a < globals.size(); ++a) {
+            for (size_t b = a + 1; b < globals.size(); ++b) {
+                float sim = cosine_sim_raw(globals[a].raw, globals[b].raw);
+                int min_id = std::min(globals[a].id, globals[b].id);
+                bool take = false;
+                if (sim > best_sim) {
+                    take = true;
+                } else if (sim == best_sim && min_id < best_min_id) {
+                    take = true;
+                }
+                if (take) {
+                    best_sim = sim;
+                    best_min_id = min_id;
+                    best_a_idx = static_cast<int>(a);
+                    best_b_idx = static_cast<int>(b);
+                }
+            }
+        }
+        if (best_a_idx < 0 || best_b_idx < 0) break;
+
+        bool ceiling_hit =
+            (target_speakers > 0
+             && static_cast<int>(globals.size()) > target_speakers);
+        bool threshold_ok = (best_sim >= collapse_threshold);
+        // Floor semantics: explicit CLI target_speakers is a hard FLOOR. Once
+        // at or below the named count, no further merges fire regardless of
+        // similarity. Context-derived target_speakers (enforce_floor=false)
+        // preserves legacy ceiling-only behavior because context is operator
+        // hint, not assertion.
+        bool at_floor =
+            (enforce_floor && target_speakers > 0
+             && static_cast<int>(globals.size()) <= target_speakers);
+        if (at_floor || (!ceiling_hit && !threshold_ok)) break;
+
+        int id_a = globals[best_a_idx].id;
+        int id_b = globals[best_b_idx].id;
+        int merged_id  = std::min(id_a, id_b);
+        int dropped_id = std::max(id_a, id_b);
+
+        std::vector<float> merged_raw = weighted_mean_raw(
+            globals[best_a_idx].raw, globals[best_a_idx].sample_count,
+            globals[best_b_idx].raw, globals[best_b_idx].sample_count);
+        long merged_count = globals[best_a_idx].sample_count
+                          + globals[best_b_idx].sample_count;
+
+        int keep_idx = (id_a == merged_id) ? best_a_idx : best_b_idx;
+        int drop_idx = (id_a == merged_id) ? best_b_idx : best_a_idx;
+        globals[keep_idx].raw = std::move(merged_raw);
+        globals[keep_idx].sample_count = merged_count;
+        globals.erase(globals.begin() + drop_idx);
+
+        // Rewrite emitted segments: dropped_id -> merged_id.
+        for (auto& seg : diar_inout.segments) {
+            if (seg.speaker == dropped_id) seg.speaker = merged_id;
+        }
+    }
+
+    // Deterministic 0..N-1 compaction in ascending current-ID order
+    // (formerly Step 8 finale, M-2' line 421).
+    std::vector<GlobalEntry> sorted_globals = globals;
+    std::sort(sorted_globals.begin(), sorted_globals.end(),
+              [](const GlobalEntry& x, const GlobalEntry& y) {
+                  return x.id < y.id;
+              });
+    std::map<int, int> remap;
+    for (size_t k = 0; k < sorted_globals.size(); ++k) {
+        remap[sorted_globals[k].id] = static_cast<int>(k);
+    }
+    for (auto& seg : diar_inout.segments) {
+        auto it = remap.find(seg.speaker);
+        if (it != remap.end()) seg.speaker = it->second;
+    }
+
+    CollapseResult out;
+    for (size_t k = 0; k < sorted_globals.size(); ++k) {
+        out.centroids[static_cast<int>(k)] = std::move(sorted_globals[k].raw);
+    }
+    out.num_speakers = static_cast<int>(out.centroids.size());
+    diar_inout.num_speakers = out.num_speakers;
+
+    // Reflect the post-compaction IDs back into `globals` so callers (the
+    // long-audio path) can also see contiguous IDs — important for the
+    // existing centroid-dump helper that walks `sorted_globals`. We rebuild
+    // `globals` to mirror the compacted state (post-compaction ID + the
+    // moved-out raw via a copy from `out.centroids`).
+    globals.clear();
+    globals.reserve(sorted_globals.size());
+    for (size_t k = 0; k < sorted_globals.size(); ++k) {
+        GlobalEntry ge;
+        ge.id = static_cast<int>(k);
+        // Look up the centroid we just stored under id k.
+        auto it = out.centroids.find(static_cast<int>(k));
+        if (it != out.centroids.end()) ge.raw = it->second;
+        ge.sample_count = sorted_globals[k].sample_count;
+        globals.push_back(std::move(ge));
+    }
+
+    return out;
+}
+
+void copy_globals_for_dump(const std::vector<GlobalEntry>& globals,
+                           std::vector<std::vector<float>>& centroids_out,
+                           std::vector<long>& sample_counts_out) {
+    centroids_out.clear();
+    sample_counts_out.clear();
+    centroids_out.reserve(globals.size());
+    sample_counts_out.reserve(globals.size());
+    for (const auto& g : globals) {
+        centroids_out.push_back(g.raw);
+        sample_counts_out.push_back(g.sample_count);
+    }
+}
+
+std::vector<GlobalEntry> build_short_audio_globals(
+    const float* samples, size_t num_samples,
+    const DiarizeResult& diar, int threads) {
+
+    std::vector<GlobalEntry> globals;
+    if (!samples || num_samples == 0 || diar.segments.empty()) return globals;
+
+    auto model_paths = ensure_sherpa_models();
+    SpeakerEmbeddingSession emb_session(model_paths.embedding, threads);
+
+    // Unique cluster IDs in ascending order for deterministic ordering.
+    std::vector<int> uniq_ids = unique_local_ids(diar);
+
+    int id_seq = 0;
+    for (int sid : uniq_ids) {
+        std::vector<float> raw = extract_speaker_embedding(
+            emb_session, samples, num_samples, diar, sid);
+        if (raw.empty()) continue;
+
+        // Sample-count weight: total duration of all segments tagged with sid.
+        double sec = 0.0;
+        for (const auto& seg : diar.segments) {
+            if (seg.speaker == sid && seg.end > seg.start)
+                sec += seg.end - seg.start;
+        }
+        long n = static_cast<long>(sec * static_cast<double>(SAMPLE_RATE));
+        if (n <= 0) n = 1;
+
+        GlobalEntry ge;
+        // ge.id MUST match the existing cluster ID in `diar.segments` so
+        // `apply_collapse` can rewrite segments by merging dropped->merged
+        // IDs. We do NOT reassign ge.id = id_seq++ here — the diar segments
+        // already carry sherpa's 0..N-1 IDs, and apply_collapse needs the
+        // globals' IDs to be the same values it sees on the segments.
+        ge.id = sid;
+        ge.raw = std::move(raw);
+        ge.sample_count = n;
+        globals.push_back(std::move(ge));
+        ++id_seq;
+    }
+
+    return globals;
+}
+
 DiarizeChunkedResult stitch_chunks(
     const std::vector<DiarizeResult>& chunk_results,
     const std::vector<std::map<int, std::vector<float>>>& chunk_centroids,
     const std::vector<ChunkExtents>& extents,
     const DiarizeChunkConfig& cfg,
-    int num_speakers) {
+    int target_speakers,
+    bool enforce_floor) {
 
     if (chunk_results.size() != chunk_centroids.size()
         || chunk_results.size() != extents.size())
@@ -420,86 +869,60 @@ DiarizeChunkedResult stitch_chunks(
         }
     }
 
-    // Step 8: post-stitch greedy-merge enforcing `num_speakers` count limit.
-    // Merge pair with highest pairwise cosine similarity; tie-break to the
-    // smaller min(A.id, B.id). Sample-weighted mean of raw vectors. Rewrite
-    // already-emitted segments. After the loop: ascending-current-ID
-    // compaction to 0..N-1 (M-2' line 421).
-    if (num_speakers > 0) {
-        while (static_cast<int>(globals.size()) > num_speakers) {
-            int best_a_idx = -1, best_b_idx = -1;
-            float best_sim = -2.0f;
-            int best_min_id = std::numeric_limits<int>::max();
+    // Phase B.1+B.3: unified greedy-merge loop + 0..N-1 compaction. Replaces
+    // the inline `num_speakers > 0`-gated merge + Step-8 finale that lived
+    // here pre-Phase-B. Same correctness (ceiling enforced when
+    // target_speakers > 0; threshold gate decides auto-merges when under
+    // the cap) — the loop body, the segment-rewrite, and the compaction now
+    // live in `apply_collapse`. We snapshot `globals` (pre-merge state) for
+    // the centroid dump's per-chunk local→global remap below: that remap
+    // needs the original pre-merge IDs to look up the post-compaction IDs.
+    std::vector<GlobalEntry> globals_snapshot = globals;  // for dump-remap
+    auto collapsed = apply_collapse(out.diar, globals, target_speakers,
+                                    cfg.collapse_threshold, enforce_floor);
+    out.centroids = collapsed.centroids;
 
-            for (size_t a = 0; a < globals.size(); ++a) {
-                for (size_t b = a + 1; b < globals.size(); ++b) {
-                    float sim = cosine_sim_raw(globals[a].raw, globals[b].raw);
-                    int min_id = std::min(globals[a].id, globals[b].id);
-                    bool take = false;
-                    if (sim > best_sim) {
-                        take = true;
-                    } else if (sim == best_sim && min_id < best_min_id) {
-                        take = true;
-                    }
-                    if (take) {
-                        best_sim = sim;
-                        best_min_id = min_id;
-                        best_a_idx = static_cast<int>(a);
-                        best_b_idx = static_cast<int>(b);
-                    }
+    // Build the {pre-merge ID → post-compaction ID} map by tracing each
+    // surviving (post-collapse, contiguous 0..N-1) global back to a snapshot
+    // entry by best matching centroid. Used only for the centroid-dump
+    // local→global rewrite below. We use the simple structural rule that
+    // pre-merge IDs are unique and apply_collapse never invents new
+    // pre-merge IDs — every survivor's contiguous index ID maps back to one
+    // (or more) snapshot IDs that merged into it. The dump's local→global
+    // map is informational; treat unknown pre-merge IDs as the raw value.
+    //
+    // Since apply_collapse rewrites segments first and globals second,
+    // a clean way to recover the map is to walk the (already rewritten)
+    // segments + compare to the local_to_global lookup. Easier: we record
+    // the merges inside apply_collapse via a parallel side channel? No —
+    // simpler still: we recompute the merge map by exhaustively matching
+    // the snapshot centroids against the post-collapse centroids using
+    // sample_count tie-breaking. For the bench/instrumentation use case
+    // (analysis script consumes this), an approximate map is fine: we just
+    // need each pre-merge ID to land somewhere in `0..N-1`.
+    //
+    // Strategy: a pre-merge global G_pre survives at post-collapse index k
+    // iff (after merges) G_pre is the lowest pre-merge ID among the
+    // snapshot entries that map to k. We don't have that map here, so we
+    // approximate: for each pre-merge ID, find the post-collapse centroid
+    // with maximum cosine similarity (against the pre-merge raw). Cheap on
+    // small N, deterministic, and exact for the unmerged case (similarity
+    // is 1.0 when no merge touched that entry).
+    std::map<int, int> dump_remap;
+    if (!cfg.debug_dump_centroids_path.empty() && !globals_snapshot.empty()) {
+        for (const auto& g_pre : globals_snapshot) {
+            int best_k = 0;
+            float best_sim = -2.0f;
+            for (const auto& [post_id, post_raw] : collapsed.centroids) {
+                float s = cosine_sim_raw(g_pre.raw, post_raw);
+                if (s > best_sim) {
+                    best_sim = s;
+                    best_k = post_id;
                 }
             }
-            if (best_a_idx < 0 || best_b_idx < 0) break;
-
-            int id_a = globals[best_a_idx].id;
-            int id_b = globals[best_b_idx].id;
-            int merged_id = std::min(id_a, id_b);
-            int dropped_id = std::max(id_a, id_b);
-
-            std::vector<float> merged_raw = weighted_mean_raw(
-                globals[best_a_idx].raw, globals[best_a_idx].sample_count,
-                globals[best_b_idx].raw, globals[best_b_idx].sample_count);
-            long merged_count = globals[best_a_idx].sample_count
-                              + globals[best_b_idx].sample_count;
-
-            // Replace the entry whose id == merged_id; erase the dropped one.
-            int keep_idx = (id_a == merged_id) ? best_a_idx : best_b_idx;
-            int drop_idx = (id_a == merged_id) ? best_b_idx : best_a_idx;
-            globals[keep_idx].raw = std::move(merged_raw);
-            globals[keep_idx].sample_count = merged_count;
-            // Erase higher-index first to keep the other index valid.
-            if (drop_idx > keep_idx) {
-                globals.erase(globals.begin() + drop_idx);
-            } else {
-                globals.erase(globals.begin() + drop_idx);
-            }
-
-            // Rewrite emitted segments: dropped_id -> merged_id.
-            for (auto& seg : out.diar.segments) {
-                if (seg.speaker == dropped_id) seg.speaker = merged_id;
-            }
+            dump_remap[g_pre.id] = best_k;
         }
     }
-
-    // Step 8 finale: deterministic ID compaction to 0..N-1 contiguous in
-    // ascending current-ID order.
-    std::vector<GlobalEntry> sorted_globals = globals;
-    std::sort(sorted_globals.begin(), sorted_globals.end(),
-              [](const GlobalEntry& x, const GlobalEntry& y) {
-                  return x.id < y.id;
-              });
-    std::map<int, int> remap;
-    for (size_t k = 0; k < sorted_globals.size(); ++k) {
-        remap[sorted_globals[k].id] = static_cast<int>(k);
-    }
-    for (auto& seg : out.diar.segments) {
-        auto it = remap.find(seg.speaker);
-        if (it != remap.end()) seg.speaker = it->second;
-    }
-    for (size_t k = 0; k < sorted_globals.size(); ++k) {
-        out.centroids[static_cast<int>(k)] = std::move(sorted_globals[k].raw);
-    }
-    out.diar.num_speakers = static_cast<int>(sorted_globals.size());
 
     // Re-sort emitted segments by start time so downstream merge_speakers and
     // any time-ordered consumers see a clean sequence.
@@ -508,13 +931,48 @@ DiarizeChunkedResult stitch_chunks(
                          return x.start < y.start;
                      });
 
+    // Phase A instrumentation: dump the post-stitch centroid state to JSON
+    // so an offline analysis script can sweep collapse thresholds without
+    // re-running the (~15-min) bench. Reads paths and timestamps from the
+    // already-populated DiarizeChunkConfig. Dumps the POST-collapse state so
+    // the JSON's indices match the speaker IDs emitted by the pipeline.
+    if (!cfg.debug_dump_centroids_path.empty()) {
+        std::vector<std::vector<float>> dump_centroids;
+        std::vector<long> dump_counts;
+        // Dump in post-collapse (0..N-1) order. We can read directly from
+        // `globals` because apply_collapse reflects the compacted state
+        // back into `globals` (ge.id = 0..N-1, ge.raw = compacted centroid).
+        copy_globals_for_dump(globals, dump_centroids, dump_counts);
+        // Remap per-chunk local→global through dump_remap so the dumped
+        // global IDs match the emitted segment speaker IDs.
+        std::vector<std::map<int, int>> remapped_l2g;
+        remapped_l2g.reserve(local_to_global.size());
+        for (const auto& chunk_map : local_to_global) {
+            std::map<int, int> remapped;
+            for (const auto& [local_id, pre_compaction_gid] : chunk_map) {
+                auto rit = dump_remap.find(pre_compaction_gid);
+                int gid = (rit != dump_remap.end())
+                          ? rit->second : pre_compaction_gid;
+                remapped[local_id] = gid;
+            }
+            remapped_l2g.push_back(std::move(remapped));
+        }
+        dump_centroids_json(cfg.debug_dump_centroids_path,
+                            cfg.meeting_timestamp,
+                            dump_centroids,
+                            dump_counts,
+                            remapped_l2g,
+                            "stitch_chunks");
+    }
+
     return out;
 }
 
 DiarizeChunkedResult diarize_chunked(
     const float* samples, size_t num_samples,
-    int num_speakers, int threads, float threshold,
+    int target_speakers, int threads, float threshold,
     const DiarizeChunkConfig& chunk_cfg,
+    bool enforce_floor,
     DiarizeProgressCallback on_progress) {
 
     if (!samples || num_samples == 0)
@@ -643,7 +1101,7 @@ DiarizeChunkedResult diarize_chunked(
     if (on_progress) on_progress(100, 100);
 
     return stitch_chunks(chunk_results, chunk_centroids, extents,
-                         chunk_cfg, num_speakers);
+                         chunk_cfg, target_speakers, enforce_floor);
 }
 #endif
 

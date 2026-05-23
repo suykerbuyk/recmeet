@@ -40,6 +40,11 @@ JsonMap config_to_map(const Config& cfg) {
     m["chunk_minutes"]       = static_cast<double>(cfg.chunk_minutes);
     m["chunk_overlap_sec"]   = static_cast<double>(cfg.chunk_overlap_sec);
     m["stitch_threshold"]    = static_cast<double>(cfg.stitch_threshold);
+    // Phase B (diarize-overcount):
+    m["max_auto_speakers"]   = static_cast<int64_t>(cfg.max_auto_speakers);
+    m["collapse_threshold"]  = static_cast<double>(cfg.collapse_threshold);
+    // Short-audio min-cluster-duration filter (Phase A.3 follow-up):
+    m["min_cluster_duration_sec"] = static_cast<double>(cfg.min_cluster_duration_sec);
 
     // Speaker identification
     m["speaker_id"]          = cfg.speaker_id;
@@ -164,6 +169,11 @@ Config config_from_map(const JsonMap& m) {
     f("chunk_minutes", cfg.chunk_minutes);
     f("chunk_overlap_sec", cfg.chunk_overlap_sec);
     f("stitch_threshold", cfg.stitch_threshold);
+    // Phase B (diarize-overcount):
+    i("max_auto_speakers", cfg.max_auto_speakers);
+    f("collapse_threshold", cfg.collapse_threshold);
+    // Short-audio min-cluster-duration filter (Phase A.3 follow-up):
+    f("min_cluster_duration_sec", cfg.min_cluster_duration_sec);
 
     b("speaker_id", cfg.speaker_id);
     f("speaker_threshold", cfg.speaker_threshold);

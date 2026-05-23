@@ -104,11 +104,11 @@
 <body>
 <div class="container">
 
-<h1>Component Interaction Diagrams</h1>
+<h1 id="component-interaction-diagrams">Component Interaction Diagrams</h1>
 <p>Detailed Mermaid diagrams documenting recmeet's architecture, component
 interactions, and internal control flow. These diagrams reflect the actual
 source code implementation, not aspirational design.</p>
-
+<hr>
 <nav class="toc">
 <h3>Table of Contents</h3>
 <ol>
@@ -125,17 +125,17 @@ source code implementation, not aspirational design.</p>
   <li><a href="#s11">Subprocess Postprocessing</a></li>
   <li><a href="#s12">Audio Capture Subsystem</a></li>
   <li><a href="#s13">Go Tools Module</a></li>
+  <li><a href="#s14">Live Captioning Pipeline</a></li>
+  <li><a href="#s15">GPU Plugin Architecture (ggml backends)</a></li>
 </ol>
 </nav>
 
 <hr>
 
-<!-- ================================================================ -->
 <h2 id="s1">1. Top-Level Component Interaction</h2>
 <p>All runtime communication paths between binaries, libraries, and external
 systems. Solid lines are compile-time links; dashed lines are runtime IPC or
 network calls.</p>
-
 <div class="diagram-wrapper"><pre class="mermaid">
 graph TB
     subgraph "C++ Binaries"
@@ -192,65 +192,68 @@ graph TB
         TCP["TCP socket&lt;br/&gt;(configurable host:port)"]
     end
 
-    CORE -->|"links"| IPC
-    CORE --> WHISPER
-    CORE -.->|"if RECMEET_USE_LLAMA"| LLAMA
-    CORE -.->|"if RECMEET_USE_SHERPA"| SHERPA
-    SHERPA --> ONNX
-    CORE --> PW
-    CORE --> PA
-    CORE --> SNDFILE
-    IPC --> CURL
-    IPC --> PA
-    IPC -.->|"if RECMEET_USE_NOTIFY"| NOTIFY
+    %% Library links
+    CORE --&gt;|"links"| IPC
+    CORE --&gt; WHISPER
+    CORE -.-&gt;|"if RECMEET_USE_LLAMA"| LLAMA
+    CORE -.-&gt;|"if RECMEET_USE_SHERPA"| SHERPA
+    SHERPA --&gt; ONNX
+    CORE --&gt; PW
+    CORE --&gt; PA
+    CORE --&gt; SNDFILE
+    IPC --&gt; CURL
+    IPC --&gt; PA
+    IPC -.-&gt;|"if RECMEET_USE_NOTIFY"| NOTIFY
 
-    CLI -->|"links"| CORE
-    DAEMON -->|"links"| CORE
-    WEB -->|"links"| CORE
-    WEB --> HTTPLIB
-    TRAY -->|"links (thin client)"| IPC
-    TRAY --> GTK
-    TRAY --> APPIND
+    %% Binary links
+    CLI --&gt;|"links"| CORE
+    DAEMON --&gt;|"links"| CORE
+    WEB --&gt;|"links"| CORE
+    WEB --&gt; HTTPLIB
+    TRAY --&gt;|"links (thin client)"| IPC
+    TRAY --&gt; GTK
+    TRAY --&gt; APPIND
 
-    CLI -.->|"client mode"| UNIX
-    CLI -.->|"client mode"| TCP
-    TRAY -.->|"always"| UNIX
-    TRAY -.->|"remote"| TCP
-    UNIX -.-> DAEMON
-    TCP -.-> DAEMON
+    %% IPC runtime paths
+    CLI -.-&gt;|"client mode"| UNIX
+    CLI -.-&gt;|"client mode"| TCP
+    TRAY -.-&gt;|"always"| UNIX
+    TRAY -.-&gt;|"remote"| TCP
+    UNIX -.-&gt; DAEMON
+    TCP -.-&gt; DAEMON
 
-    DAEMON -.->|"fork/exec postprocessing"| CLI
+    %% Subprocess fork/exec
+    DAEMON -.-&gt;|"fork/exec&lt;br/&gt;postprocessing"| CLI
 
-    CLI --> CONFIG
-    CLI --> MEETINGS
-    DAEMON --> CONFIG
-    DAEMON --> MEETINGS
-    DAEMON --> LOGS
-    TRAY --> CONFIG
-    WEB --> MEETINGS
-    WEB --> SPEAKERS
-    CORE --> MODELS
-    CORE --> SPEAKERS
+    %% Data access
+    CLI --&gt; CONFIG
+    CLI --&gt; MEETINGS
+    DAEMON --&gt; CONFIG
+    DAEMON --&gt; MEETINGS
+    DAEMON --&gt; LOGS
+    TRAY --&gt; CONFIG
+    WEB --&gt; MEETINGS
+    WEB --&gt; SPEAKERS
+    CORE --&gt; MODELS
+    CORE --&gt; SPEAKERS
 
-    CORE -.->|"summarize_http()"| CLOUD
-    CORE -.->|"model download"| CURL
-    AGENT -.-> CLAUDE
-    AGENT -.-> BRAVE
+    %% Network
+    CORE -.-&gt;|"summarize_http()"| CLOUD
+    CORE -.-&gt;|"model download"| CURL
+    AGENT -.-&gt; CLAUDE
+    AGENT -.-&gt; BRAVE
 
-    MCP --> MEETINGS
-    MCP --> SPEAKERS
-    MCP --> CONFIG
-    AGENT --> MEETINGS
-    AGENT --> SPEAKERS
-    AGENT --> CONFIG
+    %% Go data access
+    MCP --&gt; MEETINGS
+    MCP --&gt; SPEAKERS
+    MCP --&gt; CONFIG
+    AGENT --&gt; MEETINGS
+    AGENT --&gt; SPEAKERS
+    AGENT --&gt; CONFIG
 </pre></div>
-
 <hr>
-
-<!-- ================================================================ -->
 <h2 id="s2">2. Build Topology and Library Dependencies</h2>
 <p>Exact source file inventory per CMake target and the link dependency graph.</p>
-
 <div class="diagram-wrapper"><pre class="mermaid">
 graph TB
     subgraph "recmeet_ipc (static lib — no ML deps)"
@@ -266,7 +269,7 @@ graph TB
         BIN_DAEMON["recmeet-daemon&lt;br/&gt;(daemon.cpp)"]
         BIN_WEB["recmeet-web&lt;br/&gt;(web.cpp + httplib.cpp)"]
         BIN_TRAY["recmeet-tray&lt;br/&gt;(tray.cpp)"]
-        BIN_TEST["recmeet_tests&lt;br/&gt;(tests/test_*.cpp x 26)"]
+        BIN_TEST["recmeet_tests&lt;br/&gt;(tests/test_*.cpp × 35)"]
     end
 
     subgraph "Vendored"
@@ -289,89 +292,87 @@ graph TB
         SYS_AI["ayatana-appindicator3"]
     end
 
-    IPC_SRC --> SYS_PA
-    IPC_SRC --> SYS_CURL
-    IPC_SRC -.->|"RECMEET_USE_NOTIFY"| SYS_NOTIFY
+    %% recmeet_ipc deps
+    IPC_SRC --&gt; SYS_PA
+    IPC_SRC --&gt; SYS_CURL
+    IPC_SRC -.-&gt;|"RECMEET_USE_NOTIFY"| SYS_NOTIFY
 
-    CORE_SRC -->|"PUBLIC link"| IPC_SRC
-    CORE_SRC --> V_WHISPER
-    CORE_SRC -.->|"RECMEET_USE_LLAMA"| V_LLAMA
-    CORE_SRC -.->|"RECMEET_USE_SHERPA"| V_SHERPA
-    V_SHERPA --> V_ONNX
-    CORE_SRC --> SYS_PW
-    CORE_SRC --> SYS_PAS
-    CORE_SRC --> SYS_SF
+    %% recmeet_core deps
+    CORE_SRC --&gt;|"PUBLIC link"| IPC_SRC
+    CORE_SRC --&gt; V_WHISPER
+    CORE_SRC -.-&gt;|"RECMEET_USE_LLAMA"| V_LLAMA
+    CORE_SRC -.-&gt;|"RECMEET_USE_SHERPA"| V_SHERPA
+    V_SHERPA --&gt; V_ONNX
+    CORE_SRC --&gt; SYS_PW
+    CORE_SRC --&gt; SYS_PAS
+    CORE_SRC --&gt; SYS_SF
 
-    BIN_CLI --> CORE_SRC
-    BIN_DAEMON --> CORE_SRC
-    BIN_WEB --> CORE_SRC
-    BIN_WEB --> V_HTTPLIB
-    BIN_TRAY -->|"thin client"| IPC_SRC
-    BIN_TRAY --> SYS_GTK
-    BIN_TRAY --> SYS_AI
-    BIN_TEST --> CORE_SRC
-    BIN_TEST --> V_CATCH
+    %% Binary links
+    BIN_CLI --&gt; CORE_SRC
+    BIN_DAEMON --&gt; CORE_SRC
+    BIN_WEB --&gt; CORE_SRC
+    BIN_WEB --&gt; V_HTTPLIB
+    BIN_TRAY --&gt;|"thin client"| IPC_SRC
+    BIN_TRAY --&gt; SYS_GTK
+    BIN_TRAY --&gt; SYS_AI
+    BIN_TEST --&gt; CORE_SRC
+    BIN_TEST --&gt; V_CATCH
 
     style BIN_TRAY fill:#e8f5e9,stroke:#2e7d32
     style IPC_SRC fill:#e3f2fd,stroke:#1565c0
     style CORE_SRC fill:#fff3e0,stroke:#e65100
 </pre></div>
-
 <hr>
-
-<!-- ================================================================ -->
 <h2 id="s3">3. Daemon Internals</h2>
-
-<h3>3a. Daemon Startup Sequence</h3>
+<h3 id="3a-daemon-startup-sequence">3a. Daemon Startup Sequence</h3>
 <div class="diagram-wrapper"><pre class="mermaid">
 flowchart TD
-    START["main(argc, argv)"] --> PARSE["Parse CLI args&lt;br/&gt;(--socket, --listen, --log-level)"]
-    PARSE --> PID["Compute pid_path&lt;br/&gt;Unix: socket.pid&lt;br/&gt;TCP: daemon-tcp.pid"]
-    PID --> FLOCK["open() + flock(LOCK_EX|LOCK_NB)"]
-    FLOCK -->|"locked"| ABORT["stderr: 'Another instance running'&lt;br/&gt;return 1"]
-    FLOCK -->|"acquired"| INIT["log_init()&lt;br/&gt;whisper_log_set(null)&lt;br/&gt;load_config()&lt;br/&gt;resolve_api_key()&lt;br/&gt;notify_init()"]
-    INIT --> SELF["Resolve g_self_exe&lt;br/&gt;(/proc/self/exe -> sibling 'recmeet')"]
-    SELF --> SERVER["IpcServer server(socket_path)"]
-    SERVER --> HANDLERS["Register method handlers:&lt;br/&gt;status.get, sources.list,&lt;br/&gt;config.reload, config.update,&lt;br/&gt;record.start, record.stop,&lt;br/&gt;job.context, speakers.*,&lt;br/&gt;models.list/ensure/update"]
-    HANDLERS --> BIND["server.start()&lt;br/&gt;(bind + listen)"]
-    BIND -->|"fail"| EXIT1["return 1"]
-    BIND -->|"ok"| PPWORKER["Spawn g_pp_worker thread&lt;br/&gt;(pp_worker_loop — long-lived)"]
-    PPWORKER --> SIGNALS["Install sigaction:&lt;br/&gt;SIGINT/SIGTERM -> stop&lt;br/&gt;SIGHUP -> reload config"]
-    SIGNALS --> RUN["server.run()&lt;br/&gt;(blocks in poll loop)"]
-    RUN --> SHUTDOWN["Shutdown:&lt;br/&gt;request all StopTokens&lt;br/&gt;SIGTERM child if alive&lt;br/&gt;g_queue_shutdown = true&lt;br/&gt;join all workers&lt;br/&gt;unlink pid + socket&lt;br/&gt;log_shutdown()"]
+    START["main(argc, argv)"] --&gt; PARSE["Parse CLI args&lt;br/&gt;(--socket, --listen, --log-level)"]
+    PARSE --&gt; PID["Compute pid_path&lt;br/&gt;Unix: socket.pid&lt;br/&gt;TCP: daemon-tcp.pid"]
+    PID --&gt; FLOCK["open() + flock(LOCK_EX|LOCK_NB)"]
+    FLOCK --&gt;|"locked"| ABORT["stderr: 'Another instance running'&lt;br/&gt;return 1"]
+    FLOCK --&gt;|"acquired"| INIT["log_init()&lt;br/&gt;whisper_log_set(null)&lt;br/&gt;load_config()&lt;br/&gt;resolve_api_key()&lt;br/&gt;notify_init()"]
+    INIT --&gt; SELF["Resolve g_self_exe&lt;br/&gt;(/proc/self/exe → sibling 'recmeet')"]
+    SELF --&gt; SERVER["IpcServer server(socket_path)"]
+    SERVER --&gt; HANDLERS["Register method handlers:&lt;br/&gt;status.get, sources.list,&lt;br/&gt;config.reload, config.update,&lt;br/&gt;record.start, record.stop,&lt;br/&gt;job.context, speakers.*,&lt;br/&gt;models.list/ensure/update"]
+    HANDLERS --&gt; BIND["server.start()&lt;br/&gt;(bind + listen)"]
+    BIND --&gt;|"fail"| EXIT1["return 1"]
+    BIND --&gt;|"ok"| PPWORKER["Spawn g_pp_worker thread&lt;br/&gt;(pp_worker_loop — long-lived)"]
+    PPWORKER --&gt; SIGNALS["Install sigaction:&lt;br/&gt;SIGINT/SIGTERM → stop&lt;br/&gt;SIGHUP → reload config"]
+    SIGNALS --&gt; RUN["server.run()&lt;br/&gt;(blocks in poll loop)"]
+    RUN --&gt; SHUTDOWN["Shutdown:&lt;br/&gt;request all StopTokens&lt;br/&gt;SIGTERM child if alive&lt;br/&gt;g_queue_shutdown = true&lt;br/&gt;join all workers&lt;br/&gt;unlink pid + socket&lt;br/&gt;log_shutdown()"]
 </pre></div>
-
-<h3>3b. Daemon State Machine</h3>
+<h3 id="3b-daemon-state-machine">3b. Daemon State Machine</h3>
 <div class="diagram-wrapper"><pre class="mermaid">
 stateDiagram-v2
-    [*] --> Idle
+    [*] --&gt; Idle
 
-    Idle --> Recording : record.start (set g_recording)
-    Idle --> Downloading : models.ensure (set g_downloading)
+    Idle --&gt; Recording : record.start (set g_recording)
+    Idle --&gt; Downloading : models.ensure (set g_downloading)
 
-    Recording --> RecPP : run_recording() returns
+    Recording --&gt; RecPP : run_recording() returns
 
-    Recording --> Idle : pipeline error (clear g_recording)
+    Recording --&gt; Idle : pipeline error (clear g_recording)
 
-    RecPP --> Postprocessing : rec_worker exits
+    RecPP --&gt; Postprocessing : rec_worker exits
 
-    Recording --> ConcurrentRecPP : new record.start while PP active
+    Recording --&gt; ConcurrentRecPP : new record.start while PP active
 
-    Postprocessing --> Idle : subprocess exits (clear g_postprocessing)
+    Postprocessing --&gt; Idle : subprocess exits (clear g_postprocessing)
 
-    Downloading --> Idle : complete or error (clear g_downloading)
+    Downloading --&gt; Idle : complete or error (clear g_downloading)
 
-    ConcurrentRecPP --> RecPP : run_recording() returns
+    ConcurrentRecPP --&gt; RecPP : run_recording() returns
 
     state RecPP {
         direction LR
-        [*] --> handoff
-        handoff : Atomic handoff under g_state_mu —\ng_postprocessing = true THEN\ng_recording = false.\nNo transient idle broadcast.
+        [*] --&gt; handoff
+        handoff : Atomic handoff under g_state_mu ―\ng_postprocessing = true THEN\ng_recording = false.\nNo transient idle broadcast.
     }
 
     state ConcurrentRecPP {
         direction LR
-        [*] --> overlap
+        [*] --&gt; overlap
         overlap : g_recording = true\ng_postprocessing = true\n\nrecord.start guard checks\ng_recording or g_downloading\nbut NOT g_postprocessing\nso overlap is allowed.
     }
 
@@ -379,10 +380,18 @@ stateDiagram-v2
         Worker threads use lock_guard on g_state_mu
         for all multi-flag transitions.
         Bare atomic reads are fine without the mutex.
+
+        Reprocess (`--reprocess` or `--reprocess-batch`)
+        traverses the same path: record.start handler
+        receives `reprocess_dir` param, sets g_recording
+        briefly, run_recording() validates paths (no
+        capture), then hands off as above.
+        composite_state_name() projects the live flags
+        as "reprocessing" or "reprocessing+postprocessing"
+        for the on-wire `state.changed` event.
     end note
 </pre></div>
-
-<h3>3c. Worker Thread Lifecycle</h3>
+<h3 id="3c-worker-thread-lifecycle">3c. Worker Thread Lifecycle</h3>
 <div class="diagram-wrapper"><pre class="mermaid">
 flowchart TB
     subgraph "rec_worker (one-shot per record.start)"
@@ -393,11 +402,11 @@ flowchart TB
         RW_ENQUEUE["Absorb pending context/vocab&lt;br/&gt;Enqueue PostprocessJob&lt;br/&gt;lock(g_state_mu):&lt;br/&gt;  g_postprocessing = true&lt;br/&gt;  g_recording = false&lt;br/&gt;g_queue_cv.notify_one()"]
         RW_ERR["lock(g_state_mu):&lt;br/&gt;  g_recording = false&lt;br/&gt;server.post(broadcast error state)"]
 
-        RW_START --> RW_RUN
-        RW_RUN --> RW_PHASE
-        RW_RUN --> RW_OK
-        RW_OK -->|"yes"| RW_ENQUEUE
-        RW_OK -->|"exception"| RW_ERR
+        RW_START --&gt; RW_RUN
+        RW_RUN --&gt; RW_PHASE
+        RW_RUN --&gt; RW_OK
+        RW_OK --&gt;|"yes"| RW_ENQUEUE
+        RW_OK --&gt;|"exception"| RW_ERR
     end
 
     subgraph "pp_worker (long-lived, started at daemon init)"
@@ -405,16 +414,16 @@ flowchart TB
         PP_SHUT{shutdown?}
         PP_DEQUEUE["Dequeue PostprocessJob"]
         PP_FLAG["if !already_flagged:&lt;br/&gt;  g_postprocessing = true&lt;br/&gt;  broadcast state"]
-        PP_FORK["Fork/exec subprocess&lt;br/&gt;(see section 11)"]
+        PP_FORK["Fork/exec subprocess&lt;br/&gt;(see §11)"]
         PP_DONE["lock(g_state_mu):&lt;br/&gt;  g_postprocessing = false&lt;br/&gt;broadcast state"]
 
-        PP_WAIT --> PP_SHUT
-        PP_SHUT -->|"yes"| PP_EXIT["return"]
-        PP_SHUT -->|"no"| PP_DEQUEUE
-        PP_DEQUEUE --> PP_FLAG
-        PP_FLAG --> PP_FORK
-        PP_FORK --> PP_DONE
-        PP_DONE --> PP_WAIT
+        PP_WAIT --&gt; PP_SHUT
+        PP_SHUT --&gt;|"yes"| PP_EXIT["return"]
+        PP_SHUT --&gt;|"no"| PP_DEQUEUE
+        PP_DEQUEUE --&gt; PP_FLAG
+        PP_FLAG --&gt; PP_FORK
+        PP_FORK --&gt; PP_DONE
+        PP_DONE --&gt; PP_WAIT
     end
 
     subgraph "dl_worker (one-shot per models.ensure)"
@@ -422,206 +431,190 @@ flowchart TB
         DL_DOWNLOAD["Download models&lt;br/&gt;server.post(broadcast model events)"]
         DL_DONE["lock(g_state_mu):&lt;br/&gt;  g_downloading = false&lt;br/&gt;broadcast state"]
 
-        DL_START --> DL_DOWNLOAD
-        DL_DOWNLOAD --> DL_DONE
+        DL_START --&gt; DL_DOWNLOAD
+        DL_DOWNLOAD --&gt; DL_DONE
     end
 </pre></div>
-
-<h3>3d. Signal Handling</h3>
+<h3 id="3d-signal-handling">3d. Signal Handling</h3>
 <div class="diagram-wrapper"><pre class="mermaid">
 flowchart LR
     SIG["Signal received"]
-    SIG -->|"SIGHUP"| RELOAD["server.post(lambda:&lt;br/&gt;  load_config()&lt;br/&gt;  store under g_config_mu)"]
-    SIG -->|"SIGINT / SIGTERM"| STOP["g_rec_stop.request()&lt;br/&gt;g_pp_stop.request()&lt;br/&gt;server.stop()&lt;br/&gt;(write 'X' to wakeup pipe)"]
+    SIG --&gt;|"SIGHUP"| RELOAD["server.post(lambda:&lt;br/&gt;  load_config()&lt;br/&gt;  store under g_config_mu)"]
+    SIG --&gt;|"SIGINT / SIGTERM"| STOP["g_rec_stop.request()&lt;br/&gt;g_pp_stop.request()&lt;br/&gt;server.stop()&lt;br/&gt;(write 'X' to wakeup pipe)"]
 
-    STOP --> POLL_EXIT["poll() returns ->  run() exits ->  shutdown sequence"]
+    STOP --&gt; POLL_EXIT["poll() returns →&lt;br/&gt;run() exits →&lt;br/&gt;shutdown sequence"]
 </pre></div>
-
 <hr>
-
-<!-- ================================================================ -->
 <h2 id="s4">4. IPC Server Poll Loop</h2>
-
 <div class="diagram-wrapper"><pre class="mermaid">
 flowchart TD
     RUN["server.run()"]
     BUILD["Build pollfd array:&lt;br/&gt;[0] wakeup_read_ (POLLIN)&lt;br/&gt;[1] listen_fd_ (POLLIN)&lt;br/&gt;[2..N] client fds (POLLIN)"]
     POLL["poll(fds, N, -1)&lt;br/&gt;(blocks indefinitely)"]
     EINTR{EINTR?}
-    WAKE{"fds[0] wakeup?"}
-    LISTEN{"fds[1] new conn?"}
-    CLIENTS{"fds[2..N] client data?"}
+    WAKE{"fds[0]&lt;br/&gt;wakeup?"}
+    LISTEN{"fds[1]&lt;br/&gt;new conn?"}
+    CLIENTS{"fds[2..N]&lt;br/&gt;client data?"}
     CHECK_RUN{running_?}
 
-    RUN --> BUILD
-    BUILD --> POLL
-    POLL --> EINTR
-    EINTR -->|"yes"| BUILD
-    EINTR -->|"no"| WAKE
+    RUN --&gt; BUILD
+    BUILD --&gt; POLL
+    POLL --&gt; EINTR
+    EINTR --&gt;|"yes"| BUILD
+    EINTR --&gt;|"no"| WAKE
 
-    WAKE -->|"POLLIN"| DRAIN["drain_wakeup()&lt;br/&gt;(read all bytes, discard)"]
-    DRAIN --> POSTED["run_posted():&lt;br/&gt;swap posted_ under lock&lt;br/&gt;execute all lambdas"]
-    POSTED --> CHECK_RUN
-    CHECK_RUN -->|"false"| EXIT["return from run()"]
-    CHECK_RUN -->|"true"| LISTEN
-    WAKE -->|"no event"| LISTEN
+    WAKE --&gt;|"POLLIN"| DRAIN["drain_wakeup()&lt;br/&gt;(read all bytes, discard)"]
+    DRAIN --&gt; POSTED["run_posted():&lt;br/&gt;swap posted_ under lock&lt;br/&gt;execute all lambdas"]
+    POSTED --&gt; CHECK_RUN
+    CHECK_RUN --&gt;|"false"| EXIT["return from run()"]
+    CHECK_RUN --&gt;|"true"| LISTEN
+    WAKE --&gt;|"no event"| LISTEN
 
-    LISTEN -->|"POLLIN"| ACCEPT["accept_client():&lt;br/&gt;accept(), O_NONBLOCK&lt;br/&gt;TCP: TCP_NODELAY + SO_KEEPALIVE&lt;br/&gt;clients_[fd] = {}"]
-    ACCEPT --> CLIENTS
-    LISTEN -->|"no event"| CLIENTS
+    LISTEN --&gt;|"POLLIN"| ACCEPT["accept_client():&lt;br/&gt;accept(), O_NONBLOCK&lt;br/&gt;TCP: TCP_NODELAY + SO_KEEPALIVE&lt;br/&gt;clients_[fd] = {}"]
+    ACCEPT --&gt; CLIENTS
+    LISTEN --&gt;|"no event"| CLIENTS
 
-    CLIENTS -->|"POLLIN/HUP/ERR"| HANDLE["handle_client_data(fd)"]
-    HANDLE --> READ_LOOP
+    CLIENTS --&gt;|"POLLIN/HUP/ERR"| HANDLE["handle_client_data(fd)"]
+    HANDLE --&gt; READ_LOOP
 
     subgraph "handle_client_data(fd)"
         READ_LOOP["read(fd, buf, 4096)"]
-        READ_LOOP -->|"n <= 0"| REMOVE["remove_client(fd):&lt;br/&gt;close(fd)&lt;br/&gt;clients_.erase(fd)"]
-        READ_LOOP -->|"n > 0"| APPEND["Append to client read_buf"]
-        APPEND --> NEWLINE{"Contains newline?"}
-        NEWLINE -->|"yes"| EXTRACT["Extract line"]
-        EXTRACT --> PARSE["parse_ipc_message(line)"]
-        PARSE -->|"not Request"| SEND_ERR["send InvalidRequest error"]
-        PARSE -->|"Request"| LOOKUP["Look up handlers_[method]"]
-        LOOKUP -->|"not found"| SEND_ERR2["send MethodNotFound error"]
-        LOOKUP -->|"found"| INVOKE["Invoke handler(req, resp, err)"]
-        INVOKE -->|"true"| SEND_RESP["send_to(fd, serialize(resp))"]
-        INVOKE -->|"false"| SEND_ERR3["send_to(fd, serialize(err))"]
-        SEND_RESP --> NEWLINE
-        SEND_ERR --> NEWLINE
-        SEND_ERR2 --> NEWLINE
-        SEND_ERR3 --> NEWLINE
-        NEWLINE -->|"no"| DONE_CLIENT["done with this fd"]
+        READ_LOOP --&gt;|"n ≤ 0"| REMOVE["remove_client(fd):&lt;br/&gt;close(fd)&lt;br/&gt;clients_.erase(fd)"]
+        READ_LOOP --&gt;|"n &gt; 0"| APPEND["Append to client read_buf"]
+        APPEND --&gt; NEWLINE{"Contains \\n?"}
+        NEWLINE --&gt;|"yes"| EXTRACT["Extract line up to \\n"]
+        EXTRACT --&gt; PARSE["parse_ipc_message(line)"]
+        PARSE --&gt;|"not Request"| SEND_ERR["send InvalidRequest error"]
+        PARSE --&gt;|"Request"| LOOKUP["Look up handlers_[method]"]
+        LOOKUP --&gt;|"not found"| SEND_ERR2["send MethodNotFound error"]
+        LOOKUP --&gt;|"found"| INVOKE["Invoke handler(req, resp, err)"]
+        INVOKE --&gt;|"true"| SEND_RESP["send_to(fd, serialize(resp))"]
+        INVOKE --&gt;|"false"| SEND_ERR3["send_to(fd, serialize(err))"]
+        SEND_RESP --&gt; NEWLINE
+        SEND_ERR --&gt; NEWLINE
+        SEND_ERR2 --&gt; NEWLINE
+        SEND_ERR3 --&gt; NEWLINE
+        NEWLINE --&gt;|"no"| DONE_CLIENT["done with this fd"]
     end
 
-    CLIENTS --> BUILD
+    CLIENTS --&gt; BUILD
 
-    subgraph "post() — called from worker threads"
+    subgraph "post() (called from worker threads)"
         POST_CALL["server.post(fn)"]
         POST_LOCK["lock(post_mu_)&lt;br/&gt;posted_.push_back(fn)"]
         POST_WAKE["write(wakeup_write_, 'P', 1)"]
-        POST_CALL --> POST_LOCK --> POST_WAKE
+        POST_CALL --&gt; POST_LOCK --&gt; POST_WAKE
     end
 
-    subgraph "broadcast() — poll thread only"
+    subgraph "broadcast() (poll thread only)"
         BC_CALL["server.broadcast(event)"]
-        BC_WIRE["wire = serialize(event) + newline"]
+        BC_WIRE["wire = serialize(event) + '\\n'"]
         BC_SNAP["Snapshot client fd list"]
         BC_SEND["for each fd: send_to(fd, wire)"]
-        BC_CALL --> BC_WIRE --> BC_SNAP --> BC_SEND
+        BC_CALL --&gt; BC_WIRE --&gt; BC_SNAP --&gt; BC_SEND
     end
 </pre></div>
-
 <hr>
-
-<!-- ================================================================ -->
 <h2 id="s5">5. IPC Client Flow</h2>
-
-<h3>5a. Connection</h3>
+<h3 id="5a-connection">5a. Connection</h3>
 <div class="diagram-wrapper"><pre class="mermaid">
 flowchart TD
     CONNECT["client.connect()"]
-    CONNECTED{"fd_ >= 0?"}
-    CONNECTED -->|"yes"| OK["return true&lt;br/&gt;(already connected)"]
-    CONNECTED -->|"no"| TRANSPORT{"addr_.transport?"}
+    CONNECTED{"fd_ &gt;= 0?"}
+    CONNECTED --&gt;|"yes"| OK["return true&lt;br/&gt;(already connected)"]
+    CONNECTED --&gt;|"no"| TRANSPORT{"addr_.transport?"}
 
-    TRANSPORT -->|"Unix"| UNIX["socket(AF_UNIX)&lt;br/&gt;connect(sock_addr)"]
-    UNIX -->|"ok"| FD["fd_ = socket"]
-    UNIX -->|"fail"| FAIL["return false"]
+    TRANSPORT --&gt;|"Unix"| UNIX["socket(AF_UNIX)&lt;br/&gt;connect(sock_addr)"]
+    UNIX --&gt;|"ok"| FD["fd_ = socket"]
+    UNIX --&gt;|"fail"| FAIL["return false"]
 
-    TRANSPORT -->|"TCP"| TCP_SOCK["socket(AF_INET)&lt;br/&gt;set O_NONBLOCK"]
-    TCP_SOCK --> TCP_CONN["connect() -> EINPROGRESS"]
-    TCP_CONN --> TCP_POLL["poll(POLLOUT, 5000 ms)"]
-    TCP_POLL -->|"timeout"| TCP_FAIL["close, return false"]
-    TCP_POLL -->|"ready"| TCP_CHECK["getsockopt(SO_ERROR)"]
-    TCP_CHECK -->|"error"| TCP_FAIL
-    TCP_CHECK -->|"0"| TCP_OPTS["Restore blocking mode&lt;br/&gt;TCP_NODELAY&lt;br/&gt;SO_KEEPALIVE 30s/10s/3"]
-    TCP_OPTS --> FD
+    TRANSPORT --&gt;|"TCP"| TCP_SOCK["socket(AF_INET)&lt;br/&gt;set O_NONBLOCK"]
+    TCP_SOCK --&gt; TCP_CONN["connect() → EINPROGRESS"]
+    TCP_CONN --&gt; TCP_POLL["poll(POLLOUT, 5000 ms)"]
+    TCP_POLL --&gt;|"timeout"| TCP_FAIL["close, return false"]
+    TCP_POLL --&gt;|"ready"| TCP_CHECK["getsockopt(SO_ERROR)"]
+    TCP_CHECK --&gt;|"error"| TCP_FAIL
+    TCP_CHECK --&gt;|"0"| TCP_OPTS["Restore blocking mode&lt;br/&gt;TCP_NODELAY&lt;br/&gt;SO_KEEPALIVE 30s/10s/3"]
+    TCP_OPTS --&gt; FD
 
-    FD --> OK2["return true"]
+    FD --&gt; OK2["return true"]
 </pre></div>
-
-<h3>5b. Blocking RPC (call)</h3>
+<h3 id="5b-blocking-rpc-call">5b. Blocking RPC (<code>call()</code>)</h3>
 <div class="diagram-wrapper"><pre class="mermaid">
 flowchart TD
     CALL["client.call(method, params, timeout)"]
-    SEND["Serialize IpcRequest&lt;br/&gt;write(fd_, json + newline)"]
+    SEND["Serialize IpcRequest&lt;br/&gt;write(fd_, json + '\\n')"]
     SETUP["pending_id_ = req.id&lt;br/&gt;pending_done_ = false"]
 
     LOOP{"pending_done_?"}
-    TIMEOUT_CHECK{"remaining > 0?"}
+    TIMEOUT_CHECK{"remaining &gt; 0?"}
     RAD["read_and_dispatch(remaining_ms)"]
     RAD_OK{return value?}
 
-    CALL --> SEND --> SETUP --> LOOP
-    LOOP -->|"yes"| RESULT
-    LOOP -->|"no"| TIMEOUT_CHECK
-    TIMEOUT_CHECK -->|"no"| TIMEOUT["return InternalError 'Timeout'"]
-    TIMEOUT_CHECK -->|"yes"| RAD
-    RAD --> RAD_OK
-    RAD_OK -->|"false (disconnect)"| LOST["return InternalError 'Connection lost'"]
-    RAD_OK -->|"true"| LOOP
+    CALL --&gt; SEND --&gt; SETUP --&gt; LOOP
+    LOOP --&gt;|"yes"| RESULT
+    LOOP --&gt;|"no"| TIMEOUT_CHECK
+    TIMEOUT_CHECK --&gt;|"no"| TIMEOUT["return InternalError&lt;br/&gt;'Timeout'"]
+    TIMEOUT_CHECK --&gt;|"yes"| RAD
+    RAD --&gt; RAD_OK
+    RAD_OK --&gt;|"false (disconnect)"| LOST["return InternalError&lt;br/&gt;'Connection lost'"]
+    RAD_OK --&gt;|"true"| LOOP
 
     RESULT{"pending_result_.type?"}
-    RESULT -->|"Response"| RESP["resp = result, return true"]
-    RESULT -->|"Error"| ERR["err = result, return false"]
+    RESULT --&gt;|"Response"| RESP["resp = result&lt;br/&gt;return true"]
+    RESULT --&gt;|"Error"| ERR["err = result&lt;br/&gt;return false"]
 </pre></div>
-
-<h3>5c. read_and_dispatch() Internal</h3>
+<h3 id="5c-read-and-dispatch-internal">5c. <code>read_and_dispatch()</code> Internal</h3>
 <div class="diagram-wrapper"><pre class="mermaid">
 flowchart TD
     ENTRY["read_and_dispatch(timeout_ms)"]
-    DRAIN1{"read_buf_ contains newline?"}
-    DRAIN1 -->|"yes"| PROCESS1["Extract line, process_line()"]
-    PROCESS1 --> CHECK1{"pending_done_?"}
-    CHECK1 -->|"yes"| RET_TRUE["return true"]
-    CHECK1 -->|"no"| DRAIN1
-    DRAIN1 -->|"no"| FD_CHECK{"fd_ >= 0?"}
-    FD_CHECK -->|"no"| RET_FALSE["return false"]
-    FD_CHECK -->|"yes"| POLL["poll(fd_, POLLIN, timeout)"]
-    POLL -->|"ret = 0"| RET_TRUE2["return true (timeout)"]
-    POLL -->|"ret < 0"| RET_FALSE2["return false (error)"]
-    POLL -->|"HUP/ERR"| RET_FALSE3["return false"]
-    POLL -->|"POLLIN"| READ["read(fd_, buf, 4096)"]
-    READ -->|"n <= 0"| CLOSE["close_connection(), return false"]
-    READ -->|"n > 0"| APPEND["Append to read_buf_"]
-    APPEND --> DRAIN2{"Contains newline?"}
-    DRAIN2 -->|"yes"| PROCESS2["Extract line, process_line()"]
-    PROCESS2 --> DRAIN2
-    DRAIN2 -->|"no"| RET_TRUE3["return true"]
+    DRAIN1{"read_buf_&lt;br/&gt;contains \\n?"}
+    DRAIN1 --&gt;|"yes"| PROCESS1["Extract line&lt;br/&gt;process_line()"]
+    PROCESS1 --&gt; CHECK1{"pending_done_?"}
+    CHECK1 --&gt;|"yes"| RET_TRUE["return true"]
+    CHECK1 --&gt;|"no"| DRAIN1
+    DRAIN1 --&gt;|"no"| FD_CHECK{"fd_ &gt;= 0?"}
+    FD_CHECK --&gt;|"no"| RET_FALSE["return false"]
+    FD_CHECK --&gt;|"yes"| POLL["poll(fd_, POLLIN, timeout)"]
+    POLL --&gt;|"ret = 0"| RET_TRUE2["return true (timeout)"]
+    POLL --&gt;|"ret &lt; 0"| RET_FALSE2["return false (error)"]
+    POLL --&gt;|"HUP/ERR"| RET_FALSE3["return false"]
+    POLL --&gt;|"POLLIN"| READ["read(fd_, buf, 4096)"]
+    READ --&gt;|"n ≤ 0"| CLOSE["close_connection()&lt;br/&gt;return false"]
+    READ --&gt;|"n &gt; 0"| APPEND["Append to read_buf_"]
+    APPEND --&gt; DRAIN2{"Contains \\n?"}
+    DRAIN2 --&gt;|"yes"| PROCESS2["Extract line&lt;br/&gt;process_line()"]
+    PROCESS2 --&gt; DRAIN2
+    DRAIN2 --&gt;|"no"| RET_TRUE3["return true"]
 </pre></div>
-
-<h3>5d. process_line() Dispatch</h3>
+<h3 id="5d-process-line-dispatch">5d. <code>process_line()</code> Dispatch</h3>
 <div class="diagram-wrapper"><pre class="mermaid">
 flowchart TD
     LINE["process_line(line)"]
     PARSE["parse_ipc_message(line)"]
-    PARSE -->|"parse fail"| SKIP["return (skip)"]
-    PARSE -->|"Event"| EV_CHECK{"until_event_ matches?"}
-    EV_CHECK -->|"yes"| MATCH["event_matched_ = true"]
-    EV_CHECK -->|"no"| CB_CHECK{"event_cb_?"}
-    MATCH --> CB_CHECK
-    CB_CHECK -->|"yes"| CB_CALL["event_cb_(event)"]
-    CB_CHECK -->|"no"| DONE["return"]
-    CB_CALL --> DONE
+    PARSE --&gt;|"parse fail"| SKIP["return (skip)"]
+    PARSE --&gt;|"Event"| EV_CHECK{"until_event_&lt;br/&gt;matches?"}
+    EV_CHECK --&gt;|"yes"| MATCH["event_matched_ = true"]
+    EV_CHECK --&gt;|"no"| CB_CHECK{"event_cb_?"}
+    MATCH --&gt; CB_CHECK
+    CB_CHECK --&gt;|"yes"| CB_CALL["event_cb_(event)"]
+    CB_CHECK --&gt;|"no"| DONE["return"]
+    CB_CALL --&gt; DONE
 
-    PARSE -->|"Response/Error"| PENDING{"pending_id_ > 0 and id matches?"}
-    PENDING -->|"yes"| STORE["pending_result_ = msg, pending_done_ = true"]
-    PENDING -->|"no"| DONE
+    PARSE --&gt;|"Response/Error"| PENDING{"pending_id_ &gt; 0&lt;br/&gt;and id matches?"}
+    PENDING --&gt;|"yes"| STORE["pending_result_ = msg&lt;br/&gt;pending_done_ = true"]
+    PENDING --&gt;|"no"| DONE
 </pre></div>
-
 <hr>
-
-<!-- ================================================================ -->
 <h2 id="s6">6. IPC Protocol Wire Format</h2>
-
 <div class="diagram-wrapper"><pre class="mermaid">
 flowchart LR
     subgraph "Message Discrimination"
         MSG["JSON object"]
-        MSG -->|"has 'method' key"| REQ["Request&lt;br/&gt;{id, method, params}"]
-        MSG -->|"has 'result' key"| RESP["Response&lt;br/&gt;{id, result}"]
-        MSG -->|"has 'error' key"| ERR["Error&lt;br/&gt;{id, error: {code, message}}"]
-        MSG -->|"has 'event' key"| EV["Event&lt;br/&gt;{event, data}"]
+        MSG --&gt;|"has 'method' key"| REQ["Request&lt;br/&gt;{id, method, params}"]
+        MSG --&gt;|"has 'result' key"| RESP["Response&lt;br/&gt;{id, result}"]
+        MSG --&gt;|"has 'error' key"| ERR["Error&lt;br/&gt;{id, error: {code, message}}"]
+        MSG --&gt;|"has 'event' key"| EV["Event&lt;br/&gt;{event, data}"]
     end
 
     subgraph "Value Types (JsonVal)"
@@ -642,264 +635,297 @@ flowchart LR
 
     subgraph "Address Parsing (parse_ipc_address)"
         ADDR["Input string"]
-        ADDR -->|"empty"| DEFAULT["Unix: default_socket_path()"]
-        ADDR -->|"host:port (digits)"| TCP_ADDR["TCP: {host, port}"]
-        ADDR -->|"multiple colons (bare IPv6)"| REJECT["Rejected"]
-        ADDR -->|"path string"| UNIX_ADDR["Unix: path"]
+        ADDR --&gt;|"empty"| DEFAULT["Unix: default_socket_path()"]
+        ADDR --&gt;|"host:port&lt;br/&gt;(digits after last ':')"| TCP_ADDR["TCP: {host, port}"]
+        ADDR --&gt;|"multiple ':'&lt;br/&gt;(bare IPv6)"| REJECT["Rejected"]
+        ADDR --&gt;|"path string"| UNIX_ADDR["Unix: path"]
     end
 </pre></div>
-
 <hr>
-
-<!-- ================================================================ -->
 <h2 id="s7">7. Recording Pipeline</h2>
 <p><code>run_recording()</code> control flow with dual-capture and reprocess branching.</p>
-
 <div class="diagram-wrapper"><pre class="mermaid">
 flowchart TD
     ENTRY["run_recording(cfg, stop, on_phase)"]
-    MODE{"cfg.reprocess_dir non-empty?"}
+    MODE{"cfg.reprocess_dir&lt;br/&gt;non-empty?"}
 
-    MODE -->|"yes"| REPROC_RESOLVE["Resolve path&lt;br/&gt;(absolute or relative to output_dir)"]
-    REPROC_RESOLVE --> REPROC_VALIDATE["validate_reprocess_input(path)&lt;br/&gt;-> pp.audio_path"]
-    REPROC_VALIDATE --> REPROC_DIR["pp.out_dir = output_dir_explicit ?&lt;br/&gt;  cfg.output_dir : parent(audio)"]
-    REPROC_DIR --> REPROC_MKDIR["fs::create_directories(pp.out_dir)"]
-    REPROC_MKDIR --> RETURN["Return PostprocessInput"]
+    MODE --&gt;|"yes"| REPROC_RESOLVE["Resolve path&lt;br/&gt;(absolute or relative to output_dir)"]
+    REPROC_RESOLVE --&gt; REPROC_VALIDATE["validate_reprocess_input(path)&lt;br/&gt;→ pp.audio_path"]
+    REPROC_VALIDATE --&gt; REPROC_DIR["pp.out_dir = output_dir_explicit ?&lt;br/&gt;  cfg.output_dir : parent(audio)"]
+    REPROC_DIR --&gt; REPROC_MKDIR["fs::create_directories(pp.out_dir)"]
+    REPROC_MKDIR --&gt; RETURN["Return PostprocessInput"]
 
-    MODE -->|"no"| DETECT{"cfg.mic_source empty?"}
-    DETECT -->|"yes"| AUTO["detect_sources(device_pattern)&lt;br/&gt;-> mic + monitor"]
-    DETECT -->|"no"| USE_CFG["Use cfg.mic_source,&lt;br/&gt;cfg.monitor_source"]
-    AUTO -->|"no mic"| THROW["throw DeviceError"]
-    AUTO --> DUAL_CHECK
-    USE_CFG --> DUAL_CHECK
+    MODE --&gt;|"no"| DETECT{"cfg.mic_source&lt;br/&gt;empty?"}
+    DETECT --&gt;|"yes"| AUTO["detect_sources(device_pattern)&lt;br/&gt;→ mic + monitor"]
+    DETECT --&gt;|"no"| USE_CFG["Use cfg.mic_source,&lt;br/&gt;cfg.monitor_source"]
+    AUTO --&gt;|"no mic"| THROW["throw DeviceError"]
+    AUTO --&gt; DUAL_CHECK
+    USE_CFG --&gt; DUAL_CHECK
 
-    DUAL_CHECK{"dual_mode?&lt;br/&gt;(!mic_only and monitor)"}
-    DUAL_CHECK -->|"no"| SINGLE
+    DUAL_CHECK{"dual_mode?&lt;br/&gt;(!mic_only &amp;&amp; monitor)"}
+    DUAL_CHECK --&gt;|"no"| SINGLE
 
-    DUAL_CHECK -->|"yes"| DUAL
+    DUAL_CHECK --&gt;|"yes"| DUAL
 
     subgraph DUAL["Dual Capture Mode"]
         D_NOTIFY["notify('Recording started')"]
         D_MIC["PipeWireCapture mic(mic_source)&lt;br/&gt;mic.start()"]
-        D_MON_CHECK{"source ends with .monitor?"}
-        D_MON_CHECK -->|"yes"| D_MON_PA["PulseMonitorCapture(source)"]
-        D_MON_CHECK -->|"no"| D_MON_PW["try PipeWireCapture(source, sink=true)"]
-        D_MON_PW -->|"RecmeetError"| D_MON_PA
-        D_MON_PW -->|"ok"| D_TIMER
-        D_MON_PA --> D_TIMER
+        D_MON_CHECK{"source ends&lt;br/&gt;with .monitor?"}
+        D_MON_CHECK --&gt;|"yes"| D_MON_PA["PulseMonitorCapture(source)"]
+        D_MON_CHECK --&gt;|"no"| D_MON_PW["try PipeWireCapture(source, sink=true)"]
+        D_MON_PW --&gt;|"RecmeetError"| D_MON_PA
+        D_MON_PW --&gt;|"ok"| D_TIMER
+        D_MON_PA --&gt; D_TIMER
 
         D_TIMER["Spawn timer_thread&lt;br/&gt;(display_elapsed on stderr)"]
         D_LOOP["while !stop.stop_requested()&lt;br/&gt;  sleep_for(200ms)"]
-        D_STOP["timer_stop -> join timer&lt;br/&gt;mic.stop() -> mon.stop()"]
+        D_STOP["timer_stop → join timer&lt;br/&gt;mic.stop() → mon.stop()"]
         D_DRAIN["mic_samples = mic.drain()&lt;br/&gt;mon_samples = mon.drain()"]
         D_WRITE["Write mic.wav + monitor.wav"]
-        D_VAL_MIC["validate_audio(mic.wav, 1.0s)&lt;br/&gt;-> fatal on fail"]
-        D_VAL_MON["validate_audio(monitor.wav)&lt;br/&gt;-> non-fatal"]
-        D_VAL_MON -->|"ok"| D_MIX["mix_audio(mic, mon)&lt;br/&gt;-> write audio_YYYY-MM-DD_HH-MM.wav"]
-        D_VAL_MON -->|"AudioValidationError"| D_MIC_ONLY["Write mic-only&lt;br/&gt;-> audio_YYYY-MM-DD_HH-MM.wav"]
-        D_MIX --> D_CLEANUP
-        D_MIC_ONLY --> D_CLEANUP
+        D_VAL_MIC["validate_audio(mic.wav, 1.0s)&lt;br/&gt;→ fatal on fail"]
+        D_VAL_MON["validate_audio(monitor.wav)&lt;br/&gt;→ non-fatal"]
+        D_VAL_MON --&gt;|"ok"| D_MIX["mix_audio(mic, mon)&lt;br/&gt;→ write audio_YYYY-MM-DD_HH-MM.wav"]
+        D_VAL_MON --&gt;|"AudioValidationError"| D_MIC_ONLY["Write mic-only&lt;br/&gt;→ audio_YYYY-MM-DD_HH-MM.wav"]
+        D_MIX --&gt; D_CLEANUP
+        D_MIC_ONLY --&gt; D_CLEANUP
         D_CLEANUP["if !keep_sources: remove raw WAVs"]
 
-        D_NOTIFY --> D_MIC --> D_MON_CHECK
-        D_TIMER --> D_LOOP --> D_STOP --> D_DRAIN
-        D_DRAIN --> D_WRITE --> D_VAL_MIC --> D_VAL_MON
+        D_NOTIFY --&gt; D_MIC --&gt; D_MON_CHECK
+        D_TIMER --&gt; D_LOOP --&gt; D_STOP --&gt; D_DRAIN
+        D_DRAIN --&gt; D_WRITE --&gt; D_VAL_MIC --&gt; D_VAL_MON
     end
 
     subgraph SINGLE["Single Mic Mode"]
-        S_MIC["PipeWireCapture(mic_source), start()"]
+        S_MIC["PipeWireCapture(mic_source)&lt;br/&gt;start()"]
         S_TIMER["Spawn timer_thread"]
         S_LOOP["while !stop.stop_requested()&lt;br/&gt;  sleep_for(200ms)"]
-        S_STOP["stop() -> drain()"]
+        S_STOP["stop() → drain()"]
         S_WRITE["Write audio_YYYY-MM-DD_HH-MM.wav"]
 
-        S_MIC --> S_TIMER --> S_LOOP --> S_STOP --> S_WRITE
+        S_MIC --&gt; S_TIMER --&gt; S_LOOP --&gt; S_STOP --&gt; S_WRITE
     end
 
-    DUAL --> RETURN
-    SINGLE --> RETURN
+    DUAL --&gt; RETURN
+    SINGLE --&gt; RETURN
 </pre></div>
-
 <hr>
-
-<!-- ================================================================ -->
 <h2 id="s8">8. Postprocessing Pipeline</h2>
 <p><code>run_postprocessing()</code> with memory scoping, cancellation, and all ML stages.</p>
-
 <div class="diagram-wrapper"><pre class="mermaid">
 flowchart TD
     ENTRY["run_postprocessing(cfg, input,&lt;br/&gt;on_phase, on_progress, stop)"]
 
-    PROMPT["Build initial_prompt:&lt;br/&gt;enrolled speaker names +&lt;br/&gt;cfg.vocabulary -> comma-separated"]
+    PROMPT["Build initial_prompt:&lt;br/&gt;enrolled speaker names +&lt;br/&gt;cfg.vocabulary → comma-separated"]
 
-    SKIP_TX{"input.transcript_text non-empty?"}
+    SKIP_TX{"input.transcript_text&lt;br/&gt;non-empty?"}
 
-    ENTRY --> PROMPT --> SKIP_TX
-    SKIP_TX -->|"yes"| CONTEXT
-    SKIP_TX -->|"no"| AUDIO_OPEN
+    ENTRY --&gt; PROMPT --&gt; SKIP_TX
+    SKIP_TX --&gt;|"yes"| CONTEXT
+    SKIP_TX --&gt;|"no"| AUDIO_OPEN
 
     subgraph AUDIO_SCOPE ["Audio Buffer Scope (freed before summarization)"]
-        AUDIO_OPEN["samples = read_wav_float(audio_path)&lt;br/&gt;vector float allocated"]
+        AUDIO_OPEN["samples = read_wav_float(audio_path)&lt;br/&gt;← vector&amp;lt;float&amp;gt; allocated"]
 
         subgraph WHISPER_SCOPE ["Whisper Model Scope (freed before diarization)"]
             MODEL_LOAD["model_path = ensure_whisper_model(cfg)&lt;br/&gt;WhisperModel model(model_path)"]
 
-            VAD_CHECK{"SHERPA and cfg.vad?"}
-            VAD_CHECK -->|"yes"| VAD
-            VAD_CHECK -->|"no"| TX_DIRECT
+            VAD_CHECK{"SHERPA &amp;&amp;&lt;br/&gt;cfg.vad?"}
+            VAD_CHECK --&gt;|"yes"| VAD
+            VAD_CHECK --&gt;|"no"| TX_DIRECT
 
             subgraph VAD["VAD + Segmented Transcription"]
                 VAD_PHASE["phase('detecting speech')"]
-                VAD_RUN["detect_speech(samples, vad_cfg, threads)&lt;br/&gt;-> VadResult with segments"]
+                VAD_RUN["detect_speech(samples, vad_cfg, threads)&lt;br/&gt;→ VadResult with segments"]
                 TX_PHASE["phase('transcribing')"]
                 TX_WEIGHTS["Compute seg_samples[] for&lt;br/&gt;weighted progress"]
                 TX_LOOP["For each VAD segment:"]
                 TX_CANCEL["check_cancel()"]
                 TX_OPTS["TranscribeOptions:&lt;br/&gt;  initial_prompt, language,&lt;br/&gt;  on_progress = vad_weighted_progress()"]
-                TX_CALL["transcribe(model, samples+start,&lt;br/&gt;  n_samples, offset, opts)"]
+                TX_CALL["transcribe(model, &amp;samples[start],&lt;br/&gt;  n_samples, offset, opts)"]
                 TX_APPEND["Append segments to result"]
 
-                VAD_PHASE --> VAD_RUN --> TX_PHASE --> TX_WEIGHTS
-                TX_WEIGHTS --> TX_LOOP --> TX_CANCEL --> TX_OPTS --> TX_CALL --> TX_APPEND
-                TX_APPEND -->|"next segment"| TX_LOOP
+                VAD_PHASE --&gt; VAD_RUN --&gt; TX_PHASE --&gt; TX_WEIGHTS
+                TX_WEIGHTS --&gt; TX_LOOP --&gt; TX_CANCEL --&gt; TX_OPTS --&gt; TX_CALL --&gt; TX_APPEND
+                TX_APPEND --&gt;|"next segment"| TX_LOOP
             end
 
             subgraph TX_DIRECT["Direct Transcription (no VAD)"]
                 TXD_PHASE["phase('transcribing')"]
                 TXD_CALL["result = transcribe(model,&lt;br/&gt;  samples, n, 0.0, opts)"]
-                TXD_PHASE --> TXD_CALL
+                TXD_PHASE --&gt; TXD_CALL
             end
 
-            AUDIO_OPEN --> MODEL_LOAD --> VAD_CHECK
+            AUDIO_OPEN --&gt; MODEL_LOAD --&gt; VAD_CHECK
         end
 
-        WHISPER_FREE["WhisperModel destructor:&lt;br/&gt;whisper_free() called&lt;br/&gt;(75 MB - 1.5 GB freed)"]
+        WHISPER_FREE["← WhisperModel destructor:&lt;br/&gt;  whisper_free() called&lt;br/&gt;  (75 MB – 1.5 GB freed)"]
 
-        DIAR_CHECK{"SHERPA and cfg.diarize and segments?"}
-        DIAR_CHECK -->|"no"| AUDIO_FREE
-        DIAR_CHECK -->|"yes"| DIAR
+        DIAR_CHECK{"SHERPA &amp;&amp;&lt;br/&gt;cfg.diarize &amp;&amp;&lt;br/&gt;segments?"}
+        DIAR_CHECK --&gt;|"no"| AUDIO_FREE
+        DIAR_CHECK --&gt;|"yes"| DIAR
 
         subgraph DIAR["Diarization + Speaker ID"]
             DIAR_CANCEL["check_cancel()"]
             DIAR_PHASE["phase('diarizing')"]
             DIAR_RUN["diarize(samples, n, num_speakers,&lt;br/&gt;  threads, threshold, progress_cb)"]
-            DIAR_DONE["-> DiarizeResult"]
+            DIAR_DONE["→ DiarizeResult"]
 
             SPKID_CHECK{"cfg.speaker_id?"}
-            SPKID_CHECK -->|"yes"| SPKID
-            SPKID_CHECK -->|"no"| MERGE_NOID
+            SPKID_CHECK --&gt;|"yes"| SPKID
+            SPKID_CHECK --&gt;|"no"| MERGE_NOID
 
             subgraph SPKID["Speaker Identification"]
                 SPKID_DB["Load speaker DB"]
-                SPKID_MODELS["ensure_sherpa_models()&lt;br/&gt;-> embedding model"]
+                SPKID_MODELS["ensure_sherpa_models()&lt;br/&gt;→ embedding model"]
                 SPKID_PHASE["phase('identifying speakers')"]
                 SPKID_RUN["identify_speakers(samples, diar,&lt;br/&gt;  db, model, threshold, threads)"]
                 SPKID_SAVE["save_meeting_speakers(out_dir,&lt;br/&gt;  speakers with durations)"]
 
-                SPKID_DB --> SPKID_MODELS --> SPKID_PHASE
-                SPKID_PHASE --> SPKID_RUN --> SPKID_SAVE
+                SPKID_DB --&gt; SPKID_MODELS --&gt; SPKID_PHASE
+                SPKID_PHASE --&gt; SPKID_RUN --&gt; SPKID_SAVE
             end
 
-            MERGE["merge_speakers(segments, diar, names)&lt;br/&gt;-> 'John: Hello' / 'Speaker_01: Hello'"]
-            MERGE_NOID["merge_speakers(segments, diar)&lt;br/&gt;-> 'Speaker_01: Hello'"]
+            MERGE["merge_speakers(segments, diar, names)&lt;br/&gt;→ 'John: Hello' / 'Speaker_01: Hello'"]
+            MERGE_NOID["merge_speakers(segments, diar)&lt;br/&gt;→ 'Speaker_01: Hello'"]
 
-            DIAR_CANCEL --> DIAR_PHASE --> DIAR_RUN --> DIAR_DONE --> SPKID_CHECK
-            SPKID --> MERGE
+            DIAR_CANCEL --&gt; DIAR_PHASE --&gt; DIAR_RUN --&gt; DIAR_DONE --&gt; SPKID_CHECK
+            SPKID --&gt; MERGE
         end
 
-        AUDIO_FREE["vector float freed&lt;br/&gt;(~115 MB/hour of audio)"]
+        AUDIO_FREE["← vector&amp;lt;float&amp;gt; freed&lt;br/&gt;  (~115 MB/hour of audio)"]
 
-        VAD --> WHISPER_FREE
-        TX_DIRECT --> WHISPER_FREE
-        WHISPER_FREE --> DIAR_CHECK
-        DIAR --> AUDIO_FREE
-        MERGE_NOID --> AUDIO_FREE
+        VAD --&gt; WHISPER_FREE
+        TX_DIRECT --&gt; WHISPER_FREE
+        WHISPER_FREE --&gt; DIAR_CHECK
+        DIAR --&gt; AUDIO_FREE
+        MERGE_NOID --&gt; AUDIO_FREE
     end
 
     TRANSCRIPT["transcript_text = result.to_string()&lt;br/&gt;[MM:SS - MM:SS] Speaker: text"]
-    EMPTY_CHECK{"transcript empty?"}
-    EMPTY_CHECK -->|"yes"| THROW["throw RecmeetError('No text produced')"]
-    EMPTY_CHECK -->|"no"| CONTEXT
+    EMPTY_CHECK{"transcript&lt;br/&gt;empty?"}
+    EMPTY_CHECK --&gt;|"yes"| THROW["throw RecmeetError&lt;br/&gt;('No text produced')"]
+    EMPTY_CHECK --&gt;|"no"| CONTEXT
 
-    AUDIO_FREE --> TRANSCRIPT --> EMPTY_CHECK
+    AUDIO_FREE --&gt; TRANSCRIPT --&gt; EMPTY_CHECK
 
     subgraph CONTEXT["Context Resolution (read-only inside run_postprocessing)"]
         CTX_INLINE["1. cfg.context_inline"]
         CTX_FILE["2. cfg.context_file (read from disk)"]
         CTX_REPROC["3. load_meeting_context(out_dir)&lt;br/&gt;   (find_context_file: prefers&lt;br/&gt;   context_&amp;lt;ts&amp;gt;.json, falls back&lt;br/&gt;   to legacy context.json)"]
-        CTX_INLINE --> CTX_FILE --> CTX_REPROC
+        CTX_INLINE --&gt; CTX_FILE --&gt; CTX_REPROC
     end
 
-    %% Note: persistence of context_<ts>.json now happens in the PARENT process
+    %% Note: persistence of context_&lt;ts&gt;.json now happens in the PARENT process
     %% (daemon::rec_worker or pipeline::run_pipeline) BEFORE run_postprocessing
     %% is invoked — never inside run_postprocessing. See ARCHITECTURE.md
     %% "Meeting directory layout" for the rationale.
 
     SUMM_CHECK{"cfg.no_summary?"}
-    CONTEXT --> SUMM_CHECK
-    SUMM_CHECK -->|"yes"| NOTE
+    CONTEXT --&gt; SUMM_CHECK
+    SUMM_CHECK --&gt;|"yes"| NOTE
 
     subgraph SUMMARIZE["Summarization"]
         SUMM_PHASE["phase('summarizing')"]
-        SUMM_SELECT{"LLAMA and llm_model set?"}
-        SUMM_SELECT -->|"yes"| LOCAL["ensure_llama_model(cfg.llm_model)&lt;br/&gt;summarize_local(transcript, model,&lt;br/&gt;  context, threads, mmap)"]
-        SUMM_SELECT -->|"no"| CLOUD_CHECK{"api_key?"}
-        CLOUD_CHECK -->|"yes"| CLOUD["Resolve URL from provider table&lt;br/&gt;summarize_http(transcript, url,&lt;br/&gt;  key, model, context)"]
-        CLOUD_CHECK -->|"no"| SKIP_SUMM["log_warn: skip"]
-        LOCAL --> META
-        CLOUD --> META
+        SUMM_SELECT{"LLAMA &amp;&amp;&lt;br/&gt;llm_model set?"}
+        SUMM_SELECT --&gt;|"yes"| LOCAL["ensure_llama_model(cfg.llm_model)&lt;br/&gt;summarize_local(transcript, model,&lt;br/&gt;  context, threads, mmap)"]
+        SUMM_SELECT --&gt;|"no"| CLOUD_CHECK{"api_key?"}
+        CLOUD_CHECK --&gt;|"yes"| CLOUD["Resolve URL from provider table&lt;br/&gt;summarize_http(transcript, url,&lt;br/&gt;  key, model, context)"]
+        CLOUD_CHECK --&gt;|"no"| SKIP_SUMM["log_warn: skip"]
+        LOCAL --&gt; META
+        CLOUD --&gt; META
         META["extract_meeting_metadata(summary)&lt;br/&gt;strip_metadata_block(summary)"]
 
-        SUMM_PHASE --> SUMM_SELECT
+        SUMM_PHASE --&gt; SUMM_SELECT
     end
 
-    SUMM_CHECK -->|"no"| SUMMARIZE
+    SUMM_CHECK --&gt;|"no"| SUMMARIZE
 
     subgraph NOTE["Note Generation"]
         NOTE_TIME["resolve_meeting_time(out_dir, audio)"]
         NOTE_BUILD["Build MeetingData struct"]
-        NOTE_WRITE["write_meeting_note(cfg.note, data)&lt;br/&gt;-> Meeting_YYYY-MM-DD_HH-MM.md"]
-        NOTE_COMPLETE["phase('complete'), notify('Meeting processed')"]
+        NOTE_WRITE["write_meeting_note(cfg.note, data)&lt;br/&gt;→ Meeting_YYYY-MM-DD_HH-MM.md"]
+        NOTE_COMPLETE["phase('complete')&lt;br/&gt;notify('Meeting processed')"]
 
-        NOTE_TIME --> NOTE_BUILD --> NOTE_WRITE --> NOTE_COMPLETE
+        NOTE_TIME --&gt; NOTE_BUILD --&gt; NOTE_WRITE --&gt; NOTE_COMPLETE
     end
 
-    SUMMARIZE --> NOTE
-    SKIP_SUMM --> NOTE
+    SUMMARIZE --&gt; NOTE
+    SKIP_SUMM --&gt; NOTE
 
     RESULT["Return PipelineResult&lt;br/&gt;{note_path, output_dir, transcript_text}"]
-    NOTE --> RESULT
+    NOTE --&gt; RESULT
 </pre></div>
-
 <hr>
+<h2 id="8a-chunked-diarization--stitching">8a. Chunked Diarization + Stitching</h2>
+<p>When audio length exceeds <code>chunk_minutes*60 + chunk_overlap_sec + 120</code> seconds the dispatch in <code>pipeline.cpp</code> switches from <code>diarize()</code> to <code>diarize_chunked()</code>. The chunked path keeps one <code>DiarizeSession</code> and one <code>SpeakerEmbeddingSession</code> alive across all chunks (T2.0a/T2.0b session-reuse refactor) and stitches per-chunk speaker IDs into a global registry. The pipeline then bypasses the second extractor pass via <code>identify_speakers_with_centroids()</code> (T2.2 H1), avoiding the multi-GB working-set spike that re-streaming the audio would cost on long recordings.</p>
+<div class="diagram-wrapper"><pre class="mermaid">
+flowchart TD
+    BUF["samples (float32 16 kHz mono)&lt;br/&gt;length &gt; threshold"]
+    SLICE["Slice into chunks N=ceil(length / chunk_minutes)&lt;br/&gt;Each chunk: pcm_start, pcm_end, core_start, core_end"]
 
-<!-- ================================================================ -->
+    subgraph PER_CHUNK["For each chunk i in 0..N-1"]
+        DSESS["DiarizeSession&lt;br/&gt;(loaded once)"]
+        ESESS["SpeakerEmbeddingSession&lt;br/&gt;(loaded once)"]
+        CHUNK_DIAR["diarize_with_session(session, samples+offset, len)&lt;br/&gt;→ chunk-local DiarizeResult"]
+        CHUNK_EMB["For each chunk-local speaker:&lt;br/&gt;extract_speaker_embedding(esess, samples+offset, ...)&lt;br/&gt;→ raw centroid (non-unit-norm)"]
+
+        DSESS --&gt; CHUNK_DIAR
+        CHUNK_DIAR --&gt; CHUNK_EMB
+        ESESS --&gt; CHUNK_EMB
+    end
+
+    STITCH["stitch_chunks(chunk_results, chunk_centroids, extents, cfg, num_speakers)"]
+    REG["Global registry&lt;br/&gt;(raw centroid, sample_count) per global ID"]
+    MATCH["Per chunk-local centroid:&lt;br/&gt;L2-normalize transiently → cosine vs registry&lt;br/&gt;≥ stitch_threshold → merge (sample-weighted mean)&lt;br/&gt;else → new global ID"]
+    OWN["Midpoint-in-core ownership:&lt;br/&gt;emit segment in full extent, rewrite times to global coords"]
+    CAP["if num_speakers &gt; 0: greedy-merge most-similar pairs&lt;br/&gt;until count ≤ num_speakers"]
+    COMPACT["ID compaction pass:&lt;br/&gt;renumber globals to 0..N-1 contiguous"]
+
+    RESULT["DiarizeChunkedResult {&lt;br/&gt;  diar: DiarizeResult (global coords),&lt;br/&gt;  centroids: map&amp;lt;global_id, raw_vec&amp;gt;&lt;br/&gt;}"]
+
+    BYPASS["identify_speakers_with_centroids(&lt;br/&gt;  result.centroids, db, threshold)&lt;br/&gt;(no extractor instantiated)"]
+
+    MS["MeetingSpeaker {&lt;br/&gt;  cluster_id (compacted),&lt;br/&gt;  embedding (raw, byte-shape compatible),&lt;br/&gt;  label, identified, confidence&lt;br/&gt;}"]
+
+    BUF --&gt; SLICE
+    SLICE --&gt; PER_CHUNK
+    PER_CHUNK --&gt; STITCH
+    STITCH --&gt; REG --&gt; MATCH --&gt; OWN --&gt; CAP --&gt; COMPACT --&gt; RESULT
+    RESULT --&gt; BYPASS --&gt; MS
+</pre></div>
+<p><strong>Key invariants enforced by stitch_chunks:</strong></p>
+<ul>
+<li><strong>Raw centroid storage (T2.1 H1).</strong> Centroids are kept as raw model output throughout — L2-normalization happens transiently for the cosine dot product only. Persisted <code>MeetingSpeaker.embedding</code> therefore stays byte-shape compatible with the legacy single-call path; <code>remove_embedding</code> and the <code>--enroll</code> matcher still work.</li>
+<li><strong>Full-extent segment emit (rev 7 M-1').</strong> A boundary segment owned by chunk[i] is emitted with its full duration, not trimmed to the core. Adjacent-chunk benign overlap is handled by <code>merge_speakers</code>'s max-overlap rule. Trim-to-core was vulnerable to silent speech loss across chunk boundaries.</li>
+<li><strong>Sample-weighted greedy-merge.</strong> The post-stitch count limit merges the most-similar pair using <code>(count_a*centroid_a + count_b*centroid_b) / (count_a+count_b)</code>, preserving the relative voice contribution rather than averaging blindly.</li>
+<li><strong>ID compaction (rev 7 M-2').</strong> After all merges complete, surviving global IDs are renumbered to <code>0..N-1</code> so transcripts never show gaps like <code>Speaker_01, Speaker_02, Speaker_04</code>.</li>
+</ul>
+<p>The peak-RSS gate <code>tests/test_benchmark.cpp</code> ([benchmark][t2-1]) head-to-heads <code>diarize()</code> vs <code>diarize_chunked()</code> on the same buffer, sampling <code>recmeet::read_self_rss_kb()</code> at 1 Hz; pinned thresholds are <code>&lt; 4 GB</code> peak on 30-min synthetic and <code>&lt; 6 GB</code> on the iter-110 60-min real fixture.</p>
+<hr>
 <h2 id="s9">9. Tray Applet</h2>
-
-<h3>9a. Tray Startup and GTK Main Loop</h3>
+<h3 id="9a-tray-startup-and-gtk-main-loop">9a. Tray Startup and GTK Main Loop</h3>
 <div class="diagram-wrapper"><pre class="mermaid">
 flowchart TD
     MAIN["main(argc, argv)"]
     PARSE["Parse --daemon ADDRESS&lt;br/&gt;or RECMEET_DAEMON_ADDR env"]
     INIT["gtk_init()&lt;br/&gt;load_config()&lt;br/&gt;log_init(level, stderr=true)"]
     INDICATOR["app_indicator_new('recmeet-tray')&lt;br/&gt;Resolve icon theme path&lt;br/&gt;Set ACTIVE status"]
-    SOURCES["refresh_sources()&lt;br/&gt;-> g_tray.mics, g_tray.monitors"]
+    SOURCES["refresh_sources()&lt;br/&gt;→ g_tray.mics, g_tray.monitors"]
     CONNECT["connect_to_daemon()"]
     CONNECT_OK{connected?}
     MENU["build_menu()&lt;br/&gt;fetch_provider_models()"]
-    SIGNALS["SIGCHLD -> reap recmeet-web zombies&lt;br/&gt;SIGTERM/SIGINT -> gtk_main_quit"]
+    SIGNALS["SIGCHLD → reap recmeet-web zombies&lt;br/&gt;SIGTERM/SIGINT → gtk_main_quit"]
     GTK_MAIN["gtk_main()&lt;br/&gt;(blocks in GTK event loop)"]
     CLEANUP["Send record.stop if active&lt;br/&gt;teardown_ipc_watch()&lt;br/&gt;close IPC connection&lt;br/&gt;stop_web_server()&lt;br/&gt;log_shutdown()"]
 
-    MAIN --> PARSE --> INIT --> INDICATOR --> SOURCES --> CONNECT
-    CONNECT --> CONNECT_OK
-    CONNECT_OK -->|"yes"| MENU
-    CONNECT_OK -->|"no"| RECONNECT_SCHED["g_timeout_add_seconds(1, try_reconnect)"]
-    RECONNECT_SCHED --> MENU
-    MENU --> SIGNALS --> GTK_MAIN --> CLEANUP
+    MAIN --&gt; PARSE --&gt; INIT --&gt; INDICATOR --&gt; SOURCES --&gt; CONNECT
+    CONNECT --&gt; CONNECT_OK
+    CONNECT_OK --&gt;|"yes"| MENU
+    CONNECT_OK --&gt;|"no"| RECONNECT_SCHED["g_timeout_add_seconds(1,&lt;br/&gt;try_reconnect)"]
+    RECONNECT_SCHED --&gt; MENU
+    MENU --&gt; SIGNALS --&gt; GTK_MAIN --&gt; CLEANUP
 </pre></div>
-
-<h3>9b. IPC Event Integration with GTK</h3>
+<h3 id="9b-ipc-event-integration-with-gtk">9b. IPC Event Integration with GTK</h3>
 <div class="diagram-wrapper"><pre class="mermaid">
 flowchart TD
     subgraph "GTK Main Loop"
@@ -907,372 +933,412 @@ flowchart TD
         WATCH["GIOChannel watch on&lt;br/&gt;IPC socket fd&lt;br/&gt;(G_IO_IN | G_IO_HUP | G_IO_ERR)"]
     end
 
-    WATCH -->|"G_IO_IN"| READ["ipc.read_and_dispatch(0)"]
-    READ -->|"ok"| DISPATCH["Event dispatched to handle_ipc_event()"]
-    READ -->|"fail"| DISCONN
+    WATCH --&gt;|"G_IO_IN"| READ["ipc.read_and_dispatch(0)"]
+    READ --&gt;|"ok"| DISPATCH["Event dispatched to&lt;br/&gt;handle_ipc_event()"]
+    READ --&gt;|"fail"| DISCONN
 
-    WATCH -->|"G_IO_HUP / G_IO_ERR"| DISCONN["teardown_ipc_watch()&lt;br/&gt;ipc.close_connection()&lt;br/&gt;update_state(false,false,false)"]
-    DISCONN --> BACKOFF["Reset delay = 1s&lt;br/&gt;g_timeout_add_seconds(delay, try_reconnect)"]
+    WATCH --&gt;|"G_IO_HUP / G_IO_ERR"| DISCONN["teardown_ipc_watch()&lt;br/&gt;ipc.close_connection()&lt;br/&gt;update_state(false,false,false)"]
+    DISCONN --&gt; BACKOFF["Reset delay = 1s&lt;br/&gt;g_timeout_add_seconds&lt;br/&gt;(delay, try_reconnect)"]
 
     subgraph "handle_ipc_event(ev)"
         EV{"ev.event?"}
-        EV -->|"phase"| PHASE["Update current_phase&lt;br/&gt;Clear progress_percent&lt;br/&gt;Patch status label in-place"]
-        EV -->|"progress"| PROGRESS["Update phase + percent&lt;br/&gt;Patch status label in-place"]
-        EV -->|"state.changed"| STATE["Check error -> notify()&lt;br/&gt;Read recording/postprocessing/&lt;br/&gt;downloading booleans&lt;br/&gt;-> update_state()"]
-        EV -->|"job.complete"| COMPLETE["notify() with note_path"]
-        EV -->|"model.downloading"| MODEL["Update download_model&lt;br/&gt;rebuild_menu / notify"]
+        EV --&gt;|"phase"| PHASE["Update current_phase&lt;br/&gt;Clear progress_percent&lt;br/&gt;Patch status label in-place"]
+        EV --&gt;|"progress"| PROGRESS["Update phase + percent&lt;br/&gt;Patch status label in-place"]
+        EV --&gt;|"state.changed"| STATE["Check error → notify()&lt;br/&gt;Read {recording, postprocessing,&lt;br/&gt;downloading} booleans&lt;br/&gt;→ update_state()"]
+        EV --&gt;|"job.complete"| COMPLETE["notify() with note_path"]
+        EV --&gt;|"model.downloading"| MODEL["Update download_model&lt;br/&gt;rebuild_menu / notify"]
     end
 
     subgraph "update_state(rec, pp, dl)"
-        US_CTX["Close context window&lt;br/&gt;if was_recording and not rec"]
-        US_CLEAR["Clear progress/phase if all false"]
+        US_CTX["Close context window&lt;br/&gt;if was_recording → !rec"]
+        US_CLEAR["Clear progress/phase&lt;br/&gt;if all false"]
         US_ICON{"Which state?"}
-        US_ICON -->|"recording"| ICON_REC["Set ICON_RECORDING"]
-        US_ICON -->|"pp / dl"| ICON_PROC["Set ICON_PROCESSING"]
-        US_ICON -->|"idle"| ICON_IDLE["Set ICON_IDLE"]
+        US_ICON --&gt;|"recording"| ICON_REC["Set ICON_RECORDING"]
+        US_ICON --&gt;|"pp / dl"| ICON_PROC["Set ICON_PROCESSING"]
+        US_ICON --&gt;|"idle"| ICON_IDLE["Set ICON_IDLE"]
         US_REBUILD["build_menu()"]
 
-        US_CTX --> US_CLEAR --> US_ICON
-        ICON_REC --> US_REBUILD
-        ICON_PROC --> US_REBUILD
-        ICON_IDLE --> US_REBUILD
+        US_CTX --&gt; US_CLEAR --&gt; US_ICON
+        ICON_REC --&gt; US_REBUILD
+        ICON_PROC --&gt; US_REBUILD
+        ICON_IDLE --&gt; US_REBUILD
     end
 
-    STATE --> US_CTX
+    STATE --&gt; US_CTX
 
     subgraph "Reconnection (exponential backoff)"
         TRY["try_reconnect()"]
-        TRY --> TRY_CONN["connect_to_daemon()"]
-        TRY_CONN -->|"success"| RESET["delay = 1s, build_menu()"]
-        TRY_CONN -->|"fail"| NEXT["delay = min(delay x 2, 30)&lt;br/&gt;g_timeout_add_seconds(delay, try_reconnect)"]
+        TRY --&gt; TRY_CONN["connect_to_daemon()"]
+        TRY_CONN --&gt;|"success"| RESET["delay = 1s&lt;br/&gt;build_menu()"]
+        TRY_CONN --&gt;|"fail"| NEXT["delay = min(delay × 2, 30)&lt;br/&gt;g_timeout_add_seconds(delay,&lt;br/&gt;try_reconnect)"]
     end
 </pre></div>
-
-<h3>9c. Recording Start/Stop Flow</h3>
+<h3 id="9c-recording-startstop-flow">9c. Recording Start/Stop Flow</h3>
 <div class="diagram-wrapper"><pre class="mermaid">
 flowchart TD
     subgraph "on_record()"
-        REC_GUARD{"recording or downloading?"}
-        REC_GUARD -->|"yes"| REC_RET["return"]
-        REC_GUARD -->|"no"| REC_CONN{"daemon_connected?"}
-        REC_CONN -->|"no"| REC_RETRY["connect_to_daemon()"]
-        REC_RETRY -->|"fail"| REC_NOTIFY["notify('Cannot connect')"]
-        REC_RETRY -->|"ok"| REC_KEY
-        REC_CONN -->|"yes"| REC_KEY
+        REC_GUARD{"recording ||&lt;br/&gt;downloading?"}
+        REC_GUARD --&gt;|"yes"| REC_RET["return"]
+        REC_GUARD --&gt;|"no"| REC_CONN{"daemon_connected?"}
+        REC_CONN --&gt;|"no"| REC_RETRY["connect_to_daemon()"]
+        REC_RETRY --&gt;|"fail"| REC_NOTIFY["notify('Cannot connect')"]
+        REC_RETRY --&gt;|"ok"| REC_KEY
+        REC_CONN --&gt;|"yes"| REC_KEY
 
         REC_KEY["resolve_api_key(provider)"]
-        REC_KEY --> REC_KEY_CHECK{"key empty and !no_summary?"}
-        REC_KEY_CHECK -->|"yes"| REC_PROMPT["prompt_api_key() GTK dialog"]
-        REC_PROMPT --> REC_SAVE["Save to api_keys + config"]
-        REC_KEY_CHECK -->|"no"| REC_BUILD
-        REC_SAVE --> REC_BUILD
+        REC_KEY --&gt; REC_KEY_CHECK{"key empty &amp;&amp;&lt;br/&gt;!no_summary?"}
+        REC_KEY_CHECK --&gt;|"yes"| REC_PROMPT["prompt_api_key() GTK dialog"]
+        REC_PROMPT --&gt; REC_SAVE["Save to api_keys + config"]
+        REC_KEY_CHECK --&gt;|"no"| REC_BUILD
+        REC_SAVE --&gt; REC_BUILD
 
-        REC_BUILD["Build run_cfg from g_tray.cfg&lt;br/&gt;config_to_map() -> params"]
-        REC_BUILD --> REC_CALL["ipc.call('record.start', params, 10s timeout)"]
-        REC_CALL -->|"fail"| REC_ERR_NOTIFY["notify(error)"]
-        REC_CALL -->|"ok"| REC_STATE["update_state(true, pp, false)"]
-        REC_STATE --> REC_CTX["show_context_window()"]
+        REC_BUILD["Build run_cfg from g_tray.cfg&lt;br/&gt;config_to_map() → params"]
+        REC_BUILD --&gt; REC_CALL["ipc.call('record.start',&lt;br/&gt;params, 10s timeout)"]
+        REC_CALL --&gt;|"fail"| REC_ERR_NOTIFY["notify(error)"]
+        REC_CALL --&gt;|"ok"| REC_STATE["update_state(true, pp, false)"]
+        REC_STATE --&gt; REC_CTX["show_context_window()"]
     end
 
     subgraph "on_stop()"
-        STOP_GUARD{"!recording and !postprocessing?"}
-        STOP_GUARD -->|"yes"| STOP_RET["return"]
-        STOP_GUARD -->|"no"| STOP_CTX{"recording and context window?"}
-        STOP_CTX -->|"yes"| STOP_CAPTURE["capture_and_clear_context()&lt;br/&gt;-> {context_inline, vocab}"]
-        STOP_CAPTURE --> STOP_JOB_CTX["ipc.call('job.context',&lt;br/&gt;{context_inline, vocabulary_append})"]
-        STOP_CTX -->|"no"| STOP_TARGET
-        STOP_JOB_CTX --> STOP_TARGET
+        STOP_GUARD{"!recording &amp;&amp;&lt;br/&gt;!postprocessing?"}
+        STOP_GUARD --&gt;|"yes"| STOP_RET["return"]
+        STOP_GUARD --&gt;|"no"| STOP_CTX{"recording &amp;&amp;&lt;br/&gt;context window?"}
+        STOP_CTX --&gt;|"yes"| STOP_CAPTURE["capture_and_clear_context()&lt;br/&gt;→ {context_inline, vocab}"]
+        STOP_CAPTURE --&gt; STOP_JOB_CTX["ipc.call('job.context',&lt;br/&gt;{context_inline, vocabulary_append})"]
+        STOP_CTX --&gt;|"no"| STOP_TARGET
+        STOP_JOB_CTX --&gt; STOP_TARGET
 
-        STOP_TARGET["params target =&lt;br/&gt;recording ? 'recording' : 'postprocessing'"]
-        STOP_TARGET --> STOP_CALL["ipc.call('record.stop', params, 5s timeout)"]
+        STOP_TARGET["params[target] =&lt;br/&gt;recording ? 'recording' : 'postprocessing'"]
+        STOP_TARGET --&gt; STOP_CALL["ipc.call('record.stop',&lt;br/&gt;params, 5s timeout)"]
     end
 </pre></div>
-
-<h3>9d. Tray Menu Structure</h3>
+<h3 id="9d-tray-menu-structure">9d. Tray Menu Structure</h3>
 <div class="diagram-wrapper"><pre class="mermaid">
 graph TD
     MENU["GTK Menu"]
-    MENU --> STATUS["Status label (insensitive, patched in-place)"]
-    MENU --> SEP1["--- separator ---"]
-    MENU --> REC_SECTION["Record / Stop / Cancel (context-sensitive)"]
-    MENU --> SEP2["--- separator ---"]
-    MENU --> MIC["Mic Source: Auto-detect, source1, source2"]
-    MENU --> MON["Monitor Source: Auto-detect, monitor1"]
-    MENU --> MODEL["Whisper Model: tiny / base / small / medium / large-v3"]
-    MENU --> LANG["Language: Auto-detect, en / es / fr / ..."]
-    MENU --> SEP3["--- separator ---"]
-    MENU --> CHECKS["Mic Only, No Summary, Speaker Diarization, VAD Segmentation"]
-    MENU --> SEP4["--- separator ---"]
-    MENU --> SUMMARY["Summary: Provider submenu, Model submenu"]
-    MENU --> OUTPUT["Output: dirs, Open Latest, Set Output Dir, Set Note Dir, Set LLM Model"]
-    MENU --> SEP5["--- separator ---"]
-    MENU --> EDIT["Edit Config"]
-    MENU --> SPEAKER["Speaker Management"]
-    MENU --> REFRESH["Refresh Devices"]
-    MENU --> UPDATE["Update Models"]
-    MENU --> ABOUT["About"]
-    MENU --> SEP6["--- separator ---"]
-    MENU --> QUIT["Quit"]
+    MENU --&gt; STATUS["(i) Status label&lt;br/&gt;(insensitive, patched in-place)"]
+    MENU --&gt; SEP1["─── separator ───"]
+    MENU --&gt; REC_SECTION["Record / Stop / Cancel&lt;br/&gt;(context-sensitive)"]
+    MENU --&gt; SEP2["─── separator ───"]
+    MENU --&gt; MIC["▶ Mic Source&lt;br/&gt;  ○ Auto-detect&lt;br/&gt;  ○ source1&lt;br/&gt;  ○ source2"]
+    MENU --&gt; MON["▶ Monitor Source&lt;br/&gt;  ○ Auto-detect&lt;br/&gt;  ○ monitor1"]
+    MENU --&gt; MODEL["▶ Whisper Model&lt;br/&gt;  ○ tiny / base / small /&lt;br/&gt;    medium / large-v3"]
+    MENU --&gt; LANG["▶ Language&lt;br/&gt;  ○ Auto-detect&lt;br/&gt;  ○ en / es / fr / ..."]
+    MENU --&gt; SEP3["─── separator ───"]
+    MENU --&gt; CHECKS["☑ Mic Only&lt;br/&gt;☑ No Summary&lt;br/&gt;☑ Speaker Diarization&lt;br/&gt;☑ VAD Segmentation"]
+    MENU --&gt; SEP4["─── separator ───"]
+    MENU --&gt; SUMMARY["▶ Summary&lt;br/&gt;  ▶ Provider&lt;br/&gt;    ○ xAI / OpenAI / Anthropic / Local&lt;br/&gt;  ▶ Model&lt;br/&gt;    ○ (fetched from API)"]
+    MENU --&gt; OUTPUT["▶ Output&lt;br/&gt;  (i) Output dir&lt;br/&gt;  (i) Note dir&lt;br/&gt;  Open Latest Session&lt;br/&gt;  Set Output Dir...&lt;br/&gt;  Set Note Dir...&lt;br/&gt;  Set LLM Model..."]
+    MENU --&gt; SEP5["─── separator ───"]
+    MENU --&gt; EDIT["Edit Config"]
+    MENU --&gt; SPEAKER["Speaker Management"]
+    MENU --&gt; REFRESH["Refresh Devices"]
+    MENU --&gt; UPDATE["Update Models"]
+    MENU --&gt; ABOUT["About"]
+    MENU --&gt; SEP6["─── separator ───"]
+    MENU --&gt; QUIT["Quit"]
 </pre></div>
-
 <hr>
-
-<!-- ================================================================ -->
 <h2 id="s10">10. CLI Mode Selection</h2>
-
 <div class="diagram-wrapper"><pre class="mermaid">
 flowchart TD
     ENTRY["main(argc, argv)"]
-    PARSE["parse_cli(argc, argv) -> CliResult"]
+    PARSE["parse_cli(argc, argv) → CliResult"]
 
-    PARSE --> VER{"--version?"}
-    VER -->|"yes"| PRINT_VER["Print version, exit 0"]
-    VER -->|"no"| HELP{"--help?"}
-    HELP -->|"yes"| PRINT_HELP["Print help, exit 0"]
-    HELP -->|"no"| ADDR_ENV{"RECMEET_DAEMON_ADDR env set?"}
-    ADDR_ENV -->|"yes"| SET_ADDR["daemon_addr = env, force DaemonMode::Force"]
-    ADDR_ENV -->|"no"| STATUS_CHECK
-    SET_ADDR --> STATUS_CHECK
+    PARSE --&gt; VER{"--version?"}
+    VER --&gt;|"yes"| PRINT_VER["Print version, exit 0"]
+    VER --&gt;|"no"| HELP{"--help?"}
+    HELP --&gt;|"yes"| PRINT_HELP["Print help, exit 0"]
+    HELP --&gt;|"no"| ADDR_ENV{"RECMEET_DAEMON_ADDR&lt;br/&gt;env set?"}
+    ADDR_ENV --&gt;|"yes"| SET_ADDR["daemon_addr = env&lt;br/&gt;force DaemonMode::Force"]
+    ADDR_ENV --&gt;|"no"| STATUS_CHECK
+    SET_ADDR --&gt; STATUS_CHECK
 
     STATUS_CHECK{"--status?"}
-    STATUS_CHECK -->|"yes"| CLIENT_STATUS["client_status(addr) -> exit"]
-    STATUS_CHECK -->|"no"| STOP_CHECK{"--stop?"}
-    STOP_CHECK -->|"yes"| CLIENT_STOP["client_stop(addr) -> exit"]
-    STOP_CHECK -->|"no"| MODEL_DL{"--download-model?"}
-    MODEL_DL -->|"yes"| DL_LOOP["Download models -> exit"]
-    MODEL_DL -->|"no"| VOCAB{"--list/add/remove/reset-vocab?"}
-    VOCAB -->|"yes"| VOCAB_OPS["Vocab management + save_config() -> exit"]
-    VOCAB -->|"no"| SPKR{"--speakers/reset/remove-speaker?"}
-    SPKR -->|"yes"| SPKR_OPS["Speaker DB ops -> exit"]
-    SPKR -->|"no"| ENROLL{"--enroll NAME?"}
-    ENROLL -->|"yes"| ENROLL_FLOW["Diarize -> select speaker -> extract embedding -> save to DB -> exit"]
-    ENROLL -->|"no"| IDENTIFY{"--identify DIR?"}
-    IDENTIFY -->|"yes"| ID_FLOW["Diarize -> identify -> print results -> exit"]
-    IDENTIFY -->|"no"| RECORD_FLOW
+    STATUS_CHECK --&gt;|"yes"| CLIENT_STATUS["client_status(addr) → exit"]
+    STATUS_CHECK --&gt;|"no"| STOP_CHECK{"--stop?"}
+    STOP_CHECK --&gt;|"yes"| CLIENT_STOP["client_stop(addr) → exit"]
+    STOP_CHECK --&gt;|"no"| MODEL_DL{"--download-model?"}
+    MODEL_DL --&gt;|"yes"| DL_LOOP["Download models → exit"]
+    MODEL_DL --&gt;|"no"| VOCAB{"--list/add/remove/&lt;br/&gt;reset-vocab?"}
+    VOCAB --&gt;|"yes"| VOCAB_OPS["Vocab management&lt;br/&gt;+ save_config() → exit"]
+    VOCAB --&gt;|"no"| SPKR{"--speakers/reset/&lt;br/&gt;remove-speaker?"}
+    SPKR --&gt;|"yes"| SPKR_OPS["Speaker DB ops → exit"]
+    SPKR --&gt;|"no"| ENROLL{"--enroll NAME?"}
+    ENROLL --&gt;|"yes"| ENROLL_FLOW["Diarize → select speaker →&lt;br/&gt;extract embedding →&lt;br/&gt;save to DB → exit"]
+    ENROLL --&gt;|"no"| IDENTIFY{"--identify DIR?"}
+    IDENTIFY --&gt;|"yes"| ID_FLOW["Diarize → identify →&lt;br/&gt;print results → exit"]
+    IDENTIFY --&gt;|"no"| RECORD_FLOW
 
     subgraph RECORD_FLOW["Recording Flow"]
-        REC_INIT["resolve_api_key(), log_init(), validate inputs"]
+        REC_INIT["resolve_api_key()&lt;br/&gt;log_init()&lt;br/&gt;validate inputs"]
         DAEMON_MODE{"DaemonMode?"}
-        DAEMON_MODE -->|"Force"| USE_DAEMON["use_daemon = true"]
-        DAEMON_MODE -->|"Disable"| STANDALONE["use_daemon = false"]
-        DAEMON_MODE -->|"Auto"| PROBE["daemon_running(addr)?"]
-        PROBE -->|"yes"| USE_DAEMON
-        PROBE -->|"no"| STANDALONE
+        DAEMON_MODE --&gt;|"Force"| USE_DAEMON["use_daemon = true"]
+        DAEMON_MODE --&gt;|"Disable"| STANDALONE["use_daemon = false"]
+        DAEMON_MODE --&gt;|"Auto"| PROBE["daemon_running(addr)?"]
+        PROBE --&gt;|"yes"| USE_DAEMON
+        PROBE --&gt;|"no"| STANDALONE
 
-        USE_DAEMON --> CLIENT_RECORD
-        STANDALONE --> STANDALONE_MAIN
+        USE_DAEMON --&gt; CLIENT_RECORD
+        STANDALONE --&gt; STANDALONE_MAIN
 
         subgraph CLIENT_RECORD["Client Mode"]
             CR_CONNECT["IpcClient::connect()"]
-            CR_CB["Set event callback (phase, progress, state, complete)"]
+            CR_CB["Set event callback&lt;br/&gt;(phase, progress, state, complete)"]
             CR_START["call('record.start', params)"]
-            CR_PRINT["Print 'Recording started. Press Ctrl+C to stop.'"]
-            CR_SIGINT["Install SIGINT handler -> call('record.stop')"]
-            CR_WAIT["read_events('job.complete') — blocks until done"]
+            CR_PRINT["Print 'Recording started.&lt;br/&gt;Press Ctrl+C to stop.'"]
+            CR_SIGINT["Install SIGINT handler&lt;br/&gt;→ call('record.stop')"]
+            CR_WAIT["read_events('job.complete')&lt;br/&gt;(blocks until done)"]
 
-            CR_CONNECT --> CR_CB --> CR_START --> CR_PRINT --> CR_SIGINT --> CR_WAIT
+            CR_CONNECT --&gt; CR_CB --&gt; CR_START --&gt; CR_PRINT --&gt; CR_SIGINT --&gt; CR_WAIT
         end
 
         subgraph STANDALONE_MAIN["Standalone Mode"]
-            SM_SUBPROC{"--progress-json and --config-json?"}
-            SM_SUBPROC -->|"yes"| SUBPROCESS["subprocess_main() (see section 11)"]
-            SM_SUBPROC -->|"no"| SM_NORMAL
+            SM_SUBPROC{"--progress-json &amp;&amp;&lt;br/&gt;--config-json?"}
+            SM_SUBPROC --&gt;|"yes"| SUBPROCESS["subprocess_main()&lt;br/&gt;(see §11)"]
+            SM_SUBPROC --&gt;|"no"| SM_NORMAL
 
             subgraph SM_NORMAL["Normal Standalone"]
                 SM_KEY["Validate API key"]
-                SM_SIG["sigaction(SIGINT) -> g_stop"]
-                SM_MODELS["Interactive model checks: whisper Y/n, LLM, diarize, VAD"]
+                SM_SIG["sigaction(SIGINT) → g_stop"]
+                SM_MODELS["Interactive model checks:&lt;br/&gt;whisper Y/n, LLM, diarize, VAD"]
                 SM_RUN["run_pipeline(cfg, g_stop)"]
-                SM_DONE["log_shutdown(), notify_cleanup()"]
+                SM_DONE["log_shutdown()&lt;br/&gt;notify_cleanup()"]
 
-                SM_KEY --> SM_SIG --> SM_MODELS --> SM_RUN --> SM_DONE
+                SM_KEY --&gt; SM_SIG --&gt; SM_MODELS --&gt; SM_RUN --&gt; SM_DONE
             end
         end
 
-        REC_INIT --> DAEMON_MODE
+        REC_INIT --&gt; DAEMON_MODE
     end
 </pre></div>
+<h3 id="10b-batch-reprocess-orchestration">10b. Batch Reprocess Orchestration</h3>
+<p><code>--reprocess-batch DIR</code> (iter 128) wraps the single-meeting reprocess path in a classify-and-dispatch loop. The driver is <code>run_reprocess_batch()</code> in <code>src/reprocess_batch.cpp</code>; it locks the daemon-vs-standalone dispatch decision once at start and tags every dispatched job with <code>cfg.batch_mode = true</code> so the tray can suppress per-meeting notifications and emit only the end-of-batch summary.</p>
+<div class="diagram-wrapper"><pre class="mermaid">
+flowchart TD
+    BATCH_ENTRY["main: --reprocess-batch DIR&lt;br/&gt;(set cfg.reprocess_batch_dir)"]
+    BATCH_GUARD["batch_sigint_handler installed once&lt;br/&gt;(daemon-mode also installs per-iter&lt;br/&gt;handler in dispatch_one_reprocess)"]
+    CLASSIFY["classify_batch_entries(DIR)&lt;br/&gt;→ {needs_processing, has_note,&lt;br/&gt;   no_wav, malformed_dirname}"]
+    PRINT_SUMMARY["Print classification tally"]
 
+    DRY{"--dry-run?"}
+    DRY --&gt;|"yes"| DRY_EXIT["exit 0 (no work done)"]
+    DRY --&gt;|"no"| MODE_LOCK
+
+    MODE_LOCK["Lock daemon-vs-standalone:&lt;br/&gt;probe daemon ONCE&lt;br/&gt;(failures mid-batch error out cleanly)"]
+    ENSURE_MODELS["ensure_models_cached_or_fail()&lt;br/&gt;(once, not per meeting)"]
+
+    LOOP_HEAD{"For each entry&lt;br/&gt;in needs_processing"}
+    DISPATCH["dispatch_one_reprocess(entry, locked_mode)&lt;br/&gt;↳ daemon: client_record_no_sigaction()&lt;br/&gt;  standalone: subprocess pp via run_pipeline&lt;br/&gt;  cfg.batch_mode = true on the dispatched job"]
+    OUTCOME{"Outcome?"}
+    SIGNAL_CHECK{"g_batch_stop_requested&lt;br/&gt;set?"}
+
+    BATCH_ENTRY --&gt; BATCH_GUARD --&gt; CLASSIFY --&gt; PRINT_SUMMARY --&gt; DRY
+    MODE_LOCK --&gt; ENSURE_MODELS --&gt; LOOP_HEAD
+    LOOP_HEAD --&gt;|"next"| DISPATCH
+    DISPATCH --&gt; OUTCOME
+    OUTCOME --&gt;|"Success / Failed"| RECORD_RESULT["Append per-meeting status&lt;br/&gt;to batch summary"]
+    OUTCOME --&gt;|"Cancelled&lt;br/&gt;(SIGINT or batch_stop)"| RECLASSIFY["Reclassify Failed→Cancelled&lt;br/&gt;if iter_stop or&lt;br/&gt;g_batch_stop_requested set"]
+    RECORD_RESULT --&gt; SIGNAL_CHECK
+    RECLASSIFY --&gt; SIGNAL_CHECK
+    SIGNAL_CHECK --&gt;|"yes"| BREAK["Break loop&lt;br/&gt;print partial summary&lt;br/&gt;exit 130"]
+    SIGNAL_CHECK --&gt;|"no"| LOOP_HEAD
+    LOOP_HEAD --&gt;|"done"| END_SUMMARY["Print end-of-batch summary&lt;br/&gt;(tray emits ONE notification&lt;br/&gt;via batch_job gating, see §11e)"]
+    END_SUMMARY --&gt; EXIT_BATCH["exit 0 (or 1 if any meeting failed)"]
+</pre></div>
+<p><strong>Hybrid SIGINT model.</strong> Two handlers cooperate:</p>
+<ul>
+<li><code>batch_sigint_handler</code> (installed once at batch entry, standalone-only): sets <code>g_batch_stop_requested</code> so the loop breaks after the current iteration's clean shutdown.</li>
+<li><code>batch_daemon_sigint_handler</code> (re-installed per iteration via <code>dispatch_one_reprocess</code> in daemon mode): forwards SIGINT to the daemon as <code>record.stop</code> for the current job, then sets <code>g_batch_stop_requested</code> so the loop breaks once the daemon reports the job ended.</li>
+</ul>
+<p>A single Ctrl-C aborts the current meeting's pipeline, lets it shut down cleanly, then exits the loop with code 130. Per-meeting failures (transcription error, OOM, malformed audio) record into the summary but do not abort the batch.</p>
+<p><strong>Daemon-disappearance handling.</strong> If the daemon dies between iterations (rare), <code>client_record_no_sigaction()</code> returns the canonical exit code <code>kClientConnectFailedExitCode == 2</code> from <code>dispatch_one_reprocess</code> and the batch loop exits with a clear &quot;daemon died mid-batch&quot; error rather than silently switching to standalone mode mid-run.</p>
 <hr>
-
-<!-- ================================================================ -->
 <h2 id="s11">11. Subprocess Postprocessing</h2>
 <p>The daemon's <code>pp_worker_loop</code> fork/exec's the <code>recmeet</code> binary as a child
 process for crash isolation. Communication is via NDJSON on stdout/stderr pipes.</p>
-
-<h3>11a. Fork/Exec Flow</h3>
+<h3 id="11a-forkexec-flow">11a. Fork/Exec Flow</h3>
 <div class="diagram-wrapper"><pre class="mermaid">
 flowchart TD
     JOB["PostprocessJob dequeued"]
     CFG_FIX["job.cfg.reprocess_dir = job.input.out_dir&lt;br/&gt;(ensures subprocess reprocesses,&lt;br/&gt;never starts live recording)"]
-    CFG_WRITE["write_job_config() -> temp JSON file&lt;br/&gt;/tmp/recmeet-pp-job_id.json"]
+    CFG_WRITE["write_job_config() → temp JSON file&lt;br/&gt;/tmp/recmeet-pp-{job_id}.json"]
     ARGV["Build argv:&lt;br/&gt;[g_self_exe, --reprocess, out_dir,&lt;br/&gt; --config-json, cfg_path,&lt;br/&gt; --progress-json, --no-daemon]"]
-    PIPES["pipe(stdout_pipe), pipe(stderr_pipe)"]
+    PIPES["pipe(stdout_pipe)&lt;br/&gt;pipe(stderr_pipe)"]
     FORK["fork()"]
 
-    JOB --> CFG_FIX --> CFG_WRITE --> ARGV --> PIPES --> FORK
+    JOB --&gt; CFG_FIX --&gt; CFG_WRITE --&gt; ARGV --&gt; PIPES --&gt; FORK
 
-    FORK -->|"child (pid=0)"| CHILD
-    FORK -->|"parent"| PARENT
+    FORK --&gt;|"child (pid=0)"| CHILD
+    FORK --&gt;|"parent"| PARENT
 
     subgraph CHILD["Child Process"]
-        C_SIG["Reset SIGINT/SIGTERM/SIGHUP to SIG_DFL"]
-        C_DUP["dup2(stdout_pipe write, STDOUT)&lt;br/&gt;dup2(stderr_pipe write, STDERR)"]
+        C_SIG["Reset SIGINT/SIGTERM/SIGHUP&lt;br/&gt;to SIG_DFL"]
+        C_DUP["dup2(stdout_pipe[1], STDOUT)&lt;br/&gt;dup2(stderr_pipe[1], STDERR)"]
         C_CLOSE["closefrom(3)&lt;br/&gt;(close ALL inherited fds:&lt;br/&gt;log fd, IPC sockets, pid lock)"]
         C_EXEC["execv(g_self_exe, argv)"]
         C_FAIL["_exit(127) on exec failure"]
 
-        C_SIG --> C_DUP --> C_CLOSE --> C_EXEC --> C_FAIL
+        C_SIG --&gt; C_DUP --&gt; C_CLOSE --&gt; C_EXEC --&gt; C_FAIL
     end
 
     subgraph PARENT["Parent (pp_worker thread)"]
         P_CLOSE["Close write ends of both pipes"]
         P_PID["g_pp_child_pid.store(child_pid)"]
-        P_POLL["Poll loop (see 11b)"]
-        P_WAIT["waitpid(pid, status, 0)"]
-        P_CLEAR["g_pp_child_pid = -1, Delete temp config JSON"]
-        P_INTERPRET["Interpret exit status (see 11c)"]
+        P_POLL["Poll loop&lt;br/&gt;(see §11b)"]
+        P_WAIT["waitpid(pid, &amp;status, 0)"]
+        P_CLEAR["g_pp_child_pid = -1&lt;br/&gt;Delete temp config JSON"]
+        P_INTERPRET["Interpret exit status&lt;br/&gt;(see §11c)"]
 
-        P_CLOSE --> P_PID --> P_POLL --> P_WAIT --> P_CLEAR --> P_INTERPRET
+        P_CLOSE --&gt; P_PID --&gt; P_POLL --&gt; P_WAIT --&gt; P_CLEAR --&gt; P_INTERPRET
     end
 </pre></div>
-
-<h3>11b. NDJSON Poll Loop and Watchdog</h3>
+<h3 id="11b-ndjson-poll-loop-and-watchdog">11b. NDJSON Poll Loop and Watchdog</h3>
 <div class="diagram-wrapper"><pre class="mermaid">
 flowchart TD
-    POLL["poll(stdout_fd + stderr_fd, 1000ms)"]
+    POLL["poll({stdout_fd, stderr_fd}, 2, 1000ms)"]
 
-    POLL --> STDOUT{"stdout readable?"}
-    STDOUT -->|"yes"| PARSE_OUT["Read lines, parse NDJSON"]
+    POLL --&gt; STDOUT{"stdout&lt;br/&gt;readable?"}
+    STDOUT --&gt;|"yes"| PARSE_OUT["Read lines, parse NDJSON"]
 
-    PARSE_OUT --> EV_TYPE{"event type?"}
-    EV_TYPE -->|"phase"| PHASE_BC["server.post(broadcast phase)&lt;br/&gt;Reset last_percent = -1&lt;br/&gt;Update last_progress timestamp"]
-    EV_TYPE -->|"progress"| PROG_THROTTLE{"pct jump >= 10% or elapsed >= 120s?"}
-    PROG_THROTTLE -->|"yes"| PROG_BC["server.post(broadcast progress)&lt;br/&gt;Update last_progress"]
-    PROG_THROTTLE -->|"no"| SKIP["Skip (throttled)"]
-    EV_TYPE -->|"job.complete"| CAPTURE["Capture note_path, output_dir"]
-    EV_TYPE -->|"heartbeat"| HEARTBEAT["Update last_heartbeat only"]
+    PARSE_OUT --&gt; EV_TYPE{"event type?"}
+    EV_TYPE --&gt;|"phase"| PHASE_BC["server.post(broadcast phase)&lt;br/&gt;Reset last_percent = -1&lt;br/&gt;Update last_progress timestamp"]
+    EV_TYPE --&gt;|"progress"| PROG_THROTTLE{"pct jump ≥ 10%&lt;br/&gt;or elapsed ≥ 120s?"}
+    PROG_THROTTLE --&gt;|"yes"| PROG_BC["server.post(broadcast progress)&lt;br/&gt;Update last_progress"]
+    PROG_THROTTLE --&gt;|"no"| SKIP["Skip (throttled)"]
+    EV_TYPE --&gt;|"job.complete"| CAPTURE["Capture note_path, output_dir"]
+    EV_TYPE --&gt;|"heartbeat"| HEARTBEAT["Update last_heartbeat only"]
 
-    STDOUT -->|"no"| STDERR
-    STDERR{"stderr readable?"}
-    STDERR -->|"yes"| LOG_ERR["Log line, track last_stderr_line"]
-    STDERR -->|"no"| WATCHDOG
+    STDOUT --&gt;|"no"| STDERR
+    STDERR{"stderr&lt;br/&gt;readable?"}
+    STDERR --&gt;|"yes"| LOG_ERR["Log line, track last_stderr_line"]
+    STDERR --&gt;|"no"| WATCHDOG
 
-    PHASE_BC --> WATCHDOG
-    PROG_BC --> WATCHDOG
-    SKIP --> WATCHDOG
-    CAPTURE --> WATCHDOG
-    HEARTBEAT --> WATCHDOG
-    LOG_ERR --> WATCHDOG
+    PHASE_BC --&gt; WATCHDOG
+    PROG_BC --&gt; WATCHDOG
+    SKIP --&gt; WATCHDOG
+    CAPTURE --&gt; WATCHDOG
+    HEARTBEAT --&gt; WATCHDOG
+    LOG_ERR --&gt; WATCHDOG
 
     subgraph WATCHDOG["Dual-Timestamp Watchdog"]
-        WD1{"last_heartbeat > 120s stale?"}
-        WD1 -->|"yes"| KILL["kill(pid, SIGTERM)&lt;br/&gt;killed_stale = true&lt;br/&gt;Close both pipes, break poll loop"]
-        WD1 -->|"no"| WD2{"last_progress > 300s stale?"}
-        WD2 -->|"yes"| KILL
-        WD2 -->|"no"| CANCEL_CHECK
+        WD1{"last_heartbeat&lt;br/&gt;&gt; 120s stale?"}
+        WD1 --&gt;|"yes"| KILL["kill(pid, SIGTERM)&lt;br/&gt;killed_stale = true&lt;br/&gt;Close both pipes&lt;br/&gt;Break poll loop"]
+        WD1 --&gt;|"no"| WD2{"last_progress&lt;br/&gt;&gt; 300s stale?"}
+        WD2 --&gt;|"yes"| KILL
+        WD2 --&gt;|"no"| CANCEL_CHECK
     end
 
-    CANCEL_CHECK{"g_pp_stop requested?"}
-    CANCEL_CHECK -->|"yes"| CANCEL_KILL["kill(pid, SIGTERM), g_pp_stop.reset()"]
-    CANCEL_CHECK -->|"no"| EOF_CHECK
+    CANCEL_CHECK{"g_pp_stop&lt;br/&gt;requested?"}
+    CANCEL_CHECK --&gt;|"yes"| CANCEL_KILL["kill(pid, SIGTERM)&lt;br/&gt;g_pp_stop.reset()"]
+    CANCEL_CHECK --&gt;|"no"| EOF_CHECK
 
-    EOF_CHECK{"Both pipes closed?"}
-    EOF_CHECK -->|"yes"| EXIT_POLL["Exit poll loop"]
-    EOF_CHECK -->|"no"| POLL
+    EOF_CHECK{"Both pipes&lt;br/&gt;closed?"}
+    EOF_CHECK --&gt;|"yes"| EXIT_POLL["Exit poll loop"]
+    EOF_CHECK --&gt;|"no"| POLL
 
-    CANCEL_KILL --> POLL
+    CANCEL_KILL --&gt; POLL
 </pre></div>
-
-<h3>11c. Exit Status Interpretation</h3>
+<h3 id="11c-exit-status-interpretation">11c. Exit Status Interpretation</h3>
 <div class="diagram-wrapper"><pre class="mermaid">
 flowchart LR
     EXIT{"Child exit status"}
-    EXIT -->|"exit 0"| OK["server.post(broadcast job.complete event)"]
-    EXIT -->|"exit 2"| CANCELLED["Log: 'Cancelled' (no notification)"]
-    EXIT -->|"exit 127"| LAUNCH_FAIL["'Failed to launch subprocess'"]
-    EXIT -->|"killed_stale"| DEADLOCK["'Processing stalled (no progress)&lt;br/&gt;likely onnxruntime deadlock'"]
-    EXIT -->|"signal N"| CRASH["'Processing crashed (signal N: SIGNAME)'"]
-    EXIT -->|"exit N other"| FAIL["'Processing failed (exit N): last_stderr_line'"]
+    EXIT --&gt;|"exit(0)"| OK["server.post(broadcast&lt;br/&gt;job.complete event)"]
+    EXIT --&gt;|"exit(2)"| CANCELLED["Log: 'Cancelled'&lt;br/&gt;(no notification)"]
+    EXIT --&gt;|"exit(127)"| LAUNCH_FAIL["'Failed to launch subprocess'"]
+    EXIT --&gt;|"killed_stale"| DEADLOCK["'Processing stalled&lt;br/&gt;(no progress) — likely&lt;br/&gt;onnxruntime deadlock'"]
+    EXIT --&gt;|"signal N"| CRASH["'Processing crashed&lt;br/&gt;(signal N: SIGNAME)'"]
+    EXIT --&gt;|"exit(N) other"| FAIL["'Processing failed&lt;br/&gt;(exit N): last_stderr_line'"]
 
-    LAUNCH_FAIL --> NOTIFY["notify() + broadcast_state(error)"]
-    DEADLOCK --> NOTIFY
-    CRASH --> NOTIFY
-    FAIL --> NOTIFY
+    LAUNCH_FAIL --&gt; NOTIFY["notify() + broadcast_state(error)"]
+    DEADLOCK --&gt; NOTIFY
+    CRASH --&gt; NOTIFY
+    FAIL --&gt; NOTIFY
 </pre></div>
-
-<h3>11d. Subprocess Internal Flow</h3>
+<h3 id="11d-subprocess-internal-flow">11d. Subprocess Internal Flow</h3>
 <div class="diagram-wrapper"><pre class="mermaid">
 flowchart TD
     ENTRY["subprocess_main(cli)"]
-    LOG_OFF["log_shutdown()&lt;br/&gt;(no file/stderr logging; NDJSON stdout only)"]
-    READ_CFG["Read config JSON from cli.config_json_path"]
-    PARSE["config_from_json(content) -> cfg"]
+    LOG_OFF["log_shutdown()&lt;br/&gt;(no file/stderr logging;&lt;br/&gt;NDJSON stdout only)"]
+    READ_CFG["Read config JSON from&lt;br/&gt;cli.config_json_path"]
+    PARSE["config_from_json(content) → cfg"]
     SUPPRESS["Suppress whisper log noise"]
-    SIGNALS["sigaction(SIGINT/SIGTERM) -> g_stop.request()"]
-    HEARTBEAT["Spawn heartbeat thread:&lt;br/&gt;write NDJSON heartbeat every ~10s"]
-    REC["run_recording(cfg, g_stop, on_phase)&lt;br/&gt;-> input (reprocess mode: returns immediately)"]
-    PP["run_postprocessing(cfg, input,&lt;br/&gt;on_phase, on_progress, g_stop)"]
-    COMPLETE["Write NDJSON job.complete {note_path, output_dir}"]
-    CLEANUP["Stop heartbeat thread, Remove temp config JSON"]
+    SIGNALS["sigaction(SIGINT/SIGTERM)&lt;br/&gt;→ g_stop.request()"]
+    HEARTBEAT["Spawn heartbeat thread:&lt;br/&gt;write NDJSON {'event':'heartbeat'}&lt;br/&gt;every ~10s"]
+    REC["run_recording(cfg, g_stop, on_phase)&lt;br/&gt;→ input (reprocess mode: returns immediately)"]
+    PP["run_postprocessing(cfg, input,&lt;br/&gt;on_phase, on_progress, &amp;g_stop)"]
+    COMPLETE["Write NDJSON job.complete&lt;br/&gt;{note_path, output_dir}"]
+    CLEANUP["Stop heartbeat thread&lt;br/&gt;Remove temp config JSON"]
     RET{"result?"}
-    RET -->|"success"| EXIT0["return 0"]
-    RET -->|"Cancelled"| EXIT2["return 2"]
-    RET -->|"other error"| EXIT1["return 1"]
+    RET --&gt;|"success"| EXIT0["return 0"]
+    RET --&gt;|"RecmeetError('Cancelled')"| EXIT2["return 2"]
+    RET --&gt;|"other error"| EXIT1["return 1"]
 
-    ENTRY --> LOG_OFF --> READ_CFG --> PARSE --> SUPPRESS
-    SUPPRESS --> SIGNALS --> HEARTBEAT --> REC --> PP --> COMPLETE --> CLEANUP --> RET
+    ENTRY --&gt; LOG_OFF --&gt; READ_CFG --&gt; PARSE --&gt; SUPPRESS
+    SUPPRESS --&gt; SIGNALS --&gt; HEARTBEAT --&gt; REC --&gt; PP --&gt; COMPLETE --&gt; CLEANUP --&gt; RET
 </pre></div>
+<h3 id="11e-batch-mode-and-batch-job-propagation">11e. batch_mode and batch_job propagation</h3>
+<p>When <code>--reprocess-batch</code> is the entry point (see §10b), each dispatched job carries <code>cfg.batch_mode = true</code>. This propagates through the IPC and subprocess boundary so the tray can render exactly one end-of-batch desktop notification instead of one per meeting.</p>
+<div class="diagram-wrapper"><pre class="mermaid">
+flowchart LR
+    BATCH_DRIVER["run_reprocess_batch:&lt;br/&gt;cfg.batch_mode = true&lt;br/&gt;per dispatched job"]
+    DAEMON["daemon.cpp record.start&lt;br/&gt;handler stores cfg&lt;br/&gt;(includes batch_mode)"]
+    JSON["write_job_config():&lt;br/&gt;job config JSON&lt;br/&gt;includes 'batch_mode' field"]
+    SUBPROC["subprocess_main reads&lt;br/&gt;config_from_json,&lt;br/&gt;cfg.batch_mode set"]
+    JOB_COMPLETE["subprocess emits&lt;br/&gt;NDJSON job.complete&lt;br/&gt;{note_path, output_dir,&lt;br/&gt; batch_job: cfg.batch_mode}"]
+    DAEMON_BC["daemon poll loop:&lt;br/&gt;broadcasts job.complete&lt;br/&gt;WITH batch_job field"]
+    TRAY["tray.cpp on_job_complete:&lt;br/&gt;if (batch_job) skip notify();&lt;br/&gt;else notify('Note written: …')"]
 
+    BATCH_DRIVER --&gt; DAEMON --&gt; JSON --&gt; SUBPROC --&gt; JOB_COMPLETE --&gt; DAEMON_BC --&gt; TRAY
+</pre></div>
+<p>The standalone <code>--reprocess-batch</code> path (no daemon) bypasses the tray entirely — the CLI prints the per-meeting status lines directly and emits a single libnotify desktop notification at end of batch, gated by the same <code>cfg.batch_mode</code> flag inside <code>run_reprocess_batch()</code>.</p>
+<p>A live single-meeting reprocess or live recording leaves <code>cfg.batch_mode = false</code>; the tray then renders a per-meeting &quot;Note written: …&quot; notification on <code>job.complete</code> as before.</p>
 <hr>
-
-<!-- ================================================================ -->
 <h2 id="s12">12. Audio Capture Subsystem</h2>
-
 <div class="diagram-wrapper"><pre class="mermaid">
 flowchart TD
     subgraph "Source Selection (run_recording)"
         SEL_START["Audio source names from Config"]
-        SEL_EMPTY{"mic_source empty?"}
-        SEL_EMPTY -->|"yes"| SEL_DETECT["detect_sources(pattern) -> mic + monitor"]
-        SEL_EMPTY -->|"no"| SEL_USE["Use config values"]
-        SEL_DETECT -->|"no mic"| SEL_ERR["throw DeviceError"]
-        SEL_DETECT --> DUAL{"!mic_only and monitor found?"}
-        SEL_USE --> DUAL
+        SEL_EMPTY{"mic_source&lt;br/&gt;empty?"}
+        SEL_EMPTY --&gt;|"yes"| SEL_DETECT["detect_sources(pattern)&lt;br/&gt;→ mic + monitor"]
+        SEL_EMPTY --&gt;|"no"| SEL_USE["Use config values"]
+        SEL_DETECT --&gt;|"no mic"| SEL_ERR["throw DeviceError"]
+        SEL_DETECT --&gt; DUAL{"!mic_only &amp;&amp;&lt;br/&gt;monitor found?"}
+        SEL_USE --&gt; DUAL
     end
 
-    DUAL -->|"yes"| DUAL_CAP
-    DUAL -->|"no"| SINGLE_CAP
+    DUAL --&gt;|"yes"| DUAL_CAP
+    DUAL --&gt;|"no"| SINGLE_CAP
 
     subgraph DUAL_CAP["Dual Capture"]
         subgraph MIC_CAP["Mic Capture"]
-            MIC_PW["PipeWireCapture(mic_source) S16LE mono 16kHz"]
+            MIC_PW["PipeWireCapture(mic_source)&lt;br/&gt;S16LE mono 16kHz"]
             MIC_START["mic.start()"]
-            MIC_PW --> MIC_START
+            MIC_PW --&gt; MIC_START
         end
 
         subgraph MON_CAP["Monitor Capture"]
             MON_CHECK{".monitor suffix?"}
-            MON_CHECK -->|"yes"| MON_PA["PulseMonitorCapture (pa_simple, own thread)"]
-            MON_CHECK -->|"no"| MON_PW_TRY["try PipeWireCapture (capture_sink=true)"]
-            MON_PW_TRY -->|"RecmeetError"| MON_PA
-            MON_PW_TRY -->|"ok"| MON_OK["Monitor capturing"]
-            MON_PA --> MON_OK
+            MON_CHECK --&gt;|"yes"| MON_PA["PulseMonitorCapture&lt;br/&gt;(pa_simple, own thread)"]
+            MON_CHECK --&gt;|"no"| MON_PW_TRY["try PipeWireCapture&lt;br/&gt;(capture_sink=true)"]
+            MON_PW_TRY --&gt;|"RecmeetError"| MON_PA
+            MON_PW_TRY --&gt;|"ok"| MON_OK["Monitor capturing"]
+            MON_PA --&gt; MON_OK
         end
 
-        STOP_LOOP["while !stop.stop_requested() sleep_for(200ms)"]
+        STOP_LOOP["while !stop.stop_requested()&lt;br/&gt;  sleep_for(200ms)"]
         DRAIN_BOTH["mic.stop() + mon.stop()&lt;br/&gt;mic_samples = mic.drain()&lt;br/&gt;mon_samples = mon.drain()"]
         WRITE_RAW["Write mic.wav + monitor.wav"]
         VALIDATE["validate_audio(mic.wav) — fatal&lt;br/&gt;validate_audio(monitor.wav) — non-fatal"]
         MIX_OR_SKIP{"Monitor valid?"}
-        MIX_OR_SKIP -->|"yes"| MIX["mix_audio(mic, mon) -> averaged int16_t stream"]
-        MIX_OR_SKIP -->|"AudioValidationError"| MIC_FALLBACK["Use mic-only"]
+        MIX_OR_SKIP --&gt;|"yes"| MIX["mix_audio(mic, mon)&lt;br/&gt;→ averaged int16_t stream"]
+        MIX_OR_SKIP --&gt;|"AudioValidationError"| MIC_FALLBACK["Use mic-only"]
 
-        MIC_START --> STOP_LOOP
-        MON_OK --> STOP_LOOP
-        STOP_LOOP --> DRAIN_BOTH --> WRITE_RAW --> VALIDATE --> MIX_OR_SKIP
-        MIX --> WRITE_OUT
-        MIC_FALLBACK --> WRITE_OUT
+        MIC_START --&gt; STOP_LOOP
+        MON_OK --&gt; STOP_LOOP
+        STOP_LOOP --&gt; DRAIN_BOTH --&gt; WRITE_RAW --&gt; VALIDATE --&gt; MIX_OR_SKIP
+        MIX --&gt; WRITE_OUT
+        MIC_FALLBACK --&gt; WRITE_OUT
         WRITE_OUT["Write audio_YYYY-MM-DD_HH-MM.wav"]
     end
 
@@ -1280,63 +1346,63 @@ flowchart TD
         S_PW["PipeWireCapture(mic_source)"]
         S_START["start()"]
         S_LOOP["while !stop.stop_requested()"]
-        S_DRAIN["stop() -> drain()"]
+        S_DRAIN["stop() → drain()"]
         S_WRITE["Write audio_YYYY-MM-DD_HH-MM.wav"]
 
-        S_PW --> S_START --> S_LOOP --> S_DRAIN --> S_WRITE
+        S_PW --&gt; S_START --&gt; S_LOOP --&gt; S_DRAIN --&gt; S_WRITE
     end
 
     subgraph "PipeWireCapture Internals (Pimpl)"
-        PW_INIT["pw_init(), pw_main_loop_new(), pw_stream_new()"]
-        PW_PROPS["Properties: S16LE, 16kHz, mono, capture_sink for loopback"]
-        PW_CB["on_process callback (RT thread):&lt;br/&gt;dequeue buffer -> memcpy to ring buffer&lt;br/&gt;(atomic flag, no mutex)"]
+        PW_INIT["pw_init(), pw_main_loop_new()&lt;br/&gt;pw_stream_new()"]
+        PW_PROPS["Properties:&lt;br/&gt;S16LE, 16kHz, mono&lt;br/&gt;capture_sink for loopback"]
+        PW_CB["on_process callback (RT thread):&lt;br/&gt;dequeue buffer → memcpy to ring buffer&lt;br/&gt;(atomic flag, no mutex)"]
         PW_THREAD["pw_main_loop runs in own thread"]
+        PW_STOP["stop(): set atomic flag&lt;br/&gt;pw_main_loop_quit()"]
+        PW_DRAIN["drain(): move ring buffer out&lt;br/&gt;→ vector&lt;int16_t&gt;"]
 
-        PW_INIT --> PW_PROPS --> PW_CB --> PW_THREAD
+        PW_INIT --&gt; PW_PROPS --&gt; PW_CB --&gt; PW_THREAD
     end
 
     subgraph "PulseMonitorCapture Internals"
-        PA_INIT["pa_simple_new(source, record) S16LE, 16kHz, mono"]
-        PA_THREAD["Capture thread: pa_simple_read() in loop, mutex-protected vector buffer"]
+        PA_INIT["pa_simple_new(source, record)&lt;br/&gt;S16LE, 16kHz, mono"]
+        PA_THREAD["Capture thread:&lt;br/&gt;pa_simple_read() in loop&lt;br/&gt;mutex-protected vector buffer"]
+        PA_STOP["stop(): set StopToken&lt;br/&gt;join thread"]
+        PA_DRAIN["drain(): move buffer out"]
 
-        PA_INIT --> PA_THREAD
+        PA_INIT --&gt; PA_THREAD
     end
 </pre></div>
-
 <hr>
-
-<!-- ================================================================ -->
 <h2 id="s13">13. Go Tools Module</h2>
-
-<h3>13a. Module Structure and Data Flow</h3>
+<h3 id="13a-module-structure-and-data-flow">13a. Module Structure and Data Flow</h3>
 <div class="diagram-wrapper"><pre class="mermaid">
 graph TB
     subgraph "Go Binaries"
-        MCP_BIN["recmeet-mcp (cmd/recmeet-mcp/main.go)"]
-        AGENT_BIN["recmeet-agent (cmd/recmeet-agent/main.go)"]
+        MCP_BIN["recmeet-mcp&lt;br/&gt;(cmd/recmeet-mcp/main.go)"]
+        AGENT_BIN["recmeet-agent&lt;br/&gt;(cmd/recmeet-agent/main.go)"]
     end
 
     subgraph "meetingdata (shared library)"
-        MD_CONFIG["config.go: Parse config.yaml (flat YAML, matches C++)"]
-        MD_MEETINGS["meetings.go: Scan output dirs, YYYY-MM-DD_HH-MM pattern"]
-        MD_NOTES["notes.go: Parse frontmatter + callout sections + search"]
-        MD_ACTIONS["actionitems.go: Parse Action Items, checkbox format"]
-        MD_SPEAKERS["speakers.go: Load JSON profiles (strips embeddings)"]
+        MD_CONFIG["config.go&lt;br/&gt;Parse config.yaml&lt;br/&gt;(flat YAML, matches C++)"]
+        MD_MEETINGS["meetings.go&lt;br/&gt;Scan output dirs&lt;br/&gt;YYYY-MM-DD_HH-MM pattern"]
+        MD_NOTES["notes.go&lt;br/&gt;Parse frontmatter +&lt;br/&gt;callout sections + search"]
+        MD_ACTIONS["actionitems.go&lt;br/&gt;Parse ## Action Items&lt;br/&gt;- [ ] / - [x] format"]
+        MD_SPEAKERS["speakers.go&lt;br/&gt;Load JSON profiles&lt;br/&gt;(strips embeddings)"]
     end
 
     subgraph "mcpserver"
-        MCP_SERVER["server.go: Setup + registration"]
-        MCP_TOOLS["tools.go: 5 tool handlers"]
+        MCP_SERVER["server.go&lt;br/&gt;Setup + registration"]
+        MCP_TOOLS["tools.go&lt;br/&gt;5 tool handlers"]
     end
 
     subgraph "agent"
-        AG_CONFIG["config.go: Agent-specific config"]
-        AG_LOOP["loop.go: Agentic loop (Claude API)"]
-        AG_TOOLS["tools.go: 7 tool definitions"]
-        AG_WORKFLOWS["workflows.go: Prep + follow-up prompts"]
-        AG_SEARCH["search.go: Brave web search"]
-        AG_FETCH["fetch.go: HTML text extractor"]
-        AG_WRITE["writefile.go: File writer"]
+        AG_CONFIG["config.go&lt;br/&gt;Agent-specific config"]
+        AG_LOOP["loop.go&lt;br/&gt;Agentic loop (Claude API)"]
+        AG_TOOLS["tools.go&lt;br/&gt;7 tool definitions"]
+        AG_WORKFLOWS["workflows.go&lt;br/&gt;Prep + follow-up prompts"]
+        AG_SEARCH["search.go&lt;br/&gt;Brave web search"]
+        AG_FETCH["fetch.go&lt;br/&gt;HTML text extractor"]
+        AG_WRITE["writefile.go&lt;br/&gt;File writer"]
     end
 
     subgraph "External APIs"
@@ -1345,95 +1411,284 @@ graph TB
     end
 
     subgraph "Filesystem"
-        FS_CONFIG["~/.config/recmeet/config.yaml"]
-        FS_MEETINGS["meetings/ (dirs + notes)"]
-        FS_SPEAKERS["~/.local/share/recmeet/speakers/*.json"]
-        FS_CONTEXT["~/.local/share/recmeet/context/"]
+        FS_CONFIG["~/.config/recmeet/&lt;br/&gt;config.yaml"]
+        FS_MEETINGS["meetings/&lt;br/&gt;(dirs + notes)"]
+        FS_SPEAKERS["~/.local/share/recmeet/&lt;br/&gt;speakers/*.json"]
+        FS_CONTEXT["~/.local/share/recmeet/&lt;br/&gt;context/"]
     end
 
-    MCP_BIN --> MCP_SERVER
-    MCP_SERVER --> MCP_TOOLS
-    MCP_TOOLS --> MD_CONFIG
-    MCP_TOOLS --> MD_NOTES
-    MCP_TOOLS --> MD_ACTIONS
-    MCP_TOOLS --> MD_SPEAKERS
+    MCP_BIN --&gt; MCP_SERVER
+    MCP_SERVER --&gt; MCP_TOOLS
+    MCP_TOOLS --&gt; MD_CONFIG
+    MCP_TOOLS --&gt; MD_NOTES
+    MCP_TOOLS --&gt; MD_ACTIONS
+    MCP_TOOLS --&gt; MD_SPEAKERS
 
-    AGENT_BIN --> AG_WORKFLOWS
-    AG_WORKFLOWS --> AG_LOOP
-    AG_LOOP --> AG_TOOLS
-    AG_TOOLS --> MD_CONFIG
-    AG_TOOLS --> MD_NOTES
-    AG_TOOLS --> MD_ACTIONS
-    AG_TOOLS --> MD_SPEAKERS
-    AG_TOOLS --> AG_SEARCH
-    AG_TOOLS --> AG_FETCH
-    AG_TOOLS --> AG_WRITE
+    AGENT_BIN --&gt; AG_WORKFLOWS
+    AG_WORKFLOWS --&gt; AG_LOOP
+    AG_LOOP --&gt; AG_TOOLS
+    AG_TOOLS --&gt; MD_CONFIG
+    AG_TOOLS --&gt; MD_NOTES
+    AG_TOOLS --&gt; MD_ACTIONS
+    AG_TOOLS --&gt; MD_SPEAKERS
+    AG_TOOLS --&gt; AG_SEARCH
+    AG_TOOLS --&gt; AG_FETCH
+    AG_TOOLS --&gt; AG_WRITE
 
-    AG_LOOP --> CLAUDE_API
-    AG_SEARCH --> BRAVE_API
+    AG_LOOP --&gt; CLAUDE_API
+    AG_SEARCH --&gt; BRAVE_API
 
-    MD_CONFIG --> FS_CONFIG
-    MD_MEETINGS --> FS_MEETINGS
-    MD_NOTES --> FS_MEETINGS
-    MD_ACTIONS --> FS_MEETINGS
-    MD_SPEAKERS --> FS_SPEAKERS
-    AG_WRITE --> FS_CONTEXT
-    MCP_TOOLS -->|"write_context_file"| FS_CONTEXT
+    MD_CONFIG --&gt; FS_CONFIG
+    MD_MEETINGS --&gt; FS_MEETINGS
+    MD_NOTES --&gt; FS_MEETINGS
+    MD_ACTIONS --&gt; FS_MEETINGS
+    MD_SPEAKERS --&gt; FS_SPEAKERS
+    AG_WRITE --&gt; FS_CONTEXT
+    MCP_TOOLS --&gt;|"write_context_file"| FS_CONTEXT
 </pre></div>
-
-<h3>13b. MCP Server Tool Dispatch</h3>
+<h3 id="13b-mcp-server-tool-dispatch">13b. MCP Server Tool Dispatch</h3>
 <div class="diagram-wrapper"><pre class="mermaid">
 flowchart TD
-    CLIENT["MCP Client (Claude Code / Desktop / Cursor)"]
+    CLIENT["MCP Client&lt;br/&gt;(Claude Code / Desktop / Cursor)"]
     STDIO["stdio (JSON-RPC)"]
-    INIT["Redirect stdout -> stderr (protect JSON-RPC stream)"]
+    INIT["Redirect stdout → stderr&lt;br/&gt;(protect JSON-RPC stream)"]
 
-    CLIENT -->|"tools/list"| STDIO
-    STDIO --> INIT
-    INIT --> REGISTER["Register 5 tools"]
+    CLIENT --&gt;|"tools/list"| STDIO
+    STDIO --&gt; INIT
+    INIT --&gt; REGISTER["Register 5 tools"]
 
-    CLIENT -->|"tools/call"| DISPATCH{"Tool name?"}
+    CLIENT --&gt;|"tools/call"| DISPATCH{"Tool name?"}
 
-    DISPATCH -->|"search_meetings"| SM["SearchNotes(noteDir, outputDir, query, filters) -> formatted results"]
-    DISPATCH -->|"get_meeting"| GM["FindMeeting(outputDir, meeting_dir), ParseNote(path) -> full details"]
-    DISPATCH -->|"list_action_items"| LA["ListActionItems(noteDir, outputDir, status, assignee, limit) -> filtered items"]
-    DISPATCH -->|"get_speaker_profiles"| SP["LoadSpeakerProfiles(dbDir) -> profiles (no embeddings)"]
-    DISPATCH -->|"write_context_file"| WC["Sanitize filename, Write to context staging dir"]
+    DISPATCH --&gt;|"search_meetings"| SM["SearchNotes(noteDir, outputDir,&lt;br/&gt;query, filters)&lt;br/&gt;→ formatted results"]
+    DISPATCH --&gt;|"get_meeting"| GM["FindMeeting(outputDir, meeting_dir)&lt;br/&gt;ParseNote(path)&lt;br/&gt;→ full details"]
+    DISPATCH --&gt;|"list_action_items"| LA["ListActionItems(noteDir, outputDir,&lt;br/&gt;status, assignee, limit)&lt;br/&gt;→ filtered items"]
+    DISPATCH --&gt;|"get_speaker_profiles"| SP["LoadSpeakerProfiles(dbDir)&lt;br/&gt;→ profiles (no embeddings)"]
+    DISPATCH --&gt;|"write_context_file"| WC["Sanitize filename&lt;br/&gt;Write to context staging dir"]
 
-    SM --> CLIENT
-    GM --> CLIENT
-    LA --> CLIENT
-    SP --> CLIENT
-    WC --> CLIENT
+    SM --&gt; CLIENT
+    GM --&gt; CLIENT
+    LA --&gt; CLIENT
+    SP --&gt; CLIENT
+    WC --&gt; CLIENT
 </pre></div>
-
-<h3>13c. Agent Agentic Loop</h3>
+<h3 id="13c-agent-agentic-loop">13c. Agent Agentic Loop</h3>
 <div class="diagram-wrapper"><pre class="mermaid">
 flowchart TD
-    ENTRY["recmeet-agent prep or follow-up"]
-    BUILD_PROMPT["Build system prompt + user message from workflow"]
+    ENTRY["recmeet-agent prep|follow-up"]
+    BUILD_PROMPT["Build system prompt +&lt;br/&gt;user message from workflow"]
     REGISTER["Register tools:&lt;br/&gt;search_meetings, get_meeting,&lt;br/&gt;list_action_items, get_speaker_profiles,&lt;br/&gt;web_search (if BRAVE_API_KEY),&lt;br/&gt;web_fetch, write_file"]
 
-    SEND["Send to Claude API (messages + tool definitions)"]
+    SEND["Send to Claude API&lt;br/&gt;(messages + tool definitions)"]
     CHECK{"Stop reason?"}
 
-    CHECK -->|"end_turn"| EXTRACT["Extract text response, print to stdout"]
-    CHECK -->|"max_iterations (20)"| EXTRACT
-    CHECK -->|"tool_use"| EXEC["For each tool_use block:"]
+    CHECK --&gt;|"end_turn"| EXTRACT["Extract text response&lt;br/&gt;Print to stdout"]
+    CHECK --&gt;|"max_iterations (20)"| EXTRACT
+    CHECK --&gt;|"tool_use"| EXEC["For each tool_use block:"]
 
-    EXEC --> TOOL_DISPATCH{"Tool name?"}
-    TOOL_DISPATCH --> TOOL_EXEC["Execute tool, collect result string"]
-    TOOL_EXEC --> APPEND["Append tool_result to conversation"]
-    APPEND -->|"more tools"| TOOL_DISPATCH
-    APPEND -->|"all done"| SEND
+    EXEC --&gt; TOOL_DISPATCH{"Tool name?"}
+    TOOL_DISPATCH --&gt; TOOL_EXEC["Execute tool&lt;br/&gt;Collect result string"]
+    TOOL_EXEC --&gt; APPEND["Append tool_result&lt;br/&gt;to conversation"]
+    APPEND --&gt;|"more tools"| TOOL_DISPATCH
+    APPEND --&gt;|"all done"| SEND
 
-    ENTRY --> BUILD_PROMPT --> REGISTER --> SEND --> CHECK
+    ENTRY --&gt; BUILD_PROMPT --&gt; REGISTER --&gt; SEND --&gt; CHECK
 
     subgraph "Verbose Mode (--verbose)"
         V_CALL["stderr: tool name + params"]
         V_RESULT["stderr: result preview"]
     end
 </pre></div>
+<hr>
+<h2 id="s14">14. Live Captioning Pipeline</h2>
+<p>End-to-end flow for the V1 capstone live-captioning feature. Audio
+capture, ASR worker, IPC fan-out, and <code>.vtt</code> sidecar persistence all live
+in <code>recmeet_core</code>; the tray applet and CLI are display-only consumers
+that render the same IPC events.</p>
+<div class="diagram-wrapper"><pre class="mermaid">
+flowchart TD
+    subgraph "Capture (PipeWire RT thread / Pulse capture thread)"
+        ON_PROC["on_process / pa_simple_read&lt;br/&gt;(int16 mono 16 kHz chunks)"]
+        SET_CB{"set_audio_callback&lt;br/&gt;installed?"}
+        BUF["Append to capture&lt;br/&gt;ring buffer (drained at stop)"]
+        PUSH["Invoke callback&lt;br/&gt;(lock-free, non-allocating)"]
+
+        ON_PROC --&gt; SET_CB
+        SET_CB --&gt;|"yes (captions on)"| PUSH
+        SET_CB --&gt;|"no"| BUF
+        PUSH --&gt; BUF
+    end
+
+    subgraph "CaptionEngine (recmeet_core)"
+        CB_FN["CaptionEngine::on_audio_chunk&lt;br/&gt;(static, atomic ptr-stable)"]
+        RING["SPSC ring buffer&lt;br/&gt;~32 768 int16 samples&lt;br/&gt;(~2 s @ 16 kHz)"]
+        DROP{"ring full?"}
+        DROP_PATH["drop oldest samples;&lt;br/&gt;set atomic overflow flag"]
+        WORKER["ASR worker thread&lt;br/&gt;(SCHED_BATCH; nice +10 fallback)"]
+        DRAIN["drain ring → recognizer.AcceptWaveform"]
+        DECODE["recognizer.Decode&lt;br/&gt;(streaming Zipformer, int8)"]
+        ENDPOINT{"endpoint detected?"}
+        EMIT_PARTIAL["emit CaptionResult&lt;br/&gt;(is_partial=true)"]
+        EMIT_FINAL["emit CaptionResult&lt;br/&gt;(is_partial=false);&lt;br/&gt;recognizer.Reset"]
+        DEGRADED["emit CaptionDegraded&lt;br/&gt;(BufferOverrun;&lt;br/&gt;rate-limited 1/s)"]
+
+        PUSH --&gt; CB_FN --&gt; RING
+        RING --&gt; DROP
+        DROP --&gt;|"yes"| DROP_PATH --&gt; RING
+        WORKER --&gt; DRAIN --&gt; DECODE --&gt; ENDPOINT
+        ENDPOINT --&gt;|"no"| EMIT_PARTIAL --&gt; WORKER
+        ENDPOINT --&gt;|"yes"| EMIT_FINAL --&gt; WORKER
+        DROP_PATH -.-&gt; DEGRADED
+    end
+
+    subgraph "Pipeline fan-out (pipeline.cpp)"
+        ADAPTER["CaptionFanoutAdapter&lt;br/&gt;(downstream cb + VttWriter)"]
+        DOWNSTREAM["downstream callback&lt;br/&gt;= daemon's IPC hook"]
+        VTT_TIMER["VttCueTimer&lt;br/&gt;(prev_final_ms watermark)"]
+        VTT_APPEND["VttWriter::append&lt;br/&gt;(O_APPEND, single write)"]
+    end
+
+    EMIT_PARTIAL --&gt; ADAPTER
+    EMIT_FINAL --&gt; ADAPTER
+    ADAPTER --&gt; DOWNSTREAM
+    ADAPTER --&gt;|"is_partial=false only"| VTT_TIMER --&gt; VTT_APPEND
+
+    subgraph "Daemon broadcast (daemon.cpp + ipc_server.cpp)"
+        IPC_POST["IpcServer::post&lt;br/&gt;(self-pipe wakeup)"]
+        BROADCAST["broadcast caption / caption.degraded&lt;br/&gt;NDJSON over Unix socket"]
+    end
+
+    DOWNSTREAM --&gt; IPC_POST --&gt; BROADCAST
+    DEGRADED --&gt; IPC_POST
+
+    subgraph "Tray (recmeet-tray)"
+        TRAY_RX["IPC client receives&lt;br/&gt;caption event"]
+        NORM_T["normalize_caption()&lt;br/&gt;(ALL-CAPS → human)"]
+        OVERLAY["GtkLabel popup&lt;br/&gt;(replace partial in place;&lt;br/&gt;append finalized)"]
+    end
+
+    subgraph "CLI (recmeet)"
+        CLI_RX["IPC client receives&lt;br/&gt;caption event"]
+        NORM_C["normalize_caption()"]
+        STDERR["fprintf(stderr, '[caption] …')&lt;br/&gt;isatty-gated"]
+    end
+
+    BROADCAST -.-&gt;|"NDJSON"| TRAY_RX --&gt; NORM_T --&gt; OVERLAY
+    BROADCAST -.-&gt;|"NDJSON"| CLI_RX --&gt; NORM_C --&gt; STDERR
+
+    VTT_APPEND --&gt; SIDECAR["~/meetings/&amp;lt;dir&amp;gt;/captions.vtt&lt;br/&gt;WEBVTT, finalized cues only"]
+
+    subgraph "Teardown order (load-bearing)"
+        T1["1. capture.stop()&lt;br/&gt;(RT thread exits)"]
+        T2["2. ActiveCaptionEngine dtor&lt;br/&gt;= unsubscribe + engine.stop()&lt;br/&gt;= worker join + ring drain"]
+        T3["3. capture.drain()&lt;br/&gt;(WAV write)"]
+        T1 --&gt; T2 --&gt; T3
+    end
+</pre></div>
+<p><strong>Key invariants:</strong></p>
+<ul>
+<li>The audio callback pointer is atomic; the engine destructor unsubscribes
+before joining its worker, so the destroyed engine's address can never
+observe a live capture callback.</li>
+<li>The VTT writer uses <code>O_APPEND</code> with a single <code>write(2)</code> per cue (~100 B,
+well under the FS atomic-write block size). No <code>fsync</code>. Crash recovery
+is &quot;valid up to last fully-flushed cue.&quot;</li>
+<li>Display normalization (<code>normalize_caption()</code>) lives at the client
+render boundary, not in the engine — the IPC payload always carries
+raw engine output so a downstream consumer can opt out.</li>
+<li>Sherpa-OFF builds compile every component cleanly; <code>CaptionEngine::start</code>
+returns false with the canonical error message and recording continues
+without captions.</li>
+</ul>
+<hr>
+<h2 id="s15">15. GPU Plugin Architecture (ggml backends)</h2>
+<p>Starting in v1.6.0, the vendored <code>whisper.cpp</code> and <code>llama.cpp</code> subbuilds ship as <strong>shared libraries</strong> with ggml's <code>GGML_BACKEND_DL=ON</code> plugin model. Compute backends (CPU variants, Vulkan, future CUDA / HIP / Metal) are no longer statically linked into the <code>recmeet</code> binary — they are separate <code>libggml-*.so</code> files loaded at startup by <code>dlopen()</code>. <code>recmeet::load_backends()</code> in <code>src/backend_info.cpp</code> is the daemon-side entry point; the diagram below walks plugin discovery, ggml's plugin-load callback, and the active-device picker that selects the highest-priority enumerable device.</p>
+<div class="diagram-wrapper"><pre class="mermaid">
+flowchart TD
+    START["recmeet::load_backends()&lt;br/&gt;(src/backend_info.cpp)"]
+
+    subgraph DISCOVER["Plugin directory resolution (candidate ladder)"]
+        ENV{"RECMEET_GGML_BACKEND_PATH&lt;br/&gt;env set + directory?"}
+        SELF["fs::read_symlink('/proc/self/exe')&lt;br/&gt;→ exe_dir"]
+        CAND1{"exe_dir/../lib&lt;br/&gt;directory?"}
+        CAND2{"exe_dir/bin&lt;br/&gt;directory?"}
+        CAND3{"exe_dir&lt;br/&gt;directory?"}
+        NONE["return ''&lt;br/&gt;(no plugins loadable)"]
+        DIR["plugin_dir resolved"]
+
+        ENV --&gt;|"yes"| DIR
+        ENV --&gt;|"no"| SELF --&gt; CAND1
+        CAND1 --&gt;|"yes (install layout)"| DIR
+        CAND1 --&gt;|"no"| CAND2
+        CAND2 --&gt;|"yes (in-tree layout)"| DIR
+        CAND2 --&gt;|"no"| CAND3
+        CAND3 --&gt;|"yes"| DIR
+        CAND3 --&gt;|"no"| NONE
+    end
+
+    subgraph LOAD["ggml plugin load (vendored libggml-base)"]
+        SCAN["ggml_backend_load_all_from_path(plugin_dir)&lt;br/&gt;scans for libggml-*.so"]
+        CPU_PLUGINS["libggml-cpu-sse42.so&lt;br/&gt;libggml-cpu-avx.so&lt;br/&gt;libggml-cpu-avx2.so&lt;br/&gt;libggml-cpu-avx512.so&lt;br/&gt;libggml-cpu-amx.so&lt;br/&gt;(per-ISA variants; scored vs host)"]
+        VULKAN_PLUGIN["libggml-vulkan.so&lt;br/&gt;(only when libvulkan.so.1 + ICD present)"]
+        REGISTRY["ggml_backend_reg_count() &amp;gt; 0&lt;br/&gt;registry populated"]
+
+        SCAN --&gt; CPU_PLUGINS
+        SCAN --&gt; VULKAN_PLUGIN
+        CPU_PLUGINS --&gt; REGISTRY
+        VULKAN_PLUGIN --&gt; REGISTRY
+    end
+
+    subgraph PICK["Active-device picker (pick_active_device)"]
+        ITER["Iterate ggml_backend_dev_get(0..N-1)"]
+        TYPE{"device type?"}
+        GPU["GPU&lt;br/&gt;(discrete)"]
+        IGPU["IGPU&lt;br/&gt;(integrated)"]
+        ACCEL["ACCEL&lt;br/&gt;(NPU / TPU)"]
+        CPU["CPU&lt;br/&gt;(always-present)"]
+        PRIORITY["Priority: GPU &amp;gt; IGPU &amp;gt; ACCEL &amp;gt; CPU&lt;br/&gt;(first non-null wins)"]
+        ACTIVE["active_device"]
+
+        ITER --&gt; TYPE
+        TYPE --&gt; GPU
+        TYPE --&gt; IGPU
+        TYPE --&gt; ACCEL
+        TYPE --&gt; CPU
+        GPU --&gt; PRIORITY
+        IGPU --&gt; PRIORITY
+        ACCEL --&gt; PRIORITY
+        CPU --&gt; PRIORITY
+        PRIORITY --&gt; ACTIVE
+    end
+
+    subgraph BANNER["Startup banner (log_backend_summary)"]
+        WARN_ZERO{"any non-CPU backend&lt;br/&gt;registered with&lt;br/&gt;zero devices?"}
+        WARN["log warn:&lt;br/&gt;'libggml-vulkan.so loaded but exposed zero devices —&lt;br/&gt;missing or broken Vulkan ICD'"]
+        REG_LINE["log info + stderr:&lt;br/&gt;'ggml backends: CPU, Vulkan'"]
+        ACTIVE_LINE["log info + stderr:&lt;br/&gt;'active backend: Vulkan (Radeon Pro W5500)'&lt;br/&gt;or 'active backend: CPU (haswell)'"]
+
+        WARN_ZERO --&gt;|"yes"| WARN --&gt; REG_LINE
+        WARN_ZERO --&gt;|"no"| REG_LINE
+        REG_LINE --&gt; ACTIVE_LINE
+    end
+
+    subgraph BIND["whisper/llama backend binding"]
+        WHISPER_INIT["whisper_init_from_file_with_params(...)"]
+        WHISPER_PICK["whisper.cpp picks best registered&lt;br/&gt;backend per layer (GPU offload if available;&lt;br/&gt;per-ISA CPU plugin otherwise)"]
+        LLAMA_INIT["llama_model_load_from_file(...)"]
+        LLAMA_PICK["llama.cpp picks best registered&lt;br/&gt;backend (CPU only in v1.6.x — no GPU offload&lt;br/&gt;for summarization yet)"]
+    end
+
+    START --&gt; ENV
+    DIR --&gt; SCAN
+    NONE -.-&gt;|"CPU-only fallback"| REGISTRY
+    REGISTRY --&gt; ITER
+    ACTIVE --&gt; WARN_ZERO
+    ACTIVE_LINE --&gt; WHISPER_INIT --&gt; WHISPER_PICK
+    ACTIVE_LINE --&gt; LLAMA_INIT --&gt; LLAMA_PICK
+</pre></div>
+<p><strong>Why the deterministic plugin-dir resolution matters.</strong> The ggml plugin loader's built-in search uses <code>$ORIGIN/../lib</code> baked into <code>libggml-base.so</code> at compile time, plus a CWD fallback. <code>dlopen</code> does not expand <code>$ORIGIN</code> the way <code>ld.so</code> does for <code>DT_RPATH</code>, so the macro never resolves; the loader falls back to CWD, which is operator-controllable and attacker-plantable. <code>recmeet::load_backends()</code> resolves the plugin directory itself from <code>/proc/self/exe</code> and passes the absolute path to <code>ggml_backend_load_all_from_path()</code>, bypassing both the unresolved-<code>$ORIGIN</code> and CWD-fallback paths.</p>
+<p><strong>Why per-ISA CPU plugins matter.</strong> <code>GGML_NATIVE=OFF</code> + <code>GGML_CPU_ALL_VARIANTS=ON</code> produces one <code>libggml-cpu-&lt;isa&gt;.so</code> per supported instruction-set baseline (sse4_2, avx, avx2, avx512, amx on x86). At startup ggml scores each one against <code>__builtin_cpu_supports()</code> results and picks the highest-supported variant. The same recmeet binary then runs unchanged on a 2015 server (sse4_2) and a 2024 laptop (avx512), with the latter getting ~3× the per-core matmul throughput from AVX-512 without recompilation. Distro packagers benefit because one binary build covers their entire user base; operators benefit because there is no &quot;did I build for the right CPU baseline?&quot; question.</p>
+<p><strong>Binary invariants.</strong> <code>ldd build/recmeet | grep -E 'vulkan|cuda'</code> returns empty on every build. <code>ldd build/recmeet-tray | grep -E 'onnxruntime|whisper|llama|ggml'</code> returns empty on every build (the iter-104 library split keeps these out of the tray entirely; the GPU plugin model adds runtime-loaded GPU libs to the same exclusion list).</p>
+
 
 <hr>
 <p style="text-align:center;color:#585b70;margin-top:3rem;font-size:0.85rem;">
