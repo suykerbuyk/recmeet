@@ -1,13 +1,15 @@
 {
-  "iter_n": 203,
-  "anchor_sha": "eb39893c30d46a2796379a9128e89f949779b0d4",
+  "iter_n": 206,
+  "anchor_sha": "2be9b20c88d610189f6c95df7326cd66eec2333a",
   "active": [
     "cancel-recording-and-discard",
     "full-stack-captions-60min-regression",
     "sherpa-onnx-1-13-bump",
     "test-and-verification-hardening",
     "test-handler-coverage-phase2c",
+    "test-runner-progress-heartbeat",
     "thin-client-recording-server",
+    "tmp-dir-isolation-full-stack-tests",
     "webui-live-captions",
     "whisper-vocab-hint-bleed"
   ],
