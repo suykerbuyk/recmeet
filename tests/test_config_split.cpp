@@ -14,6 +14,7 @@
 #include <catch2/catch_test_macros.hpp>
 #include "config.h"
 #include "config_json.h"
+#include "test_tmpdir.h"
 
 #include <filesystem>
 #include <fstream>
@@ -26,7 +27,7 @@ using namespace recmeet;
 namespace {
 
 fs::path make_tmp_dir(const char* slug) {
-    fs::path dir = fs::temp_directory_path() / slug;
+    fs::path dir = recmeet::test::tmp_path(slug);
     fs::remove_all(dir);
     fs::create_directories(dir);
     return dir;
