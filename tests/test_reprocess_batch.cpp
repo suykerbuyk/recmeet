@@ -17,6 +17,7 @@
 #include "config.h"
 #include "model_manager.h"
 #include "reprocess_batch.h"
+#include "test_tmpdir.h"
 #include "util.h"
 
 #include <csignal>
@@ -36,9 +37,9 @@ namespace fs = std::filesystem;
 // /tmp using a counter + the test name's hash.
 static fs::path make_scratch_dir(const std::string& tag) {
     static unsigned counter = 0;
-    fs::path dir = fs::temp_directory_path() /
-        ("recmeet_reprocess_batch_" + tag + "_" + std::to_string(++counter) +
-         "_" + std::to_string(::getpid()));
+    fs::path dir = recmeet::test::tmp_path(
+        "recmeet_reprocess_batch_" + tag + "_" + std::to_string(++counter) +
+        "_" + std::to_string(::getpid()));
     fs::remove_all(dir);
     fs::create_directories(dir);
     return dir;
