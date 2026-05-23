@@ -5,6 +5,7 @@
 #include "ipc_server.h"
 #include "ipc_client.h"
 #include "ipc_protocol.h"
+#include "test_tmpdir.h"
 
 #include <atomic>
 #include <cstdlib>
@@ -24,7 +25,8 @@ using namespace recmeet;
 
 namespace {
 
-const char* TEST_SOCK = "/tmp/recmeet_test_ipc.sock";
+const std::string TEST_SOCK =
+    recmeet::test::tmp_path("recmeet_test_ipc.sock").string();
 
 // Connect to a Unix socket. Returns fd or -1.
 //
@@ -38,12 +40,12 @@ const char* TEST_SOCK = "/tmp/recmeet_test_ipc.sock";
 // a 100 ms poll, then only consume the line if it starts with
 // `{"type":"auth.ok"`. This is the same peek-or-tolerate idiom used by
 // IpcClient::connect_unix() in the production path.
-int connect_client(const char* path) {
+int connect_client(const std::string& path) {
     int fd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (fd < 0) return -1;
     struct sockaddr_un addr{};
     addr.sun_family = AF_UNIX;
-    std::strncpy(addr.sun_path, path, sizeof(addr.sun_path) - 1);
+    std::strncpy(addr.sun_path, path.c_str(), sizeof(addr.sun_path) - 1);
     if (connect(fd, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) < 0) {
         close(fd);
         return -1;
@@ -123,7 +125,7 @@ std::string read_line(int fd, int timeout_ms = 2000) {
 } // anonymous namespace
 
 TEST_CASE("IpcServer: request/response round-trip", "[ipc_server]") {
-    unlink(TEST_SOCK);
+    unlink(TEST_SOCK.c_str());
 
     IpcServer server(TEST_SOCK);
     server.on("echo", [](const IpcRequest& req, IpcResponse& resp, IpcError&) {
@@ -162,7 +164,7 @@ TEST_CASE("IpcServer: request/response round-trip", "[ipc_server]") {
 }
 
 TEST_CASE("IpcServer: unknown method returns error", "[ipc_server]") {
-    unlink(TEST_SOCK);
+    unlink(TEST_SOCK.c_str());
 
     IpcServer server(TEST_SOCK);
     REQUIRE(server.start());
@@ -193,7 +195,7 @@ TEST_CASE("IpcServer: unknown method returns error", "[ipc_server]") {
 }
 
 TEST_CASE("IpcServer: broadcast sends events to all clients", "[ipc_server]") {
-    unlink(TEST_SOCK);
+    unlink(TEST_SOCK.c_str());
 
     IpcServer server(TEST_SOCK);
     server.on("ping", [](const IpcRequest&, IpcResponse& resp, IpcError&) {
@@ -239,7 +241,7 @@ TEST_CASE("IpcServer: broadcast sends events to all clients", "[ipc_server]") {
 }
 
 TEST_CASE("IpcServer: handler returning false sends error", "[ipc_server]") {
-    unlink(TEST_SOCK);
+    unlink(TEST_SOCK.c_str());
 
     IpcServer server(TEST_SOCK);
     server.on("fail", [](const IpcRequest&, IpcResponse&, IpcError& err) {
@@ -274,7 +276,7 @@ TEST_CASE("IpcServer: handler returning false sends error", "[ipc_server]") {
 }
 
 TEST_CASE("IpcServer: post() wakes poll loop", "[ipc_server]") {
-    unlink(TEST_SOCK);
+    unlink(TEST_SOCK.c_str());
 
     IpcServer server(TEST_SOCK);
     REQUIRE(server.start());
@@ -495,7 +497,7 @@ TEST_CASE("A.2: oversized NDJSON line without newline drops the connection",
           "[ipc][a2]") {
     // Set a small cap so we don't have to push 8 MB to trigger it. The
     // cap applies per-connection on the read accumulation buffer.
-    unlink(TEST_SOCK);
+    unlink(TEST_SOCK.c_str());
     IpcServer server(TEST_SOCK);
     server.set_max_message_bytes(1024);  // 1 KB cap
     REQUIRE(server.start());
@@ -540,7 +542,7 @@ TEST_CASE("A.2: slowloris byte-at-a-time accumulates past the cap and drops",
     // Same cap-trigger as the oversized test, but the bytes arrive one at
     // a time. Confirms the cap is evaluated on the cumulative read_buf
     // after every read, not just on a single oversized send.
-    unlink(TEST_SOCK);
+    unlink(TEST_SOCK.c_str());
     IpcServer server(TEST_SOCK);
     server.set_max_message_bytes(512);
     REQUIRE(server.start());
@@ -592,7 +594,7 @@ TEST_CASE("A.2: NDJSON line cap is configurable via set_max_message_bytes",
     // Confirms a small operator-supplied cap (1024 bytes) triggers the
     // drop on a 2 KB line, AND that a line *under* the cap passes through
     // the dispatcher unchanged.
-    unlink(TEST_SOCK);
+    unlink(TEST_SOCK.c_str());
     IpcServer server(TEST_SOCK);
     server.set_max_message_bytes(1024);
 
@@ -937,7 +939,7 @@ TEST_CASE("A.3: connection cap rejects past the limit with JSON refusal frame",
     // `accept_client()` sees `clients_.size() >= max_clients_`, writes a
     // single-line JSON `server_full` frame, and closes the fd before
     // registration. The two existing clients must remain functional.
-    unlink(TEST_SOCK);
+    unlink(TEST_SOCK.c_str());
     IpcServer server(TEST_SOCK);
     server.set_max_clients(2);
     server.on("ping", [](const IpcRequest& req, IpcResponse& resp, IpcError&) {
@@ -1030,7 +1032,7 @@ TEST_CASE("A.3: JSON refusal frame is well-formed and parses as error event",
     // We assert the parsed `event.event` field via the standard parser,
     // then probe the raw string for `kind` / `reason` because the parser
     // routes those into `top` rather than `event.data` for flat shapes.
-    unlink(TEST_SOCK);
+    unlink(TEST_SOCK.c_str());
     IpcServer server(TEST_SOCK);
     server.set_max_clients(1);
     REQUIRE(server.start());
@@ -1075,8 +1077,8 @@ TEST_CASE("A.3: cap is configurable — 1 then 5",
     // We use two distinct sockets so the second IpcServer instance is not
     // racing the first on the unlink path.
     SECTION("cap=1 admits one, rejects the second") {
-        const char* SOCK = "/tmp/recmeet_test_ipc_a3_cap1.sock";
-        unlink(SOCK);
+        const std::string SOCK = recmeet::test::tmp_path("recmeet_test_ipc_a3_cap1.sock").string();
+        unlink(SOCK.c_str());
         IpcServer server(SOCK);
         server.set_max_clients(1);
         REQUIRE(server.start());
@@ -1096,12 +1098,12 @@ TEST_CASE("A.3: cap is configurable — 1 then 5",
         close(ok);
         server.stop();
         srv.join();
-        unlink(SOCK);
+        unlink(SOCK.c_str());
     }
 
     SECTION("cap=5 admits five, rejects the sixth") {
-        const char* SOCK = "/tmp/recmeet_test_ipc_a3_cap5.sock";
-        unlink(SOCK);
+        const std::string SOCK = recmeet::test::tmp_path("recmeet_test_ipc_a3_cap5.sock").string();
+        unlink(SOCK.c_str());
         IpcServer server(SOCK);
         server.set_max_clients(5);
         server.on("ping", [](const IpcRequest& req, IpcResponse& resp,
@@ -1145,7 +1147,7 @@ TEST_CASE("A.3: cap is configurable — 1 then 5",
         for (int fd : fds) close(fd);
         server.stop();
         srv.join();
-        unlink(SOCK);
+        unlink(SOCK.c_str());
     }
 }
 
@@ -1194,12 +1196,12 @@ namespace {
 // tests that want to assert the wire shape of the auth.ok frame itself
 // use this helper; tests that just want a registered client downstream
 // use the standard `connect_client()` helper above.
-int a4_connect_raw(const char* path) {
+int a4_connect_raw(const std::string& path) {
     int fd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (fd < 0) return -1;
     struct sockaddr_un addr{};
     addr.sun_family = AF_UNIX;
-    std::strncpy(addr.sun_path, path, sizeof(addr.sun_path) - 1);
+    std::strncpy(addr.sun_path, path.c_str(), sizeof(addr.sun_path) - 1);
     if (connect(fd, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) < 0) {
         close(fd);
         return -1;
@@ -1291,7 +1293,7 @@ TEST_CASE("A.4: Unix client also gets a populated client_id via synthetic auth.o
     // the raw frame off the fd ourselves — bypassing IpcClient — so the
     // test pins the wire contract directly, not just the client-side
     // convenience getter.
-    unlink(TEST_SOCK);
+    unlink(TEST_SOCK.c_str());
     IpcServer server(TEST_SOCK);
     REQUIRE(server.start());
     std::thread srv([&server]() { server.run(); });
@@ -1332,7 +1334,7 @@ TEST_CASE("A.4: send_to_client routes to the named client only",
     // poll thread is the only correct caller for send_to_client (today's
     // contract — locking is not required because all the maps are read
     // there). client1 must observe the event; client2 must NOT.
-    unlink(TEST_SOCK);
+    unlink(TEST_SOCK.c_str());
     IpcServer server(TEST_SOCK);
     REQUIRE(server.start());
     std::thread srv([&server]() { server.run(); });
@@ -1390,7 +1392,7 @@ TEST_CASE("A.4: send_to_client to a disconnected id drops silently",
     // must not leak the event to client2 (which stays connected). This
     // pins the "best-effort delivery" contract spelled out in the A.4
     // plan body.
-    unlink(TEST_SOCK);
+    unlink(TEST_SOCK.c_str());
     IpcServer server(TEST_SOCK);
     REQUIRE(server.start());
     std::thread srv([&server]() { server.run(); });
@@ -1452,7 +1454,7 @@ TEST_CASE("A.4: broadcast() still fans out to every connected client",
     // behavior of any existing event — current call sites in daemon.cpp
     // continue to call `broadcast()` and continue to fan out. Two
     // clients, one broadcast, both see it.
-    unlink(TEST_SOCK);
+    unlink(TEST_SOCK.c_str());
     IpcServer server(TEST_SOCK);
     REQUIRE(server.start());
     std::thread srv([&server]() { server.run(); });
@@ -1506,7 +1508,7 @@ TEST_CASE("A.5: auth.ok carries IPC_PROTOCOL_VERSION (Unix)",
     // frame on the Unix accept path. We read the raw bytes off the fd
     // (bypassing IpcClient so the assertion is on the wire shape, not
     // the parser) and check both fields are present.
-    unlink(TEST_SOCK);
+    unlink(TEST_SOCK.c_str());
     IpcServer server(TEST_SOCK);
     REQUIRE(server.start());
     std::thread srv([&server]() { server.run(); });
@@ -1568,7 +1570,7 @@ TEST_CASE("A.5: mismatched protocol_version fails connect and latches flag",
     // Use the test seam to make the server stamp a different version
     // than the client expects. IpcClient::connect() must return false,
     // protocol_mismatch() must be true, and client_id() must remain empty.
-    unlink(TEST_SOCK);
+    unlink(TEST_SOCK.c_str());
     IpcServer server(TEST_SOCK);
     // Pretend the server speaks a future version that the client does
     // not understand. Reusing IPC_PROTOCOL_VERSION + 1 guarantees a
@@ -1597,7 +1599,7 @@ TEST_CASE("A.5: missing protocol_version is treated as mismatch",
     // emits the auth.ok frame WITHOUT a `protocol_version` field. The
     // client must reject the same way as a numeric mismatch and the
     // mismatch flag must surface true with seen=0.
-    unlink(TEST_SOCK);
+    unlink(TEST_SOCK.c_str());
     IpcServer server(TEST_SOCK);
     server.set_protocol_version_for_test(-1);  // suppress field
     REQUIRE(server.start());
@@ -1633,7 +1635,7 @@ TEST_CASE("A.5: successful reconnect clears prior mismatch flag",
     // through the failed connect's return and only cleared on the next
     // connect(). Drive a mismatch, then re-point at a daemon speaking
     // the matching version and confirm the flag is clean.
-    unlink(TEST_SOCK);
+    unlink(TEST_SOCK.c_str());
     IpcServer bad_server(TEST_SOCK);
     bad_server.set_protocol_version_for_test(IPC_PROTOCOL_VERSION + 42);
     REQUIRE(bad_server.start());
@@ -1646,7 +1648,7 @@ TEST_CASE("A.5: successful reconnect clears prior mismatch flag",
 
     bad_server.stop();
     bad_srv.join();
-    unlink(TEST_SOCK);
+    unlink(TEST_SOCK.c_str());
 
     // Stand up a fresh server at the matching version and reconnect.
     IpcServer good_server(TEST_SOCK);
@@ -1678,7 +1680,7 @@ TEST_CASE("A.5: successful reconnect clears prior mismatch flag",
 // ---------------------------------------------------------------------------
 TEST_CASE("A.5: protocol-version mismatch flag persists until successful reconnect",
           "[ipc][a5][reconnect][mismatch-persist]") {
-    unlink(TEST_SOCK);
+    unlink(TEST_SOCK.c_str());
     IpcServer bad_server(TEST_SOCK);
     bad_server.set_protocol_version_for_test(IPC_PROTOCOL_VERSION + 99);
     REQUIRE(bad_server.start());
@@ -1704,7 +1706,7 @@ TEST_CASE("A.5: protocol-version mismatch flag persists until successful reconne
 
     bad_server.stop();
     bad_srv.join();
-    unlink(TEST_SOCK);
+    unlink(TEST_SOCK.c_str());
 
     // Stand up a fresh server speaking the matching version. The next
     // connect succeeds and clears the latched mismatch flag.
