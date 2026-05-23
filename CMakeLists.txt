@@ -688,6 +688,12 @@ if(RECMEET_BUILD_TESTS)
         # parser tests. Spawns the real recmeet-tray binary to exercise
         # the pre-gtk_init flag pre-parse in main().
         tests/test_tray_cli.cpp
+        # tmp-dir-isolation-full-stack-tests-v2 Phase 1 — per-process test
+        # root helper (test_tmpdir.h is header-only; not listed here) plus
+        # the Catch2 EventListener that fs::remove_all's the root on a
+        # successful testRunEnded, and the helper's own unit tests.
+        tests/test_tmpdir_listener.cpp
+        tests/test_tmpdir_helper.cpp
         # Phase 2b — production IPC verb registrations. Same TU the daemon
         # binary links via `recmeet-daemon`; pulling it into recmeet_tests
         # lets the new `DaemonTestHarness` exercise the production code
