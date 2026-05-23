@@ -31,6 +31,7 @@
 #include "ipc_protocol.h"
 #include "json_util.h"
 #include "test_helpers.h"
+#include "test_tmpdir.h"
 
 #include <chrono>
 #include <cstdlib>
@@ -63,8 +64,7 @@ TEST_CASE("V2 e2e: real daemon over TCP with PSK accepts process.submit, "
     // --------------------------------------------------------------------
     // 1. Stage a per-test work directory
     // --------------------------------------------------------------------
-    fs::path workdir = fs::temp_directory_path()
-                     / ("recmeet_e2e_" + std::to_string(::getpid()));
+    fs::path workdir = recmeet::test::tmp_path("recmeet_e2e");
     fs::remove_all(workdir);
     fs::create_directories(workdir);
 
