@@ -37,6 +37,7 @@
 #include "reprocess_batch.h"
 #include "speaker_id.h"
 #include "test_helpers.h"
+#include "test_tmpdir.h"
 #include "util.h"
 
 #include <atomic>
@@ -316,7 +317,7 @@ TEST_CASE("Captions full-stack: 30-min synthetic, engine wiring",
              "or set RECMEET_USE_SHERPA=ON build.");
     }
 
-    auto out_dir = fs::temp_directory_path() / "recmeet_fullstack_captions_30min_synth";
+    auto out_dir = recmeet::test::tmp_path("recmeet_fullstack_captions_30min_synth");
     fs::remove_all(out_dir);
     fs::create_directories(out_dir);
     fs::path vtt_path = out_dir / "captions.vtt";
@@ -422,7 +423,7 @@ TEST_CASE("Captions full-stack: 60-min real fixture, caption quality",
     REQUIRE(!floats.empty());
     auto samples = floats_to_int16(floats);
 
-    auto out_dir = fs::temp_directory_path() / "recmeet_fullstack_captions_60min_real";
+    auto out_dir = recmeet::test::tmp_path("recmeet_fullstack_captions_60min_real");
     fs::remove_all(out_dir);
     fs::create_directories(out_dir);
     fs::path vtt_path = out_dir / "captions.vtt";
@@ -478,7 +479,7 @@ TEST_CASE("Captions stress: CPU contention with concurrent reprocess",
     if (!fs::exists(audio_src)) SKIP("Debate audio asset not found");
     if (!is_whisper_model_cached("base")) SKIP("Whisper base model not cached");
 
-    auto workspace = fs::temp_directory_path() / "recmeet_caption_stress";
+    auto workspace = recmeet::test::tmp_path("recmeet_caption_stress");
     fs::remove_all(workspace);
     fs::create_directories(workspace);
 
@@ -601,7 +602,7 @@ TEST_CASE("Captions memory bound: peak RSS overhead ≤ 1 GB",
     });
 
     // --- ON: run the engine on the same buffer with VTT persistence.
-    auto vtt_path = fs::temp_directory_path() / "recmeet_caption_rss_bench.vtt";
+    auto vtt_path = recmeet::test::tmp_path("recmeet_caption_rss_bench.vtt");
     fs::remove(vtt_path);
     auto [on_secs, on_peak_kb] = measure([&]() {
         run_captions_on_samples(model_dir, samples, vtt_path);
