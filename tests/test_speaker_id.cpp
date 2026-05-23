@@ -4,6 +4,7 @@
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/catch_approx.hpp>
 #include "speaker_id.h"
+#include "test_tmpdir.h"
 
 #include <cmath>
 #include <fstream>
@@ -20,7 +21,7 @@ TEST_CASE("speaker_id: default_speaker_db_dir is under data_dir", "[speaker_id]"
 }
 
 TEST_CASE("speaker_id: load empty directory returns empty", "[speaker_id]") {
-    auto tmp = fs::temp_directory_path() / "recmeet_test_spk_empty";
+    auto tmp = recmeet::test::tmp_path("recmeet_test_spk_empty");
     fs::create_directories(tmp);
     auto db = load_speaker_db(tmp);
     CHECK(db.empty());
@@ -28,12 +29,14 @@ TEST_CASE("speaker_id: load empty directory returns empty", "[speaker_id]") {
 }
 
 TEST_CASE("speaker_id: load non-existent directory returns empty", "[speaker_id]") {
-    auto db = load_speaker_db("/tmp/recmeet_no_such_dir_xyz");
+    auto missing = recmeet::test::tmp_path("recmeet_no_such_dir_xyz");
+    fs::remove_all(missing);
+    auto db = load_speaker_db(missing);
     CHECK(db.empty());
 }
 
 TEST_CASE("speaker_id: save and load round-trip", "[speaker_id]") {
-    auto tmp = fs::temp_directory_path() / "recmeet_test_spk_roundtrip";
+    auto tmp = recmeet::test::tmp_path("recmeet_test_spk_roundtrip");
     fs::remove_all(tmp);
 
     SpeakerProfile p;
@@ -63,7 +66,7 @@ TEST_CASE("speaker_id: save and load round-trip", "[speaker_id]") {
 }
 
 TEST_CASE("speaker_id: save multiple speakers", "[speaker_id]") {
-    auto tmp = fs::temp_directory_path() / "recmeet_test_spk_multi";
+    auto tmp = recmeet::test::tmp_path("recmeet_test_spk_multi");
     fs::remove_all(tmp);
 
     SpeakerProfile p1;
@@ -95,7 +98,7 @@ TEST_CASE("speaker_id: save multiple speakers", "[speaker_id]") {
 }
 
 TEST_CASE("speaker_id: remove speaker", "[speaker_id]") {
-    auto tmp = fs::temp_directory_path() / "recmeet_test_spk_remove";
+    auto tmp = recmeet::test::tmp_path("recmeet_test_spk_remove");
     fs::remove_all(tmp);
 
     SpeakerProfile p;
@@ -112,7 +115,7 @@ TEST_CASE("speaker_id: remove speaker", "[speaker_id]") {
 }
 
 TEST_CASE("speaker_id: list_speakers returns sorted names", "[speaker_id]") {
-    auto tmp = fs::temp_directory_path() / "recmeet_test_spk_list";
+    auto tmp = recmeet::test::tmp_path("recmeet_test_spk_list");
     fs::remove_all(tmp);
 
     SpeakerProfile p1, p2;
@@ -135,7 +138,7 @@ TEST_CASE("speaker_id: list_speakers returns sorted names", "[speaker_id]") {
 }
 
 TEST_CASE("speaker_id: overwrite existing profile", "[speaker_id]") {
-    auto tmp = fs::temp_directory_path() / "recmeet_test_spk_overwrite";
+    auto tmp = recmeet::test::tmp_path("recmeet_test_spk_overwrite");
     fs::remove_all(tmp);
 
     SpeakerProfile p;
@@ -168,7 +171,7 @@ TEST_CASE("speaker_id: iso_now returns valid format", "[speaker_id]") {
 }
 
 TEST_CASE("speaker_id: load ignores non-json files", "[speaker_id]") {
-    auto tmp = fs::temp_directory_path() / "recmeet_test_spk_nonjson";
+    auto tmp = recmeet::test::tmp_path("recmeet_test_spk_nonjson");
     fs::remove_all(tmp);
     fs::create_directories(tmp);
 
@@ -190,7 +193,7 @@ TEST_CASE("speaker_id: load ignores non-json files", "[speaker_id]") {
 }
 
 TEST_CASE("speaker_id: load skips malformed json", "[speaker_id]") {
-    auto tmp = fs::temp_directory_path() / "recmeet_test_spk_malformed";
+    auto tmp = recmeet::test::tmp_path("recmeet_test_spk_malformed");
     fs::remove_all(tmp);
     fs::create_directories(tmp);
 
@@ -208,7 +211,7 @@ TEST_CASE("speaker_id: load skips malformed json", "[speaker_id]") {
 // ---------------------------------------------------------------------------
 
 TEST_CASE("speaker_id: save/load meeting speakers round-trip", "[speaker_id]") {
-    auto tmp = fs::temp_directory_path() / "recmeet_test_meeting_spk_rt";
+    auto tmp = recmeet::test::tmp_path("recmeet_test_meeting_spk_rt");
     fs::remove_all(tmp);
 
     std::vector<MeetingSpeaker> speakers = {
@@ -242,12 +245,14 @@ TEST_CASE("speaker_id: save/load meeting speakers round-trip", "[speaker_id]") {
 }
 
 TEST_CASE("speaker_id: load meeting speakers from nonexistent dir returns empty", "[speaker_id]") {
-    auto loaded = load_meeting_speakers("/tmp/recmeet_no_such_meeting_dir_xyz");
+    auto missing = recmeet::test::tmp_path("recmeet_no_such_meeting_dir_xyz");
+    fs::remove_all(missing);
+    auto loaded = load_meeting_speakers(missing);
     CHECK(loaded.empty());
 }
 
 TEST_CASE("speaker_id: meeting speakers embedding data preserved exactly", "[speaker_id]") {
-    auto tmp = fs::temp_directory_path() / "recmeet_test_meeting_spk_emb";
+    auto tmp = recmeet::test::tmp_path("recmeet_test_meeting_spk_emb");
     fs::remove_all(tmp);
 
     // Use a longer embedding to test preservation
@@ -269,7 +274,7 @@ TEST_CASE("speaker_id: meeting speakers embedding data preserved exactly", "[spe
 }
 
 TEST_CASE("speaker_id: save meeting speakers to empty vector writes valid file", "[speaker_id]") {
-    auto tmp = fs::temp_directory_path() / "recmeet_test_meeting_spk_empty";
+    auto tmp = recmeet::test::tmp_path("recmeet_test_meeting_spk_empty");
     fs::remove_all(tmp);
 
     save_meeting_speakers(tmp, {});
@@ -281,7 +286,7 @@ TEST_CASE("speaker_id: save meeting speakers to empty vector writes valid file",
 
 TEST_CASE("speaker_id: save_meeting_speakers timestamp arg writes per-instance file",
           "[speaker_id]") {
-    auto tmp = fs::temp_directory_path() / "recmeet_test_meeting_spk_per_instance";
+    auto tmp = recmeet::test::tmp_path("recmeet_test_meeting_spk_per_instance");
     fs::remove_all(tmp);
 
     std::vector<MeetingSpeaker> speakers = {
@@ -304,7 +309,7 @@ TEST_CASE("speaker_id: save_meeting_speakers timestamp arg writes per-instance f
 
 TEST_CASE("speaker_id: load_meeting_speakers prefers per-instance over legacy",
           "[speaker_id]") {
-    auto tmp = fs::temp_directory_path() / "recmeet_test_meeting_spk_prefer";
+    auto tmp = recmeet::test::tmp_path("recmeet_test_meeting_spk_prefer");
     fs::remove_all(tmp);
 
     // Write legacy first.
@@ -327,7 +332,7 @@ TEST_CASE("speaker_id: load_meeting_speakers prefers per-instance over legacy",
 // ---------------------------------------------------------------------------
 
 TEST_CASE("speaker_id: reset removes all profiles", "[speaker_id]") {
-    auto tmp = fs::temp_directory_path() / "recmeet_test_spk_reset";
+    auto tmp = recmeet::test::tmp_path("recmeet_test_spk_reset");
     fs::remove_all(tmp);
 
     SpeakerProfile p1, p2;
@@ -350,7 +355,7 @@ TEST_CASE("speaker_id: reset removes all profiles", "[speaker_id]") {
 }
 
 TEST_CASE("speaker_id: reset on empty dir returns 0", "[speaker_id]") {
-    auto tmp = fs::temp_directory_path() / "recmeet_test_spk_reset_empty";
+    auto tmp = recmeet::test::tmp_path("recmeet_test_spk_reset_empty");
     fs::remove_all(tmp);
     fs::create_directories(tmp);
 
@@ -360,11 +365,13 @@ TEST_CASE("speaker_id: reset on empty dir returns 0", "[speaker_id]") {
 }
 
 TEST_CASE("speaker_id: reset on nonexistent dir returns 0", "[speaker_id]") {
-    CHECK(reset_speakers("/tmp/recmeet_no_such_dir_reset_xyz") == 0);
+    auto missing = recmeet::test::tmp_path("recmeet_no_such_dir_reset_xyz");
+    fs::remove_all(missing);
+    CHECK(reset_speakers(missing) == 0);
 }
 
 TEST_CASE("speaker_id: reset preserves non-json files", "[speaker_id]") {
-    auto tmp = fs::temp_directory_path() / "recmeet_test_spk_reset_preserve";
+    auto tmp = recmeet::test::tmp_path("recmeet_test_spk_reset_preserve");
     fs::remove_all(tmp);
     fs::create_directories(tmp);
 
@@ -390,7 +397,7 @@ TEST_CASE("speaker_id: reset preserves non-json files", "[speaker_id]") {
 // ---------------------------------------------------------------------------
 
 TEST_CASE("speaker_id: remove_embedding exact match removes embedding", "[speaker_id]") {
-    auto tmp = fs::temp_directory_path() / "recmeet_test_spk_rm_emb_exact";
+    auto tmp = recmeet::test::tmp_path("recmeet_test_spk_rm_emb_exact");
     fs::remove_all(tmp);
     fs::create_directories(tmp);
 
@@ -409,7 +416,7 @@ TEST_CASE("speaker_id: remove_embedding exact match removes embedding", "[speake
 }
 
 TEST_CASE("speaker_id: remove_embedding epsilon tolerance matches near-equal", "[speaker_id]") {
-    auto tmp = fs::temp_directory_path() / "recmeet_test_spk_rm_emb_eps";
+    auto tmp = recmeet::test::tmp_path("recmeet_test_spk_rm_emb_eps");
     fs::remove_all(tmp);
     fs::create_directories(tmp);
 
@@ -426,7 +433,7 @@ TEST_CASE("speaker_id: remove_embedding epsilon tolerance matches near-equal", "
 }
 
 TEST_CASE("speaker_id: remove_embedding no match returns false", "[speaker_id]") {
-    auto tmp = fs::temp_directory_path() / "recmeet_test_spk_rm_emb_nomatch";
+    auto tmp = recmeet::test::tmp_path("recmeet_test_spk_rm_emb_nomatch");
     fs::remove_all(tmp);
     fs::create_directories(tmp);
 
@@ -442,7 +449,7 @@ TEST_CASE("speaker_id: remove_embedding no match returns false", "[speaker_id]")
 }
 
 TEST_CASE("speaker_id: remove_embedding last embedding deletes profile", "[speaker_id]") {
-    auto tmp = fs::temp_directory_path() / "recmeet_test_spk_rm_emb_last";
+    auto tmp = recmeet::test::tmp_path("recmeet_test_spk_rm_emb_last");
     fs::remove_all(tmp);
     fs::create_directories(tmp);
 
@@ -459,7 +466,7 @@ TEST_CASE("speaker_id: remove_embedding last embedding deletes profile", "[speak
 }
 
 TEST_CASE("speaker_id: remove_embedding nonexistent speaker returns false", "[speaker_id]") {
-    auto tmp = fs::temp_directory_path() / "recmeet_test_spk_rm_emb_nospeaker";
+    auto tmp = recmeet::test::tmp_path("recmeet_test_spk_rm_emb_nospeaker");
     fs::remove_all(tmp);
     fs::create_directories(tmp);
 
@@ -468,7 +475,7 @@ TEST_CASE("speaker_id: remove_embedding nonexistent speaker returns false", "[sp
 }
 
 TEST_CASE("speaker_id: remove_embedding empty vector returns false", "[speaker_id]") {
-    auto tmp = fs::temp_directory_path() / "recmeet_test_spk_rm_emb_empty";
+    auto tmp = recmeet::test::tmp_path("recmeet_test_spk_rm_emb_empty");
     fs::remove_all(tmp);
     fs::create_directories(tmp);
 
@@ -483,7 +490,7 @@ TEST_CASE("speaker_id: remove_embedding empty vector returns false", "[speaker_i
 }
 
 TEST_CASE("speaker_id: remove_embedding preserves other embeddings", "[speaker_id]") {
-    auto tmp = fs::temp_directory_path() / "recmeet_test_spk_rm_emb_preserve";
+    auto tmp = recmeet::test::tmp_path("recmeet_test_spk_rm_emb_preserve");
     fs::remove_all(tmp);
     fs::create_directories(tmp);
 
@@ -503,7 +510,7 @@ TEST_CASE("speaker_id: remove_embedding preserves other embeddings", "[speaker_i
 }
 
 TEST_CASE("speaker_id: remove_embedding dimension mismatch returns false", "[speaker_id]") {
-    auto tmp = fs::temp_directory_path() / "recmeet_test_spk_rm_emb_dim";
+    auto tmp = recmeet::test::tmp_path("recmeet_test_spk_rm_emb_dim");
     fs::remove_all(tmp);
     fs::create_directories(tmp);
 
@@ -523,7 +530,7 @@ TEST_CASE("speaker_id: remove_embedding dimension mismatch returns false", "[spe
 // ---------------------------------------------------------------------------
 
 TEST_CASE("speaker_id: relabel changes label and flags", "[speaker_id]") {
-    auto tmp = fs::temp_directory_path() / "recmeet_test_spk_relabel";
+    auto tmp = recmeet::test::tmp_path("recmeet_test_spk_relabel");
     fs::remove_all(tmp);
     fs::create_directories(tmp);
 
@@ -544,7 +551,7 @@ TEST_CASE("speaker_id: relabel changes label and flags", "[speaker_id]") {
 }
 
 TEST_CASE("speaker_id: relabel unknown cluster_id returns false", "[speaker_id]") {
-    auto tmp = fs::temp_directory_path() / "recmeet_test_spk_relabel_unknown";
+    auto tmp = recmeet::test::tmp_path("recmeet_test_spk_relabel_unknown");
     fs::remove_all(tmp);
     fs::create_directories(tmp);
 
@@ -558,13 +565,13 @@ TEST_CASE("speaker_id: relabel unknown cluster_id returns false", "[speaker_id]"
 }
 
 TEST_CASE("speaker_id: relabel empty speakers returns false", "[speaker_id]") {
-    auto tmp = fs::temp_directory_path() / "recmeet_test_spk_relabel_empty";
+    auto tmp = recmeet::test::tmp_path("recmeet_test_spk_relabel_empty");
     fs::remove_all(tmp);
     CHECK_FALSE(relabel_meeting_speaker(tmp, 0, "John"));
 }
 
 TEST_CASE("speaker_id: relabel custom confidence value", "[speaker_id]") {
-    auto tmp = fs::temp_directory_path() / "recmeet_test_spk_relabel_conf";
+    auto tmp = recmeet::test::tmp_path("recmeet_test_spk_relabel_conf");
     fs::remove_all(tmp);
     fs::create_directories(tmp);
 
