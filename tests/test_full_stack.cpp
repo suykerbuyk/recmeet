@@ -9,6 +9,7 @@
 #include "speaker_id.h"
 #include "model_manager.h"
 #include "config.h"
+#include "test_tmpdir.h"
 
 #include <chrono>
 #include <cstdlib>
@@ -67,7 +68,7 @@ DebateResult run_debate_pipeline(bool use_local_llm, const fs::path& llm_model_p
     REQUIRE(fs::exists(audio_src));
 
     // Create temp directory
-    auto out_dir = fs::temp_directory_path() / "recmeet_fullstack_test";
+    auto out_dir = recmeet::test::tmp_path("recmeet_fullstack_test");
     fs::remove_all(out_dir);
     fs::create_directories(out_dir);
 
@@ -373,7 +374,7 @@ TEST_CASE("Reprocess with context.json fallback", "[full-stack]") {
         SKIP("Whisper base model not cached");
 
     // Create temp directory
-    auto out_dir = fs::temp_directory_path() / "recmeet_reprocess_test";
+    auto out_dir = recmeet::test::tmp_path("recmeet_reprocess_test");
     fs::remove_all(out_dir);
     fs::create_directories(out_dir);
 
@@ -438,7 +439,7 @@ TEST_CASE("Reprocess with per-instance context_<ts>.json fallback", "[full-stack
     if (!is_whisper_model_cached("base"))
         SKIP("Whisper base model not cached");
 
-    auto out_dir = fs::temp_directory_path() / "2020-09-29_21-00";
+    auto out_dir = recmeet::test::tmp_path("2020-09-29_21-00");
     fs::remove_all(out_dir);
     fs::create_directories(out_dir);
 
@@ -519,7 +520,7 @@ TEST_CASE("Reprocess-batch: skip-existing + reprocess-missing end-to-end",
     // Workspace: parent dir holds the two meeting subdirs; note_dir is a
     // sibling so the skip-rule's <note-dir>/YYYY/MM/Meeting_<ts>*.md glob
     // is exercised exactly as in production.
-    auto workspace = fs::temp_directory_path() / "recmeet_reprocess_batch_full_stack";
+    auto workspace = recmeet::test::tmp_path("recmeet_reprocess_batch_full_stack");
     fs::remove_all(workspace);
     fs::create_directories(workspace);
     fs::path parent_dir = workspace / "meetings";
