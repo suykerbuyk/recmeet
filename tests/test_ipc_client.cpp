@@ -5,7 +5,9 @@
 #include "daemon_test_harness.h"
 #include "ipc_client.h"
 #include "ipc_server.h"
+#include "test_tmpdir.h"
 
+#include <filesystem>
 #include <thread>
 #include <chrono>
 #include <unistd.h>
@@ -14,11 +16,12 @@ using namespace recmeet;
 using recmeet::test::DaemonTestHarness;
 
 namespace {
-const char* TEST_SOCK = "/tmp/recmeet_test_client.sock";
+const std::string TEST_SOCK =
+    recmeet::test::tmp_path("recmeet_test_client.sock").string();
 }
 
 TEST_CASE("IpcClient: call() round-trip", "[ipc_client]") {
-    unlink(TEST_SOCK);
+    unlink(TEST_SOCK.c_str());
 
     IpcServer server(TEST_SOCK);
     server.on("greet", [](const IpcRequest& req, IpcResponse& resp, IpcError&) {
@@ -45,7 +48,7 @@ TEST_CASE("IpcClient: call() round-trip", "[ipc_client]") {
 }
 
 TEST_CASE("IpcClient: call() error response", "[ipc_client]") {
-    unlink(TEST_SOCK);
+    unlink(TEST_SOCK.c_str());
 
     IpcServer server(TEST_SOCK);
     REQUIRE(server.start());
@@ -65,7 +68,7 @@ TEST_CASE("IpcClient: call() error response", "[ipc_client]") {
 }
 
 TEST_CASE("IpcClient: events dispatched during call()", "[ipc_client]") {
-    unlink(TEST_SOCK);
+    unlink(TEST_SOCK.c_str());
 
     IpcServer server(TEST_SOCK);
     server.on("slow", [&server](const IpcRequest&, IpcResponse& resp, IpcError&) {
@@ -100,14 +103,16 @@ TEST_CASE("IpcClient: events dispatched during call()", "[ipc_client]") {
 }
 
 TEST_CASE("IpcClient: connect fails without server", "[ipc_client]") {
-    unlink(TEST_SOCK);
+    unlink(TEST_SOCK.c_str());
     IpcClient client(TEST_SOCK);
     CHECK_FALSE(client.connect());
     CHECK_FALSE(client.connected());
 }
 
 TEST_CASE("IpcClient: call() without connect returns error", "[ipc_client]") {
-    IpcClient client("/tmp/recmeet_test_noexist.sock");
+    auto missing = recmeet::test::tmp_path("recmeet_test_noexist.sock");
+    std::filesystem::remove_all(missing);
+    IpcClient client(missing.string());
     IpcResponse resp;
     IpcError err;
     CHECK_FALSE(client.call("status.get", resp, err));
@@ -115,7 +120,7 @@ TEST_CASE("IpcClient: call() without connect returns error", "[ipc_client]") {
 }
 
 TEST_CASE("IpcClient: read_events exits when callback closes connection", "[ipc_client]") {
-    unlink(TEST_SOCK);
+    unlink(TEST_SOCK.c_str());
 
     IpcServer server(TEST_SOCK);
     server.on("trigger", [&server](const IpcRequest&, IpcResponse& resp, IpcError&) {
@@ -162,7 +167,7 @@ TEST_CASE("IpcClient: read_events exits when callback closes connection", "[ipc_
 }
 
 TEST_CASE("daemon_running: returns false when no daemon", "[ipc_client]") {
-    unlink(TEST_SOCK);
+    unlink(TEST_SOCK.c_str());
     CHECK_FALSE(daemon_running(TEST_SOCK));
 }
 
