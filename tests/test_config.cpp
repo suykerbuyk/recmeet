@@ -3,6 +3,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 #include "config.h"
+#include "test_tmpdir.h"
 
 #include <cstdlib>
 #include <fstream>
@@ -11,7 +12,7 @@
 using namespace recmeet;
 
 static fs::path tmp_config() {
-    fs::path dir = fs::temp_directory_path() / "recmeet_test_config";
+    fs::path dir = recmeet::test::tmp_path("recmeet_test_config");
     fs::create_directories(dir);
     return dir / "config.yaml";
 }
@@ -100,7 +101,7 @@ TEST_CASE("save_config + load_config round-trip", "[config]") {
 }
 
 TEST_CASE("load_config: returns defaults when no file exists", "[config]") {
-    fs::path path = fs::temp_directory_path() / "recmeet_test_config_noexist" / "config.yaml";
+    fs::path path = recmeet::test::tmp_path("recmeet_test_config_noexist") / "config.yaml";
     fs::remove_all(path.parent_path());
 
     JobConfig cfg = load_legacy_config_as_job_config(path);
@@ -158,7 +159,7 @@ TEST_CASE("load_config: partial config fills only specified fields", "[config]")
 }
 
 TEST_CASE("load_config: reads XAI_API_KEY from environment", "[config]") {
-    fs::path path = fs::temp_directory_path() / "recmeet_test_config_env" / "config.yaml";
+    fs::path path = recmeet::test::tmp_path("recmeet_test_config_env") / "config.yaml";
     fs::remove_all(path.parent_path());
 
     // Save and set env var
@@ -177,7 +178,7 @@ TEST_CASE("load_config: reads XAI_API_KEY from environment", "[config]") {
 }
 
 TEST_CASE("save_config never writes legacy api_key to YAML", "[config]") {
-    fs::path dir = fs::temp_directory_path() / "recmeet_test_save_apikey";
+    fs::path dir = recmeet::test::tmp_path("recmeet_test_save_apikey");
     fs::remove_all(dir);
     fs::path path = dir / "config.yaml";
 
@@ -199,7 +200,7 @@ TEST_CASE("save_config never writes legacy api_key to YAML", "[config]") {
 }
 
 TEST_CASE("api_keys round-trip via save_config + load_config", "[config]") {
-    fs::path dir = fs::temp_directory_path() / "recmeet_test_api_keys_rt";
+    fs::path dir = recmeet::test::tmp_path("recmeet_test_api_keys_rt");
     fs::remove_all(dir);
     fs::path path = dir / "config.yaml";
 
@@ -218,7 +219,7 @@ TEST_CASE("api_keys round-trip via save_config + load_config", "[config]") {
 }
 
 TEST_CASE("api_keys section format in YAML", "[config]") {
-    fs::path dir = fs::temp_directory_path() / "recmeet_test_api_keys_fmt";
+    fs::path dir = recmeet::test::tmp_path("recmeet_test_api_keys_fmt");
     fs::remove_all(dir);
     fs::path path = dir / "config.yaml";
 
@@ -239,7 +240,7 @@ TEST_CASE("api_keys section format in YAML", "[config]") {
 }
 
 TEST_CASE("save_config sets file permissions to 0600", "[config]") {
-    fs::path dir = fs::temp_directory_path() / "recmeet_test_perms";
+    fs::path dir = recmeet::test::tmp_path("recmeet_test_perms");
     fs::remove_all(dir);
     fs::path path = dir / "config.yaml";
 
@@ -300,7 +301,7 @@ TEST_CASE("resolve_api_key priority: env > api_keys > legacy > empty", "[config]
 
 TEST_CASE("load_config: chunked-diarize defaults when keys absent",
           "[config][t2-2]") {
-    fs::path path = fs::temp_directory_path() / "recmeet_test_cfg_chunk_def" / "config.yaml";
+    fs::path path = recmeet::test::tmp_path("recmeet_test_cfg_chunk_def") / "config.yaml";
     fs::remove_all(path.parent_path());
 
     JobConfig cfg = load_legacy_config_as_job_config(path);
@@ -311,7 +312,7 @@ TEST_CASE("load_config: chunked-diarize defaults when keys absent",
 
 TEST_CASE("save_config + load_config: chunked-diarize fields round-trip",
           "[config][t2-2]") {
-    fs::path dir = fs::temp_directory_path() / "recmeet_test_cfg_chunk_rt";
+    fs::path dir = recmeet::test::tmp_path("recmeet_test_cfg_chunk_rt");
     fs::remove_all(dir);
     fs::path path = dir / "config.yaml";
 
@@ -345,7 +346,7 @@ TEST_CASE("save_config + load_config: chunked-diarize fields round-trip",
 
 TEST_CASE("save_config: chunked-diarize fields omitted at defaults",
           "[config][t2-2]") {
-    fs::path dir = fs::temp_directory_path() / "recmeet_test_cfg_chunk_omit";
+    fs::path dir = recmeet::test::tmp_path("recmeet_test_cfg_chunk_omit");
     fs::remove_all(dir);
     fs::path path = dir / "config.yaml";
 
@@ -365,7 +366,7 @@ TEST_CASE("save_config: chunked-diarize fields omitted at defaults",
 
 TEST_CASE("load_config: M-5' invalid persisted values fall back to defaults",
           "[config][t2-2]") {
-    fs::path dir = fs::temp_directory_path() / "recmeet_test_cfg_chunk_invalid";
+    fs::path dir = recmeet::test::tmp_path("recmeet_test_cfg_chunk_invalid");
     fs::remove_all(dir);
     fs::path path = dir / "config.yaml";
 
@@ -391,7 +392,7 @@ TEST_CASE("load_config: M-5' invalid persisted values fall back to defaults",
 
 TEST_CASE("load_config: M-5' boundary equal-to-zero spacing falls back",
           "[config][t2-2]") {
-    fs::path dir = fs::temp_directory_path() / "recmeet_test_cfg_chunk_eq";
+    fs::path dir = recmeet::test::tmp_path("recmeet_test_cfg_chunk_eq");
     fs::remove_all(dir);
     fs::path path = dir / "config.yaml";
 
@@ -412,7 +413,7 @@ TEST_CASE("load_config: M-5' boundary equal-to-zero spacing falls back",
 }
 
 TEST_CASE("backward compat: legacy api_key in config used as fallback", "[config]") {
-    fs::path dir = fs::temp_directory_path() / "recmeet_test_legacy_compat";
+    fs::path dir = recmeet::test::tmp_path("recmeet_test_legacy_compat");
     fs::remove_all(dir);
     fs::path path = dir / "config.yaml";
 
@@ -443,7 +444,7 @@ TEST_CASE("backward compat: legacy api_key in config used as fallback", "[config
 TEST_CASE("load_config: retain_terminal_hours defaults to 24 h with derived "
           "diarization_cache_ttl_secs",
           "[config][c13]") {
-    fs::path dir = fs::temp_directory_path() / "recmeet_test_rth_default";
+    fs::path dir = recmeet::test::tmp_path("recmeet_test_rth_default");
     fs::remove_all(dir);
     fs::path path = dir / "config.yaml";
     fs::create_directories(dir);
@@ -460,7 +461,7 @@ TEST_CASE("load_config: retain_terminal_hours defaults to 24 h with derived "
 TEST_CASE("load_config: retain_terminal_hours overrides legacy "
           "diarization_cache_ttl_secs (M-1 precedence)",
           "[config][c13]") {
-    fs::path dir = fs::temp_directory_path() / "recmeet_test_rth_override";
+    fs::path dir = recmeet::test::tmp_path("recmeet_test_rth_override");
     fs::remove_all(dir);
     fs::path path = dir / "config.yaml";
     fs::create_directories(dir);
@@ -480,7 +481,7 @@ TEST_CASE("load_config: retain_terminal_hours overrides legacy "
 TEST_CASE("load_config: legacy diarization_cache_ttl_secs derives "
           "retain_terminal_hours when unified knob absent",
           "[config][c13]") {
-    fs::path dir = fs::temp_directory_path() / "recmeet_test_rth_legacy";
+    fs::path dir = recmeet::test::tmp_path("recmeet_test_rth_legacy");
     fs::remove_all(dir);
     fs::path path = dir / "config.yaml";
     fs::create_directories(dir);
@@ -501,7 +502,7 @@ TEST_CASE("load_config: legacy diarization_cache_ttl_secs derives "
 
 TEST_CASE("load_config: staging_max_bytes defaults to 500 GiB when absent",
           "[config][d6]") {
-    fs::path dir = fs::temp_directory_path() / "recmeet_test_d6_default";
+    fs::path dir = recmeet::test::tmp_path("recmeet_test_d6_default");
     fs::remove_all(dir);
     JobConfig cfg = load_legacy_config_as_job_config(dir / "config.yaml");
     constexpr size_t expected = static_cast<size_t>(500) * 1024 * 1024 * 1024;
@@ -511,7 +512,7 @@ TEST_CASE("load_config: staging_max_bytes defaults to 500 GiB when absent",
 
 TEST_CASE("save_config + load_config: staging_max_bytes round-trips via [client] section",
           "[config][d6]") {
-    fs::path dir = fs::temp_directory_path() / "recmeet_test_d6_roundtrip";
+    fs::path dir = recmeet::test::tmp_path("recmeet_test_d6_roundtrip");
     fs::remove_all(dir);
     fs::path path = dir / "config.yaml";
     fs::create_directories(dir);
@@ -534,7 +535,7 @@ TEST_CASE("save_config + load_config: staging_max_bytes round-trips via [client]
 
 TEST_CASE("save_config: staging_max_bytes section omitted at default",
           "[config][d6]") {
-    fs::path dir = fs::temp_directory_path() / "recmeet_test_d6_omit";
+    fs::path dir = recmeet::test::tmp_path("recmeet_test_d6_omit");
     fs::remove_all(dir);
     fs::path path = dir / "config.yaml";
     fs::create_directories(dir);
@@ -554,7 +555,7 @@ TEST_CASE("save_config: staging_max_bytes section omitted at default",
 
 TEST_CASE("load_config: invalid staging_max_bytes falls back to default",
           "[config][d6]") {
-    fs::path dir = fs::temp_directory_path() / "recmeet_test_d6_invalid";
+    fs::path dir = recmeet::test::tmp_path("recmeet_test_d6_invalid");
     fs::remove_all(dir);
     fs::path path = dir / "config.yaml";
     fs::create_directories(dir);
