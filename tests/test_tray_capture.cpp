@@ -15,6 +15,7 @@
 
 #include "audio_capture.h"
 #include "device_enum.h"
+#include "test_tmpdir.h"
 #include "tray_capture.h"
 #include "util.h"
 
@@ -43,8 +44,8 @@ namespace {
 fs::path make_scratch() {
     std::random_device rd;
     std::ostringstream oss;
-    oss << "/tmp/recmeet_tray_cap_" << ::getpid() << "_" << rd();
-    fs::path p = oss.str();
+    oss << "recmeet_tray_cap_" << ::getpid() << "_" << rd();
+    fs::path p = recmeet::test::tmp_path(oss.str());
     std::error_code ec;
     fs::create_directories(p, ec);
     REQUIRE_FALSE(ec);
