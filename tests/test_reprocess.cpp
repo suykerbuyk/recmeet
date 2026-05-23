@@ -30,6 +30,7 @@
 #include "job_queue.h"
 #include "meeting_index.h"
 #include "pipeline.h"   // save_meeting_context
+#include "test_tmpdir.h"
 #include "util.h"       // find_audio_file, is_valid_meeting_id, derive_meeting_timestamp
 
 #include <atomic>
@@ -54,7 +55,8 @@ struct SigpipeIgnorer {
     SigpipeIgnorer() { signal(SIGPIPE, SIG_IGN); }
 } s_ignore_sigpipe;
 
-const char* REPROCESS_SOCK = "/tmp/recmeet_test_reprocess.sock";
+const std::string REPROCESS_SOCK =
+    recmeet::test::tmp_path("recmeet_test_reprocess.sock").string();
 
 struct ServerGuard {
     IpcServer& server;
@@ -75,11 +77,11 @@ struct JqShutdownGuard {
 };
 
 fs::path tmp_root(const std::string& tag) {
-    auto base = fs::temp_directory_path() /
-                ("recmeet-c12-" + tag + "-" +
-                 std::to_string(::getpid()) + "-" +
-                 std::to_string(std::chrono::steady_clock::now()
-                                    .time_since_epoch().count()));
+    auto base = recmeet::test::tmp_path(
+        "recmeet-c12-" + tag + "-" +
+        std::to_string(::getpid()) + "-" +
+        std::to_string(std::chrono::steady_clock::now()
+                           .time_since_epoch().count()));
     fs::create_directories(base);
     return base;
 }
@@ -240,7 +242,7 @@ TEST_CASE("C.12 process.reprocess: known meeting_id enqueues job pointing at "
 // ============================================================================
 TEST_CASE("C.12 process.reprocess: per-stage flag overrides propagate to cfg",
           "[c12][reprocess]") {
-    ::unlink(REPROCESS_SOCK);
+    ::unlink(REPROCESS_SOCK.c_str());
 
     auto root = tmp_root("flags");
     const std::string id = "11111111-2222-4333-8444-555555555555";
@@ -298,7 +300,7 @@ TEST_CASE("C.12 process.reprocess: per-stage flag overrides propagate to cfg",
 TEST_CASE("C.12 process.reprocess: indexed dir vanished from disk → "
           "InternalError",
           "[c12][reprocess]") {
-    ::unlink(REPROCESS_SOCK);
+    ::unlink(REPROCESS_SOCK.c_str());
 
     auto root = tmp_root("vanished");
     const std::string id = "22222222-3333-4444-8555-666666666666";
