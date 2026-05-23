@@ -52,6 +52,7 @@
 #include "model_manager.h"
 #include "speaker_id.h"
 #include "test_helpers.h"
+#include "test_tmpdir.h"
 
 #include <httplib.h>
 
@@ -272,9 +273,7 @@ TEST_CASE("V2 full-stack webui: HTTP write endpoints drive real daemon state",
     //    sharing the daemon's config dir (smoke.sh rev-2 C1 contract:
     //    BOTH spawns inherit the same XDG_CONFIG_HOME).
     // --------------------------------------------------------------------
-    fs::path workdir = fs::temp_directory_path()
-                     / ("recmeet_full_stack_webui_"
-                        + std::to_string(::getpid()));
+    fs::path workdir = recmeet::test::tmp_path("recmeet_full_stack_webui");
     fs::remove_all(workdir);
     fs::create_directories(workdir);
 
