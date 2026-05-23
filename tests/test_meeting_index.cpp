@@ -7,6 +7,7 @@
 
 #include "meeting_index.h"
 #include "pipeline.h" // save_meeting_context
+#include "test_tmpdir.h"
 
 #include <atomic>
 #include <chrono>
@@ -23,11 +24,11 @@ using namespace recmeet;
 
 namespace {
 fs::path tmp_dir(const std::string& tag) {
-    auto base = fs::temp_directory_path() /
-                ("recmeet-meeting-index-" + tag + "-" +
-                 std::to_string(::getpid()) + "-" +
-                 std::to_string(std::chrono::steady_clock::now()
-                                    .time_since_epoch().count()));
+    auto base = recmeet::test::tmp_path(
+        "recmeet-meeting-index-" + tag + "-" +
+        std::to_string(::getpid()) + "-" +
+        std::to_string(std::chrono::steady_clock::now()
+                           .time_since_epoch().count()));
     fs::create_directories(base);
     return base;
 }
