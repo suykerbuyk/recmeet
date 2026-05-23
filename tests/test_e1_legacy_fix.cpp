@@ -36,6 +36,7 @@
 #include "ipc_server.h"
 #include "reprocess_batch.h"
 #include "session_manager.h"
+#include "test_tmpdir.h"
 #include "util.h"
 
 #include <httplib.h>
@@ -84,8 +85,8 @@ struct ScopedAuthToken {
 fs::path make_scratch(const char* tag) {
     std::random_device rd;
     std::ostringstream oss;
-    oss << "/tmp/recmeet_e1fix_" << tag << "_" << ::getpid() << "_" << rd();
-    fs::path p = oss.str();
+    oss << "recmeet_e1fix_" << tag << "_" << ::getpid() << "_" << rd();
+    fs::path p = recmeet::test::tmp_path(oss.str());
     std::error_code ec;
     fs::create_directories(p, ec);
     REQUIRE_FALSE(ec);
