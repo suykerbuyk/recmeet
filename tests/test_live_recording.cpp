@@ -38,6 +38,7 @@
 #include "pipeline.h"
 #include "config.h"
 #include "audio_file.h"
+#include "test_tmpdir.h"
 #include "util.h"
 
 #include <atomic>
@@ -52,7 +53,7 @@ namespace {
 // Per-test working dir under the system temp tree. Each TEST_CASE gets its
 // own subdir keyed on `tag` so parallel runs don't collide.
 fs::path test_dir(const std::string& tag) {
-    fs::path d = fs::temp_directory_path() / ("recmeet_test_live_recording_" + tag);
+    fs::path d = recmeet::test::tmp_path("recmeet_test_live_recording_" + tag);
     fs::remove_all(d);
     fs::create_directories(d);
     return d;
