@@ -27,6 +27,7 @@
 #include "pending_jobs_journal.h"
 #include "resume_token_store.h"
 #include "session_manager.h"
+#include "test_tmpdir.h"
 #include "tray_capture.h"
 #include "uuid.h"
 
@@ -64,8 +65,8 @@ struct ScopedAuthToken {
 fs::path make_scratch() {
     std::random_device rd;
     std::ostringstream oss;
-    oss << "/tmp/recmeet_d5_resume_" << ::getpid() << "_" << rd();
-    fs::path p = oss.str();
+    oss << "recmeet_d5_resume_" << ::getpid() << "_" << rd();
+    fs::path p = recmeet::test::tmp_path(oss.str());
     std::error_code ec;
     fs::create_directories(p, ec);
     REQUIRE_FALSE(ec);
