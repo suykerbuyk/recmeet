@@ -19,6 +19,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include "pending_jobs_journal.h"
+#include "test_tmpdir.h"
 #include "util.h"
 
 #include <sys/stat.h>
@@ -38,8 +39,8 @@ namespace {
 fs::path make_scratch() {
     std::random_device rd;
     std::ostringstream oss;
-    oss << "/tmp/recmeet_d5_journal_" << ::getpid() << "_" << rd();
-    fs::path p = oss.str();
+    oss << "recmeet_d5_journal_" << ::getpid() << "_" << rd();
+    fs::path p = recmeet::test::tmp_path(oss.str());
     std::error_code ec;
     fs::create_directories(p, ec);
     REQUIRE_FALSE(ec);
