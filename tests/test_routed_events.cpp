@@ -30,6 +30,7 @@
 #include "ipc_protocol.h"
 #include "ipc_server.h"
 #include "job_queue.h"
+#include "test_tmpdir.h"
 
 #include <atomic>
 #include <chrono>
@@ -51,7 +52,8 @@ struct SigpipeIgnorer {
     SigpipeIgnorer() { signal(SIGPIPE, SIG_IGN); }
 } s_ignore_sigpipe;
 
-const char* ROUTED_SOCK = "/tmp/recmeet_test_routed_events.sock";
+const std::string ROUTED_SOCK =
+    recmeet::test::tmp_path("recmeet_test_routed_events.sock").string();
 
 // ServerGuard — joins the IpcServer poll thread on destruction, even on
 // REQUIRE-thrown exception. Same pattern as test_streaming_session.cpp.
@@ -180,7 +182,7 @@ struct ClientReader {
 TEST_CASE("C.3 acceptance — postprocess events route to originator only; "
           "B's stream is silent",
           "[c3][routing]") {
-    ::unlink(ROUTED_SOCK);
+    ::unlink(ROUTED_SOCK.c_str());
 
     JobQueue q;
     JqGuard jqg(q);
@@ -281,7 +283,7 @@ TEST_CASE("C.3 acceptance — postprocess events route to originator only; "
     // ClientReader destructors run before IpcClient destructors (reverse
     // declaration order), stopping the reader threads cleanly. The
     // IpcClient destructor then calls close_connection().
-    ::unlink(ROUTED_SOCK);
+    ::unlink(ROUTED_SOCK.c_str());
 }
 
 // ===========================================================================
@@ -292,7 +294,7 @@ TEST_CASE("C.3 acceptance — postprocess events route to originator only; "
 // ===========================================================================
 TEST_CASE("C.3 — JobEventSink progress.job routes to originator",
           "[c3][routing]") {
-    ::unlink(ROUTED_SOCK);
+    ::unlink(ROUTED_SOCK.c_str());
 
     JobQueue q;
     JqGuard jqg(q);
@@ -362,7 +364,7 @@ TEST_CASE("C.3 — JobEventSink progress.job routes to originator",
     // ClientReader destructors run before IpcClient destructors (reverse
     // declaration order), stopping the reader threads cleanly. The
     // IpcClient destructor then calls close_connection().
-    ::unlink(ROUTED_SOCK);
+    ::unlink(ROUTED_SOCK.c_str());
 }
 
 // ===========================================================================
@@ -373,7 +375,7 @@ TEST_CASE("C.3 — JobEventSink progress.job routes to originator",
 // ===========================================================================
 TEST_CASE("C.3 — caption events route via session-owned client_id",
           "[c3][routing]") {
-    ::unlink(ROUTED_SOCK);
+    ::unlink(ROUTED_SOCK.c_str());
 
     IpcServer server(ROUTED_SOCK);
     REQUIRE(server.start());
@@ -431,7 +433,7 @@ TEST_CASE("C.3 — caption events route via session-owned client_id",
     // ClientReader destructors run before IpcClient destructors (reverse
     // declaration order), stopping the reader threads cleanly. The
     // IpcClient destructor then calls close_connection().
-    ::unlink(ROUTED_SOCK);
+    ::unlink(ROUTED_SOCK.c_str());
 }
 
 // ===========================================================================
@@ -441,7 +443,7 @@ TEST_CASE("C.3 — caption events route via session-owned client_id",
 // ===========================================================================
 TEST_CASE("C.3 — upload progress.job routes via upload-session client_id",
           "[c3][routing]") {
-    ::unlink(ROUTED_SOCK);
+    ::unlink(ROUTED_SOCK.c_str());
 
     IpcServer server(ROUTED_SOCK);
     REQUIRE(server.start());
@@ -490,7 +492,7 @@ TEST_CASE("C.3 — upload progress.job routes via upload-session client_id",
     // ClientReader destructors run before IpcClient destructors (reverse
     // declaration order), stopping the reader threads cleanly. The
     // IpcClient destructor then calls close_connection().
-    ::unlink(ROUTED_SOCK);
+    ::unlink(ROUTED_SOCK.c_str());
 }
 
 // ===========================================================================
@@ -500,7 +502,7 @@ TEST_CASE("C.3 — upload progress.job routes via upload-session client_id",
 // ===========================================================================
 TEST_CASE("C.3 — model.downloading routes via the model_id job's client_id",
           "[c3][routing]") {
-    ::unlink(ROUTED_SOCK);
+    ::unlink(ROUTED_SOCK.c_str());
 
     JobQueue q;
     JqGuard jqg(q);
@@ -564,7 +566,7 @@ TEST_CASE("C.3 — model.downloading routes via the model_id job's client_id",
     // ClientReader destructors run before IpcClient destructors (reverse
     // declaration order), stopping the reader threads cleanly. The
     // IpcClient destructor then calls close_connection().
-    ::unlink(ROUTED_SOCK);
+    ::unlink(ROUTED_SOCK.c_str());
 }
 
 // ===========================================================================
@@ -574,7 +576,7 @@ TEST_CASE("C.3 — model.downloading routes via the model_id job's client_id",
 // ===========================================================================
 TEST_CASE("C.3 — state.changed stays GLOBAL (broadcast to all clients)",
           "[c3][routing]") {
-    ::unlink(ROUTED_SOCK);
+    ::unlink(ROUTED_SOCK.c_str());
 
     IpcServer server(ROUTED_SOCK);
     REQUIRE(server.start());
@@ -619,7 +621,7 @@ TEST_CASE("C.3 — state.changed stays GLOBAL (broadcast to all clients)",
     // ClientReader destructors run before IpcClient destructors (reverse
     // declaration order), stopping the reader threads cleanly. The
     // IpcClient destructor then calls close_connection().
-    ::unlink(ROUTED_SOCK);
+    ::unlink(ROUTED_SOCK.c_str());
 }
 
 // ===========================================================================
@@ -635,7 +637,7 @@ TEST_CASE("C.3 — state.changed stays GLOBAL (broadcast to all clients)",
 // ===========================================================================
 TEST_CASE("C.3 — empty client_id falls back to broadcast",
           "[c3][routing]") {
-    ::unlink(ROUTED_SOCK);
+    ::unlink(ROUTED_SOCK.c_str());
 
     JobQueue q;
     JqGuard jqg(q);
@@ -684,7 +686,7 @@ TEST_CASE("C.3 — empty client_id falls back to broadcast",
     // ClientReader destructors run before IpcClient destructors (reverse
     // declaration order), stopping the reader threads cleanly. The
     // IpcClient destructor then calls close_connection().
-    ::unlink(ROUTED_SOCK);
+    ::unlink(ROUTED_SOCK.c_str());
 }
 
 // ===========================================================================
@@ -695,7 +697,7 @@ TEST_CASE("C.3 — empty client_id falls back to broadcast",
 // ===========================================================================
 TEST_CASE("C.3 — late job.complete for a terminal job still routes",
           "[c3][routing]") {
-    ::unlink(ROUTED_SOCK);
+    ::unlink(ROUTED_SOCK.c_str());
 
     JobQueue q;
     JqGuard jqg(q);
@@ -753,7 +755,7 @@ TEST_CASE("C.3 — late job.complete for a terminal job still routes",
     // ClientReader destructors run before IpcClient destructors (reverse
     // declaration order), stopping the reader threads cleanly. The
     // IpcClient destructor then calls close_connection().
-    ::unlink(ROUTED_SOCK);
+    ::unlink(ROUTED_SOCK.c_str());
 }
 
 // ===========================================================================
@@ -763,7 +765,7 @@ TEST_CASE("C.3 — late job.complete for a terminal job still routes",
 // ===========================================================================
 TEST_CASE("C.3 — cross-routed: A's job → A, B's job → B, no leakage either way",
           "[c3][routing]") {
-    ::unlink(ROUTED_SOCK);
+    ::unlink(ROUTED_SOCK.c_str());
 
     JobQueue q;
     JqGuard jqg(q);
@@ -841,5 +843,5 @@ TEST_CASE("C.3 — cross-routed: A's job → A, B's job → B, no leakage either
     // ClientReader destructors run before IpcClient destructors (reverse
     // declaration order), stopping the reader threads cleanly. The
     // IpcClient destructor then calls close_connection().
-    ::unlink(ROUTED_SOCK);
+    ::unlink(ROUTED_SOCK.c_str());
 }
