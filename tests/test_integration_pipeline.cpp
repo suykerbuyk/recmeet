@@ -49,6 +49,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 #include "test_helpers.h"
+#include "test_tmpdir.h"
 #include "pipeline.h"
 #include "speaker_id.h"
 #include "model_manager.h"
@@ -150,7 +151,7 @@ TEST_CASE("Chunked pipeline: long-audio reprocess under memory cap",
 
     // Set up a temp output directory so persisted speakers.json doesn't
     // leak between runs.
-    auto out_dir = fs::temp_directory_path() / "recmeet_t2_1_integration";
+    auto out_dir = recmeet::test::tmp_path("recmeet_t2_1_integration");
     fs::remove_all(out_dir);
     fs::create_directories(out_dir);
 
