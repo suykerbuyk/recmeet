@@ -17,6 +17,7 @@
 #include "config.h"
 #include "config_json.h"
 #include "model_manager.h"
+#include "test_tmpdir.h"
 #include "util.h"
 
 #include <cstdio>
@@ -39,7 +40,8 @@ CliResult run_cli(std::initializer_list<const char*> args) {
     optind = 0;
 
     const char* old_xdg = std::getenv("XDG_CONFIG_HOME");
-    setenv("XDG_CONFIG_HOME", "/tmp/recmeet_test_caption_no_config", 1);
+    auto xdg = recmeet::test::tmp_path("recmeet_test_caption_no_config");
+    setenv("XDG_CONFIG_HOME", xdg.c_str(), 1);
 
     auto result = parse_cli(static_cast<int>(argv.size() - 1), argv.data());
 
@@ -166,8 +168,7 @@ TEST_CASE("Config: captions fields round-trip via JSON",
 
 TEST_CASE("Config: captions fields round-trip via YAML save/load",
           "[caption-model-manager][config]") {
-    fs::path tmp = fs::temp_directory_path() /
-                   "recmeet_test_caption_yaml_roundtrip.yaml";
+    fs::path tmp = recmeet::test::tmp_path("recmeet_test_caption_yaml_roundtrip.yaml");
     std::error_code ec; fs::remove(tmp, ec);
 
     JobConfig cfg;
@@ -185,8 +186,7 @@ TEST_CASE("Config: captions fields round-trip via YAML save/load",
 
 TEST_CASE("Config: captions disabled is the default and not emitted in YAML",
           "[caption-model-manager][config]") {
-    fs::path tmp = fs::temp_directory_path() /
-                   "recmeet_test_caption_yaml_default.yaml";
+    fs::path tmp = recmeet::test::tmp_path("recmeet_test_caption_yaml_default.yaml");
     std::error_code ec; fs::remove(tmp, ec);
 
     JobConfig cfg;  // defaults: enabled=false, model=""
