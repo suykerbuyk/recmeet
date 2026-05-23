@@ -46,6 +46,7 @@
 #include "json_util.h"
 #include "model_manager.h"
 #include "test_helpers.h"
+#include "test_tmpdir.h"
 
 #include "audio_file.h"
 
@@ -224,9 +225,8 @@ TEST_CASE("Captions paced full-stack: real-time wire-pump degraded-events discri
     // --------------------------------------------------------------------
     // 1. Per-test workdir + daemon config.
     // --------------------------------------------------------------------
-    fs::path workdir = fs::temp_directory_path()
-                     / ("recmeet_full_stack_captions_paced_"
-                        + std::to_string(::getpid()));
+    fs::path workdir = recmeet::test::tmp_path(
+        "recmeet_full_stack_captions_paced");
     fs::remove_all(workdir);
     fs::create_directories(workdir);
 
