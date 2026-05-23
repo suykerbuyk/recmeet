@@ -27,6 +27,7 @@
 #include "ipc_protocol.h"
 #include "job_queue.h"
 #include "streaming_session.h"
+#include "test_tmpdir.h"
 #include "upload_session.h"
 #include "util.h"
 
@@ -254,7 +255,7 @@ SubmitRequest default_submit_req(int64_t audio_size) {
 
 // A unique temp dir for the test's staging files / WAVs.
 fs::path test_temp_dir(const std::string& tag) {
-    fs::path d = fs::temp_directory_path() / ("recmeet_c5_test_" + tag);
+    fs::path d = recmeet::test::tmp_path("recmeet_c5_test_" + tag);
     std::error_code ec;
     fs::remove_all(d, ec);
     fs::create_directories(d);
