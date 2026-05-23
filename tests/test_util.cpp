@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 #include <catch2/catch_test_macros.hpp>
+#include "test_tmpdir.h"
 #include "util.h"
 #include "uuid.h"
 
@@ -57,7 +58,7 @@ TEST_CASE("models_dir: is subdirectory of data_dir", "[util]") {
 }
 
 TEST_CASE("create_output_dir: creates timestamped directory", "[util]") {
-    auto base = fs::temp_directory_path() / "recmeet_test_output";
+    auto base = recmeet::test::tmp_path("recmeet_test_output");
     fs::create_directories(base);
 
     auto out = create_output_dir(base);
@@ -79,7 +80,7 @@ TEST_CASE("create_output_dir: creates timestamped directory", "[util]") {
 }
 
 TEST_CASE("create_output_dir: handles collision", "[util]") {
-    auto base = fs::temp_directory_path() / "recmeet_test_collision";
+    auto base = recmeet::test::tmp_path("recmeet_test_collision");
     fs::create_directories(base);
 
     auto out1 = create_output_dir(base);
@@ -118,7 +119,7 @@ TEST_CASE("default_thread_count: returns hardware_concurrency - 1 when available
 // ---------------------------------------------------------------------------
 
 TEST_CASE("write_text_file: writes content to new file", "[util]") {
-    auto dir = fs::temp_directory_path() / "recmeet_test_write";
+    auto dir = recmeet::test::tmp_path("recmeet_test_write");
     fs::create_directories(dir);
     fs::path file = dir / "output.txt";
 
@@ -133,7 +134,7 @@ TEST_CASE("write_text_file: writes content to new file", "[util]") {
 }
 
 TEST_CASE("write_text_file: overwrites existing file", "[util]") {
-    auto dir = fs::temp_directory_path() / "recmeet_test_write";
+    auto dir = recmeet::test::tmp_path("recmeet_test_write");
     fs::create_directories(dir);
     fs::path file = dir / "overwrite.txt";
 
@@ -154,7 +155,7 @@ TEST_CASE("write_text_file: throws for nonexistent directory", "[util]") {
 }
 
 TEST_CASE("write_text_file: throws for read-only directory", "[util]") {
-    auto dir = fs::temp_directory_path() / "recmeet_test_readonly";
+    auto dir = recmeet::test::tmp_path("recmeet_test_readonly");
     fs::create_directories(dir);
     fs::path file = dir / "blocked.txt";
 
@@ -169,7 +170,7 @@ TEST_CASE("write_text_file: throws for read-only directory", "[util]") {
 }
 
 TEST_CASE("write_text_file: handles empty content", "[util]") {
-    auto dir = fs::temp_directory_path() / "recmeet_test_write";
+    auto dir = recmeet::test::tmp_path("recmeet_test_write");
     fs::create_directories(dir);
     fs::path file = dir / "empty.txt";
 
@@ -186,7 +187,7 @@ TEST_CASE("write_text_file: handles empty content", "[util]") {
 // ---------------------------------------------------------------------------
 
 TEST_CASE("resolve_meeting_time: parses YYYY-MM-DD_HH-MM from directory name", "[util]") {
-    auto base = fs::temp_directory_path() / "recmeet_test_rmt";
+    auto base = recmeet::test::tmp_path("recmeet_test_rmt");
     fs::path dir = base / "2026-02-15_14-30";
     fs::create_directories(dir);
     fs::path audio = dir / "audio.wav";
@@ -201,7 +202,7 @@ TEST_CASE("resolve_meeting_time: parses YYYY-MM-DD_HH-MM from directory name", "
 }
 
 TEST_CASE("resolve_meeting_time: handles dir name with collision suffix", "[util]") {
-    auto base = fs::temp_directory_path() / "recmeet_test_rmt2";
+    auto base = recmeet::test::tmp_path("recmeet_test_rmt2");
     fs::path dir = base / "2026-03-08_09-15_2";
     fs::create_directories(dir);
     fs::path audio = dir / "audio.wav";
@@ -215,7 +216,7 @@ TEST_CASE("resolve_meeting_time: handles dir name with collision suffix", "[util
 }
 
 TEST_CASE("resolve_meeting_time: falls back to audio mtime when dir name doesn't match", "[util]") {
-    auto base = fs::temp_directory_path() / "recmeet_test_rmt3";
+    auto base = recmeet::test::tmp_path("recmeet_test_rmt3");
     fs::path dir = base / "random_dir_name";
     fs::create_directories(dir);
     fs::path audio = dir / "audio.wav";
@@ -233,7 +234,8 @@ TEST_CASE("resolve_meeting_time: falls back to audio mtime when dir name doesn't
 }
 
 TEST_CASE("resolve_meeting_time: falls back to now when audio doesn't exist", "[util]") {
-    fs::path dir = "/tmp/recmeet_test_nonexistent_dir";
+    fs::path dir = recmeet::test::tmp_path("recmeet_test_nonexistent_dir");
+    fs::remove_all(dir);
     fs::path audio = dir / "audio.wav";
 
     auto [date, time] = resolve_meeting_time(dir, audio);
@@ -247,7 +249,7 @@ TEST_CASE("resolve_meeting_time: falls back to now when audio doesn't exist", "[
 // ---------------------------------------------------------------------------
 
 TEST_CASE("find_audio_file: finds timestamped audio file", "[util]") {
-    auto base = fs::temp_directory_path() / "recmeet_test_find_audio_ts";
+    auto base = recmeet::test::tmp_path("recmeet_test_find_audio_ts");
     fs::remove_all(base);
     fs::create_directories(base);
     std::ofstream(base / "audio_2026-02-21_09-41.wav") << "RIFF";
@@ -259,7 +261,7 @@ TEST_CASE("find_audio_file: finds timestamped audio file", "[util]") {
 }
 
 TEST_CASE("find_audio_file: finds legacy audio.wav", "[util]") {
-    auto base = fs::temp_directory_path() / "recmeet_test_find_audio_legacy";
+    auto base = recmeet::test::tmp_path("recmeet_test_find_audio_legacy");
     fs::remove_all(base);
     fs::create_directories(base);
     std::ofstream(base / "audio.wav") << "RIFF";
@@ -271,7 +273,7 @@ TEST_CASE("find_audio_file: finds legacy audio.wav", "[util]") {
 }
 
 TEST_CASE("find_audio_file: prefers timestamped over legacy", "[util]") {
-    auto base = fs::temp_directory_path() / "recmeet_test_find_audio_both";
+    auto base = recmeet::test::tmp_path("recmeet_test_find_audio_both");
     fs::remove_all(base);
     fs::create_directories(base);
     std::ofstream(base / "audio_2026-02-21_09-41.wav") << "RIFF";
@@ -285,7 +287,7 @@ TEST_CASE("find_audio_file: prefers timestamped over legacy", "[util]") {
 }
 
 TEST_CASE("find_audio_file: empty directory returns empty", "[util]") {
-    auto base = fs::temp_directory_path() / "recmeet_test_find_audio_empty";
+    auto base = recmeet::test::tmp_path("recmeet_test_find_audio_empty");
     fs::remove_all(base);
     fs::create_directories(base);
 
@@ -296,12 +298,14 @@ TEST_CASE("find_audio_file: empty directory returns empty", "[util]") {
 }
 
 TEST_CASE("find_audio_file: non-existent directory returns empty", "[util]") {
-    auto result = find_audio_file("/tmp/recmeet_nonexistent_find_audio");
+    auto missing = recmeet::test::tmp_path("recmeet_nonexistent_find_audio");
+    fs::remove_all(missing);
+    auto result = find_audio_file(missing);
     CHECK(result.empty());
 }
 
 TEST_CASE("find_audio_file: directory with non-audio files only returns empty", "[util]") {
-    auto base = fs::temp_directory_path() / "recmeet_test_find_audio_noaudio";
+    auto base = recmeet::test::tmp_path("recmeet_test_find_audio_noaudio");
     fs::remove_all(base);
     fs::create_directories(base);
     std::ofstream(base / "transcript.txt") << "hello";
@@ -314,7 +318,7 @@ TEST_CASE("find_audio_file: directory with non-audio files only returns empty", 
 }
 
 TEST_CASE("find_audio_file: ignores audio_ files without .wav extension", "[util]") {
-    auto base = fs::temp_directory_path() / "recmeet_test_find_audio_notwav";
+    auto base = recmeet::test::tmp_path("recmeet_test_find_audio_notwav");
     fs::remove_all(base);
     fs::create_directories(base);
     std::ofstream(base / "audio_2026-02-21_09-41.mp3") << "data";
@@ -330,7 +334,7 @@ TEST_CASE("find_audio_file: ignores audio_ files without .wav extension", "[util
 // ---------------------------------------------------------------------------
 
 TEST_CASE("resolve_meeting_time: extracts timestamp from audio filename (priority 1)", "[util]") {
-    auto base = fs::temp_directory_path() / "recmeet_test_rmt_fname";
+    auto base = recmeet::test::tmp_path("recmeet_test_rmt_fname");
     fs::path dir = base / "2026-03-08_10-00";
     fs::create_directories(dir);
     fs::path audio = dir / "audio_2026-03-08_10-00.wav";
@@ -344,7 +348,7 @@ TEST_CASE("resolve_meeting_time: extracts timestamp from audio filename (priorit
 }
 
 TEST_CASE("resolve_meeting_time: filename takes precedence over directory name", "[util]") {
-    auto base = fs::temp_directory_path() / "recmeet_test_rmt_fname_prio";
+    auto base = recmeet::test::tmp_path("recmeet_test_rmt_fname_prio");
     // Directory says 09:15, but filename says 14:30
     fs::path dir = base / "2026-03-08_09-15";
     fs::create_directories(dir);
@@ -360,7 +364,7 @@ TEST_CASE("resolve_meeting_time: filename takes precedence over directory name",
 }
 
 TEST_CASE("resolve_meeting_time: legacy audio.wav falls through to directory name", "[util]") {
-    auto base = fs::temp_directory_path() / "recmeet_test_rmt_legacy";
+    auto base = recmeet::test::tmp_path("recmeet_test_rmt_legacy");
     fs::path dir = base / "2026-02-15_14-30";
     fs::create_directories(dir);
     fs::path audio = dir / "audio.wav";
@@ -375,7 +379,7 @@ TEST_CASE("resolve_meeting_time: legacy audio.wav falls through to directory nam
 }
 
 TEST_CASE("resolve_meeting_time: rejects invalid dates in filename", "[util]") {
-    auto base = fs::temp_directory_path() / "recmeet_test_rmt_invalid";
+    auto base = recmeet::test::tmp_path("recmeet_test_rmt_invalid");
     fs::path dir = base / "2026-02-15_14-30";
     fs::create_directories(dir);
     // Month 13 is invalid
@@ -391,7 +395,7 @@ TEST_CASE("resolve_meeting_time: rejects invalid dates in filename", "[util]") {
 }
 
 TEST_CASE("resolve_meeting_time: rejects too-short filename stem", "[util]") {
-    auto base = fs::temp_directory_path() / "recmeet_test_rmt_short";
+    auto base = recmeet::test::tmp_path("recmeet_test_rmt_short");
     fs::path dir = base / "2026-02-15_14-30";
     fs::create_directories(dir);
     // "audio_short" has the prefix but stem is too short for timestamp
@@ -411,7 +415,7 @@ TEST_CASE("resolve_meeting_time: rejects too-short filename stem", "[util]") {
 // ---------------------------------------------------------------------------
 
 TEST_CASE("create_output_dir: returns clean timestamp without collision suffix", "[util]") {
-    auto base = fs::temp_directory_path() / "recmeet_test_outdir_struct";
+    auto base = recmeet::test::tmp_path("recmeet_test_outdir_struct");
     fs::remove_all(base);
     fs::create_directories(base);
 
@@ -574,8 +578,8 @@ namespace {
 class ScopedTempDir {
 public:
     explicit ScopedTempDir(const std::string& tag) {
-        path_ = fs::temp_directory_path() / ("recmeet_test_" + tag + "_" +
-                                              std::to_string(::getpid()));
+        path_ = recmeet::test::tmp_path("recmeet_test_" + tag + "_" +
+                                        std::to_string(::getpid()));
         fs::remove_all(path_);
         fs::create_directories(path_);
     }
@@ -645,8 +649,8 @@ TEST_CASE("find_speakers_file: prefers timestamped when both present", "[meeting
 
 TEST_CASE("derive_meeting_timestamp: clean dir name returns canonical timestamp",
           "[meeting-files]") {
-    auto base = fs::temp_directory_path() / ("recmeet_test_dmt_clean_" +
-                                              std::to_string(::getpid()));
+    auto base = recmeet::test::tmp_path("recmeet_test_dmt_clean_" +
+                                        std::to_string(::getpid()));
     fs::path dir = base / "2026-05-06_12-00";
     fs::remove_all(base);
     fs::create_directories(dir);
@@ -658,8 +662,8 @@ TEST_CASE("derive_meeting_timestamp: clean dir name returns canonical timestamp"
 
 TEST_CASE("derive_meeting_timestamp: collision-suffix dir strips _N",
           "[meeting-files]") {
-    auto base = fs::temp_directory_path() / ("recmeet_test_dmt_collision_" +
-                                              std::to_string(::getpid()));
+    auto base = recmeet::test::tmp_path("recmeet_test_dmt_collision_" +
+                                        std::to_string(::getpid()));
     fs::path dir = base / "2026-05-06_12-00_2";
     fs::remove_all(base);
     fs::create_directories(dir);
@@ -671,8 +675,8 @@ TEST_CASE("derive_meeting_timestamp: collision-suffix dir strips _N",
 
 TEST_CASE("derive_meeting_timestamp: audio fallback when dir name unrelated",
           "[meeting-files]") {
-    auto base = fs::temp_directory_path() / ("recmeet_test_dmt_audio_" +
-                                              std::to_string(::getpid()));
+    auto base = recmeet::test::tmp_path("recmeet_test_dmt_audio_" +
+                                        std::to_string(::getpid()));
     fs::path dir = base / "random_dir_name";
     fs::remove_all(base);
     fs::create_directories(dir);
@@ -792,8 +796,8 @@ TEST_CASE("atomic_write_file: writes bytes; .tmp gone after success",
           "[util][d5]") {
     std::random_device rd;
     std::ostringstream oss;
-    oss << "/tmp/recmeet_atomic_" << ::getpid() << "_" << rd();
-    fs::path scratch = oss.str();
+    oss << "recmeet_atomic_" << ::getpid() << "_" << rd();
+    fs::path scratch = recmeet::test::tmp_path(oss.str());
     fs::create_directories(scratch);
     fs::path file = scratch / "out.bin";
     fs::path tmp  = file; tmp += ".tmp";
@@ -815,8 +819,8 @@ TEST_CASE("atomic_write_file: mode=0600 applied post-rename",
           "[util][d5]") {
     std::random_device rd;
     std::ostringstream oss;
-    oss << "/tmp/recmeet_atomic_mode_" << ::getpid() << "_" << rd();
-    fs::path scratch = oss.str();
+    oss << "recmeet_atomic_mode_" << ::getpid() << "_" << rd();
+    fs::path scratch = recmeet::test::tmp_path(oss.str());
     fs::create_directories(scratch);
     fs::path file = scratch / "secret.json";
 
