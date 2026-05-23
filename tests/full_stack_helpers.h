@@ -35,14 +35,20 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <sys/types.h>
+
 #include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <random>
+#include <sstream>
 #include <string>
 #include <string_view>
 #include <thread>
+#include <vector>
 
 namespace recmeet::full_stack {
 
@@ -568,5 +574,232 @@ inline void write_minimal_test_config(const fs::path& xdg_config_dir,
             << "  enabled: false\n";
     }
 }
+
+// ---------------------------------------------------------------------------
+// BackgroundProc — fork+exec'd auxiliary child process with SIGTERM-on-dtor.
+//
+// Same RAII shape as SpawnedDaemon / SpawnedTray, but stripped to the
+// minimum needed to drive a short-lived helper executable (in this file's
+// usage: `paplay` or `pw-cat` feeding a WAV file into a null-sink). The
+// helper has no readiness contract — the test's PipeWireCapture callback
+// is the readiness oracle (first chunk received = playback is producing
+// frames), so the ctor here just fires the exec and returns.
+//
+// Stdout + stderr go to /dev/null by default. Set RECMEET_FULL_STACK_PROC_STDERR=1
+// in the environment to keep the child's stderr on the test runner's TTY
+// for debugging a stuck paplay / pw-cat call.
+//
+// argv layout: argv[0] is the executable path (passed to execvp so a bare
+// name like "paplay" gets PATH-resolved, but an absolute path also works).
+// argv[1..] are forwarded as-is.
+//
+// Lifetime: dtor SIGTERMs, polls waitpid for 3s, escalates to SIGKILL.
+// The 3s budget is shorter than SpawnedDaemon's 5s because paplay/pw-cat
+// have no postprocess subprocesses to flush — they're pure audio pipes.
+struct BackgroundProc {
+    // Forking ctor. argv must be non-empty (argv[0] = executable path);
+    // argv[1..] are the program's arguments. The child's argv is built
+    // from argv with a nullptr terminator appended for execvp.
+    explicit BackgroundProc(const std::vector<std::string>& argv) {
+        REQUIRE_FALSE(argv.empty());
+
+        pid_ = fork();
+        REQUIRE(pid_ >= 0);
+
+        if (pid_ == 0) {
+            // Child: redirect stdout to /dev/null unconditionally (these
+            // helpers emit no useful stdout) and stderr to /dev/null
+            // unless the operator opted in via env var.
+            int devnull = ::open("/dev/null", O_WRONLY);
+            if (devnull >= 0) {
+                ::dup2(devnull, STDOUT_FILENO);
+                const char* keep_stderr =
+                    std::getenv("RECMEET_FULL_STACK_PROC_STDERR");
+                if (!keep_stderr || keep_stderr[0] == '\0') {
+                    ::dup2(devnull, STDERR_FILENO);
+                }
+                ::close(devnull);
+            }
+            // Build a C-style argv from the std::string vector. The
+            // pointers are owned by the strings in this stack-frame; since
+            // execvp replaces the process image on success, they don't
+            // need to outlive the call. On exec failure we _exit before
+            // returning to any caller.
+            std::vector<char*> c_argv;
+            c_argv.reserve(argv.size() + 1);
+            for (const auto& s : argv) {
+                c_argv.push_back(const_cast<char*>(s.c_str()));
+            }
+            c_argv.push_back(nullptr);
+            ::execvp(c_argv[0], c_argv.data());
+            // exec failed (typically ENOENT for a missing helper); bail
+            // out without running atexit handlers.
+            _exit(127);
+        }
+    }
+
+    ~BackgroundProc() {
+        if (pid_ <= 0) return;
+        ::kill(pid_, SIGTERM);
+        auto deadline = std::chrono::steady_clock::now() + 3s;
+        while (std::chrono::steady_clock::now() < deadline) {
+            int status = 0;
+            pid_t r = ::waitpid(pid_, &status, WNOHANG);
+            if (r == pid_) return;
+            std::this_thread::sleep_for(50ms);
+        }
+        // Stuck — escalate.
+        ::kill(pid_, SIGKILL);
+        int status = 0;
+        ::waitpid(pid_, &status, 0);
+    }
+
+    BackgroundProc(const BackgroundProc&) = delete;
+    BackgroundProc& operator=(const BackgroundProc&) = delete;
+
+    pid_t pid() const noexcept { return pid_; }
+
+private:
+    pid_t pid_ = -1;
+};
+
+// ---------------------------------------------------------------------------
+// NullSink — load a PipeWire/PulseAudio module-null-sink for the lifetime
+// of this object, exposing the resulting sink name + its `.monitor` source.
+//
+// Why pactl is preferred over pw-cli:
+//   * `pactl load-module module-null-sink ...` prints the resulting
+//     module-id (a single line on stdout) which we capture for an
+//     unambiguous `pactl unload-module <id>` in the dtor. That handoff
+//     guarantees we clean up exactly the module we loaded.
+//   * `pw-cli load-module libpipewire-module-null-sink ...` returns
+//     pw-cli's interactive prompt and a heterogeneous "added/removed"
+//     log line that varies across pipewire versions; the cleanest
+//     unload path is `pw-cli destroy-module <name>` (by name, not by
+//     id), which is best-effort but fine for the fallback case.
+//   * pactl exists on any host with pipewire-pulse (the operator's
+//     Arch+Sway setup) or full PulseAudio. pw-cli is the pure-PipeWire
+//     fallback for hosts that don't ship the PA compatibility shims.
+//
+// Unique sink name: `<prefix>_<pid>_<ts_ns>_<rand4>` — pid handles
+// concurrent test-process invocations, nanosecond timestamp covers
+// rapid back-to-back ctor calls in the same test binary, and the
+// 4-hex-digit random suffix is belt-and-braces against extremely
+// rare collisions if a stale module from a prior crashed run shares
+// the same pid/ts.
+//
+// Lifetime:
+//   ctor — composes the unique sink name, tries pactl first (captures
+//          module id via popen on the load-module command), falls
+//          back to pw-cli on non-zero exit. Issues a Catch2 FAIL if
+//          BOTH backends fail (the calling test's SKIP gate is
+//          expected to have already filtered out hosts with neither
+//          tool available; reaching the ctor and failing to load is a
+//          real environment fault, not a tool-presence gap).
+//   dtor — pactl unload-module <id> (preferred) or pw-cli
+//          destroy-module <name> (fallback). Best-effort; ignores
+//          non-zero exit codes — the dtor must not throw.
+struct NullSink {
+    // Compose-and-load ctor. `prefix` is the static portion of the sink
+    // name; the dynamic suffix (pid + ns timestamp + rand4) ensures
+    // uniqueness across runs and processes. Typical prefix:
+    // "recmeet_test_live".
+    explicit NullSink(const std::string& prefix) {
+        // Compose a unique sink name. We do all formatting in std::ostringstream
+        // to keep the body free of stdio printf-format mismatches.
+        auto now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                          std::chrono::steady_clock::now().time_since_epoch())
+                          .count();
+        std::random_device rd;
+        std::uniform_int_distribution<unsigned> dist(0, 0xFFFF);
+        std::ostringstream nm;
+        nm << prefix << "_" << ::getpid() << "_" << now_ns << "_";
+        nm << std::hex << dist(rd);
+        name_ = nm.str();
+
+        // Try pactl first — preferred for the module-id handoff.
+        std::string pactl_cmd =
+            "pactl load-module module-null-sink "
+            "sink_name=" + name_ +
+            " sink_properties=device.description=" + name_ +
+            " 2>/dev/null";
+        FILE* pipe = ::popen(pactl_cmd.c_str(), "r");
+        if (pipe) {
+            std::string out;
+            char buf[128];
+            while (std::fgets(buf, sizeof(buf), pipe)) out += buf;
+            int rc = ::pclose(pipe);
+            // Trim trailing whitespace.
+            while (!out.empty() &&
+                   (out.back() == '\n' || out.back() == '\r' ||
+                    out.back() == ' '  || out.back() == '\t')) {
+                out.pop_back();
+            }
+            if (rc == 0 && !out.empty()) {
+                // Validate the module id is a positive integer — pactl prints
+                // the module index as a single decimal line on success.
+                bool digits_only = true;
+                for (char c : out) {
+                    if (c < '0' || c > '9') { digits_only = false; break; }
+                }
+                if (digits_only) {
+                    module_id_ = out;
+                    backend_ = Backend::PaCtl;
+                    return;
+                }
+            }
+        }
+
+        // Fallback: pw-cli. No module-id handoff; we'll unload by name.
+        std::string pw_cmd =
+            "pw-cli load-module libpipewire-module-null-sink "
+            "media.class=Audio/Sink sink_name=" + name_ +
+            " 2>/dev/null >/dev/null";
+        int rc = std::system(pw_cmd.c_str());
+        if (rc == 0) {
+            backend_ = Backend::PwCli;
+            return;
+        }
+
+        FAIL("NullSink: failed to load module-null-sink via both pactl "
+             "and pw-cli (sink_name=" << name_ << "). "
+             "Confirm a PipeWire or PulseAudio server is reachable.");
+    }
+
+    ~NullSink() {
+        if (backend_ == Backend::PaCtl && !module_id_.empty()) {
+            std::string cmd = "pactl unload-module " + module_id_
+                            + " >/dev/null 2>&1";
+            // Best-effort. We don't FAIL on a nonzero exit — the test
+            // may already be in teardown and a noisy dtor would just
+            // muddy the runner output.
+            (void)std::system(cmd.c_str());
+        } else if (backend_ == Backend::PwCli && !name_.empty()) {
+            std::string cmd = "pw-cli destroy-module " + name_
+                            + " >/dev/null 2>&1";
+            (void)std::system(cmd.c_str());
+        }
+    }
+
+    NullSink(const NullSink&) = delete;
+    NullSink& operator=(const NullSink&) = delete;
+
+    // The composed sink name (`<prefix>_<pid>_<ts_ns>_<rand4>`). Use this
+    // as the `--device=<sink>` argument to paplay or `--target=<sink>`
+    // to pw-cat; playback writes INTO the sink.
+    const std::string& name() const noexcept { return name_; }
+
+    // The PA-convention name of the .monitor source attached to a
+    // null-sink. PipeWire mirrors the convention via the pipewire-pulse
+    // shim. Pass this to PipeWireCapture; it appears as a regular source
+    // (no STREAM_CAPTURE_SINK property required — `capture_sink=false`).
+    std::string monitor_source_name() const { return name_ + ".monitor"; }
+
+private:
+    enum class Backend { None, PaCtl, PwCli };
+    std::string name_;
+    std::string module_id_;     // pactl-only; empty when Backend::PwCli
+    Backend backend_ = Backend::None;
+};
 
 } // namespace recmeet::full_stack
