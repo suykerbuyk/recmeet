@@ -572,6 +572,16 @@ if(RECMEET_BUILD_TESTS)
         tests/test_ndjson_parse.cpp
         tests/test_full_stack.cpp
         tests/test_full_stack_captions.cpp
+        # Phase 4 step 2 — captions real-time-paced wire-pump
+        # discriminator. Drives process.stream + process.stream.commit
+        # against a SpawnedDaemon over Unix, feeds the debate fixture at
+        # 100ms chunks / 100ms cadence for 10 minutes, and counts
+        # caption.degraded / caption.final events. INFO-logs the
+        # numbers so the operator can decide whether the 60-min
+        # synthetic test's degraded count is a test-shape artifact or
+        # a real producer-side bug. Tag [full-stack][captions][paced]
+        # to stay distinct from the 60-min synthetic-feed baseline.
+        tests/test_full_stack_captions_paced.cpp
         tests/test_full_stack_speaker_id.cpp
         # Phase 3 (test-and-verification-hardening) Subagent 2 —
         # [full-stack][webui] real-daemon HTTP write-path coverage. Drives
