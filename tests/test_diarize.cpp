@@ -5,6 +5,7 @@
 #include <catch2/matchers/catch_matchers_string.hpp>
 #include "diarize.h"
 #include "util.h"
+#include "test_tmpdir.h"
 
 #include <cmath>
 #include <cstdio>
@@ -1235,8 +1236,7 @@ TEST_CASE("dump_centroids_json: empty path is a no-op",
 
 TEST_CASE("dump_centroids_json: writes file with expected JSON keys",
           "[diarize][dump-centroids]") {
-    auto tmp = std::filesystem::temp_directory_path()
-             / "recmeet_dump_centroids_test.json";
+    auto tmp = recmeet::test::tmp_path("recmeet_dump_centroids_test.json");
     std::filesystem::remove(tmp);
 
     // 3 globals in 4-dim space; first two have cosine sim ≈ 0.5, third is
@@ -1292,7 +1292,8 @@ TEST_CASE("dump_centroids_json: writes file with expected JSON keys",
 
 TEST_CASE("dump_centroids_json: meeting_timestamp suffix prevents collision (M-1)",
           "[diarize][dump-centroids]") {
-    auto tmp_dir = std::filesystem::temp_directory_path();
+    auto tmp_dir = recmeet::test::tmp_path("recmeet_dump_suffix_dir");
+    std::filesystem::create_directories(tmp_dir);
     auto requested = tmp_dir / "recmeet_dump_suffix.json";
     auto expected  = tmp_dir / "recmeet_dump_suffix_2026-05-18_09-36.json";
     std::filesystem::remove(requested);
@@ -1313,8 +1314,7 @@ TEST_CASE("dump_centroids_json: meeting_timestamp suffix prevents collision (M-1
 
 TEST_CASE("dump_centroids_json: empty centroids still produces valid skeleton",
           "[diarize][dump-centroids]") {
-    auto tmp = std::filesystem::temp_directory_path()
-             / "recmeet_dump_empty.json";
+    auto tmp = recmeet::test::tmp_path("recmeet_dump_empty.json");
     std::filesystem::remove(tmp);
 
     dump_centroids_json(tmp.string(), "", {}, {}, {}, "stitch_chunks");
@@ -1343,8 +1343,7 @@ TEST_CASE("stitch_chunks: dump path emits centroid JSON with compaction IDs",
         make_extents(30.0, 60.0, 30.0, 60.0),
     };
 
-    auto tmp = std::filesystem::temp_directory_path()
-             / "recmeet_stitch_dump.json";
+    auto tmp = recmeet::test::tmp_path("recmeet_stitch_dump.json");
     std::filesystem::remove(tmp);
 
     DiarizeChunkConfig cfg;
