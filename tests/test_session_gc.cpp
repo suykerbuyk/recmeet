@@ -25,6 +25,7 @@
 #include "job_queue.h"
 #include "session_manager.h"
 #include "streaming_session.h"
+#include "test_tmpdir.h"
 #include "upload_session.h"
 
 #include <atomic>
@@ -150,7 +151,7 @@ test_teardown_orphan_jobs(JobQueue& jobs,
 }
 
 fs::path test_dir(const std::string& tag) {
-    fs::path d = fs::temp_directory_path() / ("recmeet_c13_gc_" + tag);
+    fs::path d = recmeet::test::tmp_path("recmeet_c13_gc_" + tag);
     std::error_code ec; fs::remove_all(d, ec);
     fs::create_directories(d);
     return d;
