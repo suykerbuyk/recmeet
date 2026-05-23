@@ -43,6 +43,7 @@
 #include "ipc_server.h"
 #include "job_queue.h"
 #include "streaming_session.h"
+#include "test_tmpdir.h"
 #include "upload_session.h"
 #include "util.h"
 
@@ -169,7 +170,7 @@ std::string make_pcm(size_t n_samples, int16_t start = 0) {
 
 // A unique temp dir for a test's streaming WAVs.
 fs::path test_temp_dir(const std::string& tag) {
-    fs::path d = fs::temp_directory_path() / ("recmeet_c10b_test_" + tag);
+    fs::path d = recmeet::test::tmp_path("recmeet_c10b_test_" + tag);
     std::error_code ec;
     fs::remove_all(d, ec);
     fs::create_directories(d);
