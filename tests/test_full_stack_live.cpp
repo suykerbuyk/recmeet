@@ -70,6 +70,7 @@
 #include "json_util.h"
 #include "model_manager.h"
 #include "test_helpers.h"
+#include "test_tmpdir.h"
 
 #include <unistd.h>
 
@@ -331,9 +332,7 @@ TEST_CASE("V2 full-stack live: PipeWire null-sink → process.submit → daemon 
     // 1. Per-test workdir layout — same structure as the speaker-id /
     //    webui tests (config + meetings under a pid-suffixed tempdir).
     // --------------------------------------------------------------------
-    fs::path workdir = fs::temp_directory_path()
-                     / ("recmeet_full_stack_live_"
-                        + std::to_string(::getpid()));
+    fs::path workdir = recmeet::test::tmp_path("recmeet_full_stack_live");
     fs::remove_all(workdir);
     fs::create_directories(workdir);
 
