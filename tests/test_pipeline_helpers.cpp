@@ -5,13 +5,14 @@
 #include "pipeline.h"
 #include "audio_file.h"
 #include "model_manager.h"
+#include "test_tmpdir.h"
 
 #include <fstream>
 
 using namespace recmeet;
 
 static fs::path tmp_dir() {
-    fs::path dir = fs::temp_directory_path() / "recmeet_test_pipeline";
+    fs::path dir = recmeet::test::tmp_path("recmeet_test_pipeline");
     fs::create_directories(dir);
     return dir;
 }
