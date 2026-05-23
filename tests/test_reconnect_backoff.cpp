@@ -48,6 +48,7 @@
 #include "reconnect_backoff.h"
 #include "resume_token_store.h"
 #include "session_manager.h"
+#include "test_tmpdir.h"
 #include "util.h"
 
 #include <atomic>
@@ -84,7 +85,8 @@ struct ScopedAuthToken {
 fs::path make_scratch_d3() {
     std::random_device rd;
     std::ostringstream oss;
-    oss << "/tmp/recmeet_d3_" << ::getpid() << "_" << rd();
+    oss << recmeet::test::tmp_path("recmeet_d3").string()
+        << "_" << ::getpid() << "_" << rd();
     fs::path p = oss.str();
     std::error_code ec;
     fs::create_directories(p, ec);
@@ -665,7 +667,8 @@ TEST_CASE("D.3: Unix-socket clients do not exercise the reconnect path "
     CHECK_FALSE(unix_client.is_remote());
 
     // Explicit Unix path — same predicate result.
-    IpcClient unix_explicit("/tmp/recmeet_d3_unix_test.sock");
+    IpcClient unix_explicit(
+        recmeet::test::tmp_path("recmeet_d3_unix_test.sock").string());
     CHECK_FALSE(unix_explicit.is_remote());
 
     // TCP for contrast — D.3's reconnect-with-jitter exists for this
