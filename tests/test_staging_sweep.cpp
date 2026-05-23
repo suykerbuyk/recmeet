@@ -38,6 +38,7 @@
 
 #include "reconnect_backoff.h"
 #include "staging_sweep.h"
+#include "test_tmpdir.h"
 #include "util.h"
 
 #include <sys/stat.h>
@@ -60,8 +61,8 @@ namespace {
 fs::path make_scratch() {
     std::random_device rd;
     std::ostringstream oss;
-    oss << "/tmp/recmeet_d6_sweep_" << ::getpid() << "_" << rd();
-    fs::path p = oss.str();
+    oss << "recmeet_d6_sweep_" << ::getpid() << "_" << rd();
+    fs::path p = recmeet::test::tmp_path(oss.str());
     std::error_code ec;
     fs::create_directories(p, ec);
     REQUIRE_FALSE(ec);
