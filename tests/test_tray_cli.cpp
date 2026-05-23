@@ -51,6 +51,8 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include "test_tmpdir.h"
+
 #ifndef RECMEET_BUILD_DIR_DEFAULT
 #define RECMEET_BUILD_DIR_DEFAULT "./build"
 #endif
@@ -90,7 +92,16 @@ constexpr int kKilledExitMarker = -1;
 
 SpawnResult spawn_tray(std::initializer_list<const char*> argv_args,
                        int wait_ms,
-                       const char* daemon_addr = "/tmp/recmeet_test_cli_no_daemon.sock") {
+                       const char* daemon_addr = nullptr) {
+    // Default to a per-process /tmp/recmeet/<pid>_<ms>/ socket path so the
+    // tray under test addresses a non-existent daemon socket isolated from
+    // the host. Caller may override with an explicit path.
+    std::string default_daemon_addr;
+    if (daemon_addr == nullptr) {
+        default_daemon_addr =
+            recmeet::test::tmp_path("recmeet_test_cli_no_daemon.sock").string();
+        daemon_addr = default_daemon_addr.c_str();
+    }
     SpawnResult r;
     std::string tray = tray_path();
 
