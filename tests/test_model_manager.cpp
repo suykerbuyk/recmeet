@@ -3,6 +3,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 #include "model_manager.h"
+#include "test_tmpdir.h"
 
 #include <fstream>
 
@@ -110,7 +111,7 @@ TEST_CASE("is_whisper_model_cached: throws for unknown model name", "[model_mana
 
 #if RECMEET_USE_LLAMA
 TEST_CASE("ensure_llama_model: returns path for existing file", "[model_manager]") {
-    auto dir = fs::temp_directory_path() / "recmeet_test_llama";
+    auto dir = recmeet::test::tmp_path("recmeet_test_llama");
     fs::create_directories(dir);
     fs::path fake_model = dir / "test.gguf";
     {
