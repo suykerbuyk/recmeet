@@ -144,6 +144,66 @@ spawns its `recmeet-daemon` (and sometimes `recmeet-tray`) child with
 meeting notes, captions VTT, journals, IPC sockets — land under the
 parent test's per-process root without any separate env propagation.
 
+### Test progress reporting
+
+`recmeet_tests` registers a Catch2 event listener (`ProgressListener`,
+`tests/test_progress_listener.cpp`) that announces per-test start/end and
+pulses a periodic heartbeat thread between them so long-running tests are
+audibly alive on stderr. Default behavior is quiet for short unit tests
+and verbose for long-running tests via a tag-aware auto-enable; env vars
+override globally.
+
+**Tag-aware auto-enable.** Any test carrying one of these tags gets
+per-case announce + 30-second heartbeat without operator ceremony:
+`[benchmark]`, `[full-stack]`, `[slow]`, `[stress]`, `[verylong]`. Short
+unit tests stay silent unless force-enabled via env. The list is closed —
+update `kLongRunningTags` in `tests/test_progress_listener.cpp` to add
+new long-running tags.
+
+**Env vars.**
+
+- **`RECMEET_TEST_ANNOUNCE=1`** — force-enable `[test] starting "…"` /
+  `[test] passed in Xs — "…"` for every test, including short-tag ones.
+  Default off; tag-auto-enabled for long-running tests.
+- **`RECMEET_TEST_HEARTBEAT=1`** — force-enable the per-case heartbeat
+  thread that emits `[heartbeat] T+Ns rss=NN MiB current="…"` lines on
+  the interval. Default off; tag-auto-enabled for long-running tests.
+- **`RECMEET_TEST_HEARTBEAT_SECS=N`** — heartbeat interval in seconds
+  (1 ≤ N < 3600; defaults to 30).
+- **`RECMEET_TEST_PHASE_ECHO=1`** — opt-in for `[phase] X (T+Ns)` lines
+  emitted by `recmeet::test::PhaseEcho` (`tests/test_progress_phase.h`,
+  landed in Phase 2). Pipeline-driven tests pass this as their `on_phase`
+  callback; benchmark cases wrap `t0`/`t1` blocks manually. Default off.
+
+**Make target defaults.** `make benchmark` and `make full-stack` set
+`RECMEET_TEST_PHASE_ECHO=1` on the underlying `recmeet_tests` invocation
+so the full operator timeline (heartbeat + phase echo) is on by default
+when running those targets. Heartbeat + announce are tag-driven, so no
+env-set is needed for those on either target. `make test` is unchanged —
+short-tag unit tests stay silent by default.
+
+```bash
+# Direct invocation of a long-running tag set gets visibility for free
+./build/recmeet_tests "[full-stack]"
+
+# Force-enable announce for the entire unit suite (~1,850 extra lines)
+RECMEET_TEST_ANNOUNCE=1 ./build/recmeet_tests
+
+# Tighter heartbeat cadence for a long benchmark run
+RECMEET_TEST_HEARTBEAT_SECS=5 ./build/recmeet_tests "[benchmark]"
+
+# Phase echo as opt-in even outside the Make targets
+RECMEET_TEST_PHASE_ECHO=1 ./build/recmeet_tests "[full-stack][benchmark]"
+```
+
+`ProgressListener` coexists with `TmpRootCleanup` (the listener that
+cleans `<temp_dir>/recmeet/<pid>_<epoch_ms>/` on a successful
+`testRunEnded`) — they hook disjoint events (`testCaseStarting` /
+`testCaseEnded` vs. `testRunEnded`). RSS reads reuse the existing
+`recmeet::read_self_rss_kb()` from `src/util.h` (Linux-only via
+`/proc/self/statm`; returns 0 on failure, in which case the heartbeat
+prints `rss=?`).
+
 ### Test ↔ daemon integration seam
 
 Phase 2b consolidated the per-test "stub the IPC verb" pattern onto a

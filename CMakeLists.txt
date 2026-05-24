@@ -694,6 +694,15 @@ if(RECMEET_BUILD_TESTS)
         # successful testRunEnded, and the helper's own unit tests.
         tests/test_tmpdir_listener.cpp
         tests/test_tmpdir_helper.cpp
+        # test-runner-progress-heartbeat-v2-port Phase 1 — Catch2
+        # EventListenerBase subclass that announces testCaseStarting /
+        # testCaseEnded and pulses a per-case heartbeat thread between
+        # them. Tag-aware auto-enable for [benchmark]/[full-stack]/[slow]/
+        # [stress]/[verylong]; otherwise env-gated via
+        # RECMEET_TEST_ANNOUNCE / RECMEET_TEST_HEARTBEAT /
+        # RECMEET_TEST_HEARTBEAT_SECS. Event-disjoint with TmpRootCleanup
+        # (this hooks per-case; that hooks testRunEnded only).
+        tests/test_progress_listener.cpp
         # Phase 2b — production IPC verb registrations. Same TU the daemon
         # binary links via `recmeet-daemon`; pulling it into recmeet_tests
         # lets the new `DaemonTestHarness` exercise the production code

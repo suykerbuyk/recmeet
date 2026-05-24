@@ -144,13 +144,13 @@ integration-e2e: ensure-submodules
 benchmark: ensure-submodules
 	cmake -B $(BUILD_DIR) -G Ninja $(CMAKE_OPTS) -DRECMEET_BUILD_TESTS=ON
 	ninja -C $(BUILD_DIR)
-	./$(BUILD_DIR)/recmeet_tests "[benchmark]"
+	RECMEET_TEST_PHASE_ECHO=1 ./$(BUILD_DIR)/recmeet_tests "[benchmark]"
 
 full-stack: ensure-submodules
 	cmake -B $(BUILD_DIR) -G Ninja $(CMAKE_OPTS) -DRECMEET_BUILD_TESTS=ON
 	ninja -C $(BUILD_DIR)
 	./$(BUILD_DIR)/recmeet --download-models --model base
-	./$(BUILD_DIR)/recmeet_tests "[full-stack]"
+	RECMEET_TEST_PHASE_ECHO=1 ./$(BUILD_DIR)/recmeet_tests "[full-stack]"
 
 # Phase E.6 smoke gate — spawns recmeet-daemon + recmeet-tray (headless,
 # eager listener) in an isolated sandbox and exercises the embedded
