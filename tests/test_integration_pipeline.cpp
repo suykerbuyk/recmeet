@@ -49,6 +49,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 #include "test_helpers.h"
+#include "test_progress_phase.h"
 #include "pipeline.h"
 #include "speaker_id.h"
 #include "model_manager.h"
@@ -204,7 +205,8 @@ TEST_CASE("Chunked pipeline: long-audio reprocess under memory cap",
     bool threw = false;
     std::string err_msg;
     try {
-        result = run_postprocessing(cfg, input);
+        recmeet::test::PhaseEcho echo;
+        result = run_postprocessing(cfg, input, echo);
     } catch (const std::exception& e) {
         threw = true;
         err_msg = e.what();

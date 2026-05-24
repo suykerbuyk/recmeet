@@ -3,6 +3,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 #include "test_helpers.h"
+#include "test_progress_phase.h"
 #include "test_tmpdir.h"
 #include "cli.h"
 #include "pipeline.h"
@@ -104,7 +105,9 @@ DebateResult run_debate_pipeline(bool use_local_llm, const fs::path& llm_model_p
     // Phase timing
     std::map<std::string, std::chrono::steady_clock::time_point> phase_starts;
     std::map<std::string, double> phase_durations;
-    auto on_phase = [&](const std::string& phase) {
+    recmeet::test::PhaseEcho echo;
+    auto on_phase = [&, echo](const std::string& phase) mutable {
+        echo(phase);
         auto now = std::chrono::steady_clock::now();
         // Close previous phase
         if (!phase_starts.empty()) {
@@ -414,7 +417,8 @@ TEST_CASE("Reprocess with context.json fallback", "[full-stack]") {
     input.out_dir = out_dir;
     input.audio_path = audio_path;
 
-    auto result = run_postprocessing(cfg, input);
+    recmeet::test::PhaseEcho echo;
+    auto result = run_postprocessing(cfg, input, echo);
 
     // Read note
     REQUIRE(fs::exists(result.note_path));
@@ -480,7 +484,8 @@ TEST_CASE("Reprocess with per-instance context_<ts>.json fallback", "[full-stack
     input.audio_path = audio_path;
     input.timestamp = "2020-09-29_21-00";
 
-    auto result = run_postprocessing(cfg, input);
+    recmeet::test::PhaseEcho echo;
+    auto result = run_postprocessing(cfg, input, echo);
 
     REQUIRE(fs::exists(result.note_path));
     std::ifstream f(result.note_path);
@@ -581,9 +586,12 @@ TEST_CASE("Reprocess-batch: skip-existing + reprocess-missing end-to-end",
     cli.cfg.vad = true;
     cli.cfg.no_summary = true;
 
+    recmeet::test::PhaseEcho echo;
+    echo("reprocess-batch start");
     auto t0 = std::chrono::steady_clock::now();
     int rc = run_reprocess_batch(cli);
     auto t1 = std::chrono::steady_clock::now();
+    echo("reprocess-batch complete");
     double elapsed = std::chrono::duration<double>(t1 - t0).count();
     fprintf(stderr, "\n[full-stack][reprocess-batch] run_reprocess_batch rc=%d in %.1fs\n",
             rc, elapsed);

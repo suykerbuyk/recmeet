@@ -3,6 +3,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 #include "test_helpers.h"
+#include "test_progress_phase.h"
 #include "diarize.h"
 #include "speaker_id.h"
 #include "transcribe.h"
@@ -55,9 +56,12 @@ TEST_CASE("Transcribe debate audio with whisper base", "[benchmark]") {
     // Transcribe
     fs::path model_path = ensure_whisper_model("base");
 
+    recmeet::test::PhaseEcho echo;
+    echo("transcribing");
     auto t0 = std::chrono::steady_clock::now();
     auto result = transcribe(model_path, audio_path, "en");
     auto t1 = std::chrono::steady_clock::now();
+    echo("transcribing done");
     double secs = std::chrono::duration<double>(t1 - t0).count();
 
     // Collect hypothesis text from segments (raw text, no timestamps)
@@ -116,9 +120,12 @@ TEST_CASE("Summarize reference transcript with Grok API", "[benchmark]") {
     if (const char* m = std::getenv("RECMEET_BENCH_MODEL"))
         model = m;
 
+    recmeet::test::PhaseEcho echo;
+    echo("summarizing (API)");
     auto t0 = std::chrono::steady_clock::now();
     std::string summary = summarize_http(transcript, api_url, api_key, model);
     auto t1 = std::chrono::steady_clock::now();
+    echo("summarizing (API) done");
     double secs = std::chrono::duration<double>(t1 - t0).count();
 
     fprintf(stderr, "\n[benchmark] Grok API summarization (model: %s):\n", model.c_str());
@@ -163,9 +170,12 @@ TEST_CASE("Diarize debate audio with sherpa-onnx", "[benchmark]") {
     if (!is_sherpa_model_cached())
         SKIP("Sherpa diarization models not cached");
 
+    recmeet::test::PhaseEcho echo;
+    echo("diarizing");
     auto t0 = std::chrono::steady_clock::now();
     auto result = diarize(audio_path, 3);  // Biden, Trump, moderator
     auto t1 = std::chrono::steady_clock::now();
+    echo("diarizing done");
     double secs = std::chrono::duration<double>(t1 - t0).count();
 
     fprintf(stderr, "\n[benchmark] Sherpa-onnx speaker diarization:\n");
@@ -202,9 +212,12 @@ TEST_CASE("Diarize debate audio with buffer overload", "[benchmark]") {
     auto samples = read_wav_float(audio_path);
     REQUIRE(!samples.empty());
 
+    recmeet::test::PhaseEcho echo;
+    echo("diarizing (buffer)");
     auto t0 = std::chrono::steady_clock::now();
     auto result = diarize(samples.data(), samples.size(), 3);
     auto t1 = std::chrono::steady_clock::now();
+    echo("diarizing (buffer) done");
     double secs = std::chrono::duration<double>(t1 - t0).count();
 
     // Also run file-based for comparison
@@ -735,10 +748,14 @@ TEST_CASE("VAD+Whisper vs plain Whisper transcription", "[benchmark]") {
     fs::path model_path = ensure_whisper_model("base");
     WhisperModel model(model_path);
 
+    recmeet::test::PhaseEcho echo;
+
     // --- Plain whisper (no VAD) ---
+    echo("transcribing (plain)");
     auto t0 = std::chrono::steady_clock::now();
     auto plain_result = transcribe(model, samples.data(), samples.size(), 0.0, "en");
     auto t1 = std::chrono::steady_clock::now();
+    echo("transcribing (plain) done");
     double plain_secs = std::chrono::duration<double>(t1 - t0).count();
 
     std::string plain_text;
@@ -748,6 +765,7 @@ TEST_CASE("VAD+Whisper vs plain Whisper transcription", "[benchmark]") {
     double plain_wer = compute_wer(ref_words, plain_words);
 
     // --- VAD + whisper ---
+    echo("transcribing (VAD)");
     auto t2 = std::chrono::steady_clock::now();
     VadConfig vad_cfg;
     auto vad_result = detect_speech(samples, vad_cfg);
@@ -764,6 +782,7 @@ TEST_CASE("VAD+Whisper vs plain Whisper transcription", "[benchmark]") {
             vad_transcript.segments.push_back(std::move(s));
     }
     auto t5 = std::chrono::steady_clock::now();
+    echo("transcribing (VAD) done");
     double vad_transcribe_secs = std::chrono::duration<double>(t5 - t4).count();
 
     std::string vad_text;
@@ -836,9 +855,12 @@ TEST_CASE("Summarize reference transcript with local LLM", "[benchmark]") {
                             std::istreambuf_iterator<char>());
     REQUIRE(!transcript.empty());
 
+    recmeet::test::PhaseEcho echo;
+    echo("summarizing (local)");
     auto t0 = std::chrono::steady_clock::now();
     std::string summary = summarize_local(transcript, llm_model);
     auto t1 = std::chrono::steady_clock::now();
+    echo("summarizing (local) done");
     double secs = std::chrono::duration<double>(t1 - t0).count();
 
     fprintf(stderr, "\n[benchmark] Local LLM summarization:\n");
@@ -898,18 +920,23 @@ TEST_CASE("Full pipeline: whisper transcribe then LLM summarize", "[benchmark]")
     // Phase 1: Transcribe
     fs::path model_path = ensure_whisper_model("base");
 
+    recmeet::test::PhaseEcho echo;
+    echo("transcribing");
     auto t0 = std::chrono::steady_clock::now();
     auto result = transcribe(model_path, audio_path, "en");
     auto t1 = std::chrono::steady_clock::now();
+    echo("transcribing done");
     double transcribe_secs = std::chrono::duration<double>(t1 - t0).count();
 
     std::string transcript_text = result.to_string();
     REQUIRE(!transcript_text.empty());
 
     // Phase 2: Summarize — summarize_local() handles context-window truncation internally
+    echo("summarizing (local)");
     auto t2 = std::chrono::steady_clock::now();
     std::string summary = summarize_local(transcript_text, llm_model);
     auto t3 = std::chrono::steady_clock::now();
+    echo("summarizing (local) done");
     double summarize_secs = std::chrono::duration<double>(t3 - t2).count();
 
     fprintf(stderr, "\n[benchmark] Full pipeline (whisper base + local LLM):\n");

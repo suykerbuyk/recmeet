@@ -175,6 +175,80 @@ Two environment variables tune the behavior:
 | `RECMEET_TEST_ROOT=<path>` | Override the default `/tmp/recmeet/<pid>_<epoch_ms>/` root. Useful for CI that wants test artifacts under a known cleanup location (e.g. a job-scoped scratch dir). |
 | `RECMEET_TEST_KEEP=1` | Preserve the root after a successful run. Useful when debugging a passing test whose intermediate artifacts you want to inspect. Unset (the default) lets the listener clean up on success. |
 
+### Test progress reporting
+
+`recmeet_tests` carries a Catch2 progress listener
+(`tests/test_progress_listener.cpp`) that surfaces per-test announcements and
+a periodic heartbeat, paired with a per-test `PhaseEcho` callable
+(`tests/test_progress_phase.h`) that pipeline-driven cases pass as the
+`on_phase` callback. Together they close the silence gap on long
+`[benchmark]` / `[full-stack]` runs where a single TEST_CASE can spend 30+
+minutes inside one pipeline call. Short-tag unit tests stay quiet by default
+so `make test` output is unchanged.
+
+**Tag-aware auto-enable.** Any test carrying one of these tags auto-enables
+per-test announce **and** heartbeat regardless of env, so a direct invocation
+like `./build/recmeet_tests "[full-stack]"` lights up without operator
+ceremony:
+
+- `[benchmark]`
+- `[full-stack]`
+- `[slow]`
+- `[stress]`
+- `[verylong]`
+
+Operators adding new long-running tags should append them to the
+`kLongRunningTags` table in `tests/test_progress_listener.cpp` so the
+auto-enable list stays in sync with the tag taxonomy. (Phase echo is
+emission-gated separately by `RECMEET_TEST_PHASE_ECHO=1` — there is no
+tag-driven auto-enable for it, by design: only the make targets that
+explicitly want a phase timeline opt in.)
+
+**Environment variables** (global overrides — opt every test in regardless of
+tag):
+
+| Env var | Purpose | Default | Accepted values |
+|---|---|---|---|
+| `RECMEET_TEST_ANNOUNCE` | Force per-test `[test] starting "…"` / `[test] passed in Xs — "…"` on stderr for every TEST_CASE. Opting in adds roughly two stderr lines per case (~1,850 lines across the full unit suite). | off | `1` (on); unset or `0` (off) |
+| `RECMEET_TEST_HEARTBEAT` | Force the per-case heartbeat thread for every TEST_CASE. Heartbeat ticks emit `[heartbeat] T+<elapsed>s rss=<N> MiB current="<test name>"` on stderr (or `rss=?` if the procfs read fails). | off | `1` (on); unset or `0` (off) |
+| `RECMEET_TEST_HEARTBEAT_SECS` | Override the heartbeat interval (seconds). | `30` | integer in `(0, 3600)`; out-of-range values fall back to the default |
+| `RECMEET_TEST_PHASE_ECHO` | Enable the `PhaseEcho` callable; pipeline-driven tests emit `[phase] <name> (T+Ns)` on stderr as the pipeline transitions phases. `make benchmark` and `make full-stack` set this automatically. | off | `1` (on); unset or `0` (off) |
+
+**Make-target defaults.** `make test` runs the short-tag unit suite
+(`~[integration]~[benchmark]~[full-stack]`) and stays silent by default — no
+env is set, no long-running tag matches, so the listener is dormant. `make
+benchmark` and `make full-stack` set `RECMEET_TEST_PHASE_ECHO=1`; the
+`[benchmark]` / `[full-stack]` tags themselves auto-enable announce +
+heartbeat, so each of those targets gets all three signals (announce +
+heartbeat + phase echo) without the operator needing to chain env vars.
+
+**Composability.** Phase echo and heartbeat are designed to interleave into
+an operator-readable timeline of a long pipeline call. A typical excerpt
+from a `make benchmark` debate-run case looks like:
+
+```
+[test] starting "debate end-to-end pipeline [benchmark]"
+[phase] transcribing (T+0s)
+[heartbeat] T+30s rss=1820 MiB current="debate end-to-end pipeline [benchmark]"
+[heartbeat] T+60s rss=2031 MiB current="debate end-to-end pipeline [benchmark]"
+[phase] diarizing (T+72s)
+[heartbeat] T+90s rss=2147 MiB current="debate end-to-end pipeline [benchmark]"
+[phase] embedding (T+118s)
+[phase] summarizing (T+121s)
+[phase] done (T+143s)
+[test] passed in 143s — "debate end-to-end pipeline [benchmark]"
+```
+
+Phase lines show transitions; heartbeat lines show liveness + RSS between
+transitions when a single phase exceeds the heartbeat interval.
+
+**Where lines go.** All listener output (announce, heartbeat, phase echo)
+goes to **stderr**, leaving Catch2's stdout reporter machine-parseable
+(JUnit / SonarQube round-trip cleanly). Pipe stderr to `/dev/null` if you
+want only the reporter's output. Heartbeat and phase lines are pre-formatted
+then emitted with a single `<<`, so concurrent writes from the heartbeat
+thread and the test thread cannot interleave mid-line.
+
 ### Go-tools integration tests
 
 The two Go binaries (`recmeet-mcp`, `recmeet-agent`) ship with an opt-in
