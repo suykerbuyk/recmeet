@@ -46,6 +46,7 @@
 #include "json_util.h"
 #include "model_manager.h"
 #include "test_helpers.h"
+#include "test_progress_phase.h"
 #include "test_tmpdir.h"
 
 #include "audio_file.h"
@@ -334,6 +335,8 @@ TEST_CASE("Captions paced full-stack: real-time wire-pump degraded-events discri
     //    the daemon's wire-boundary guard (daemon_handlers.cpp:391-396);
     //    legacy v1 clients omit it but we set it to be explicit.
     // --------------------------------------------------------------------
+    recmeet::test::PhaseEcho echo;
+    echo("captions start");
     const std::string meeting_id = make_uuid_v4();
     std::string stream_token;
     int64_t     stream_job_id = 0;
@@ -518,6 +521,7 @@ TEST_CASE("Captions paced full-stack: real-time wire-pump degraded-events discri
             client.read_events(/*until_event=*/"", /*timeout_ms=*/200);
         }
     }
+    echo("captions complete");
 
     // --------------------------------------------------------------------
     // 10. Report.

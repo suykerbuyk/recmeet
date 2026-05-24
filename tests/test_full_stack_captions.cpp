@@ -37,6 +37,7 @@
 #include "reprocess_batch.h"
 #include "speaker_id.h"
 #include "test_helpers.h"
+#include "test_progress_phase.h"
 #include "test_tmpdir.h"
 #include "util.h"
 
@@ -326,7 +327,10 @@ TEST_CASE("Captions full-stack: 30-min synthetic, engine wiring",
     auto samples = make_synthetic_tone_int16(30.0);
     REQUIRE(samples.size() == 30u * 60u * 16000u);
 
+    recmeet::test::PhaseEcho echo;
+    echo("captions start");
     auto run = run_captions_on_samples(model_dir, samples, vtt_path);
+    echo("captions complete");
 
     fprintf(stderr, "\n[full-stack][captions] 30-min synthetic: "
             "results=%zu finals=%zu degraded=%zu vtt_cues=%zu vtt_exists=%d\n",
@@ -428,7 +432,10 @@ TEST_CASE("Captions full-stack: 60-min real fixture, caption quality",
     fs::create_directories(out_dir);
     fs::path vtt_path = out_dir / "captions.vtt";
 
+    recmeet::test::PhaseEcho echo;
+    echo("captions start");
     auto run = run_captions_on_samples(model_dir, samples, vtt_path);
+    echo("captions complete");
 
     fprintf(stderr, "\n[full-stack][captions] 60-min real: "
             "results=%zu finals=%zu degraded=%zu vtt_cues=%zu\n",
@@ -508,7 +515,8 @@ TEST_CASE("Captions stress: CPU contention with concurrent reprocess",
     std::atomic<bool> reproc_failed{false};
     std::thread reproc_thread([&]() {
         try {
-            run_postprocessing(rcfg, rinput);
+            recmeet::test::PhaseEcho echo;
+            run_postprocessing(rcfg, rinput, echo);
         } catch (const std::exception& e) {
             reproc_failed.store(true);
             fprintf(stderr, "[stress] reprocess threw: %s\n", e.what());
@@ -604,9 +612,12 @@ TEST_CASE("Captions memory bound: peak RSS overhead ≤ 1 GB",
     // --- ON: run the engine on the same buffer with VTT persistence.
     auto vtt_path = recmeet::test::tmp_path("recmeet_caption_rss_bench.vtt");
     fs::remove(vtt_path);
+    recmeet::test::PhaseEcho echo;
+    echo("captions start");
     auto [on_secs, on_peak_kb] = measure([&]() {
         run_captions_on_samples(model_dir, samples, vtt_path);
     });
+    echo("captions complete");
     fs::remove(vtt_path);
 
     long delta_kb = on_peak_kb - off_peak_kb;
