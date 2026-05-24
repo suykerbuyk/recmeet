@@ -5,6 +5,7 @@
 #include <catch2/matchers/catch_matchers_floating_point.hpp>
 #include <catch2/matchers/catch_matchers_string.hpp>
 #include "audio_file.h"
+#include "test_tmpdir.h"
 
 #include <cmath>
 #include <fstream>
@@ -14,7 +15,7 @@ using namespace recmeet;
 using Catch::Matchers::WithinAbs;
 
 static fs::path tmp_dir() {
-    fs::path dir = fs::temp_directory_path() / "recmeet_test";
+    fs::path dir = recmeet::test::tmp_path("recmeet_test");
     fs::create_directories(dir);
     return dir;
 }
