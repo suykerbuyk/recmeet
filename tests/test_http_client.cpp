@@ -3,6 +3,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 #include "http_client.h"
+#include "test_tmpdir.h"
 #include "util.h"
 
 #include <fstream>
@@ -10,7 +11,7 @@
 using namespace recmeet;
 
 static fs::path tmp_dir() {
-    fs::path dir = fs::temp_directory_path() / "recmeet_test_http";
+    fs::path dir = recmeet::test::tmp_path("recmeet_test_http");
     fs::create_directories(dir);
     return dir;
 }
