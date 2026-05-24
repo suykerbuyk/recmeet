@@ -175,6 +175,41 @@ Two environment variables tune the behavior:
 | `RECMEET_TEST_ROOT=<path>` | Override the default `/tmp/recmeet/<pid>_<epoch_ms>/` root. Useful for CI that wants test artifacts under a known cleanup location (e.g. a job-scoped scratch dir). |
 | `RECMEET_TEST_KEEP=1` | Preserve the root after a successful run. Useful when debugging a passing test whose intermediate artifacts you want to inspect. Unset (the default) lets the listener clean up on success. |
 
+### Test progress reporting
+
+`recmeet_tests` carries a Catch2 progress listener
+(`tests/test_progress_listener.cpp`) that surfaces per-test announcements and
+a periodic heartbeat — closing the silence gap on long `[benchmark]` /
+`[full-stack]` runs where a single TEST_CASE can spend 30+ minutes inside one
+pipeline call. Short-tag unit tests stay quiet by default so `make test`
+output is unchanged.
+
+**Tag-aware auto-enable.** Any test carrying one of these tags auto-enables
+per-test announce + heartbeat regardless of env, so a direct invocation like
+`./build/recmeet_tests "[full-stack]"` lights up without operator ceremony:
+
+- `[benchmark]`
+- `[full-stack]`
+- `[slow]`
+- `[stress]`
+- `[verylong]`
+
+**Environment variables** (global overrides — opt every test in regardless of
+tag):
+
+| Env var | Purpose |
+|---|---|
+| `RECMEET_TEST_ANNOUNCE=1` | Force per-test `[test] starting "…"` / `[test] passed in Xs — "…"` on stderr for every TEST_CASE. Default off; opting in adds roughly two stderr lines per case (~1,850 lines across the full unit suite). |
+| `RECMEET_TEST_HEARTBEAT=1` | Force the per-case heartbeat thread for every TEST_CASE. Default off. Heartbeat ticks emit `[heartbeat] T+<elapsed>s rss=<MiB> current="<test name>"` on stderr. |
+| `RECMEET_TEST_HEARTBEAT_SECS=<n>` | Override the heartbeat interval. Default 30 s; clamped to `(0, 3600)`. |
+| `RECMEET_TEST_PHASE_ECHO=1` | Reserved for the per-test `PhaseEcho` callable wired in via subsequent phases of this task. When set, pipeline-driven tests emit `[phase] <name> (T+Ns)` lines as the pipeline transitions phases. Default off. `make benchmark` and `make full-stack` set this automatically. |
+
+All progress lines go to **stderr**, leaving Catch2's stdout reporter
+machine-parseable (JUnit / SonarQube round-trip cleanly). Pipe stderr to
+`/dev/null` if you want only the reporter's output. Heartbeat lines are
+pre-formatted then emitted with a single `<<`, so concurrent phase / test
+writes from the test thread cannot interleave mid-line.
+
 ### Go-tools integration tests
 
 The two Go binaries (`recmeet-mcp`, `recmeet-agent`) ship with an opt-in
