@@ -246,17 +246,24 @@ public:
         // Phase 2b ext — wire the binary-frame router (also lives in
         // daemon.cpp's main, not in register_daemon_handlers). Mirrors
         // src/daemon.cpp:1987-2023 — routes `0x03` to g_streaming and
-        // `0x01` to g_uploads.
+        // `0x01` to g_uploads. IpcServer::on_binary_frame is single-slot
+        // (src/ipc_server.h:135): the router additionally bumps two
+        // observable atomics so tests can poll progress without
+        // re-installing the callback (which would orphan the routing).
         server_->on_binary_frame(
-            [](const std::string& client_id, FrameType type,
-               const std::string& payload) -> bool {
+            [this](const std::string& client_id, FrameType type,
+                   const std::string& payload) -> bool {
                 if (type == FrameType::StreamAudio) {
+                    stream_audio_bytes_.fetch_add(payload.size(),
+                                                  std::memory_order_relaxed);
                     if (!g_streaming) return false;
                     std::string token = g_streaming->token_for_client(client_id);
                     if (token.empty()) return false;
                     return g_streaming->feed_audio(token, payload);
                 }
                 if (type == FrameType::BinaryUpload) {
+                    binary_upload_bytes_.fetch_add(payload.size(),
+                                                   std::memory_order_relaxed);
                     if (!g_uploads) return false;
                     return g_uploads->feed_chunk(client_id, payload);
                 }
@@ -289,6 +296,19 @@ public:
     const fs::path&    tmp_dir()        const { return tmp_dir_; }
     const fs::path&    meetings_dir()   const { return meetings_dir_; }
     const fs::path&    speaker_db_dir() const { return speaker_db_dir_; }
+
+    // Cumulative bytes the router has received per binary-frame type.
+    // Read-only test introspection — production code does not consult
+    // these. Counters bump BEFORE the route dispatches to g_streaming /
+    // g_uploads, so a non-zero reading does not imply the dispatch
+    // succeeded; pair with the relevant ledger probe (active_count(),
+    // bytes_received_for_token, etc.) when that matters.
+    uint64_t binary_upload_bytes() const {
+        return binary_upload_bytes_.load(std::memory_order_relaxed);
+    }
+    uint64_t stream_audio_bytes() const {
+        return stream_audio_bytes_.load(std::memory_order_relaxed);
+    }
 
     /// Allocate a per-test IpcClient connected to this harness's socket.
     std::unique_ptr<IpcClient> make_client() {
@@ -355,6 +375,11 @@ private:
     bool                 upload_sink_set_ = false;
     fs::path             upload_staging_root_{};
     bool                 upload_staging_root_set_ = false;
+
+    // Per-type byte counters bumped from the binary-frame router. See
+    // binary_upload_bytes() / stream_audio_bytes() accessors.
+    std::atomic<uint64_t> binary_upload_bytes_{0};
+    std::atomic<uint64_t> stream_audio_bytes_{0};
 };
 
 } // namespace test

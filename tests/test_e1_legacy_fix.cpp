@@ -179,30 +179,30 @@ struct StderrCapture {
 struct DaemonHarness {
     recmeet::test::DaemonTestHarness harness;
     std::string addr;
-    std::atomic<int>      process_submit_calls{0};
-    std::atomic<int>      record_start_calls{0};   // tripwire — must stay 0
-    std::atomic<int>      record_stop_calls{0};    // tripwire — must stay 0
-    std::atomic<uint64_t> bytes_received{0};
-    std::atomic<int>      session_init_calls{0};
 
     DaemonHarness() {
-        // Hook the binary-frame sink BEFORE start() so the on_binary_frame
-        // callback is installed when the IpcServer's poll thread spins up.
-        harness.server().on_binary_frame(
-            [this](const std::string& /*client_id*/, FrameType type,
-                   const std::string& payload) {
-                if (type == FrameType::BinaryUpload) {
-                    bytes_received.fetch_add(payload.size());
-                }
-                return true;
-            });
+        // IpcServer::on_binary_frame is single-slot — DaemonTestHarness::start()
+        // installs the production-mirror router (g_uploads/g_streaming) and
+        // any test-side override would orphan it. Read upload progress via
+        // harness.binary_upload_bytes() instead; the router bumps that
+        // atomic alongside the dispatch.
         harness.start();
         addr = harness.socket_path();
         // The production handlers don't expose request counters. We
-        // synthesize the "process.submit was called" + "session.init was
-        // called" signal by snooping the job queue / upload-session
-        // ledgers in the test bodies via g_jobs / g_uploads.
+        // synthesize the "process.submit was called" signal by snooping
+        // the job queue / upload-session ledgers in the test bodies via
+        // g_jobs / g_uploads.
     }
+
+    // Shim for the previous local atomic — delegates to the harness's
+    // router-bumped counter. Returns a const lvalue that exposes load()
+    // so the existing CHECK(daemon.bytes_received.load() > 0) call sites
+    // keep working unchanged.
+    struct BytesReceivedProxy {
+        const recmeet::test::DaemonTestHarness& h;
+        uint64_t load() const { return h.binary_upload_bytes(); }
+    };
+    BytesReceivedProxy bytes_received{harness};
 
     bool process_submit_observed() const {
         // The production handler reserves a Postprocess job and creates
