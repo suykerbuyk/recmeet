@@ -1,8 +1,7 @@
 {
-  "iter_n": 208,
-  "anchor_sha": "960c7da7bb6c1c2220c7be3c698c21eff8870172",
+  "iter_n": 209,
+  "anchor_sha": "e944e55f4135d9eaa6a4a067bf93eb7668fecc5f",
   "active": [
-    "cancel-recording-and-discard",
     "full-stack-captions-60min-regression",
     "sherpa-onnx-1-13-bump",
     "test-and-verification-hardening",
@@ -20,6 +19,7 @@
     "binary-size",
     "breezy-zooming-ritchie",
     "bright-dreaming-scott",
+    "cancel-recording-and-discard",
     "captions-mid-recording-ipc-verb",
     "component-diagrams-html-auto-regen",
     "concurrent-recording",
@@ -100,6 +100,7 @@
     "t1b-and-t1c-pr-plan",
     "tender-sleeping-rocket",
     "thread-count-redundant-validation",
+    "tmp-dir-isolation-full-stack-tests-v2",
     "tray-background-postprocessing",
     "tray-stop-stuck-recording-state",
     "v1-doc-review-and-readme-local-ai-positioning",
