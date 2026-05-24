@@ -151,6 +151,30 @@ ninja -C build && ./build/recmeet_tests "~[integration]"
 
 The `&&` ensures tests only run if the build succeeded.
 
+### Test artifact isolation
+
+`recmeet_tests` writes every test artifact (temp WAVs, scratch configs,
+captured logs, etc.) under a **per-process root** at
+`/tmp/recmeet/<pid>_<epoch_ms>/`, created lazily on the first call to
+`recmeet::test::tmp_path()` in `tests/test_tmpdir.h`. The PID + epoch suffix
+means two concurrent `make test` or `make full-stack` invocations from
+different worktrees no longer collide on `/tmp/foo.wav`-style hardcoded
+paths — each run gets its own sandbox.
+
+A Catch2 listener (`tests/test_tmpdir_listener.cpp`) fires on
+`testRunEnded` and removes the root only when every assertion and TEST_CASE
+passed. Failed runs leave the directory in place for inspection. Stale
+roots from crashed runs are bounded to at most one per invocation and are
+self-evicted by the OS-level `/tmp` purge (`systemd-tmpfiles`, etc.) — no
+manual cleanup needed.
+
+Two environment variables tune the behavior:
+
+| Env var | Purpose |
+|---|---|
+| `RECMEET_TEST_ROOT=<path>` | Override the default `/tmp/recmeet/<pid>_<epoch_ms>/` root. Useful for CI that wants test artifacts under a known cleanup location (e.g. a job-scoped scratch dir). |
+| `RECMEET_TEST_KEEP=1` | Preserve the root after a successful run. Useful when debugging a passing test whose intermediate artifacts you want to inspect. Unset (the default) lets the listener clean up on success. |
+
 ### Go-tools integration tests
 
 The two Go binaries (`recmeet-mcp`, `recmeet-agent`) ship with an opt-in

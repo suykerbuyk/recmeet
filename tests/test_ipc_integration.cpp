@@ -8,6 +8,7 @@
 #include "pipeline.h"
 #include "speaker_id.h"
 #include "util.h"
+#include "test_tmpdir.h"
 
 #include <atomic>
 #include <chrono>
@@ -34,7 +35,7 @@ using namespace recmeet;
 
 namespace {
 
-const char* INTEGRATION_SOCK = "/tmp/recmeet_test_integration.sock";
+const std::string INTEGRATION_SOCK = recmeet::test::tmp_path("recmeet_test_integration.sock").string();
 
 // Legacy enum for backward-compat in wait_for_state() callers
 enum SimState { SIdle = 0, SRecording = 1, SPostprocessing = 2, SDownloading = 3, SReprocessing = 4 };
@@ -194,7 +195,7 @@ struct DaemonSim {
         }
     }
 
-    explicit DaemonSim(const char* sock = INTEGRATION_SOCK)
+    explicit DaemonSim(const char* sock = INTEGRATION_SOCK.c_str())
         : server(sock)
     {
         unlink(sock);
@@ -593,7 +594,7 @@ void drain_events(IpcClient& client, int ms = 200) {
     }
 }
 
-std::unique_ptr<IpcClient> make_client(const char* sock = INTEGRATION_SOCK) {
+std::unique_ptr<IpcClient> make_client(const char* sock = INTEGRATION_SOCK.c_str()) {
     auto c = std::make_unique<IpcClient>(sock);
     REQUIRE(c->connect());
     return c;
@@ -876,7 +877,8 @@ TEST_CASE("status.get during downloading returns downloading", "[ipc][integratio
 // ===========================================================================
 
 TEST_CASE("events during blocking call() are all delivered", "[ipc][integration]") {
-    const char* sock = "/tmp/recmeet_test_buffered1.sock";
+    auto sock_str = recmeet::test::tmp_path("recmeet_test_buffered1.sock").string();
+    const char* sock = sock_str.c_str();
     unlink(sock);
 
     IpcServer server(sock);
@@ -913,7 +915,8 @@ TEST_CASE("events during blocking call() are all delivered", "[ipc][integration]
 }
 
 TEST_CASE("events after response in same buffer are not lost", "[ipc][integration]") {
-    const char* sock = "/tmp/recmeet_test_buffered2.sock";
+    auto sock_str = recmeet::test::tmp_path("recmeet_test_buffered2.sock").string();
+    const char* sock = sock_str.c_str();
     unlink(sock);
 
     IpcServer server(sock);
@@ -950,7 +953,8 @@ TEST_CASE("events after response in same buffer are not lost", "[ipc][integratio
 }
 
 TEST_CASE("rapid broadcast burst: no events lost", "[ipc][integration]") {
-    const char* sock = "/tmp/recmeet_test_burst.sock";
+    auto sock_str = recmeet::test::tmp_path("recmeet_test_burst.sock").string();
+    const char* sock = sock_str.c_str();
     unlink(sock);
 
     IpcServer server(sock);
@@ -1309,10 +1313,11 @@ TEST_CASE("reprocess stop triggers postprocessing lifecycle", "[ipc][integration
 // ===========================================================================
 
 TEST_CASE("speakers.list round-trip via IPC", "[ipc][integration]") {
-    const char* sock = "/tmp/recmeet_test_spk_list.sock";
+    auto sock_str = recmeet::test::tmp_path("recmeet_test_spk_list.sock").string();
+    const char* sock = sock_str.c_str();
     unlink(sock);
 
-    auto tmp = fs::temp_directory_path() / "recmeet_ipc_spk_list";
+    auto tmp = recmeet::test::tmp_path("recmeet_ipc_spk_list");
     fs::remove_all(tmp);
 
     // Seed DB with a speaker
@@ -1355,10 +1360,11 @@ TEST_CASE("speakers.list round-trip via IPC", "[ipc][integration]") {
 }
 
 TEST_CASE("speakers.remove round-trip via IPC", "[ipc][integration]") {
-    const char* sock = "/tmp/recmeet_test_spk_remove.sock";
+    auto sock_str = recmeet::test::tmp_path("recmeet_test_spk_remove.sock").string();
+    const char* sock = sock_str.c_str();
     unlink(sock);
 
-    auto tmp = fs::temp_directory_path() / "recmeet_ipc_spk_remove";
+    auto tmp = recmeet::test::tmp_path("recmeet_ipc_spk_remove");
     fs::remove_all(tmp);
 
     SpeakerProfile p;
@@ -1492,10 +1498,11 @@ TEST_CASE("record.start api_key not leaked in state.changed events", "[ipc][inte
 }
 
 TEST_CASE("speakers.reset round-trip via IPC", "[ipc][integration]") {
-    const char* sock = "/tmp/recmeet_test_spk_reset.sock";
+    auto sock_str = recmeet::test::tmp_path("recmeet_test_spk_reset.sock").string();
+    const char* sock = sock_str.c_str();
     unlink(sock);
 
-    auto tmp = fs::temp_directory_path() / "recmeet_ipc_spk_reset";
+    auto tmp = recmeet::test::tmp_path("recmeet_ipc_spk_reset");
     fs::remove_all(tmp);
 
     SpeakerProfile p1, p2;
@@ -2115,8 +2122,7 @@ struct TmpMeetingDir {
     {
         // Unique parent (per-PID + nanos) avoids collisions between tests.
         auto now = std::chrono::steady_clock::now().time_since_epoch().count();
-        parent = fs::temp_directory_path()
-            / ("recmeet_test_ctx_persist_" + std::to_string(getpid()) + "_" + std::to_string(now));
+        parent = recmeet::test::tmp_path("recmeet_test_ctx_persist_" + std::to_string(getpid()) + "_" + std::to_string(now));
         path = parent / ts;
         fs::remove_all(parent);
         fs::create_directories(path);

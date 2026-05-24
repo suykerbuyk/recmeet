@@ -4,6 +4,7 @@
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/matchers/catch_matchers_string.hpp>
 #include "note.h"
+#include "test_tmpdir.h"
 
 #include <fstream>
 #include <sstream>
@@ -11,7 +12,7 @@
 using namespace recmeet;
 
 static fs::path tmp_dir() {
-    fs::path dir = fs::temp_directory_path() / "recmeet_test_note";
+    fs::path dir = recmeet::test::tmp_path("recmeet_test_note");
     fs::create_directories(dir);
     return dir;
 }
@@ -354,7 +355,7 @@ TEST_CASE("write_meeting_note: empty metadata falls back gracefully", "[note]") 
 
 TEST_CASE("write_meeting_note: uses note_dir with year/month subdirectories", "[note]") {
     auto audio_dir = tmp_dir();
-    auto note_dir = fs::temp_directory_path() / "recmeet_test_note_dir";
+    auto note_dir = recmeet::test::tmp_path("recmeet_test_note_dir");
     fs::create_directories(note_dir);
 
     NoteConfig config;
@@ -402,7 +403,7 @@ TEST_CASE("write_meeting_note: defaults to output_dir when note_dir empty", "[no
 
 TEST_CASE("write_meeting_note: note_dir creates year/month for different dates", "[note]") {
     auto audio_dir = tmp_dir();
-    auto note_dir = fs::temp_directory_path() / "recmeet_test_note_ym";
+    auto note_dir = recmeet::test::tmp_path("recmeet_test_note_ym");
     fs::create_directories(note_dir);
 
     NoteConfig config;

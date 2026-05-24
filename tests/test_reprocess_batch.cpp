@@ -17,6 +17,7 @@
 #include "config.h"
 #include "model_manager.h"
 #include "reprocess_batch.h"
+#include "test_tmpdir.h"
 #include "util.h"
 
 #include <csignal>
@@ -32,13 +33,13 @@ using namespace recmeet;
 namespace fs = std::filesystem;
 
 // Each test gets its own scratch tmp dir to avoid cross-test pollution. We
-// can't use `tempnam` (deprecated) so we synthesise a unique path under
-// /tmp using a counter + the test name's hash.
+// can't use `tempnam` (deprecated) so we synthesise a unique path under the
+// per-process test root using a counter + the test name's tag.
 static fs::path make_scratch_dir(const std::string& tag) {
     static unsigned counter = 0;
-    fs::path dir = fs::temp_directory_path() /
-        ("recmeet_reprocess_batch_" + tag + "_" + std::to_string(++counter) +
-         "_" + std::to_string(::getpid()));
+    fs::path dir = recmeet::test::tmp_path(
+        "recmeet_reprocess_batch_" + tag + "_" + std::to_string(++counter) +
+        "_" + std::to_string(::getpid()));
     fs::remove_all(dir);
     fs::create_directories(dir);
     return dir;

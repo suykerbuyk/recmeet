@@ -26,6 +26,7 @@
 #include "ipc_protocol.h"
 #include "ipc_server.h"
 #include "pipeline.h"
+#include "test_tmpdir.h"
 
 #include <atomic>
 #include <chrono>
@@ -51,7 +52,7 @@ static struct CapSigpipeIgnorer {
 
 namespace {
 
-const char* CAPTION_SOCK = "/tmp/recmeet_test_caption.sock";
+const std::string CAPTION_SOCK = recmeet::test::tmp_path("recmeet_test_caption.sock").string();
 
 // ---------------------------------------------------------------------------
 // CaptionDaemonSim — minimal daemon simulator focused on the caption broadcast
@@ -115,7 +116,7 @@ struct CaptionDaemonSim {
     // True if the audio callback was unsubscribed before drain time
     std::atomic<bool> unsubscribed_before_drain{false};
 
-    explicit CaptionDaemonSim(const char* sock = CAPTION_SOCK) : server(sock) {
+    explicit CaptionDaemonSim(const char* sock = CAPTION_SOCK.c_str()) : server(sock) {
         unlink(sock);
 
         server.on("status.get", [this](const IpcRequest&, IpcResponse& resp, IpcError&) {
@@ -355,7 +356,7 @@ void drain_caption_events(IpcClient& client, int ms = 200) {
     }
 }
 
-std::unique_ptr<IpcClient> caption_client(const char* sock = CAPTION_SOCK) {
+std::unique_ptr<IpcClient> caption_client(const char* sock = CAPTION_SOCK.c_str()) {
     auto c = std::make_unique<IpcClient>(sock);
     REQUIRE(c->connect());
     return c;
@@ -767,9 +768,7 @@ TEST_CASE("caption.degraded is rate-limited under sustained overflow",
 TEST_CASE("captions_enabled=true creates captions.vtt with finals only",
           "[ipc][integration][captions]") {
     namespace fs = std::filesystem;
-    fs::path meeting_dir = fs::temp_directory_path()
-                         / ("recmeet_vtt_ipc_"
-                            + std::to_string(::getpid()) + "_on");
+    fs::path meeting_dir = recmeet::test::tmp_path("recmeet_vtt_ipc_on");
     fs::remove_all(meeting_dir);
     fs::create_directories(meeting_dir);
     fs::path vtt_path = meeting_dir / "captions.vtt";
@@ -833,9 +832,7 @@ TEST_CASE("captions_enabled=true creates captions.vtt with finals only",
 TEST_CASE("captions_enabled=false produces no captions.vtt sidecar",
           "[ipc][integration][captions]") {
     namespace fs = std::filesystem;
-    fs::path meeting_dir = fs::temp_directory_path()
-                         / ("recmeet_vtt_ipc_"
-                            + std::to_string(::getpid()) + "_off");
+    fs::path meeting_dir = recmeet::test::tmp_path("recmeet_vtt_ipc_off");
     fs::remove_all(meeting_dir);
     fs::create_directories(meeting_dir);
     fs::path vtt_path = meeting_dir / "captions.vtt";
@@ -1412,9 +1409,7 @@ TEST_CASE_METHOD(CaptionChannelTestFixture,
                  "captions.start_engine: mid-recording start produces continuous VTT sidecar",
                  "[caption-ipc][regression]") {
     namespace fs = std::filesystem;
-    fs::path meeting_dir = fs::temp_directory_path()
-                         / ("recmeet_vtt_midrec_"
-                            + std::to_string(::getpid()));
+    fs::path meeting_dir = recmeet::test::tmp_path("recmeet_vtt_midrec");
     fs::remove_all(meeting_dir);
     fs::create_directories(meeting_dir);
     fs::path vtt_path = meeting_dir / "captions.vtt";

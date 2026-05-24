@@ -5,6 +5,7 @@
 #include "ipc_server.h"
 #include "ipc_client.h"
 #include "ipc_protocol.h"
+#include "test_tmpdir.h"
 
 #include <atomic>
 #include <cstring>
@@ -19,7 +20,11 @@ using namespace recmeet;
 
 namespace {
 
-const char* TEST_SOCK = "/tmp/recmeet_test_ipc.sock";
+// AF_UNIX sun_path budget is 108 bytes; the per-process root is ~55 bytes and
+// the stem is 21 bytes, so we have plenty of headroom.
+std::string test_sock() {
+    return recmeet::test::tmp_path("recmeet_test_ipc.sock").string();
+}
 
 // Connect to a Unix socket. Returns fd or -1.
 int connect_client(const char* path) {
@@ -67,9 +72,9 @@ std::string read_line(int fd, int timeout_ms = 2000) {
 } // anonymous namespace
 
 TEST_CASE("IpcServer: request/response round-trip", "[ipc_server]") {
-    unlink(TEST_SOCK);
+    unlink(test_sock().c_str());
 
-    IpcServer server(TEST_SOCK);
+    IpcServer server(test_sock());
     server.on("echo", [](const IpcRequest& req, IpcResponse& resp, IpcError&) {
         resp.result = req.params;
         return true;
@@ -81,7 +86,7 @@ TEST_CASE("IpcServer: request/response round-trip", "[ipc_server]") {
     // Give server a moment to enter poll()
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
 
-    int client = connect_client(TEST_SOCK);
+    int client = connect_client(test_sock().c_str());
     REQUIRE(client >= 0);
 
     // Send echo request
@@ -106,15 +111,15 @@ TEST_CASE("IpcServer: request/response round-trip", "[ipc_server]") {
 }
 
 TEST_CASE("IpcServer: unknown method returns error", "[ipc_server]") {
-    unlink(TEST_SOCK);
+    unlink(test_sock().c_str());
 
-    IpcServer server(TEST_SOCK);
+    IpcServer server(test_sock());
     REQUIRE(server.start());
 
     std::thread srv_thread([&server]() { server.run(); });
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
 
-    int client = connect_client(TEST_SOCK);
+    int client = connect_client(test_sock().c_str());
     REQUIRE(client >= 0);
 
     IpcRequest req;
@@ -137,9 +142,9 @@ TEST_CASE("IpcServer: unknown method returns error", "[ipc_server]") {
 }
 
 TEST_CASE("IpcServer: broadcast sends events to all clients", "[ipc_server]") {
-    unlink(TEST_SOCK);
+    unlink(test_sock().c_str());
 
-    IpcServer server(TEST_SOCK);
+    IpcServer server(test_sock());
     server.on("ping", [](const IpcRequest&, IpcResponse& resp, IpcError&) {
         resp.result["pong"] = true;
         return true;
@@ -149,8 +154,8 @@ TEST_CASE("IpcServer: broadcast sends events to all clients", "[ipc_server]") {
     std::thread srv_thread([&server]() { server.run(); });
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
 
-    int c1 = connect_client(TEST_SOCK);
-    int c2 = connect_client(TEST_SOCK);
+    int c1 = connect_client(test_sock().c_str());
+    int c2 = connect_client(test_sock().c_str());
     REQUIRE(c1 >= 0);
     REQUIRE(c2 >= 0);
 
@@ -183,9 +188,9 @@ TEST_CASE("IpcServer: broadcast sends events to all clients", "[ipc_server]") {
 }
 
 TEST_CASE("IpcServer: handler returning false sends error", "[ipc_server]") {
-    unlink(TEST_SOCK);
+    unlink(test_sock().c_str());
 
-    IpcServer server(TEST_SOCK);
+    IpcServer server(test_sock());
     server.on("fail", [](const IpcRequest&, IpcResponse&, IpcError& err) {
         err.code = 42;
         err.message = "intentional failure";
@@ -196,7 +201,7 @@ TEST_CASE("IpcServer: handler returning false sends error", "[ipc_server]") {
     std::thread srv_thread([&server]() { server.run(); });
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
 
-    int client = connect_client(TEST_SOCK);
+    int client = connect_client(test_sock().c_str());
     REQUIRE(client >= 0);
 
     IpcRequest req;
@@ -218,9 +223,9 @@ TEST_CASE("IpcServer: handler returning false sends error", "[ipc_server]") {
 }
 
 TEST_CASE("IpcServer: post() wakes poll loop", "[ipc_server]") {
-    unlink(TEST_SOCK);
+    unlink(test_sock().c_str());
 
-    IpcServer server(TEST_SOCK);
+    IpcServer server(test_sock());
     REQUIRE(server.start());
 
     bool posted_ran = false;

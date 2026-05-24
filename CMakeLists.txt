@@ -402,6 +402,8 @@ if(RECMEET_BUILD_TESTS)
         tests/test_pipeline_helpers.cpp
         tests/test_pipeline_exit.cpp
         tests/test_pipeline_cleanup.cpp
+        tests/test_tmpdir_helper.cpp
+        tests/test_tmpdir_listener.cpp
         tests/test_tray_cancel_confirm.cpp
         tests/test_cli.cpp
         tests/test_reprocess_batch.cpp

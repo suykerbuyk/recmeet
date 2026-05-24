@@ -12,6 +12,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include "caption_vtt.h"
+#include "test_tmpdir.h"
 
 #include <atomic>
 #include <cstdint>
@@ -36,9 +37,9 @@ fs::path make_tmp_dir(const std::string& tag) {
     static std::atomic<unsigned> counter{0};
     auto pid = static_cast<unsigned>(::getpid());
     auto n = counter.fetch_add(1);
-    fs::path dir = fs::temp_directory_path()
-                 / ("recmeet_vtt_" + std::to_string(pid) + "_"
-                    + std::to_string(n) + "_" + tag);
+    fs::path dir = recmeet::test::tmp_path(
+        "recmeet_vtt_" + std::to_string(pid) + "_"
+        + std::to_string(n) + "_" + tag);
     fs::remove_all(dir);
     fs::create_directories(dir);
     return dir;

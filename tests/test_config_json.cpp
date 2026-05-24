@@ -4,6 +4,7 @@
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/matchers/catch_matchers_floating_point.hpp>
 #include "config_json.h"
+#include "test_tmpdir.h"
 
 #include <filesystem>
 #include <fstream>
@@ -40,7 +41,7 @@ static Config make_test_config() {
     cfg.vad_max_speech = 20.0f;
     cfg.threads = 12;
     cfg.log_level_str = "info";
-    cfg.log_dir = "/tmp/recmeet-test-logs";
+    cfg.log_dir = recmeet::test::tmp_path("recmeet-test-logs").string();
     cfg.output_dir = "/tmp/meetings";
     cfg.note_dir = "/home/user/obsidian/Meetings";
     cfg.context_file = "/tmp/context.txt";
@@ -264,7 +265,7 @@ TEST_CASE("config_to_json file round-trip (subprocess config transfer)", "[confi
     Config original = make_test_config();
 
     // Write to temp file (same as daemon's write_job_config)
-    auto path = std::filesystem::temp_directory_path() / "recmeet-test-config.json";
+    auto path = recmeet::test::tmp_path("recmeet-test-config.json");
     {
         std::ofstream out(path);
         REQUIRE(out.good());

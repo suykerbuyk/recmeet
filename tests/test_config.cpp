@@ -4,6 +4,7 @@
 #include <catch2/catch_test_macros.hpp>
 #include "config.h"
 #include "config_json.h"
+#include "test_tmpdir.h"
 
 #include <cstdlib>
 #include <fstream>
@@ -13,7 +14,7 @@
 using namespace recmeet;
 
 static fs::path tmp_config() {
-    fs::path dir = fs::temp_directory_path() / "recmeet_test_config";
+    fs::path dir = recmeet::test::tmp_path("recmeet_test_config");
     fs::create_directories(dir);
     return dir / "config.yaml";
 }
@@ -102,7 +103,7 @@ TEST_CASE("save_config + load_config round-trip", "[config]") {
 }
 
 TEST_CASE("load_config: returns defaults when no file exists", "[config]") {
-    fs::path path = fs::temp_directory_path() / "recmeet_test_config_noexist" / "config.yaml";
+    fs::path path = recmeet::test::tmp_path("recmeet_test_config_noexist") / "config.yaml";
     fs::remove_all(path.parent_path());
 
     Config cfg = load_config(path);
@@ -160,7 +161,7 @@ TEST_CASE("load_config: partial config fills only specified fields", "[config]")
 }
 
 TEST_CASE("load_config: reads XAI_API_KEY from environment", "[config]") {
-    fs::path path = fs::temp_directory_path() / "recmeet_test_config_env" / "config.yaml";
+    fs::path path = recmeet::test::tmp_path("recmeet_test_config_env") / "config.yaml";
     fs::remove_all(path.parent_path());
 
     // Save and set env var
@@ -179,7 +180,7 @@ TEST_CASE("load_config: reads XAI_API_KEY from environment", "[config]") {
 }
 
 TEST_CASE("save_config never writes legacy api_key to YAML", "[config]") {
-    fs::path dir = fs::temp_directory_path() / "recmeet_test_save_apikey";
+    fs::path dir = recmeet::test::tmp_path("recmeet_test_save_apikey");
     fs::remove_all(dir);
     fs::path path = dir / "config.yaml";
 
@@ -201,7 +202,7 @@ TEST_CASE("save_config never writes legacy api_key to YAML", "[config]") {
 }
 
 TEST_CASE("api_keys round-trip via save_config + load_config", "[config]") {
-    fs::path dir = fs::temp_directory_path() / "recmeet_test_api_keys_rt";
+    fs::path dir = recmeet::test::tmp_path("recmeet_test_api_keys_rt");
     fs::remove_all(dir);
     fs::path path = dir / "config.yaml";
 
@@ -220,7 +221,7 @@ TEST_CASE("api_keys round-trip via save_config + load_config", "[config]") {
 }
 
 TEST_CASE("api_keys section format in YAML", "[config]") {
-    fs::path dir = fs::temp_directory_path() / "recmeet_test_api_keys_fmt";
+    fs::path dir = recmeet::test::tmp_path("recmeet_test_api_keys_fmt");
     fs::remove_all(dir);
     fs::path path = dir / "config.yaml";
 
@@ -241,7 +242,7 @@ TEST_CASE("api_keys section format in YAML", "[config]") {
 }
 
 TEST_CASE("save_config sets file permissions to 0600", "[config]") {
-    fs::path dir = fs::temp_directory_path() / "recmeet_test_perms";
+    fs::path dir = recmeet::test::tmp_path("recmeet_test_perms");
     fs::remove_all(dir);
     fs::path path = dir / "config.yaml";
 
@@ -302,7 +303,7 @@ TEST_CASE("resolve_api_key priority: env > api_keys > legacy > empty", "[config]
 
 TEST_CASE("load_config: chunked-diarize defaults when keys absent",
           "[config][t2-2]") {
-    fs::path path = fs::temp_directory_path() / "recmeet_test_cfg_chunk_def" / "config.yaml";
+    fs::path path = recmeet::test::tmp_path("recmeet_test_cfg_chunk_def") / "config.yaml";
     fs::remove_all(path.parent_path());
 
     Config cfg = load_config(path);
@@ -313,7 +314,7 @@ TEST_CASE("load_config: chunked-diarize defaults when keys absent",
 
 TEST_CASE("save_config + load_config: chunked-diarize fields round-trip",
           "[config][t2-2]") {
-    fs::path dir = fs::temp_directory_path() / "recmeet_test_cfg_chunk_rt";
+    fs::path dir = recmeet::test::tmp_path("recmeet_test_cfg_chunk_rt");
     fs::remove_all(dir);
     fs::path path = dir / "config.yaml";
 
@@ -347,7 +348,7 @@ TEST_CASE("save_config + load_config: chunked-diarize fields round-trip",
 
 TEST_CASE("save_config: chunked-diarize fields omitted at defaults",
           "[config][t2-2]") {
-    fs::path dir = fs::temp_directory_path() / "recmeet_test_cfg_chunk_omit";
+    fs::path dir = recmeet::test::tmp_path("recmeet_test_cfg_chunk_omit");
     fs::remove_all(dir);
     fs::path path = dir / "config.yaml";
 
@@ -367,7 +368,7 @@ TEST_CASE("save_config: chunked-diarize fields omitted at defaults",
 
 TEST_CASE("load_config: M-5' invalid persisted values fall back to defaults",
           "[config][t2-2]") {
-    fs::path dir = fs::temp_directory_path() / "recmeet_test_cfg_chunk_invalid";
+    fs::path dir = recmeet::test::tmp_path("recmeet_test_cfg_chunk_invalid");
     fs::remove_all(dir);
     fs::path path = dir / "config.yaml";
 
@@ -393,7 +394,7 @@ TEST_CASE("load_config: M-5' invalid persisted values fall back to defaults",
 
 TEST_CASE("load_config: M-5' boundary equal-to-zero spacing falls back",
           "[config][t2-2]") {
-    fs::path dir = fs::temp_directory_path() / "recmeet_test_cfg_chunk_eq";
+    fs::path dir = recmeet::test::tmp_path("recmeet_test_cfg_chunk_eq");
     fs::remove_all(dir);
     fs::path path = dir / "config.yaml";
 
@@ -425,8 +426,7 @@ TEST_CASE("min_cluster_duration_sec round-trips through TOML and IPC JSON",
         CHECK(defaults.min_cluster_duration_sec == 3.0f);
 
         // TOML path: defaults round-trip cleanly and don't emit the key.
-        fs::path dir = fs::temp_directory_path()
-                       / "recmeet_test_min_cluster_default";
+        fs::path dir = recmeet::test::tmp_path("recmeet_test_min_cluster_default");
         fs::remove_all(dir);
         fs::path path = dir / "config.yaml";
         save_config(defaults, path);
@@ -445,8 +445,7 @@ TEST_CASE("min_cluster_duration_sec round-trips through TOML and IPC JSON",
     }
 
     SECTION("non-default value round-trips via TOML") {
-        fs::path dir = fs::temp_directory_path()
-                       / "recmeet_test_min_cluster_toml";
+        fs::path dir = recmeet::test::tmp_path("recmeet_test_min_cluster_toml");
         fs::remove_all(dir);
         fs::path path = dir / "config.yaml";
 
@@ -472,8 +471,7 @@ TEST_CASE("min_cluster_duration_sec round-trips through TOML and IPC JSON",
     }
 
     SECTION("zero (filter-disabled) round-trips via TOML") {
-        fs::path dir = fs::temp_directory_path()
-                       / "recmeet_test_min_cluster_zero";
+        fs::path dir = recmeet::test::tmp_path("recmeet_test_min_cluster_zero");
         fs::remove_all(dir);
         fs::path path = dir / "config.yaml";
 
@@ -495,7 +493,7 @@ TEST_CASE("min_cluster_duration_sec round-trips through TOML and IPC JSON",
 }
 
 TEST_CASE("backward compat: legacy api_key in config used as fallback", "[config]") {
-    fs::path dir = fs::temp_directory_path() / "recmeet_test_legacy_compat";
+    fs::path dir = recmeet::test::tmp_path("recmeet_test_legacy_compat");
     fs::remove_all(dir);
     fs::path path = dir / "config.yaml";
 

@@ -3,6 +3,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 #include "log.h"
+#include "test_tmpdir.h"
 
 #include <filesystem>
 #include <fstream>
@@ -38,7 +39,7 @@ TEST_CASE("log_level_name: round-trip", "[log]") {
 }
 
 TEST_CASE("log_init with NONE: no file created", "[log]") {
-    fs::path tmp = fs::temp_directory_path() / "recmeet_test_log_none";
+    fs::path tmp = recmeet::test::tmp_path("recmeet_test_log_none");
     fs::remove_all(tmp);
     log_init(LogLevel::NONE, tmp);
     log_info("this should not appear");
@@ -48,7 +49,7 @@ TEST_CASE("log_init with NONE: no file created", "[log]") {
 }
 
 TEST_CASE("log_init with INFO: creates hourly log file", "[log]") {
-    fs::path tmp = fs::temp_directory_path() / "recmeet_test_log_info";
+    fs::path tmp = recmeet::test::tmp_path("recmeet_test_log_info");
     fs::remove_all(tmp);
     log_init(LogLevel::INFO, tmp);
     log_info("test message %d", 42);
@@ -82,7 +83,7 @@ TEST_CASE("log_init with INFO: creates hourly log file", "[log]") {
 }
 
 TEST_CASE("log_init with ERROR: filters INFO and WARN", "[log]") {
-    fs::path tmp = fs::temp_directory_path() / "recmeet_test_log_error";
+    fs::path tmp = recmeet::test::tmp_path("recmeet_test_log_error");
     fs::remove_all(tmp);
     log_init(LogLevel::ERROR, tmp);
     log_info("should not appear");
@@ -104,7 +105,7 @@ TEST_CASE("log_init with ERROR: filters INFO and WARN", "[log]") {
 }
 
 TEST_CASE("log_init with DEBUG: all levels appear", "[log]") {
-    fs::path tmp = fs::temp_directory_path() / "recmeet_test_log_debug";
+    fs::path tmp = recmeet::test::tmp_path("recmeet_test_log_debug");
     fs::remove_all(tmp);
     log_init(LogLevel::DEBUG, tmp);
     log_debug("debug msg");
@@ -129,7 +130,7 @@ TEST_CASE("log_init with DEBUG: all levels appear", "[log]") {
 }
 
 TEST_CASE("log format: millisecond timestamps", "[log]") {
-    fs::path tmp = fs::temp_directory_path() / "recmeet_test_log_millis";
+    fs::path tmp = recmeet::test::tmp_path("recmeet_test_log_millis");
     fs::remove_all(tmp);
     log_init(LogLevel::INFO, tmp);
     log_info("timestamp check");
@@ -159,7 +160,7 @@ TEST_CASE("log format: millisecond timestamps", "[log]") {
 }
 
 TEST_CASE("hourly log file naming", "[log]") {
-    fs::path tmp = fs::temp_directory_path() / "recmeet_test_log_hourly";
+    fs::path tmp = recmeet::test::tmp_path("recmeet_test_log_hourly");
     fs::remove_all(tmp);
     log_init(LogLevel::INFO, tmp);
     log_info("hourly check");
@@ -182,7 +183,7 @@ TEST_CASE("hourly log file naming", "[log]") {
 }
 
 TEST_CASE("log rotation: purges old files by filename", "[log]") {
-    fs::path tmp = fs::temp_directory_path() / "recmeet_test_log_rotation";
+    fs::path tmp = recmeet::test::tmp_path("recmeet_test_log_rotation");
     fs::remove_all(tmp);
     fs::create_directories(tmp);
 

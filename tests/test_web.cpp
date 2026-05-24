@@ -5,6 +5,7 @@
 #include "config.h"
 #include "speaker_id.h"
 #include "util.h"
+#include "test_tmpdir.h"
 
 #include <httplib.h>
 
@@ -458,7 +459,7 @@ struct TestServer {
 // ---------------------------------------------------------------------------
 
 TEST_CASE("web: GET /api/speakers returns empty array when no speakers", "[web]") {
-    auto tmp = fs::temp_directory_path() / "recmeet_test_web_speakers_empty";
+    auto tmp = recmeet::test::tmp_path("recmeet_test_web_speakers_empty");
     fs::remove_all(tmp);
     fs::create_directories(tmp / "speakers");
     fs::create_directories(tmp / "meetings");
@@ -478,7 +479,7 @@ TEST_CASE("web: GET /api/speakers returns empty array when no speakers", "[web]"
 }
 
 TEST_CASE("web: GET /api/speakers returns speaker list after enrollment", "[web]") {
-    auto tmp = fs::temp_directory_path() / "recmeet_test_web_speakers_list";
+    auto tmp = recmeet::test::tmp_path("recmeet_test_web_speakers_list");
     fs::remove_all(tmp);
     fs::create_directories(tmp / "speakers");
     fs::create_directories(tmp / "meetings");
@@ -506,7 +507,7 @@ TEST_CASE("web: GET /api/speakers returns speaker list after enrollment", "[web]
 }
 
 TEST_CASE("web: GET /api/speakers/:name returns 404 for unknown", "[web]") {
-    auto tmp = fs::temp_directory_path() / "recmeet_test_web_speakers_404";
+    auto tmp = recmeet::test::tmp_path("recmeet_test_web_speakers_404");
     fs::remove_all(tmp);
     fs::create_directories(tmp / "speakers");
 
@@ -524,7 +525,7 @@ TEST_CASE("web: GET /api/speakers/:name returns 404 for unknown", "[web]") {
 }
 
 TEST_CASE("web: GET /api/speakers/:name returns detail for known speaker", "[web]") {
-    auto tmp = fs::temp_directory_path() / "recmeet_test_web_speakers_detail";
+    auto tmp = recmeet::test::tmp_path("recmeet_test_web_speakers_detail");
     fs::remove_all(tmp);
     fs::create_directories(tmp / "speakers");
 
@@ -551,7 +552,7 @@ TEST_CASE("web: GET /api/speakers/:name returns detail for known speaker", "[web
 }
 
 TEST_CASE("web: DELETE /api/speakers/:name removes speaker", "[web]") {
-    auto tmp = fs::temp_directory_path() / "recmeet_test_web_speakers_delete";
+    auto tmp = recmeet::test::tmp_path("recmeet_test_web_speakers_delete");
     fs::remove_all(tmp);
     fs::create_directories(tmp / "speakers");
 
@@ -581,7 +582,7 @@ TEST_CASE("web: DELETE /api/speakers/:name removes speaker", "[web]") {
 }
 
 TEST_CASE("web: DELETE /api/speakers/:name returns 404 for unknown", "[web]") {
-    auto tmp = fs::temp_directory_path() / "recmeet_test_web_speakers_del404";
+    auto tmp = recmeet::test::tmp_path("recmeet_test_web_speakers_del404");
     fs::remove_all(tmp);
     fs::create_directories(tmp / "speakers");
 
@@ -599,7 +600,7 @@ TEST_CASE("web: DELETE /api/speakers/:name returns 404 for unknown", "[web]") {
 }
 
 TEST_CASE("web: POST /api/speakers/reset removes all speakers", "[web]") {
-    auto tmp = fs::temp_directory_path() / "recmeet_test_web_speakers_reset";
+    auto tmp = recmeet::test::tmp_path("recmeet_test_web_speakers_reset");
     fs::remove_all(tmp);
     fs::create_directories(tmp / "speakers");
 
@@ -634,7 +635,7 @@ TEST_CASE("web: POST /api/speakers/reset removes all speakers", "[web]") {
 }
 
 TEST_CASE("web: POST /api/speakers/enroll enrolls from meeting speakers.json", "[web]") {
-    auto tmp = fs::temp_directory_path() / "recmeet_test_web_enroll";
+    auto tmp = recmeet::test::tmp_path("recmeet_test_web_enroll");
     fs::remove_all(tmp);
     fs::create_directories(tmp / "speakers");
     fs::create_directories(tmp / "meetings" / "2026-03-08_14-30");
@@ -675,7 +676,7 @@ TEST_CASE("web: POST /api/speakers/enroll enrolls from meeting speakers.json", "
 }
 
 TEST_CASE("web: POST /api/speakers/enroll returns 404 for invalid meeting dir", "[web]") {
-    auto tmp = fs::temp_directory_path() / "recmeet_test_web_enroll_404";
+    auto tmp = recmeet::test::tmp_path("recmeet_test_web_enroll_404");
     fs::remove_all(tmp);
     fs::create_directories(tmp / "speakers");
     fs::create_directories(tmp / "meetings");
@@ -696,7 +697,7 @@ TEST_CASE("web: POST /api/speakers/enroll returns 404 for invalid meeting dir", 
 }
 
 TEST_CASE("web: GET /api/meetings lists meeting directories", "[web]") {
-    auto tmp = fs::temp_directory_path() / "recmeet_test_web_meetings";
+    auto tmp = recmeet::test::tmp_path("recmeet_test_web_meetings");
     fs::remove_all(tmp);
     fs::create_directories(tmp / "speakers");
     fs::create_directories(tmp / "meetings" / "2026-03-07_10-00");
@@ -731,7 +732,7 @@ TEST_CASE("web: GET /api/meetings lists meeting directories", "[web]") {
 }
 
 TEST_CASE("web: GET /api/meetings/:dir/speakers returns meeting speaker data", "[web]") {
-    auto tmp = fs::temp_directory_path() / "recmeet_test_web_meeting_speakers";
+    auto tmp = recmeet::test::tmp_path("recmeet_test_web_meeting_speakers");
     fs::remove_all(tmp);
     fs::create_directories(tmp / "speakers");
     fs::create_directories(tmp / "meetings" / "2026-03-08_14-30");
@@ -765,7 +766,7 @@ TEST_CASE("web: GET /api/meetings/:dir/speakers returns meeting speaker data", "
 }
 
 TEST_CASE("web: static file serving returns index.html", "[web]") {
-    auto tmp = fs::temp_directory_path() / "recmeet_test_web_static";
+    auto tmp = recmeet::test::tmp_path("recmeet_test_web_static");
     fs::remove_all(tmp);
     fs::create_directories(tmp / "speakers");
     fs::create_directories(tmp / "meetings");
@@ -788,7 +789,7 @@ TEST_CASE("web: static file serving returns index.html", "[web]") {
 }
 
 TEST_CASE("web: GET /api/meetings discovers new-format audio files", "[web]") {
-    auto tmp = fs::temp_directory_path() / "recmeet_test_web_meetings_newformat";
+    auto tmp = recmeet::test::tmp_path("recmeet_test_web_meetings_newformat");
     fs::remove_all(tmp);
     fs::create_directories(tmp / "speakers");
 
@@ -823,7 +824,7 @@ TEST_CASE("web: GET /api/meetings discovers new-format audio files", "[web]") {
 }
 
 TEST_CASE("web: GET /api/meetings discovers meeting with both audio formats", "[web]") {
-    auto tmp = fs::temp_directory_path() / "recmeet_test_web_meetings_both";
+    auto tmp = recmeet::test::tmp_path("recmeet_test_web_meetings_both");
     fs::remove_all(tmp);
     fs::create_directories(tmp / "speakers");
 
@@ -847,7 +848,7 @@ TEST_CASE("web: GET /api/meetings discovers meeting with both audio formats", "[
 }
 
 TEST_CASE("web: GET /nonexistent-api returns 404", "[web]") {
-    auto tmp = fs::temp_directory_path() / "recmeet_test_web_404";
+    auto tmp = recmeet::test::tmp_path("recmeet_test_web_404");
     fs::remove_all(tmp);
     fs::create_directories(tmp / "speakers");
     fs::create_directories(tmp / "meetings");
@@ -870,7 +871,7 @@ TEST_CASE("web: GET /nonexistent-api returns 404", "[web]") {
 // ---------------------------------------------------------------------------
 
 TEST_CASE("web: POST /api/speakers/:name/remove-embedding removes by index", "[web]") {
-    auto tmp = fs::temp_directory_path() / "recmeet_test_web_rm_emb";
+    auto tmp = recmeet::test::tmp_path("recmeet_test_web_rm_emb");
     fs::remove_all(tmp);
     fs::create_directories(tmp / "speakers");
     fs::create_directories(tmp / "meetings");
@@ -902,7 +903,7 @@ TEST_CASE("web: POST /api/speakers/:name/remove-embedding removes by index", "[w
 }
 
 TEST_CASE("web: POST /api/speakers/:name/remove-embedding last embedding deletes profile", "[web]") {
-    auto tmp = fs::temp_directory_path() / "recmeet_test_web_rm_emb_last";
+    auto tmp = recmeet::test::tmp_path("recmeet_test_web_rm_emb_last");
     fs::remove_all(tmp);
     fs::create_directories(tmp / "speakers");
     fs::create_directories(tmp / "meetings");
@@ -929,7 +930,7 @@ TEST_CASE("web: POST /api/speakers/:name/remove-embedding last embedding deletes
 }
 
 TEST_CASE("web: POST /api/speakers/:name/remove-embedding out-of-range returns 400", "[web]") {
-    auto tmp = fs::temp_directory_path() / "recmeet_test_web_rm_emb_oor";
+    auto tmp = recmeet::test::tmp_path("recmeet_test_web_rm_emb_oor");
     fs::remove_all(tmp);
     fs::create_directories(tmp / "speakers");
     fs::create_directories(tmp / "meetings");
@@ -955,7 +956,7 @@ TEST_CASE("web: POST /api/speakers/:name/remove-embedding out-of-range returns 4
 }
 
 TEST_CASE("web: POST /api/speakers/:name/remove-embedding unknown speaker returns 404", "[web]") {
-    auto tmp = fs::temp_directory_path() / "recmeet_test_web_rm_emb_404";
+    auto tmp = recmeet::test::tmp_path("recmeet_test_web_rm_emb_404");
     fs::remove_all(tmp);
     fs::create_directories(tmp / "speakers");
     fs::create_directories(tmp / "meetings");
@@ -974,7 +975,7 @@ TEST_CASE("web: POST /api/speakers/:name/remove-embedding unknown speaker return
 }
 
 TEST_CASE("web: POST /api/speakers/:name/remove-embedding missing index returns 400", "[web]") {
-    auto tmp = fs::temp_directory_path() / "recmeet_test_web_rm_emb_noindex";
+    auto tmp = recmeet::test::tmp_path("recmeet_test_web_rm_emb_noindex");
     fs::remove_all(tmp);
     fs::create_directories(tmp / "speakers");
     fs::create_directories(tmp / "meetings");
@@ -1005,7 +1006,7 @@ TEST_CASE("web: POST /api/speakers/:name/remove-embedding missing index returns 
 #if RECMEET_USE_SHERPA
 
 TEST_CASE("web: POST relabel changes label in speakers.json", "[web]") {
-    auto tmp = fs::temp_directory_path() / "recmeet_test_web_relabel";
+    auto tmp = recmeet::test::tmp_path("recmeet_test_web_relabel");
     fs::remove_all(tmp);
     fs::create_directories(tmp / "speakers");
     auto mtg = tmp / "meetings" / "2026-03-10_12-00";
@@ -1046,7 +1047,7 @@ TEST_CASE("web: POST relabel changes label in speakers.json", "[web]") {
 }
 
 TEST_CASE("web: POST relabel with update_profile moves embedding", "[web]") {
-    auto tmp = fs::temp_directory_path() / "recmeet_test_web_relabel_profile";
+    auto tmp = recmeet::test::tmp_path("recmeet_test_web_relabel_profile");
     fs::remove_all(tmp);
     fs::create_directories(tmp / "speakers");
     auto mtg = tmp / "meetings" / "2026-03-10_12-00";
@@ -1094,7 +1095,7 @@ TEST_CASE("web: POST relabel with update_profile moves embedding", "[web]") {
 }
 
 TEST_CASE("web: POST relabel creates new profile for unknown speaker", "[web]") {
-    auto tmp = fs::temp_directory_path() / "recmeet_test_web_relabel_newprof";
+    auto tmp = recmeet::test::tmp_path("recmeet_test_web_relabel_newprof");
     fs::remove_all(tmp);
     fs::create_directories(tmp / "speakers");
     auto mtg = tmp / "meetings" / "2026-03-10_12-00";
@@ -1126,7 +1127,7 @@ TEST_CASE("web: POST relabel creates new profile for unknown speaker", "[web]") 
 }
 
 TEST_CASE("web: POST relabel returns 404 for unknown cluster_id", "[web]") {
-    auto tmp = fs::temp_directory_path() / "recmeet_test_web_relabel_nocluster";
+    auto tmp = recmeet::test::tmp_path("recmeet_test_web_relabel_nocluster");
     fs::remove_all(tmp);
     fs::create_directories(tmp / "speakers");
     auto mtg = tmp / "meetings" / "2026-03-10_12-00";
@@ -1153,7 +1154,7 @@ TEST_CASE("web: POST relabel returns 404 for unknown cluster_id", "[web]") {
 }
 
 TEST_CASE("web: POST relabel returns 404 for unknown meeting dir", "[web]") {
-    auto tmp = fs::temp_directory_path() / "recmeet_test_web_relabel_nodir";
+    auto tmp = recmeet::test::tmp_path("recmeet_test_web_relabel_nodir");
     fs::remove_all(tmp);
     fs::create_directories(tmp / "speakers");
     fs::create_directories(tmp / "meetings");
@@ -1173,7 +1174,7 @@ TEST_CASE("web: POST relabel returns 404 for unknown meeting dir", "[web]") {
 }
 
 TEST_CASE("web: POST relabel returns 400 for missing fields", "[web]") {
-    auto tmp = fs::temp_directory_path() / "recmeet_test_web_relabel_nofields";
+    auto tmp = recmeet::test::tmp_path("recmeet_test_web_relabel_nofields");
     fs::remove_all(tmp);
     fs::create_directories(tmp / "speakers");
     fs::create_directories(tmp / "meetings");
@@ -1200,7 +1201,7 @@ TEST_CASE("web: POST relabel returns 400 for missing fields", "[web]") {
 #if RECMEET_USE_SHERPA
 
 TEST_CASE("web: POST /api/speakers/enroll rejects short duration", "[web]") {
-    auto tmp = fs::temp_directory_path() / "recmeet_test_web_enroll_short";
+    auto tmp = recmeet::test::tmp_path("recmeet_test_web_enroll_short");
     fs::remove_all(tmp);
     fs::create_directories(tmp / "speakers");
     auto mtg = tmp / "meetings" / "2026-03-10_12-00";
@@ -1237,7 +1238,7 @@ TEST_CASE("web: POST /api/speakers/enroll rejects short duration", "[web]") {
 // ---------------------------------------------------------------------------
 
 TEST_CASE("web: POST /api/meetings/:dir/reprocess returns 404 for unknown dir", "[web]") {
-    auto tmp = fs::temp_directory_path() / "recmeet_test_web_reprocess_404";
+    auto tmp = recmeet::test::tmp_path("recmeet_test_web_reprocess_404");
     fs::remove_all(tmp);
     fs::create_directories(tmp / "speakers");
     fs::create_directories(tmp / "meetings");
@@ -1264,7 +1265,7 @@ TEST_CASE("web: POST /api/meetings/:dir/reprocess returns 404 for unknown dir", 
 #if RECMEET_USE_SHERPA
 
 TEST_CASE("web: relabel then list shows updated speaker", "[web][integration]") {
-    auto tmp = fs::temp_directory_path() / "recmeet_test_web_relabel_list";
+    auto tmp = recmeet::test::tmp_path("recmeet_test_web_relabel_list");
     fs::remove_all(tmp);
     fs::create_directories(tmp / "speakers");
     auto mtg = tmp / "meetings" / "2026-03-10_14-00";
@@ -1308,7 +1309,7 @@ TEST_CASE("web: relabel then list shows updated speaker", "[web][integration]") 
 // ---------------------------------------------------------------------------
 
 TEST_CASE("web: POST batch-reidentify updates meetings after profile change", "[web]") {
-    auto tmp = fs::temp_directory_path() / "recmeet_test_web_batch_reid";
+    auto tmp = recmeet::test::tmp_path("recmeet_test_web_batch_reid");
     fs::remove_all(tmp);
     fs::create_directories(tmp / "speakers");
 
@@ -1371,7 +1372,7 @@ TEST_CASE("web: POST batch-reidentify updates meetings after profile change", "[
 }
 
 TEST_CASE("web: POST batch-reidentify empty DB returns 0 updated", "[web]") {
-    auto tmp = fs::temp_directory_path() / "recmeet_test_web_batch_reid_nodb";
+    auto tmp = recmeet::test::tmp_path("recmeet_test_web_batch_reid_nodb");
     fs::remove_all(tmp);
     fs::create_directories(tmp / "speakers");
     fs::create_directories(tmp / "meetings");
@@ -1392,7 +1393,7 @@ TEST_CASE("web: POST batch-reidentify empty DB returns 0 updated", "[web]") {
 }
 
 TEST_CASE("web: POST batch-reidentify no meetings returns 0 scanned", "[web]") {
-    auto tmp = fs::temp_directory_path() / "recmeet_test_web_batch_reid_nomtg";
+    auto tmp = recmeet::test::tmp_path("recmeet_test_web_batch_reid_nomtg");
     fs::remove_all(tmp);
     fs::create_directories(tmp / "speakers");
     fs::create_directories(tmp / "meetings");
@@ -1418,7 +1419,7 @@ TEST_CASE("web: POST batch-reidentify no meetings returns 0 scanned", "[web]") {
 }
 
 TEST_CASE("web: POST batch-reidentify preserves manual labels", "[web]") {
-    auto tmp = fs::temp_directory_path() / "recmeet_test_web_batch_reid_manual";
+    auto tmp = recmeet::test::tmp_path("recmeet_test_web_batch_reid_manual");
     fs::remove_all(tmp);
     fs::create_directories(tmp / "speakers");
     auto mtg = tmp / "meetings" / "2026-03-10_10-00";
@@ -1466,7 +1467,7 @@ TEST_CASE("web: POST batch-reidentify preserves manual labels", "[web]") {
 // ---------------------------------------------------------------------------
 
 TEST_CASE("web: relabel moves embedding from old to new profile", "[web][integration]") {
-    auto tmp = fs::temp_directory_path() / "recmeet_test_web_relabel_move";
+    auto tmp = recmeet::test::tmp_path("recmeet_test_web_relabel_move");
     fs::remove_all(tmp);
     fs::create_directories(tmp / "speakers");
     auto mtg = tmp / "meetings" / "2026-03-10_14-00";

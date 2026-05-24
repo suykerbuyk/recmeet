@@ -8,6 +8,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include "pipeline_cleanup.h"
+#include "test_tmpdir.h"
 #include "util.h"
 
 #include <atomic>
@@ -22,19 +23,21 @@ using namespace recmeet;
 
 namespace {
 
-// Generate a unique tmp path under fs::temp_directory_path(). Does NOT
-// create the directory — caller decides whether to populate it.
+// Generate a unique tmp path under the per-process test root. Does NOT
+// create the directory — caller decides whether to populate it. Uniqueness
+// (counter + steady-clock tick) is preserved so multiple calls within the
+// same test produce distinct paths; isolation across processes is provided
+// by the test root itself.
 fs::path unique_tmp_path(const std::string& prefix) {
     static std::atomic<unsigned> counter{0};
     auto now = std::chrono::steady_clock::now().time_since_epoch().count();
     unsigned salt = counter.fetch_add(1, std::memory_order_relaxed);
     char buf[64];
-    std::snprintf(buf, sizeof(buf), "%s-%lld-%u-%d",
+    std::snprintf(buf, sizeof(buf), "%s-%lld-%u",
                   prefix.c_str(),
                   static_cast<long long>(now),
-                  salt,
-                  (int)getpid());
-    return fs::temp_directory_path() / buf;
+                  salt);
+    return recmeet::test::tmp_path(buf);
 }
 
 } // anonymous namespace
