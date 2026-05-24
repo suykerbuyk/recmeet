@@ -37,6 +37,7 @@
 #include "reprocess_batch.h"
 #include "speaker_id.h"
 #include "test_helpers.h"
+#include "test_progress_phase.h"
 #include "test_tmpdir.h"
 #include "util.h"
 
@@ -365,7 +366,10 @@ TEST_CASE("Captions full-stack: 30-min synthetic, engine wiring",
     auto samples = make_synthetic_tone_int16(30.0);
     REQUIRE(samples.size() == 30u * 60u * 16000u);
 
+    recmeet::test::PhaseEcho echo;
+    echo("captions 30-min synthetic start");
     auto run = run_captions_on_samples(model_dir, samples, vtt_path);
+    echo("captions 30-min synthetic complete");
 
     fprintf(stderr, "\n[full-stack][captions] 30-min synthetic: "
             "results=%zu finals=%zu degraded=%zu vtt_cues=%zu vtt_exists=%d\n",
@@ -428,7 +432,10 @@ TEST_CASE("Captions full-stack: 60-min real fixture, caption quality",
     fs::create_directories(out_dir);
     fs::path vtt_path = out_dir / "captions.vtt";
 
+    recmeet::test::PhaseEcho echo;
+    echo("captions 60-min real start");
     auto run = run_captions_on_samples(model_dir, samples, vtt_path);
+    echo("captions 60-min real complete");
 
     fprintf(stderr, "\n[full-stack][captions] 60-min real: "
             "results=%zu finals=%zu degraded=%zu vtt_cues=%zu\n",
@@ -548,11 +555,13 @@ TEST_CASE("Captions stress: CPU contention with concurrent reprocess",
     rinput.out_dir = reproc_dir;
     rinput.audio_path = reproc_dir / "audio_2026-01-01_10-00.wav";
 
+    recmeet::test::PhaseEcho echo;
+    echo("captions stress reproc thread launching");
     std::atomic<bool> reproc_done{false};
     std::atomic<bool> reproc_failed{false};
     std::thread reproc_thread([&]() {
         try {
-            run_postprocessing(rcfg, rinput);
+            run_postprocessing(rcfg, rinput, echo);
         } catch (const std::exception& e) {
             reproc_failed.store(true);
             fprintf(stderr, "[stress] reprocess threw: %s\n", e.what());
@@ -566,7 +575,9 @@ TEST_CASE("Captions stress: CPU contention with concurrent reprocess",
     // before the engine drains. Not real speech; we're stressing the
     // scheduler, not validating caption quality.
     auto samples = make_synthetic_tone_int16(5.0);
+    echo("captions stress engine start");
     auto run = run_captions_on_samples(model_dir, samples, vtt_path);
+    echo("captions stress engine complete");
 
     // Wait for the background reprocess to finish (or time out at 5 min).
     auto deadline = std::chrono::steady_clock::now() + std::chrono::minutes(5);
@@ -635,8 +646,11 @@ TEST_CASE("Captions memory bound: peak RSS overhead ≤ 1 GB",
         return {std::chrono::duration<double>(t1 - t0).count(), peak.load()};
     };
 
+    recmeet::test::PhaseEcho echo;
+
     // --- OFF baseline: skip the engine entirely; just allocate + drop
     //     the same audio buffer so the heap state is comparable.
+    echo("captions RSS bench OFF baseline start");
     auto [off_secs, off_peak_kb] = measure([&]() {
         // Touch all samples so the optimizer can't dead-strip the buffer.
         std::int64_t accum = 0;
@@ -644,13 +658,16 @@ TEST_CASE("Captions memory bound: peak RSS overhead ≤ 1 GB",
         (void)accum;
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
     });
+    echo("captions RSS bench OFF baseline complete");
 
     // --- ON: run the engine on the same buffer with VTT persistence.
     auto vtt_path = recmeet::test::tmp_path("recmeet_caption_rss_bench.vtt");
     fs::remove(vtt_path);
+    echo("captions RSS bench ON engine start");
     auto [on_secs, on_peak_kb] = measure([&]() {
         run_captions_on_samples(model_dir, samples, vtt_path);
     });
+    echo("captions RSS bench ON engine complete");
     fs::remove(vtt_path);
 
     long delta_kb = on_peak_kb - off_peak_kb;

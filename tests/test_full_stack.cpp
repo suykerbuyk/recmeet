@@ -586,9 +586,12 @@ TEST_CASE("Reprocess-batch: skip-existing + reprocess-missing end-to-end",
     cli.cfg.vad = true;
     cli.cfg.no_summary = true;
 
+    recmeet::test::PhaseEcho echo;
+    echo("reprocess-batch start");
     auto t0 = std::chrono::steady_clock::now();
     int rc = run_reprocess_batch(cli);
     auto t1 = std::chrono::steady_clock::now();
+    echo("reprocess-batch complete");
     double elapsed = std::chrono::duration<double>(t1 - t0).count();
     fprintf(stderr, "\n[full-stack][reprocess-batch] run_reprocess_batch rc=%d in %.1fs\n",
             rc, elapsed);
