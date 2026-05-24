@@ -15,6 +15,7 @@
 #include "audio_capture.h"
 #include "audio_file.h"
 #include "audio_monitor.h"
+#include "test_tmpdir.h"
 #include "util.h"
 
 #include <atomic>
@@ -65,7 +66,7 @@ std::vector<int16_t> make_chunk(std::size_t n, int16_t start) {
 namespace fs = std::filesystem;
 
 fs::path tmp_dir() {
-    fs::path dir = fs::temp_directory_path() / "recmeet_streaming_test";
+    fs::path dir = recmeet::test::tmp_path("recmeet_streaming_test");
     fs::create_directories(dir);
     return dir;
 }
