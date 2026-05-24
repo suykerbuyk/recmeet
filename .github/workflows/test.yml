@@ -102,7 +102,17 @@ jobs:
       # integration regressions that unit tests miss. Wired here (after
       # unit tests, before integration) per
       # `agentctx/tasks/test-and-verification-hardening.md` Phase 1.
+      #
+      # LEGACY_SRC / V2_SRC override the smoke fixture defaults (which
+      # point at $HOME/meetings/... and do not exist on CI runners).
+      # tests/fixtures/smoke/{legacy_v1,v2_meeting} are empty placeholder
+      # dirs — smoke.sh writes its own context.json into the V2 fixture
+      # at copy time, and discover_meetings() only requires the directory
+      # to exist (see src/meetings_browse.cpp:63).
       - name: Smoke gate (WebUI + daemon)
+        env:
+          LEGACY_SRC: ${{ github.workspace }}/tests/fixtures/smoke/legacy_v1
+          V2_SRC: ${{ github.workspace }}/tests/fixtures/smoke/v2_meeting
         run: make smoke
 
       - name: Integration tests (C++)
