@@ -173,20 +173,28 @@ if(RECMEET_USE_SHERPA)
     # `make clean-deps` between toggles because FetchContent caches populate.
     option(RECMEET_PATCH_SHERPA_ARENA
            "Disable onnxruntime CPU mem arena via sherpa-onnx patch" ON)
-    set(_sherpa_patch_args "")
+    # Idempotent patch application — see comment on the arena patch below.
+    # The FetchContent populate sub-build re-runs PATCH_COMMAND every time
+    # `cmake -B build` is invoked (its stamp files are wiped on each
+    # configure). Plain `patch -N` exits 1 on already-applied patches, which
+    # FetchContent treats as failure. Use `git apply --reverse --check` to
+    # detect already-applied state (the populate dir is a git checkout);
+    # apply only when the reverse check fails. Real apply failures (genuine
+    # conflicts) propagate.
+    #
+    # Always-on TopkIndex correctness fix — off-by-one heap-buffer-overflow
+    # when topk > size, surfaced as a SIGABRT/SIGSEGV double-free inside
+    # libonnxruntime's Graph destructor on short recordings (~44 sec) with
+    # degenerate segmentation output. See the patch header for the full
+    # diagnosis. Cannot be disabled — without it, recmeet crashes
+    # probabilistically on short clips.
+    set(_topk_patch ${CMAKE_CURRENT_SOURCE_DIR}/cmake/sherpa-onnx-patches/0002-topkindex-clamp-overflow.patch)
+    set(_patch_chain "(git apply --reverse --check ${_topk_patch} 2>/dev/null || git apply ${_topk_patch})")
     if(RECMEET_PATCH_SHERPA_ARENA)
-        # Idempotent patch application. The FetchContent populate sub-build
-        # re-runs PATCH_COMMAND every time `cmake -B build` is invoked (its
-        # stamp files are wiped on each configure). Plain `patch -N` exits 1
-        # on already-applied patches, which FetchContent treats as failure.
-        # Use `git apply --reverse --check` to detect already-applied state
-        # (the populate dir is a git checkout); apply only when the reverse
-        # check fails. Real apply failures (genuine conflicts) propagate.
         set(_arena_patch ${CMAKE_CURRENT_SOURCE_DIR}/cmake/sherpa-onnx-patches/0001-disable-cpu-arena.patch)
-        set(_sherpa_patch_args
-            PATCH_COMMAND sh -c "git apply --reverse --check ${_arena_patch} 2>/dev/null || git apply ${_arena_patch}"
-        )
+        set(_patch_chain "${_patch_chain} && (git apply --reverse --check ${_arena_patch} 2>/dev/null || git apply ${_arena_patch})")
     endif()
+    set(_sherpa_patch_args PATCH_COMMAND sh -c "${_patch_chain}")
 
     FetchContent_Declare(sherpa-onnx
         GIT_REPOSITORY https://github.com/k2-fsa/sherpa-onnx.git
