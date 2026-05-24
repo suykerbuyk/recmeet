@@ -1,14 +1,14 @@
 {
-  "iter_n": 209,
-  "anchor_sha": "e944e55f4135d9eaa6a4a067bf93eb7668fecc5f",
+  "iter_n": 212,
+  "anchor_sha": "56a93d6878d3d2ad1891011125c7ff2877ec5f2d",
   "active": [
     "full-stack-captions-60min-regression",
     "sherpa-onnx-1-13-bump",
     "test-and-verification-hardening",
     "test-handler-coverage-phase2c",
+    "test-runner-progress-heartbeat-v2-port",
     "test-runner-progress-heartbeat",
     "thin-client-recording-server",
-    "tmp-dir-isolation-full-stack-tests",
     "webui-live-captions",
     "whisper-vocab-hint-bleed"
   ],
@@ -101,6 +101,7 @@
     "tender-sleeping-rocket",
     "thread-count-redundant-validation",
     "tmp-dir-isolation-full-stack-tests-v2",
+    "tmp-dir-isolation-full-stack-tests",
     "tray-background-postprocessing",
     "tray-stop-stuck-recording-state",
     "v1-doc-review-and-readme-local-ai-positioning",
