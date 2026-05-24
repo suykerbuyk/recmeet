@@ -886,6 +886,8 @@ make build-onnxruntime   # build vendored onnxruntime from source (~20 min, see 
 ./build/recmeet_tests "[cli]"                         # single module
 ```
 
+- For test progress visibility on long-running `make benchmark` / `make full-stack` runs, see [docs/BUILD.md — Test progress reporting](docs/BUILD.md#test-progress-reporting): the test binary emits per-test announces, a periodic heartbeat (with RSS), and `[phase] …` pipeline transitions on stderr for long-tagged cases.
+
 ## Architecture
 
 Four C++ binaries share two static libraries. The daemon owns all pipeline logic (audio capture, transcription, diarization, summarization). The CLI, tray, and web UI are thin IPC clients that communicate via a Unix domain socket (or TCP) using newline-delimited JSON. Two additional Go binaries provide AI-powered tooling.
