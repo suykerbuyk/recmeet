@@ -175,12 +175,17 @@ new long-running tags.
   landed in Phase 2). Pipeline-driven tests pass this as their `on_phase`
   callback; benchmark cases wrap `t0`/`t1` blocks manually. Default off.
 
-**Make target defaults.** `make benchmark` and `make full-stack` set
-`RECMEET_TEST_PHASE_ECHO=1` on the underlying `recmeet_tests` invocation
-so the full operator timeline (heartbeat + phase echo) is on by default
-when running those targets. Heartbeat + announce are tag-driven, so no
-env-set is needed for those on either target. `make test` is unchanged —
-short-tag unit tests stay silent by default.
+**Make target defaults.**
+
+- `make test` — no env-set; short-tag unit tests stay silent (no
+  announce, no heartbeat). If a long-tagged case sneaks into the unit
+  filter (`~[integration]~[benchmark]~[full-stack]`), it still gets
+  tag-auto-enabled visibility for free.
+- `make benchmark` — sets `RECMEET_TEST_PHASE_ECHO=1` on the underlying
+  `recmeet_tests` invocation. Announce + heartbeat ride in via
+  `[benchmark]` tag-auto-enable; phase echo gives the full timeline.
+- `make full-stack` — same as `make benchmark`:
+  `RECMEET_TEST_PHASE_ECHO=1` set, announce + heartbeat tag-driven.
 
 ```bash
 # Direct invocation of a long-running tag set gets visibility for free
@@ -196,13 +201,61 @@ RECMEET_TEST_HEARTBEAT_SECS=5 ./build/recmeet_tests "[benchmark]"
 RECMEET_TEST_PHASE_ECHO=1 ./build/recmeet_tests "[full-stack][benchmark]"
 ```
 
-`ProgressListener` coexists with `TmpRootCleanup` (the listener that
+**Composability — heartbeat + phase echo = full timeline.** With both
+on (the `make benchmark` / `make full-stack` default), a long pipeline
+case prints an interleaved stderr timeline of semantic phase
+transitions and liveness pulses. Example debate-pipeline run:
+
+```
+[test] starting "Full pipeline: debate audio with API summary" tags=[full-stack][benchmark]
+[phase] detecting speech (T+0s)
+[phase] transcribing (T+8s)
+[heartbeat] T+30s rss=NN MiB current="..."
+[heartbeat] T+60s ...
+[phase] diarizing (T+118s)
+[phase] identifying speakers (T+150s)
+[phase] summarizing (T+155s)
+[phase] complete (T+184s)
+[test] passed in 184s — "..."
+```
+
+Phase lines come from `recmeet::test::PhaseEcho`
+(`tests/test_progress_phase.h`) wired into `run_debate_pipeline`'s
+`on_phase` callback and into benchmark `t0`/`t1` timing blocks; the
+heartbeat thread is the listener's. Both emit pre-formatted line-atomic
+writes to keep streams interleavable without mid-line splices.
+
+**V2 IPC-driven full-stack tests get heartbeat but not phase echo.**
+The V2-only end-to-end tests that drive a separate `recmeet-daemon`
+subprocess — `test_full_stack_live.cpp`, `test_full_stack_speaker_id.cpp`,
+`test_full_stack_webui.cpp` (and the partly-streaming
+`test_full_stack_captions_paced.cpp`) — receive tag-auto-enabled
+announce + heartbeat for free, but no `[phase]` lines. Reason:
+`run_postprocessing` (the source of phase events) executes inside the
+daemon subprocess, not in the test process, so the `on_phase` callback
+isn't reachable across the IPC boundary. Surfacing daemon-side phase
+events to the test's stderr would require an NDJSON phase channel the
+test process consumes — out of scope here; filed as a follow-up.
+
+**Listener coexistence with `TmpRootCleanup`.** `ProgressListener`
+coexists with the temp-root cleanup listener (`tests/test_tmpdir_listener.cpp`,
 cleans `<temp_dir>/recmeet/<pid>_<epoch_ms>/` on a successful
-`testRunEnded`) — they hook disjoint events (`testCaseStarting` /
-`testCaseEnded` vs. `testRunEnded`). RSS reads reuse the existing
-`recmeet::read_self_rss_kb()` from `src/util.h` (Linux-only via
-`/proc/self/statm`; returns 0 on failure, in which case the heartbeat
-prints `rss=?`).
+`testRunEnded`). The two are event-disjoint:
+`testCaseStarting` / `testCaseEnded` (progress) vs. `testRunEnded`
+(cleanup). No registration conflict, no shared mutable state. RSS reads
+reuse the existing `recmeet::read_self_rss_kb()` from `src/util.h`
+(Linux-only via `/proc/self/statm`; returns 0 on failure, in which case
+the heartbeat prints `rss=?`).
+
+**Why stderr, not stdout.** All listener and `PhaseEcho` output —
+announce, heartbeat, phase — goes to stderr. Catch2's stdout is owned
+by its reporters (the default console reporter plus the optional
+XML / JUnit / SonarQube reporters used for machine-readable CI
+artifacts); injecting our markers there would corrupt those streams.
+Splitting to stderr keeps stdout round-trippable while still
+interleaving cleanly for an operator watching a terminal. Tooling that
+wants only Catch2 output can `2>/dev/null` to drop the progress
+stream.
 
 ### Test ↔ daemon integration seam
 

@@ -632,6 +632,8 @@ make build-onnxruntime   # build vendored onnxruntime from source (~20 min, see 
 ./build/recmeet_tests "[cli]"                         # single module
 ```
 
+- Long-running tests (`[full-stack]`, `[benchmark]`, `[slow]`, `[stress]`, `[verylong]`) automatically emit per-test announcements and a 30-second heartbeat to stderr. See `docs/BUILD.md` "Test progress reporting" for the env-var overrides (`RECMEET_TEST_ANNOUNCE`, `RECMEET_TEST_HEARTBEAT`, `RECMEET_TEST_HEARTBEAT_SECS`) and `RECMEET_TEST_PHASE_ECHO` for in-pipeline phase markers (set by `make benchmark` / `make full-stack` by default).
+
 ## Installing
 
 ```bash
