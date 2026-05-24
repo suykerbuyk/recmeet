@@ -1,13 +1,14 @@
 {
-  "iter_n": 213,
-  "anchor_sha": "66a7315326c9e5335df92b75e1cbb448a411cd7f",
+  "iter_n": 215,
+  "anchor_sha": "961d58bf0a016c3ba71bbbca27202f704f288604",
   "active": [
+    "diarize-stack-v1-to-v2-port",
     "full-stack-captions-60min-regression",
     "sherpa-onnx-1-13-bump",
     "test-and-verification-hardening",
     "test-handler-coverage-phase2c",
-    "test-runner-progress-heartbeat-v2-port",
     "thin-client-recording-server",
+    "tray-start-capture-fullstack-coverage",
     "webui-live-captions",
     "whisper-vocab-hint-bleed"
   ],
@@ -98,6 +99,7 @@
     "system-default-audio",
     "t1b-and-t1c-pr-plan",
     "tender-sleeping-rocket",
+    "test-runner-progress-heartbeat-v2-port",
     "test-runner-progress-heartbeat",
     "thread-count-redundant-validation",
     "tmp-dir-isolation-full-stack-tests-v2",
