@@ -407,7 +407,8 @@ TEST_CASE("Reprocess with context.json fallback", "[full-stack]") {
     input.out_dir = out_dir;
     input.audio_path = audio_path;
 
-    auto result = run_postprocessing(cfg, input);
+    recmeet::test::PhaseEcho echo;
+    auto result = run_postprocessing(cfg, input, echo);
 
     // Read note
     REQUIRE(fs::exists(result.note_path));
@@ -473,7 +474,8 @@ TEST_CASE("Reprocess with per-instance context_<ts>.json fallback", "[full-stack
     input.audio_path = audio_path;
     input.timestamp = "2020-09-29_21-00";
 
-    auto result = run_postprocessing(cfg, input);
+    recmeet::test::PhaseEcho echo;
+    auto result = run_postprocessing(cfg, input, echo);
 
     REQUIRE(fs::exists(result.note_path));
     std::ifstream f(result.note_path);
