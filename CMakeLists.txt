@@ -703,6 +703,10 @@ if(RECMEET_BUILD_TESTS)
         # RECMEET_TEST_HEARTBEAT_SECS. Event-disjoint with TmpRootCleanup
         # (this hooks per-case; that hooks testRunEnded only).
         tests/test_progress_listener.cpp
+        # test-runner-progress-heartbeat-v2-port Phase 2a — PhaseEcho callable
+        # (tests/test_progress_phase.h is header-only; not listed here) plus
+        # its unit tests. Gated by RECMEET_TEST_PHASE_ECHO=1 env var.
+        tests/test_progress_phase_echo.cpp
         # Phase 2b — production IPC verb registrations. Same TU the daemon
         # binary links via `recmeet-daemon`; pulling it into recmeet_tests
         # lets the new `DaemonTestHarness` exercise the production code

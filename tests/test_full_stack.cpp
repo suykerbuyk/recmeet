@@ -10,6 +10,7 @@
 #include "model_manager.h"
 #include "config.h"
 #include "test_tmpdir.h"
+#include "test_progress_phase.h"
 
 #include <chrono>
 #include <cstdlib>
@@ -104,7 +105,9 @@ DebateResult run_debate_pipeline(bool use_local_llm, const fs::path& llm_model_p
     // Phase timing
     std::map<std::string, std::chrono::steady_clock::time_point> phase_starts;
     std::map<std::string, double> phase_durations;
-    auto on_phase = [&](const std::string& phase) {
+    recmeet::test::PhaseEcho echo;
+    auto on_phase = [&, echo](const std::string& phase) mutable {
+        echo(phase);
         auto now = std::chrono::steady_clock::now();
         // Close previous phase
         if (!phase_starts.empty()) {
