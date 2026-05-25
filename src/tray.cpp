@@ -204,6 +204,13 @@ struct TrayState {
         recmeet::CaptionRenderState state;
         guint tick_id = 0;        // GLib timer for auto-hide ticks
         bool captions_enabled_for_recording = false;  // honored at record.start
+        // B3 — mid-recording toggle's runtime visibility state. Seeded from
+        // cfg.captions_enabled at record.start, then mutated by
+        // on_captions_enabled_toggled. Drives the live render gates at the
+        // four sites rewritten under B3.4. captions_enabled_for_recording
+        // stays immutable through the recording as the .pending sidecar's
+        // record-start snapshot.
+        bool overlay_visible_now = false;
     } cap;
 
     // Phase B.2 — local capture state. The tray now owns the audio
@@ -664,11 +671,13 @@ static void handle_ipc_event(const IpcEvent& ev) {
             handle_terminal_status(jid);
         }
     } else if (ev.event == "caption") {
-        // Phase 5.1 — only render captions if this recording was started
-        // with captions_enabled=true. The flag is captured at record.start.
-        // Defensive: if the daemon ever forwards a caption without us
-        // having opted in, drop it silently.
-        if (!g_tray.cap.captions_enabled_for_recording) return;
+        // Phase 5.1 (rev 5) — render captions only when the user has the
+        // overlay visible (`overlay_visible_now`). Under always-stream
+        // the daemon is sending caption events whenever it can; the
+        // client decides whether to render them based on the live
+        // toggle. The drop-silently behavior is unchanged — captions
+        // for a hidden overlay are simply discarded.
+        if (!g_tray.cap.overlay_visible_now) return;
         std::string text = json_val_as_string(ev.data.at("text"));
         bool is_partial = json_val_as_bool(ev.data.at("is_partial"));
         g_tray.cap.state.update(text, is_partial,
@@ -680,7 +689,7 @@ static void handle_ipc_event(const IpcEvent& ev) {
         // updated (via CaptionRenderState::latest_text()).
         build_menu();
     } else if (ev.event == "caption.degraded") {
-        if (!g_tray.cap.captions_enabled_for_recording) return;
+        if (!g_tray.cap.overlay_visible_now) return;
         std::string reason = json_val_as_string(ev.data.at("reason"));
         g_tray.cap.state.degraded(reason);
         caption_overlay_show_with_markup();
@@ -1962,9 +1971,17 @@ static void on_record(GtkMenuItem*, gpointer) {
         return;
     }
 
-    // Captions: snapshot the config value at recording start. Mid-
-    // recording toggles do not take effect; same semantics as Phase 5.1.
+    // Captions: snapshot the config value at record start as the
+    // `.pending` sidecar's immutable record of user intent; seed
+    // `overlay_visible_now` from the same value so the overlay starts in
+    // the user's default visible/hidden state. Mid-recording toggle of
+    // `overlay_visible_now` shows/hides the overlay live (B3.3).
     g_tray.cap.captions_enabled_for_recording = g_tray.cfg.captions_enabled;
+    // B3.2 — seed overlay visibility from the user's persistent default
+    // at record.start. Mid-recording toggles via on_captions_enabled_toggled
+    // mutate this field only; captions_enabled_for_recording stays
+    // immutable for the .pending sidecar.
+    g_tray.cap.overlay_visible_now = g_tray.cfg.captions_enabled;
     // B1.1 — under rev 5 always-stream the wire-protocol decision gates
     // on the server's reported capability (`captions_supported` from
     // session.init, cached in `g_tray.server_caps`) — NOT on the user's
@@ -1977,8 +1994,8 @@ static void on_record(GtkMenuItem*, gpointer) {
         // Pre-create the overlay window so the first caption event has
         // somewhere to render. B1.2: overlay create is unconditional
         // within the capability-supported branch; overlay visibility at
-        // record.start defers to Phase B3's `overlay_visible_now`
-        // seeding (separate later commit).
+        // record.start follows the user's `cfg.captions_enabled` default
+        // via B3.2's `overlay_visible_now` seed just above.
         caption_overlay_create();
 
         // Phase C.10a — open a live-caption streaming session on the
@@ -2602,12 +2619,33 @@ static void on_vad_toggled(GtkCheckMenuItem* item, gpointer) {
     save_legacy_config_as_job_config(g_tray.cfg);
 }
 
-// Phase 5.4 — Live captions toggle. Persists to config and applies to the
-// NEXT recording (captions are bound to record.start params; mid-recording
-// toggles do not take effect — the menu's tooltip makes this explicit).
+// Phase 5.4 — Live captions toggle. Persists the user's overlay-visible
+// default to config. If a recording is in progress, also shows or hides
+// the live caption overlay immediately by mutating
+// `g_tray.cap.overlay_visible_now` (B3.3); the snapshot in
+// `captions_enabled_for_recording` is NOT touched — it stays as the
+// immutable record-start value for the `.pending` sidecar.
 static void on_captions_enabled_toggled(GtkCheckMenuItem* item, gpointer) {
-    g_tray.cfg.captions_enabled = gtk_check_menu_item_get_active(item);
+    bool new_state = gtk_check_menu_item_get_active(item);
+    // Persist the user's overlay-visible default to config (today's
+    // behavior, kept).
+    g_tray.cfg.captions_enabled = new_state;
     save_legacy_config_as_job_config(g_tray.cfg);
+    // B3.3 — when a recording is in progress, also mutate the live
+    // overlay-visible state and show/hide the overlay immediately. No
+    // IPC call — the server keeps the engine running because rev 5's
+    // always-stream design (B1.1) opened process.stream at record.start
+    // based on server capability, not on the user's local toggle.
+    // captions_enabled_for_recording is NOT touched here — it stays as
+    // the immutable record-start snapshot for the .pending sidecar.
+    if (g_tray.recording) {
+        g_tray.cap.overlay_visible_now = new_state;
+        if (new_state) {
+            caption_overlay_show_with_markup();
+        } else if (g_tray.cap.window) {
+            gtk_widget_hide(g_tray.cap.window);
+        }
+    }
 }
 
 // --- Provider / model callbacks ---
@@ -3246,7 +3284,7 @@ static void build_menu() {
                     "processing", g_tray.postprocessing);
     append_slot_row(recmeet::SlotKind::Streaming,
                     "recording",
-                    g_tray.recording && g_tray.cap.captions_enabled_for_recording);
+                    g_tray.recording);
     append_slot_row(recmeet::SlotKind::ModelDownload,
                     g_tray.download_model.empty() ? "downloading"
                                                   : g_tray.download_model.c_str(),
@@ -3263,7 +3301,7 @@ static void build_menu() {
     //
     // The row is suppressed entirely when there is no caption text to
     // show (no streaming session, or pre-first-caption window).
-    if (g_tray.cap.captions_enabled_for_recording) {
+    if (g_tray.cap.overlay_visible_now) {
         std::string latest = g_tray.cap.state.latest_text();
         std::string row = recmeet::render_caption_inline_row(latest);
         if (!row.empty()) {
@@ -3473,13 +3511,12 @@ static void build_menu() {
         } else {
             gtk_widget_set_tooltip_text(item,
                 "Live captions appear in a small overlay during recording. "
-                "Toggling this applies to the NEXT recording (captions are "
-                "bound to record.start parameters).");
+                "Toggling this shows/hides the live caption overlay. "
+                "Applies immediately during a recording; otherwise sets "
+                "the default for the next recording.");
         }
         g_signal_connect(item, "toggled",
                          G_CALLBACK(on_captions_enabled_toggled), nullptr);
-        // Always toggleable — even mid-recording, since the change only
-        // applies to the next recording. The tooltip explains.
         gtk_menu_shell_append(GTK_MENU_SHELL(menu), item);
     }
 

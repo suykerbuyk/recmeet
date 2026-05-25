@@ -629,6 +629,13 @@ if(RECMEET_BUILD_TESTS)
         # captions_supported=true. T9 (menu sensitivity) deferred — see
         # the test file header for the manual-test rationale.
         tests/test_captions_phase_b.cpp
+        # Phase B3 — V2 captions always-stream mid-recording-toggle
+        # decoupling. Test T8 from the same plan: across three
+        # toggle ON/OFF/ON windows the snapshot field stays immutable,
+        # overlay_visible_now tracks each toggle, and the server-side
+        # streaming session count stays at exactly 1 (zero engine
+        # restarts).
+        tests/test_captions_phase_b3.cpp
         tests/test_stream_commit.cpp
         tests/test_upload_session.cpp
         tests/test_caption_ipc_integration.cpp
