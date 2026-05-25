@@ -193,7 +193,6 @@ int client_record_no_sigaction(const JobConfig& cfg, const std::string& addr,
         } else if (!cfg.no_summary) {
             prefs["summarization_backend"] = std::string("http");
         }
-        prefs["captions_enabled"] = cfg.captions_enabled;
 
         IpcResponse sresp;
         IpcError serr;

@@ -887,7 +887,6 @@ static bool connect_to_daemon() {
         } else if (!g_tray.cfg.no_summary) {
             prefs["summarization_backend"] = std::string("http");
         }
-        prefs["captions_enabled"] = g_tray.cfg.captions_enabled;
 
         IpcResponse sresp;
         IpcError serr;
@@ -2013,7 +2012,6 @@ static void on_record(GtkMenuItem*, gpointer) {
             sp["channels"]          = static_cast<int64_t>(recmeet::CHANNELS);
             sp["language"]          = g_tray.cfg.language.empty()
                                           ? std::string("en") : g_tray.cfg.language;
-            sp["captions_enabled"]  = true;
             // latency_budget_ms — the tray has no per-config knob for this
             // (it lives in the daemon's per-session SessionPreferences); use
             // the protocol default 500 ms. The daemon clamps/rejects out of
