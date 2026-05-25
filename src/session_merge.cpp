@@ -193,15 +193,19 @@ JobConfig make_job_config(
             cfg.llm_model = session_prefs.llm_model;
     }
 
-    // captions_enabled / caption_latency_ms come straight from session
-    // prefs. captions_enabled is opt-in for the C.10 streaming caption
-    // path. Phase E.2(b) landed `caption_latency_ms` on JobConfig, so the
-    // session value propagates into the merged JobConfig the daemon
-    // hands to the subprocess (and into the JSON config the streaming
-    // CaptionEngine reads). The session.init / session.update_prefs
-    // handlers enforce the [200, 2000] range upstream; this assignment
-    // does not re-validate.
-    cfg.captions_enabled    = session_prefs.captions_enabled;
+    // caption_latency_ms is the only captions-related field that flows
+    // from session prefs into the merged JobConfig (Phase E.2(b)). The
+    // value propagates into the JSON config the streaming CaptionEngine
+    // reads. The session.init / session.update_prefs handlers enforce the
+    // [200, 2000] range upstream; this assignment does not re-validate.
+    //
+    // Phase C (rev 5) — `cfg.captions_enabled` is no longer overlaid from
+    // session prefs: under v2 always-stream the server alone owns the
+    // captions toggle (`ServerConfig::captions_enabled`, AND'd with
+    // runtime capability at daemon startup). The base-layer assignment
+    // at line 48 (`cfg.captions_enabled = srv.captions_enabled;`) is the
+    // sole site that sets the JobConfig captions toggle, and after Phase
+    // A1.4 it carries the runtime-effective value.
     cfg.caption_latency_ms  = session_prefs.caption_latency_ms;
 
     return cfg;

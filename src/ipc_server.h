@@ -44,6 +44,13 @@ struct SessionCredentials {
 // `summarization_backend` is constrained to `"http"` or `"local"` — empty
 // is allowed and treated as "use daemon.yaml fallback"; any other value is
 // rejected at the handler.
+//
+// Phase C (rev 5) — `captions_enabled` retired from this struct: under v2
+// always-stream, captions liveness is server-owned (`ServerConfig::
+// captions_enabled` AND'd with runtime capability at startup, surfaced on
+// the wire as `session.init.captions_supported`). The client's per-user
+// overlay-visible toggle never crosses the wire; it lives client-side as
+// `JobConfig::captions_enabled` (config.h:160).
 struct SessionPreferences {
     std::string output_dir;
     std::string note_dir;
@@ -54,7 +61,6 @@ struct SessionPreferences {
     std::string whisper_model;
     std::string summarization_backend;   // "" / "http" / "local"
     std::string llm_model;
-    bool captions_enabled = false;
     int  caption_latency_ms = 500;
 };
 

@@ -112,7 +112,13 @@ void register_daemon_handlers(recmeet::IpcServer& server) {
     //    "preferences": {"output_dir", "note_dir", "language", "vocabulary",
     //                    "mic_source", "monitor_source", "whisper_model",
     //                    "summarization_backend", "llm_model",
-    //                    "captions_enabled", "caption_latency_ms"}}
+    //                    "caption_latency_ms"}}
+    //
+    // Phase C (rev 5) — `captions_enabled` retired from the prefs payload:
+    // captions liveness is server-owned (announced via
+    // session.init.captions_supported); a key-presence absence on the wire
+    // is now the norm. Clients still emitting the key are silently
+    // tolerated by the parser (which simply does not look for it).
     //
     // All fields optional. Validation enforced at this layer:
     //   * `summarization_backend ∈ {"", "http", "local"}`  → reject otherwise
@@ -186,8 +192,6 @@ void register_daemon_handlers(recmeet::IpcServer& server) {
         get_str("whisper_model",         dst.whisper_model);
         get_str("summarization_backend", dst.summarization_backend);
         get_str("llm_model",             dst.llm_model);
-        auto cit = src.find("captions_enabled");
-        if (cit != src.end()) dst.captions_enabled = json_val_as_bool(cit->second);
         auto lit = src.find("caption_latency_ms");
         if (lit != src.end()) dst.caption_latency_ms =
             static_cast<int>(json_val_as_int(lit->second));
@@ -305,12 +309,11 @@ void register_daemon_handlers(recmeet::IpcServer& server) {
         SessionPreferences prefs;
         server.get_session(req.client_id, creds, prefs);
         // Overlay only the fields actually present in the request — for
-        // strings this is "non-empty value overwrites"; for the boolean
-        // and integer we explicitly check key presence so a request that
-        // omits them preserves the prior value (and so a request that
-        // sets caption_latency_ms but omits captions_enabled does NOT
-        // implicitly set captions_enabled=false).
-        auto bit = req.params.find("captions_enabled");
+        // strings this is "non-empty value overwrites"; for the integer
+        // `caption_latency_ms` we explicitly check key presence so a
+        // request that omits it preserves the prior value. (Phase C
+        // retired the boolean `captions_enabled` slot, so the
+        // key-presence dance now applies only to `caption_latency_ms`.)
         auto lit = req.params.find("caption_latency_ms");
         SessionPreferences from_req;
         parse_preferences_into(req.params, from_req);
@@ -324,7 +327,6 @@ void register_daemon_handlers(recmeet::IpcServer& server) {
         if (!from_req.whisper_model.empty())         prefs.whisper_model = from_req.whisper_model;
         if (!from_req.summarization_backend.empty()) prefs.summarization_backend = from_req.summarization_backend;
         if (!from_req.llm_model.empty())             prefs.llm_model = from_req.llm_model;
-        if (bit != req.params.end()) prefs.captions_enabled   = from_req.captions_enabled;
         if (lit != req.params.end()) prefs.caption_latency_ms = from_req.caption_latency_ms;
         if (!server.set_session_preferences(req.client_id, prefs)) {
             err.code = static_cast<int>(IpcErrorCode::InternalError);
@@ -385,16 +387,15 @@ void register_daemon_handlers(recmeet::IpcServer& server) {
             auto it = req.params.find(k);
             return it != req.params.end() ? json_val_as_int(it->second) : def;
         };
-        auto gb = [&](const char* k, bool def) {
-            auto it = req.params.find(k);
-            return it != req.params.end() ? json_val_as_bool(it->second) : def;
-        };
+        // Phase C (rev 5) — the `bool` accessor (`gb`) was removed along with
+        // the `captions_enabled` parser line; no surviving StreamRequest
+        // field is parsed via JSON-bool today. Re-add the helper if a new
+        // boolean field appears on the wire.
         sr.format            = gs("format", sr.format);
         sr.sample_rate       = static_cast<int32_t>(gi("sample_rate", sr.sample_rate));
         sr.channels          = static_cast<int32_t>(gi("channels", sr.channels));
         sr.context           = gs("context", sr.context);
         sr.language          = gs("language", sr.language);
-        sr.captions_enabled  = gb("captions_enabled", sr.captions_enabled);
         sr.latency_budget_ms = static_cast<int>(gi("latency_budget_ms",
                                                    sr.latency_budget_ms));
         // C.11 — optional meeting_id. Empty is the v1-client fallback;

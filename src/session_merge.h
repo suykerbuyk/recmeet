@@ -52,12 +52,17 @@ namespace recmeet {
 //
 // The `prefs` parameter flows the A.6 preference fields
 // (whisper_model, language, vocabulary, output_dir, note_dir,
-// mic_source, monitor_source, llm_model, captions_enabled,
-// caption_latency_ms) into the JobConfig so the subprocess sees the
-// per-client view. `summarization_backend` drives provider/llm-path
-// selection downstream: `"local"` forces a non-empty `llm_model`;
-// `"http"` clears `llm_model` so the subprocess uses the HTTP path;
-// empty leaves whatever the assembly produced.
+// mic_source, monitor_source, llm_model, caption_latency_ms) into the
+// JobConfig so the subprocess sees the per-client view.
+// `summarization_backend` drives provider/llm-path selection downstream:
+// `"local"` forces a non-empty `llm_model`; `"http"` clears `llm_model`
+// so the subprocess uses the HTTP path; empty leaves whatever the
+// assembly produced.
+//
+// Phase C (rev 5) — `captions_enabled` is NOT a session-prefs field: the
+// JobConfig's captions toggle comes solely from `ServerConfig::
+// captions_enabled` (the base-layer assignment at session_merge.cpp:48),
+// which after Phase A1.4 carries the runtime-effective server capability.
 JobConfig make_job_config(
     const ServerConfig& srv,
     const SessionCredentials& session_creds,

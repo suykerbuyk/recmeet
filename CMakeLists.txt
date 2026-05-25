@@ -636,6 +636,17 @@ if(RECMEET_BUILD_TESTS)
         # streaming session count stays at exactly 1 (zero engine
         # restarts).
         tests/test_captions_phase_b3.cpp
+        # Phase C — V2 captions always-stream daemon-side dead-code
+        # cleanup. Tests T10 + T11 from the same plan:
+        #   T10 — grep-invariant scan of src/ for orphan readers of the
+        #         deleted SessionPreferences::captions_enabled and
+        #         StreamRequest::captions_enabled struct fields. Zero
+        #         hits = clean Phase C landing.
+        #   T11 — wire-shape regression: session.init and
+        #         session.update_prefs accept prefs payloads that OMIT
+        #         captions_enabled (the post-B5 norm), and still surface
+        #         captions_supported on the response.
+        tests/test_captions_phase_c.cpp
         tests/test_stream_commit.cpp
         tests/test_upload_session.cpp
         tests/test_caption_ipc_integration.cpp
@@ -779,6 +790,12 @@ if(RECMEET_BUILD_TESTS)
     # RECMEET_BUILD_DIR wins if set.
     target_compile_definitions(recmeet_tests PRIVATE
         RECMEET_BUILD_DIR_DEFAULT="${CMAKE_BINARY_DIR}")
+    # Phase C T10 — grep-invariant scan of src/ needs an absolute path
+    # to the source tree so the test can locate first-party C++ source
+    # regardless of the harness's WORKING_DIRECTORY. Mirror of the
+    # RECMEET_BUILD_DIR_DEFAULT pattern above.
+    target_compile_definitions(recmeet_tests PRIVATE
+        RECMEET_SRC_DIR_DEFAULT="${CMAKE_SOURCE_DIR}/src")
     catch_discover_tests(recmeet_tests)
 endif()
 

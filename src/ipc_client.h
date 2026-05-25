@@ -123,7 +123,12 @@ public:
     // (`provider`, `api_key`, `api_keys.<provider>`, `output_dir`,
     // `note_dir`, `language`, `vocabulary`, `mic_source`, `monitor_source`,
     // `whisper_model`, `summarization_backend`, `llm_model`,
-    // `captions_enabled`, `caption_latency_ms`).
+    // `caption_latency_ms`).
+    //
+    // Phase C (rev 5) — `captions_enabled` retired from the prefs payload:
+    // captions liveness is server-owned (announced via
+    // session.init.captions_supported). Legacy clients still emitting the
+    // key are silently tolerated by the daemon parser.
     //
     // `session_init` is intended for use after `connect()` succeeds and
     // before any `record.start`. The daemon clears the slot on

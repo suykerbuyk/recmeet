@@ -88,7 +88,6 @@ TEST_CASE("A.6: session.init populates per-client creds and prefs",
     prefs["output_dir"]            = std::string("/tmp/sessions/out");
     prefs["whisper_model"]         = std::string("base.en");
     prefs["summarization_backend"] = std::string("http");
-    prefs["captions_enabled"]      = true;
     prefs["caption_latency_ms"]    = int64_t(500);
 
     IpcResponse resp;
@@ -99,7 +98,10 @@ TEST_CASE("A.6: session.init populates per-client creds and prefs",
     CHECK(json_val_as_bool(resp.result["ok"]) == true);
     CHECK(json_val_as_bool(resp.result["session_active"]) == true);
 
-    // The server-side slot must reflect the just-sent values.
+    // The server-side slot must reflect the just-sent values. Phase C
+    // (rev 5): `SessionPreferences::captions_enabled` is gone — captions
+    // liveness is server-owned, surfaced via `captions_supported` on the
+    // session.init response (asserted by test_captions_phase_a).
     SessionCredentials got_c;
     SessionPreferences got_p;
     REQUIRE(snapshot_session(h.server, c.client_id(), got_c, got_p));
@@ -108,7 +110,6 @@ TEST_CASE("A.6: session.init populates per-client creds and prefs",
     CHECK(got_p.output_dir == "/tmp/sessions/out");
     CHECK(got_p.whisper_model == "base.en");
     CHECK(got_p.summarization_backend == "http");
-    CHECK(got_p.captions_enabled == true);
     CHECK(got_p.caption_latency_ms == 500);
 
     c.close_connection();
@@ -198,16 +199,18 @@ TEST_CASE("A.6: session.update_prefs partial preserves untouched fields",
     JsonMap creds;
     creds["provider"] = std::string("openai");
     JsonMap prefs;
-    prefs["whisper_model"]    = std::string("base.en");
-    prefs["captions_enabled"] = true;
+    prefs["whisper_model"]      = std::string("base.en");
+    prefs["language"]           = std::string("en");
     prefs["caption_latency_ms"] = int64_t(500);
     IpcResponse resp;
     IpcError err;
     REQUIRE(c.session_init(creds, prefs, resp, err));
 
-    // Patch only caption_latency_ms. captions_enabled must remain true
-    // (no key in the patch → leave the prior value); whisper_model must
-    // also stay.
+    // Patch only caption_latency_ms. whisper_model and language must
+    // remain untouched (no key in the patch → leave the prior value).
+    // Phase C (rev 5): `captions_enabled` is no longer a slot field, so
+    // the preserve-untouched-fields invariant is exercised via the other
+    // string-valued prefs.
     JsonMap patch;
     patch["caption_latency_ms"] = int64_t(800);
     REQUIRE(c.session_update_prefs(patch, resp, err));
@@ -216,8 +219,8 @@ TEST_CASE("A.6: session.update_prefs partial preserves untouched fields",
     SessionPreferences got_p;
     REQUIRE(snapshot_session(h.server, c.client_id(), got_c, got_p));
     CHECK(got_p.caption_latency_ms == 800);
-    CHECK(got_p.captions_enabled   == true);   // preserved
-    CHECK(got_p.whisper_model      == "base.en");
+    CHECK(got_p.whisper_model      == "base.en");  // preserved
+    CHECK(got_p.language           == "en");       // preserved
 
     c.close_connection();
 }
@@ -476,12 +479,16 @@ TEST_CASE("A.6.1: session preferences overlay daemon.yaml prefs",
     prefs.whisper_model         = "small.en";
     prefs.language              = "fr";
     prefs.summarization_backend = "http";
-    prefs.captions_enabled      = true;
     PostprocessInput input{};
 
     JobConfig out = make_job_config(yaml, sess, prefs, input, make_env({}));
     CHECK(out.whisper_model == "small.en");
     CHECK(out.language == "fr");
+    // Phase C (rev 5): `cfg.captions_enabled` is sourced from
+    // `srv.captions_enabled` (the kept base-layer assignment at
+    // session_merge.cpp:48 — runtime-effective after Phase A1.4), NOT
+    // from session prefs. The yaml baseline inherits the ServerConfig
+    // default (true after Phase A1.1), so out.captions_enabled = true.
     CHECK(out.captions_enabled == true);
     // summarization_backend=http clears llm_model so the subprocess
     // picks the HTTP path without inference.

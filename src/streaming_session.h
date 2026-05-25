@@ -84,13 +84,18 @@ class MeetingIndex;
 
 /// Parsed `process.stream` request shape. `speaker_hints` is reserved for v2
 /// multi-server and is accepted-and-ignored in C.10a (no field here).
+///
+/// Phase C (rev 5) — `captions_enabled` retired: under always-stream the
+/// server gates engine lifecycle on its own runtime-effective capability
+/// (`ServerConfig::captions_enabled` AND'd with model+sherpa at startup),
+/// surfaced on the wire as `session.init.captions_supported`. The wire
+/// `process.stream` request no longer carries any captions toggle.
 struct StreamRequest {
     std::string format = "s16le";   ///< only "s16le" supported in v1
     int32_t     sample_rate = 16000;
     int32_t     channels = 1;
     std::string context;            ///< meeting context (reserved for C.10b)
     std::string language = "en";    ///< English-only guard rejects others
-    bool        captions_enabled = true;
     int         latency_budget_ms = 500;  ///< [200,2000], drives emit cadence
     /// Phase C.11 — client-minted UUID v4 identifying the meeting (see
     /// docs/V2-STRATEGY.md "Meeting identity"). Empty for v1-shaped
