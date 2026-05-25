@@ -96,11 +96,13 @@ struct SpawnedDaemon {
                   const std::string& tcp_addr,
                   const std::string& psk,
                   const fs::path& xdg_config_dir,
-                  const fs::path& unix_socket)
+                  const fs::path& unix_socket,
+                  const fs::path& stderr_log = {})
         : transport_(transport)
         , address_(transport == Transport::TCP ? tcp_addr : std::string{})
         , socket_path_(transport == Transport::Unix ? unix_socket : fs::path{})
         , xdg_config_(xdg_config_dir)
+        , stderr_log_(stderr_log)
     {
         // Validate args by transport. Cheap, but the failure modes are
         // confusing enough (a missing --socket arg makes the daemon use the
@@ -129,9 +131,30 @@ struct SpawnedDaemon {
             // Quiet the daemon's stderr — the parent runs the test
             // assertions; log noise from a healthy daemon shouldn't confuse
             // the test runner output. Operator can override with
-            // RECMEET_E2E_DAEMON_STDERR=1 for debugging.
+            // RECMEET_E2E_DAEMON_STDERR=1 for debugging. When the caller
+            // passed a `stderr_log` path, redirect stderr there so the
+            // parent test can grep for daemon log lines (used by
+            // captions-supported test T3 to assert the
+            // "[startup] captions disabled at runtime: model directory not
+            // found" line was emitted). When the env override is also set,
+            // we honor the env (file capture is opt-in via ctor param,
+            // operator debug override always wins).
             const char* keep_stderr = std::getenv("RECMEET_E2E_DAEMON_STDERR");
-            if (!keep_stderr || keep_stderr[0] == '\0') {
+            if (keep_stderr && keep_stderr[0] != '\0') {
+                // fall through — keep inherited stderr
+            } else if (!stderr_log.empty()) {
+                // Force info-level so the startup log lines we assert on
+                // actually emit. The daemon default is "error" (see
+                // config.cpp loader); without bumping this, tests that
+                // grep startup INFO lines would see an empty file.
+                setenv("RECMEET_LOG_LEVEL", "info", 1);
+                int fd = ::open(stderr_log.c_str(),
+                                O_WRONLY | O_CREAT | O_TRUNC, 0644);
+                if (fd >= 0) {
+                    ::dup2(fd, STDERR_FILENO);
+                    ::close(fd);
+                }
+            } else {
                 int devnull = ::open("/dev/null", O_WRONLY);
                 if (devnull >= 0) {
                     ::dup2(devnull, STDERR_FILENO);
@@ -283,12 +306,22 @@ struct SpawnedDaemon {
         return ok;
     }
 
+    /// Path of the file the daemon's stderr was redirected to (when the
+    /// optional ctor `stderr_log` argument was non-empty). Empty when no
+    /// log redirection was requested. The file is populated by the child
+    /// process — readers should slurp it after the daemon has had a chance
+    /// to emit (typically after `~SpawnedDaemon` has reaped the child to
+    /// guarantee final flush, but readers may also poll mid-run for
+    /// startup-only lines like the captions runtime gate).
+    const fs::path& stderr_log_path() const noexcept { return stderr_log_; }
+
 private:
     pid_t pid_ = -1;
     Transport transport_;
     std::string address_;     // host:port for TCP, empty for Unix
     fs::path socket_path_;    // socket path for Unix, empty for TCP
     fs::path xdg_config_;
+    fs::path stderr_log_;     // empty unless caller opted in
 };
 
 // ---------------------------------------------------------------------------

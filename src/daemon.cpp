@@ -1896,17 +1896,52 @@ int main(int argc, char* argv[]) {
             });
         };
         std::string model_dir;
+        bool captions_runtime_enabled = false;
+        fs::path meetings_root_snapshot;
         {
+            // A1.4 lock-scope contract: the runtime-capability AND-in MUST
+            // land inside the same lock_guard `{}` as the model_dir read.
+            // session.init's captions_supported reader (A2.1) acquires this
+            // same mutex; split-phase write-after-release races even though
+            // daemon-startup happens-before listener-accept.
             std::lock_guard<std::mutex> lock(g_server_config_mu);
-            model_dir = resolve_caption_model_dir(g_server_config.caption_model).string();
+            auto resolved_model_dir =
+                resolve_caption_model_dir(g_server_config.caption_model);
+            model_dir = resolved_model_dir.string();
+
+            bool runtime_capable = g_server_config.captions_enabled
+                && fs::exists(resolved_model_dir)
+                && fs::is_directory(resolved_model_dir);
+#ifndef RECMEET_USE_SHERPA
+            runtime_capable = false;
+#endif
+            if (g_server_config.captions_enabled && !runtime_capable) {
+                // Operator opted in but the runtime can't deliver — surface why.
+                const char* reason =
+#ifndef RECMEET_USE_SHERPA
+                    "RECMEET_USE_SHERPA=OFF build";
+#else
+                    !fs::exists(resolved_model_dir)
+                        ? "model directory not found"
+                        : (!fs::is_directory(resolved_model_dir)
+                            ? "model path is not a directory"
+                            : "unknown");
+#endif
+                log_info("[startup] captions disabled at runtime: %s", reason);
+            }
+            g_server_config.captions_enabled = runtime_capable;
+            captions_runtime_enabled = runtime_capable;
+            meetings_root_snapshot = g_server_config.meetings_root;
         }
         g_streaming = std::make_unique<StreamingSessionManager>(
             *g_jobs, sink, model_dir,
             g_meeting_index.get(),    // C.11.4 — convergence-principle dedup
-            g_server_config.meetings_root);
+            meetings_root_snapshot,
+            captions_runtime_enabled);  // A3.2 — runtime-effective capability
         log_info("daemon: streaming session manager ready (caption_model_dir=%s, "
-                 "meetings_root=%s)",
-                 model_dir.c_str(), g_server_config.meetings_root.string().c_str());
+                 "captions_runtime_enabled=%d, meetings_root=%s)",
+                 model_dir.c_str(), captions_runtime_enabled ? 1 : 0,
+                 meetings_root_snapshot.string().c_str());
     }
 
     // Phase C.2 — construct the UploadSessionManager. The progress sink

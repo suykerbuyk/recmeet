@@ -746,6 +746,31 @@ captioning, so a mid-stream disconnect degrades cleanly to pattern 2
 (keep recording locally, reupload-to-overwrite later) without any
 extra client logic.
 
+#### Server captions: single-knob semantics
+
+The server's captions toggle is a single source of truth:
+`ServerConfig::captions_enabled` in daemon.yaml (default ON). At daemon
+startup the operator's config-file intent is AND'd with runtime
+capability — the resolved caption model directory must exist as a
+directory AND the daemon must have been built with `RECMEET_USE_SHERPA`.
+The resulting runtime-effective bool is written back into the same
+`captions_enabled` field under `g_server_config_mu` and announced to
+every client on the `session.init` response as `captions_supported`.
+This single additive wire field is the only captions capability signal
+the client sees; there is no env-var override and no parallel
+`captions_supported_at_startup` cache. Operators flip captions off by
+editing daemon.yaml (`captions:\n  enabled: false`) and restarting the
+daemon; mid-uptime changes are not supported (model removal mid-uptime
+surfaces as per-session `engine_error` rather than silent disablement).
+
+Migration from a pre-split monolithic `config.yaml` sets server captions
+ON by default — `migrate_legacy_config_if_present` overrides the field
+unconditionally after building the new `ServerConfig`, since the legacy
+JobConfig default was `false` and silently inheriting it would defeat
+the default-ON intent for existing recmeet hosts. Edit the generated
+daemon.yaml to opt out (the ServerConfig YAML emitter round-trips
+explicit `enabled: false` cleanly).
+
 #### Disk-space implications
 
 The server's per-meeting `audio_*.wav` slot is overwritten on each

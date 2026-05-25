@@ -998,8 +998,11 @@ ServerConfig load_server_config(const fs::path& config_path) {
     if (!vmxs.empty()) cfg.vad_max_speech = std::atof(vmxs.c_str());
 
     // Captions (server side — engine + model only; normalize_display is
-    // a client-render knob and stays in client.yaml).
-    cfg.captions_enabled = get_bool(entries, "captions", "enabled", false);
+    // a client-render knob and stays in client.yaml). Default ON — at
+    // daemon startup this is AND'd with runtime capability (model dir
+    // present + RECMEET_USE_SHERPA build) so the canonical field carries
+    // the runtime-effective value. See daemon.cpp's startup gate.
+    cfg.captions_enabled = get_bool(entries, "captions", "enabled", true);
     cfg.caption_model = get_val(entries, "captions", "model", "");
 
     // General.
@@ -1301,10 +1304,15 @@ void save_server_config(const ServerConfig& cfg, const fs::path& config_path) {
             out << "  max_speech: " << cfg.vad_max_speech << "\n";
     }
 
-    // Captions (server side: enabled + model only).
-    if (cfg.captions_enabled || !cfg.caption_model.empty()) {
+    // Captions (server side: enabled + model only). Default is ON, so we
+    // emit `enabled: false` only when the operator has explicitly opted
+    // out — the loader default flip (true) means no `captions:` block at
+    // all == ON. This mirrors the "emit-when-non-default" pattern used by
+    // `caption_normalize_display` in save_config and lets the explicit
+    // false round-trip cleanly through daemon.yaml regeneration.
+    if (!cfg.captions_enabled || !cfg.caption_model.empty()) {
         out << "\ncaptions:\n";
-        if (cfg.captions_enabled) out << "  enabled: true\n";
+        if (!cfg.captions_enabled) out << "  enabled: false\n";
         if (!cfg.caption_model.empty())
             out << "  model: " << cfg.caption_model << "\n";
     }
@@ -1499,6 +1507,17 @@ void migrate_legacy_config_if_present(const fs::path& cfg_dir_in) {
     // Load the monolithic legacy file, split, then write both halves.
     JobConfig legacy = load_legacy_config_as_job_config(old_path);
     ServerConfig srv = to_server_config(legacy);
+    // A1.6 — migration override: `to_server_config` field-copies
+    // `captions_enabled` from a JobConfig whose default is `false`. Without
+    // this override, every host migrating a pre-split monolithic
+    // `config.yaml` would inherit `captions_enabled=false`, and the
+    // startup AND-in in daemon.cpp would silently keep them in the
+    // captions-off state — defeating the default-ON intent for existing
+    // recmeet hosts. Force ON post-migration so fresh installs AND
+    // legacy-migrated hosts both default ON. Operators who explicitly
+    // want captions off can edit the generated daemon.yaml (the
+    // ServerConfig emitter now round-trips `enabled: false` correctly).
+    srv.captions_enabled = true;
     ClientConfig cli = to_client_config(legacy);
 
     save_server_config(srv, daemon_path);

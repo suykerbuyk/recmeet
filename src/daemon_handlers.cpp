@@ -247,6 +247,20 @@ void register_daemon_handlers(recmeet::IpcServer& server) {
 
         resp.result["ok"] = true;
         resp.result["session_active"] = true;
+        // A2.1 — surface the daemon's runtime-effective captions capability
+        // to the client. The struct field is named `captions_enabled`
+        // (server SoT, AND'd with capability at startup), but the wire
+        // field is named `captions_supported` because from the client's
+        // perspective the semantics are "is the server able to caption
+        // right now" — a capability, not a toggle. Read under
+        // g_server_config_mu (the same mutex that A1.4's startup gate
+        // wrote under).
+        bool captions_supported = false;
+        {
+            std::lock_guard<std::mutex> lock(g_server_config_mu);
+            captions_supported = g_server_config.captions_enabled;
+        }
+        resp.result["captions_supported"] = captions_supported;
         return true;
     });
 

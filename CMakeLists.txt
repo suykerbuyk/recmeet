@@ -616,6 +616,13 @@ if(RECMEET_BUILD_TESTS)
         tests/streaming_capture_tests.cpp
         tests/streaming_engine_tests.cpp
         tests/test_streaming_session.cpp
+        # Phase A — V2 captions always-stream + server capability reporting.
+        # Tests T1-T5 from the v2-captions-always-stream-client-renders.md
+        # plan: session.init reports captions_supported correctly under
+        # default/explicit-off/bogus-model/no-sherpa configurations, and
+        # StreamingSessionManager short-circuits the engine block when the
+        # runtime-effective captions capability is false.
+        tests/test_captions_phase_a.cpp
         tests/test_stream_commit.cpp
         tests/test_upload_session.cpp
         tests/test_caption_ipc_integration.cpp

@@ -427,8 +427,9 @@ struct ServerConfig {
     std::string llm_model;  // path or name, empty = use HTTP API
     bool llm_mmap = false;
 
-    // -- Captions (server runs CaptionEngine) --
-    bool captions_enabled = false;
+    // -- Captions (server runs CaptionEngine; default ON, AND'd with
+    // runtime capability at daemon startup — see daemon.cpp's startup gate)
+    bool captions_enabled = true;
     std::string caption_model;
 
     // -- DUAL fallback: provider / API keys (client primary; daemon fb) --

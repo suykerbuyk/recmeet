@@ -153,6 +153,13 @@ public:
     /// Bytes of PCM appended to the temp WAV so far. Test introspection.
     int64_t bytes_written() const { return bytes_written_; }
 
+    /// A3.4 — test introspection. Returns whether the session has a live
+    /// CaptionEngine instance. False when the manager was constructed with
+    /// `captions_enabled_at_startup=false` (engine block short-circuited
+    /// — see streaming_session.cpp), or when an engine that started up
+    /// failed and was reset to nullptr. No new mutating API surface.
+    bool has_engine() const { return engine_ != nullptr; }
+
 private:
     friend class StreamingSessionManager;
     StreamingSession() = default;
@@ -255,11 +262,23 @@ public:
     /// falls back to the legacy temp-WAV-becomes-meeting-dir model. The
     /// pointer + path are stored, not copied — both must outlive the
     /// manager.
+    /// A3.2 — `captions_enabled_at_startup` is the runtime-effective server
+    /// captions capability, computed at daemon startup in daemon.cpp under
+    /// `g_server_config_mu` (the operator's config-file intent AND'd with
+    /// runtime model-presence + RECMEET_USE_SHERPA build). When `false`,
+    /// `create()` short-circuits the engine-start block entirely — no
+    /// CaptionEngine allocated, no engine_error emitted; audio still
+    /// flows to the disk-backed temp WAV. The manager caches this value
+    /// for the daemon-process lifetime; config changes require a daemon
+    /// restart. Defaulted to `true` so existing test fixtures that pre-date
+    /// A3.2 continue to compile + exercise the engine path; placed last so
+    /// the bool slot does not interleave with the MeetingIndex* parameter.
     StreamingSessionManager(JobQueue& jobs,
                             const StreamingCaptionSink& sink,
                             std::string caption_model_dir,
                             MeetingIndex* meeting_index = nullptr,
-                            fs::path meetings_root = {});
+                            fs::path meetings_root = {},
+                            bool captions_enabled_at_startup = true);
     ~StreamingSessionManager();
 
     StreamingSessionManager(const StreamingSessionManager&) = delete;
@@ -402,6 +421,14 @@ public:
     /// Test introspection.
     int64_t job_id_for_token(const std::string& stream_token) const;
 
+    /// A3.4 — test introspection: return the live `StreamingSession*` bound
+    /// to `stream_token`, or nullptr if unknown. Lifetime is the session's
+    /// lifetime in the manager's map — callers must not retain the pointer
+    /// past a `cancel()` / `commit()` / `on_client_disconnect()` call.
+    /// Used by T5 to verify the engine-startup short-circuit produced a
+    /// session with `has_engine() == false`.
+    StreamingSession* session_for_token(const std::string& stream_token) const;
+
 private:
     /// Called with `mu_` held. Tears down `*sess`: stops the engine, closes
     /// + unlinks the temp WAV. Does NOT touch the JobQueue or the map — the
@@ -424,6 +451,12 @@ private:
     JobQueue&          jobs_;
     StreamingCaptionSink sink_;
     std::string        caption_model_dir_;
+    /// A3.2 — runtime-effective server captions capability cached at ctor
+    /// time. See ctor doc for the AND-in derivation. `create()` reads this
+    /// to short-circuit the engine-start block when the server can't run
+    /// captions. Const-ish: written exactly once by the ctor, never
+    /// mutated; readers do not need a lock.
+    bool               captions_runtime_enabled_ = true;
 
     /// Phase C.11.4 — dedup contract dependencies. Null/empty when the
     /// manager is constructed for tests that don't exercise the

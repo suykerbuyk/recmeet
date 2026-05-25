@@ -150,9 +150,11 @@ StreamingSessionManager::StreamingSessionManager(JobQueue& jobs,
                                                  const StreamingCaptionSink& sink,
                                                  std::string caption_model_dir,
                                                  MeetingIndex* meeting_index,
-                                                 fs::path meetings_root)
+                                                 fs::path meetings_root,
+                                                 bool captions_enabled_at_startup)
     : jobs_(jobs), sink_(sink),
       caption_model_dir_(std::move(caption_model_dir)),
+      captions_runtime_enabled_(captions_enabled_at_startup),
       meeting_index_(meeting_index),
       meetings_root_(std::move(meetings_root)) {
     // C.11.4 — symmetry with UploadSessionManager: half-wired dedup is a
@@ -455,54 +457,83 @@ StreamingSessionManager::create(const std::string& client_id,
     StreamingSession* sess_ptr = sess.get();
 
     // --- Start the CaptionEngine (the producer migrates to feed_audio()).
-    auto engine = std::make_unique<CaptionEngine>();
-    CaptionEngine::Options opts;
-    opts.model_dir = caption_model_dir_;
-    opts.num_threads = 1;
-    opts.sample_rate = req.sample_rate;
+    //
+    // A3.1 — when the server is captions-disabled at runtime (operator
+    // config + capability AND'd at daemon startup; see daemon.cpp), skip
+    // the engine-start block entirely. `sess->engine_` default-constructs
+    // to nullptr (`std::unique_ptr<CaptionEngine>`), so leaving the field
+    // untouched is correct — no allocation, no engine_error degraded event
+    // (which is reserved for actual engine failures), no spurious
+    // `caption.*` traffic.
+    //
+    // A3.3 — defense in depth. Under rev 5 the client gates its own
+    // process.stream open on the server's `session.init.captions_supported`
+    // (future Phase B work, B1.1), so a tray-shaped client should never
+    // reach this branch with `captions_runtime_enabled_ == false`. This
+    // branch primarily exists for non-tray clients (legacy / future
+    // variants / test harnesses) that open process.stream without
+    // consulting capability first. When that happens the server keeps the
+    // streaming WAV side of the contract (audio flows to disk via
+    // feed_audio's sf_write_short path) so disposition Submit still has
+    // an audio source.
+    if (captions_runtime_enabled_) {
+        auto engine = std::make_unique<CaptionEngine>();
+        CaptionEngine::Options opts;
+        opts.model_dir = caption_model_dir_;
+        opts.num_threads = 1;
+        opts.sample_rate = req.sample_rate;
 
-    // The CaptionEngine result/degraded callbacks fire on the engine's own
-    // worker thread. We forward them through the manager-level sink, which
-    // the daemon wires to marshal onto the poll thread before broadcast().
-    // Userdata is the StreamingSession* — no separate heap-allocated context
-    // to leak; the session owns the engine and outlives the worker.
-    bool started = engine->start(
-        opts,
-        // on_result
-        +[](const CaptionResult& r, void* ud) {
-            auto* s = static_cast<StreamingSession*>(ud);
-            if (s->mgr_->sink_.on_caption)
-                s->mgr_->sink_.on_caption(s->job_id_, s->client_id_,
-                                          r.text, r.is_partial,
-                                          r.timestamp_ms);
-        },
-        sess_ptr,
-        // on_degraded
-        +[](CaptionDegradedReason reason, void* ud) {
-            auto* s = static_cast<StreamingSession*>(ud);
-            const char* reason_str =
-                (reason == CaptionDegradedReason::BufferOverrun)
-                    ? "buffer_overrun" : "unknown";
-            if (s->mgr_->sink_.on_degraded)
-                s->mgr_->sink_.on_degraded(s->job_id_, s->client_id_,
-                                           reason_str, now_ms());
-        },
-        sess_ptr);
+        // The CaptionEngine result/degraded callbacks fire on the engine's own
+        // worker thread. We forward them through the manager-level sink, which
+        // the daemon wires to marshal onto the poll thread before broadcast().
+        // Userdata is the StreamingSession* — no separate heap-allocated context
+        // to leak; the session owns the engine and outlives the worker.
+        bool started = engine->start(
+            opts,
+            // on_result
+            +[](const CaptionResult& r, void* ud) {
+                auto* s = static_cast<StreamingSession*>(ud);
+                if (s->mgr_->sink_.on_caption)
+                    s->mgr_->sink_.on_caption(s->job_id_, s->client_id_,
+                                              r.text, r.is_partial,
+                                              r.timestamp_ms);
+            },
+            sess_ptr,
+            // on_degraded
+            +[](CaptionDegradedReason reason, void* ud) {
+                auto* s = static_cast<StreamingSession*>(ud);
+                const char* reason_str =
+                    (reason == CaptionDegradedReason::BufferOverrun)
+                        ? "buffer_overrun" : "unknown";
+                if (s->mgr_->sink_.on_degraded)
+                    s->mgr_->sink_.on_degraded(s->job_id_, s->client_id_,
+                                               reason_str, now_ms());
+            },
+            sess_ptr);
 
-    if (!started) {
-        // Engine failed to start (no-sherpa stub build, missing model, …).
-        // C.10a contract: this is NOT fatal to the stream — the audio still
-        // flows to the disk-backed WAV so C.10b's batch path has it. We log,
-        // emit a one-shot degraded signal, and continue with engine_ == null.
-        std::string err = engine->last_error();
-        log_warn("[streaming] caption engine failed to start (%s) — "
-                 "streaming audio to disk only (job=%ld)",
-                 err.c_str(), (long)job_id);
-        if (sink_.on_degraded)
-            sink_.on_degraded(job_id, client_id, "engine_error", now_ms());
-        engine.reset();      // null engine — feed_audio() skips the ring push
+        if (!started) {
+            // Engine failed to start (no-sherpa stub build, missing model, …).
+            // C.10a contract: this is NOT fatal to the stream — the audio still
+            // flows to the disk-backed WAV so C.10b's batch path has it. We log,
+            // emit a one-shot degraded signal, and continue with engine_ == null.
+            std::string err = engine->last_error();
+            log_warn("[streaming] caption engine failed to start (%s) — "
+                     "streaming audio to disk only (job=%ld)",
+                     err.c_str(), (long)job_id);
+            if (sink_.on_degraded)
+                sink_.on_degraded(job_id, client_id, "engine_error", now_ms());
+            engine.reset();      // null engine — feed_audio() skips the ring push
+        }
+        sess->engine_ = std::move(engine);
+    } else {
+        // A3.1 — captions disabled at runtime. Single INFO line at session-
+        // create time; the silence on the wire is intentional. No
+        // on_degraded(engine_error) — that signal is reserved for real
+        // engine failures, not operator-configured disablement.
+        log_info("[streaming] captions disabled by server config — "
+                 "session running for audio-upload only (job=%ld)",
+                 (long)job_id);
     }
-    sess->engine_ = std::move(engine);
 
     // --- Register the session under its routing token.
     sessions_.emplace(token, std::move(sess));
@@ -877,6 +908,15 @@ int64_t StreamingSessionManager::job_id_for_token(
     std::lock_guard<std::mutex> lk(mu_);
     auto it = sessions_.find(stream_token);
     return it == sessions_.end() ? -1 : it->second->job_id_;
+}
+
+// A3.4 — test introspection: returns the live `StreamingSession*` bound to
+// `stream_token`, or nullptr. See the header doc for the lifetime contract.
+StreamingSession* StreamingSessionManager::session_for_token(
+        const std::string& stream_token) const {
+    std::lock_guard<std::mutex> lk(mu_);
+    auto it = sessions_.find(stream_token);
+    return it == sessions_.end() ? nullptr : it->second.get();
 }
 
 } // namespace recmeet
