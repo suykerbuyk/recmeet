@@ -98,6 +98,15 @@ struct TrayState {
     bool downloading = false;
     bool is_reprocess = false;  // derived from state string for display
     bool daemon_connected = false;
+
+    // B2 — capability bits the client learned from the server's
+    // session.init response. Re-fetched on daemon reconnect. Defaults
+    // `false` so a fresh session that hasn't completed session.init
+    // renders the menu in a conservative captions-unavailable state.
+    struct ServerCaps {
+        bool captions_supported = false;
+    };
+    ServerCaps server_caps;
     guint reconnect_timer = 0;
     // Phase D.3 — nominal (un-jittered) backoff in seconds. Doubled
     // on each failed attempt and capped at `D3_BACKOFF_CAP_SECS` (30 s
@@ -699,6 +708,10 @@ static gboolean on_ipc_data(GIOChannel*, GIOCondition cond, gpointer) {
         log_warn("[tray] Daemon disconnected");
         g_tray.daemon_connected = false;
         g_tray.session_inited = false;
+        // B2.3 — reset capability to false on disconnect so the menu
+        // greys captions out during reconnect (conservative — matches
+        // the rest of the menu's daemon-disconnect treatment).
+        g_tray.server_caps.captions_supported = false;
         teardown_ipc_watch();
         g_tray.ipc.close_connection();
         // Phase B.2: keep tray-local recording state across disconnect —
@@ -720,6 +733,9 @@ static gboolean on_ipc_data(GIOChannel*, GIOCondition cond, gpointer) {
         log_warn("[tray] Daemon connection lost");
         g_tray.daemon_connected = false;
         g_tray.session_inited = false;
+        // B2.3 — reset capability to false on disconnect (same rationale
+        // as the G_IO_HUP/G_IO_ERR branch above).
+        g_tray.server_caps.captions_supported = false;
         teardown_ipc_watch();
         g_tray.ipc.close_connection();
         update_state(g_tray.recording, false, false);
@@ -868,10 +884,26 @@ static bool connect_to_daemon() {
         IpcError serr;
         if (g_tray.ipc.session_init(creds, prefs, sresp, serr, 5000)) {
             g_tray.session_inited = true;
-            log_debug("[tray] session.init ok");
+            // B2.2 — learn the server's runtime-effective captions
+            // capability from the additive `captions_supported` field on
+            // the session.init response. Absent field defaults to false
+            // (conservative). The capability gates B1.1's process.stream
+            // open and B4.1's menu sensitivity.
+            auto cs_it = sresp.result.find("captions_supported");
+            g_tray.server_caps.captions_supported =
+                (cs_it != sresp.result.end())
+                    ? json_val_as_bool(cs_it->second)
+                    : false;
+            log_debug("[tray] session.init ok (captions_supported=%s)",
+                      g_tray.server_caps.captions_supported ? "true" : "false");
         } else {
             log_warn("[tray] session.init failed: %s",
                      serr.message.empty() ? "unknown" : serr.message.c_str());
+            // Conservative: a failed session.init leaves the capability
+            // bit in its default-false state; B4.1's menu sensitivity
+            // reflects "captions unavailable" until a subsequent
+            // session.init succeeds.
+            g_tray.server_caps.captions_supported = false;
         }
     }
 
@@ -1933,9 +1965,20 @@ static void on_record(GtkMenuItem*, gpointer) {
     // Captions: snapshot the config value at recording start. Mid-
     // recording toggles do not take effect; same semantics as Phase 5.1.
     g_tray.cap.captions_enabled_for_recording = g_tray.cfg.captions_enabled;
-    if (g_tray.cfg.captions_enabled) {
+    // B1.1 — under rev 5 always-stream the wire-protocol decision gates
+    // on the server's reported capability (`captions_supported` from
+    // session.init, cached in `g_tray.server_caps`) — NOT on the user's
+    // local `cfg.captions_enabled` toggle. The local toggle controls
+    // only overlay rendering (B3, separate commit). A captions-
+    // unsupported server skips this branch entirely and falls back to
+    // the batch `process.submit` path at disposition Submit, avoiding a
+    // real-time upload the daemon would discard at process.stream.cancel.
+    if (g_tray.server_caps.captions_supported) {
         // Pre-create the overlay window so the first caption event has
-        // somewhere to render.
+        // somewhere to render. B1.2: overlay create is unconditional
+        // within the capability-supported branch; overlay visibility at
+        // record.start defers to Phase B3's `overlay_visible_now`
+        // seeding (separate later commit).
         caption_overlay_create();
 
         // Phase C.10a — open a live-caption streaming session on the
@@ -2010,15 +2053,24 @@ static void on_record(GtkMenuItem*, gpointer) {
                     // session reservation return. The plan body cites
                     // `process.stream.commit` as the canonical write
                     // point, but the tray does not call that verb
-                    // today (the daemon's StreamingSession auto-
-                    // commits during teardown). `process.stream`
-                    // return is the equivalent client-observable
+                    // today: the live-recording stop path at
+                    // `stop_capture` (tray.cpp:1759) calls
+                    // `process.stream.cancel`, which DISCARDS the
+                    // streaming WAV server-side. Postprocess for live
+                    // recordings flows through the separate batch
+                    // `process.submit` path at disposition Submit.
+                    // `process.stream` return is the client-observable
                     // "daemon now holds a reservation we may need to
-                    // recover" boundary, so the journal entry lands
-                    // here. Mid-stream tray crash recovery then
-                    // surfaces the meeting_id; per D.3 the streaming
-                    // resume falls back to batch via the same
-                    // meeting_id (C.10a TCP-drop policy).
+                    // recover from" boundary, so the journal entry
+                    // lands here — a mid-stream tray crash recovery
+                    // surfaces the meeting_id for the D.3 batch-resume
+                    // path (C.10a TCP-drop policy).
+                    //
+                    // Out of scope: unifying live-recording upload
+                    // paths via `process.stream.commit` (which exists
+                    // at `daemon_handlers.cpp:483`) is a separate
+                    // follow-up task —
+                    // `v2-unify-live-recording-upload-paths.md`.
                     if (s_admitted && s_job_id > 0) {
                         recmeet::PendingJobsJournal::Entry sje;
                         sje.endpoint          = g_tray.resume_server_key;
@@ -3408,10 +3460,22 @@ static void build_menu() {
         auto* item = gtk_check_menu_item_new_with_label("Show Live Captions");
         gtk_check_menu_item_set_active(GTK_CHECK_MENU_ITEM(item),
                                        g_tray.cfg.captions_enabled);
-        gtk_widget_set_tooltip_text(item,
-            "Live captions appear in a small overlay during recording. "
-            "Toggling this applies to the NEXT recording (captions are "
-            "bound to record.start parameters).");
+        // B4.1 — grey the item out when the server reports it cannot
+        // caption (no model, no sherpa build, or explicit operator
+        // opt-out via daemon.yaml). The tooltip in the unsupported case
+        // explains why; in the supported case the existing tooltip
+        // remains (B3.6, separate later commit, updates it again for
+        // mid-recording-toggle semantics).
+        if (!g_tray.server_caps.captions_supported) {
+            gtk_widget_set_sensitive(item, FALSE);
+            gtk_widget_set_tooltip_text(item,
+                "Live captions not supported by the connected server.");
+        } else {
+            gtk_widget_set_tooltip_text(item,
+                "Live captions appear in a small overlay during recording. "
+                "Toggling this applies to the NEXT recording (captions are "
+                "bound to record.start parameters).");
+        }
         g_signal_connect(item, "toggled",
                          G_CALLBACK(on_captions_enabled_toggled), nullptr);
         // Always toggleable — even mid-recording, since the change only

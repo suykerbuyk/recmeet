@@ -623,6 +623,12 @@ if(RECMEET_BUILD_TESTS)
         # StreamingSessionManager short-circuits the engine block when the
         # runtime-effective captions capability is false.
         tests/test_captions_phase_a.cpp
+        # Phase B1+B2+B4 — V2 captions always-stream client-side capability
+        # gate. Tests T6/T7 from the same plan: at record.start the client
+        # opens process.stream iff session.init reported
+        # captions_supported=true. T9 (menu sensitivity) deferred — see
+        # the test file header for the manual-test rationale.
+        tests/test_captions_phase_b.cpp
         tests/test_stream_commit.cpp
         tests/test_upload_session.cpp
         tests/test_caption_ipc_integration.cpp
