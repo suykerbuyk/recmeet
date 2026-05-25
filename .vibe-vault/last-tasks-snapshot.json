@@ -1,8 +1,8 @@
 {
-  "iter_n": 215,
-  "anchor_sha": "401767b5faa7c26db6d64820b981ba2d035c759c",
+  "iter_n": 217,
+  "anchor_sha": "3f915771c7e4f79ec44993ca627434c3c007fe9f",
   "active": [
-    "diarize-stack-v1-to-v2-port",
+    "feat-v2-full-stack-ci-timeout",
     "full-stack-captions-60min-regression",
     "sherpa-onnx-1-13-bump",
     "test-and-verification-hardening",
@@ -33,6 +33,7 @@
     "diarize-apply-collapse-over-merges",
     "diarize-auto-detect-over-segments",
     "diarize-overcount-and-context-aware-speaker-hints",
+    "diarize-stack-v1-to-v2-port",
     "e6-smoke-gate",
     "e6-tray-bundled-webui",
     "fix-subprocess-live-recording",
