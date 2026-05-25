@@ -1,6 +1,6 @@
 {
-  "iter_n": 218,
-  "anchor_sha": "ceceade8092cbc853c47edb12c74e56a70ad3913",
+  "iter_n": 220,
+  "anchor_sha": "509f4ad7cf3497893641207d9162b33a6784af0d",
   "active": [
     "feat-v2-full-stack-ci-timeout",
     "full-stack-captions-60min-regression",
@@ -9,6 +9,8 @@
     "test-handler-coverage-phase2c",
     "thin-client-recording-server",
     "tray-start-capture-fullstack-coverage",
+    "v2-captions-always-stream-client-renders",
+    "v2-captions-mid-recording-and-dual-source",
     "webui-live-captions",
     "whisper-vocab-hint-bleed"
   ],
