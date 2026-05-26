@@ -663,6 +663,16 @@ if(RECMEET_BUILD_TESTS)
         # upload → JobQueue → pp_worker) is covered by test_upload_session
         # + test_job_queue + test_fetch.
         tests/test_tray_capture.cpp
+        # test-and-verification-hardening item #4 (rev-2) — pure-helper
+        # tests for the tray "Cancel & Discard" click-to-confirm state
+        # machine (decide_cancel_button_state + label constants) plus the
+        # "cancel writes no WAV" structural invariant at the tray_capture
+        # layer. The GTK-driven cancel_capture handler itself has no
+        # unit-test harness (g_tray is a file-static TrayState with
+        # GtkWidget*/AppIndicator*/IpcClient/SlotQueue/unique_ptr fields
+        # that cannot be fabricated without an interactive tray binary);
+        # operator-level acceptance is interactive per the rev-2 plan.
+        tests/test_tray_cancel_confirm.cpp
         tests/test_job_queue.cpp
         tests/test_routed_events.cpp
         tests/test_fetch.cpp

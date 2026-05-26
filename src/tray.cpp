@@ -16,6 +16,7 @@
 #include "resume_token_store.h"
 #include "slot_queue.h"
 #include "staging_sweep.h"
+#include "tray_cancel_confirm.h"
 #include "tray_capture.h"
 #include "tray_status.h"
 #include "tray_web.h"
@@ -266,6 +267,18 @@ struct TrayState {
         guint stream_pump_id = 0;       // GTK timeout draining stream_buffer
     } capture_state;
 
+    // test-and-verification-hardening item #4 — "Cancel & Discard" tray
+    // menu item, surfaced under "Stop Recording" while recording is active
+    // (not reprocess). Click-to-confirm UX: first click flips the label
+    // and arms `cancel_armed_until_ms = now + 3000ms`; second click within
+    // the window fires `cancel_capture()`. The widget is transient (rebuilt
+    // by build_menu()), but we cache the pointer so the click + timeout
+    // callbacks can flip its label without searching the menu shell.
+    // `cancel_armed_until_ms` is monotonic-time-ms; 0 is the Idle sentinel.
+    // See `src/tray_cancel_confirm.h` for the pure state-machine decision.
+    GtkWidget* m_cancel_discard = nullptr;
+    int64_t cancel_armed_until_ms = 0;
+
     // Phase A.6 + B-bonus — session.init bookkeeping. The tray sends
     // `session.init` exactly once per IPC connection, immediately after
     // the connect() call returns. The flag prevents duplicate sends and
@@ -380,6 +393,13 @@ static void update_state(bool rec, bool pp, bool dl, bool reproc = false) {
             if (g_tray.cap.label)
                 gtk_label_set_markup(GTK_LABEL(g_tray.cap.label), "");
         }
+        // test-and-verification-hardening item #4 — disarm any in-flight
+        // Cancel & Discard click-to-confirm window when recording ends
+        // (via any path: cancel, stop, or external state change). The
+        // menu item naturally hides on the build_menu rebuild below, but
+        // resetting the field here keeps a stale revert-timer callback
+        // from acting on the next recording's widget.
+        g_tray.cancel_armed_until_ms = 0;
     }
 
     if (!rec && !pp && !dl) {
@@ -2150,6 +2170,36 @@ static void on_record(GtkMenuItem*, gpointer) {
 
 namespace tray {
 
+// test-and-verification-hardening item #4 — shared per-recording state
+// clearer. Resets every field that `start_capture` populates:
+//   * wav_path, wav_timestamp, wav_source — staging file identity
+//   * meeting_id                          — UUID v4 minted at start_capture
+//   * waiting_disposition                 — dialog-pending flag (false ==
+//                                           Idle)
+// Does NOT touch the unique_ptr `pw`, the `wav_buffer`, or the streaming
+// fields; those have lifecycle owners (stop_capture / cancel_capture)
+// because the order of teardown matters (the RT thread must quiesce
+// before the buffer can be safely drained, and the streaming session
+// must be cancelled on the daemon side before the GTK pump retires).
+//
+// Called from FOUR places, all reset to the same Idle field defaults:
+//   * apply_discard           (state 2: post-Stop dialog Discard)
+//   * apply_submit_with_context (state 2: post-Stop dialog Submit)
+//   * apply_save_for_later    (state 2: post-Stop dialog Save)
+//   * cancel_capture          (state 1: pre-Stop tray-local cancel)
+//
+// The clear is *additive* — `cancel_capture` does its own pw.reset /
+// wav_buffer.clear / stream teardown BEFORE calling this helper, then
+// hands the per-recording identity fields off here so the tray returns
+// to the same Idle defaults a post-Stop disposition leaves behind.
+static void clear_capture_fields() {
+    g_tray.capture_state.wav_path.clear();
+    g_tray.capture_state.wav_timestamp.clear();
+    g_tray.capture_state.wav_source.clear();
+    g_tray.capture_state.meeting_id.clear();
+    g_tray.capture_state.waiting_disposition = false;
+}
+
 // Discard the staged WAV immediately. Plan acceptance line: "Discard-
 // on-stop: WAV gone in <100 ms; no upload, no compute." We unlink the
 // file and clear the staging path; nothing else fires.
@@ -2163,11 +2213,7 @@ void apply_discard() {
     } else {
         log_info("[tray] discarded WAV: %s", wav_path.c_str());
     }
-    g_tray.capture_state.wav_path.clear();
-    g_tray.capture_state.wav_timestamp.clear();
-    g_tray.capture_state.wav_source.clear();
-    g_tray.capture_state.meeting_id.clear();
-    g_tray.capture_state.waiting_disposition = false;
+    clear_capture_fields();
 }
 
 // Phase C.9 — submit the staged WAV to the daemon via `process.submit` +
@@ -2372,11 +2418,7 @@ bool apply_submit_with_context(const CapturedContext& ctx, std::string& err_msg)
     // job from `WaitingForUpload` to `Queued`. The pp_worker dequeues
     // it and the existing progress / job.complete event stream takes
     // over from there. No further IPC from this thread is needed.
-    g_tray.capture_state.wav_path.clear();
-    g_tray.capture_state.wav_timestamp.clear();
-    g_tray.capture_state.wav_source.clear();
-    g_tray.capture_state.meeting_id.clear();
-    g_tray.capture_state.waiting_disposition = false;
+    clear_capture_fields();
     // The local staging WAV is now redundant (the daemon owns the
     // bytes in its own staging dir). Leave it on disk — the next
     // recording will overwrite it, and ops can find it for forensics
@@ -2433,11 +2475,104 @@ void apply_save_for_later(const CapturedContext& ctx) {
     }
     // Clear the active staging fields — the WAV is now "saved",
     // outside the active capture lifecycle.
-    g_tray.capture_state.wav_path.clear();
-    g_tray.capture_state.wav_timestamp.clear();
-    g_tray.capture_state.wav_source.clear();
-    g_tray.capture_state.meeting_id.clear();
-    g_tray.capture_state.waiting_disposition = false;
+    clear_capture_fields();
+}
+
+// test-and-verification-hardening item #4 — mid-capture cancel handler
+// (state 1: BEFORE the operator clicks Stop). Discards the in-memory PCM
+// buffer without writing a WAV to staging, tears down any live-caption
+// streaming session, and returns the tray to Idle WITHOUT opening the
+// post-Stop disposition dialog.
+//
+// Wire surface: NONE. `process.submit` is never called for a cancelled
+// recording — the daemon is uninvolved until Submit lands on the dialog
+// (state 2). The streaming session, when present, IS torn down via
+// `process.stream.cancel` because the daemon already holds that
+// reservation from `process.stream` at record-start.
+//
+// The teardown ordering mirrors `stop_capture`'s:
+//   1. Cancel the streaming session + retire the GTK pump first so a
+//      pump tick already in flight self-retires.
+//   2. Stop and reset PipeWireCapture so the RT thread quiesces and no
+//      late chunks land in the buffer after we drop it.
+//   3. Drop the in-memory wav_buffer (under wav_mtx) WITHOUT calling
+//      write_wav() — no file is written to staging.
+//   4. Clear the per-recording identity fields via clear_capture_fields().
+//
+// Returns true on success, false if no capture is currently running
+// (the menu item should never be visible in that case; the false return
+// is the defense-in-depth path).
+//
+// Side effect: callers MUST follow with `update_state(false, ...)` (or
+// equivalent) to dismiss the caption overlay and trigger a menu rebuild
+// — this function does not call update_state() directly so the test
+// harness can exercise the teardown without a live AppIndicator. The
+// production menu handler at on_cancel_discard_clicked does the call.
+bool cancel_capture() {
+    if (!g_tray.capture_state.pw) {
+        return false;
+    }
+
+    // Step 1: streaming session teardown (mirrors stop_capture). The
+    // process.stream.cancel verb tells the daemon to discard the in-
+    // flight streaming WAV server-side; if the daemon is unreachable
+    // we still clear local state and log a warning — cancel must always
+    // succeed locally even when the daemon is down.
+    if (!g_tray.capture_state.stream_token.empty()) {
+        std::string token = g_tray.capture_state.stream_token;
+        g_tray.capture_state.stream_token.clear();
+        if (g_tray.capture_state.stream_pump_id) {
+            g_source_remove(g_tray.capture_state.stream_pump_id);
+            g_tray.capture_state.stream_pump_id = 0;
+        }
+        if (g_tray.daemon_connected && g_tray.ipc.connected()) {
+            JsonMap cp;
+            cp["stream_token"] = token;
+            IpcResponse cr; IpcError ce;
+            if (!g_tray.ipc.call("process.stream.cancel", cp, cr, ce, 5000)) {
+                log_warn("[tray] cancel: process.stream.cancel failed (%s)",
+                         ce.message.c_str());
+            } else {
+                log_info("[tray] cancel: live-caption stream cancelled "
+                         "(token=%s)", token.c_str());
+            }
+        }
+    }
+    g_tray.capture_state.stream_handle = 0;
+    {
+        std::lock_guard<std::mutex> lk(g_tray.capture_state.stream_mtx);
+        g_tray.capture_state.stream_buffer.clear();
+    }
+
+    // Step 2: tear down the capture so the RT thread quiesces.
+    g_tray.capture_state.pw->stop();
+    g_tray.capture_state.pw.reset();
+    g_tray.capture_state.wav_handle = 0;
+
+    // Step 3: drop the buffered samples WITHOUT writing a WAV. This is
+    // the core behavioral difference vs stop_capture — `write_wav` is
+    // never called, so no audio_*.wav lands in staging. The acceptance
+    // signal "no file under staging/audio_*.wav for the cancelled
+    // session" is enforced here.
+    fs::path skipped_wav_path = g_tray.capture_state.wav_path;
+    std::size_t dropped = 0;
+    {
+        std::lock_guard<std::mutex> lk(g_tray.capture_state.wav_mtx);
+        dropped = g_tray.capture_state.wav_buffer.size();
+        g_tray.capture_state.wav_buffer.clear();
+        g_tray.capture_state.wav_buffer.shrink_to_fit();
+    }
+
+    // Step 4: clear per-recording identity fields — same set every
+    // disposition path uses, so the tray returns to the same Idle
+    // defaults regardless of how the recording ended. `waiting_disposition`
+    // is left false (it was false during active capture; clear_capture_fields
+    // re-asserts the false value for clarity).
+    clear_capture_fields();
+
+    log_info("[tray] cancel: discarded %zu samples (would-have-been wav=%s)",
+             dropped, skipped_wav_path.c_str());
+    return true;
 }
 
 }  // namespace tray
@@ -2556,6 +2691,91 @@ static void on_cancel_pp(GtkMenuItem*, gpointer) {
         log_error("[tray] cancel postprocessing (job=%lld) failed: %s",
                   (long long)pp_job_id, err.message.c_str());
     }
+}
+
+// test-and-verification-hardening item #4 — Cancel & Discard click +
+// revert-timer handlers. The pure state-machine decision lives in
+// `src/tray_cancel_confirm.h`; this code is the GTK glue around it.
+//
+// Lifecycle:
+//   * First click → on_cancel_discard_clicked sees Idle → flip label,
+//                   arm cancel_armed_until_ms = now + 3000ms, schedule
+//                   on_cancel_armed_timeout via g_timeout_add(3100ms).
+//   * Second click (within window) → handler sees Armed → disarm + fire
+//                   tray::cancel_capture(), then update_state(false,...)
+//                   to dismiss overlay + rebuild menu.
+//   * Timer fires (no second click) → handler sees Idle (arm already
+//                   expired) → revert label, no-op disarm.
+
+// One-shot GLib timeout: revert the cancel label 100ms past the strict
+// armed-window expiry. The 100ms grace gives the main loop time to
+// process a click that landed at exactly t=3000 before this timer
+// flips the label. On entry we re-check `decide_cancel_button_state`
+// against the freshly-sampled monotonic clock — if a second click
+// already disarmed (cancel_armed_until_ms reset to 0) OR the menu was
+// rebuilt and the widget pointer reset, we no-op. Always returns
+// G_SOURCE_REMOVE — one-shot.
+static gboolean on_cancel_armed_timeout(gpointer) {
+    int64_t now = g_get_monotonic_time() / 1000;
+    if (recmeet::decide_cancel_button_state(
+            now, g_tray.cancel_armed_until_ms)
+                == recmeet::CancelButtonState::Idle
+        && g_tray.m_cancel_discard) {
+        gtk_menu_item_set_label(GTK_MENU_ITEM(g_tray.m_cancel_discard),
+                                recmeet::CANCEL_LABEL_IDLE);
+        g_tray.cancel_armed_until_ms = 0;
+    }
+    return G_SOURCE_REMOVE;
+}
+
+// Cancel & Discard click handler. Click-to-confirm UX per the v1
+// reference (`d2d6dc5`) and the rev-2 plan: first click arms, second
+// click within the 3 s window fires. The fire path is tray-local (no
+// IPC — process.submit is never called for a cancelled recording, so
+// the daemon was never involved).
+static void on_cancel_discard_clicked(GtkMenuItem*, gpointer) {
+    int64_t now = g_get_monotonic_time() / 1000;  // monotonic ms
+    auto state = recmeet::decide_cancel_button_state(
+        now, g_tray.cancel_armed_until_ms);
+
+    if (state == recmeet::CancelButtonState::Idle) {
+        // First click: arm.
+        g_tray.cancel_armed_until_ms = now + recmeet::CANCEL_ARMED_WINDOW_MS;
+        if (g_tray.m_cancel_discard) {
+            gtk_menu_item_set_label(GTK_MENU_ITEM(g_tray.m_cancel_discard),
+                                    recmeet::CANCEL_LABEL_ARMED);
+        }
+        // Schedule revert 100ms past strict expiry.
+        g_timeout_add(static_cast<guint>(recmeet::CANCEL_REVERT_TIMER_MS),
+                      on_cancel_armed_timeout, nullptr);
+        return;
+    }
+
+    // Armed: confirm. Disarm immediately (so a concurrent timer fire
+    // sees Idle and no-ops), then tear down the capture.
+    g_tray.cancel_armed_until_ms = 0;
+
+    if (!tray::cancel_capture()) {
+        // Shouldn't happen — the menu item is only built when
+        // g_tray.recording is true, which implies capture_state.pw
+        // is set. Defense-in-depth: log + revert label + bail.
+        log_warn("[tray] cancel-discard: cancel_capture returned false "
+                 "(no active capture?)");
+        if (g_tray.m_cancel_discard) {
+            gtk_menu_item_set_label(GTK_MENU_ITEM(g_tray.m_cancel_discard),
+                                    recmeet::CANCEL_LABEL_IDLE);
+        }
+        return;
+    }
+
+    // Tray returns to Idle: dismisses the caption overlay (via
+    // update_state's was_recording && !rec branch), clears the per-slot
+    // phase/progress maps, and triggers a full menu rebuild (which
+    // naturally hides the Cancel & Discard item because recording=false).
+    update_state(false, g_tray.postprocessing, g_tray.downloading);
+    notify("Recording cancelled",
+           "The in-progress recording was discarded.");
+    log_info("[tray] cancel-discard: returned to Idle");
 }
 
 // --- Radio / checkbox callbacks ---
@@ -3312,6 +3532,13 @@ static void build_menu() {
     gtk_menu_shell_append(GTK_MENU_SHELL(menu), gtk_separator_menu_item_new());
 
     // --- Record / Stop / Cancel ---
+    // test-and-verification-hardening item #4 — drop the cached "Cancel
+    // & Discard" widget pointer at the top of every rebuild. The previous
+    // pointer is dangling now that the old menu shell is being replaced.
+    // Re-set below only on the recording && !is_reprocess branch where
+    // the menu item is re-added. Any pending revert timer can fire after
+    // this point and harmlessly no-op (it null-checks the pointer).
+    g_tray.m_cancel_discard = nullptr;
     if (g_tray.recording) {
         const char* label = g_tray.is_reprocess ? "Cancel" : "Stop Recording";
         auto* item = gtk_menu_item_new_with_label(label);
@@ -3319,6 +3546,25 @@ static void build_menu() {
         gtk_menu_shell_append(GTK_MENU_SHELL(menu), item);
 
         if (!g_tray.is_reprocess) {
+            // test-and-verification-hardening item #4 — Cancel & Discard
+            // menu item directly under Stop Recording. Visible only while
+            // a live (non-reprocess) recording is active. Label reflects
+            // any in-flight click-to-confirm arm so a menu rebuild
+            // mid-window (e.g. an unrelated phase event firing build_menu)
+            // does not silently drop the operator's first-click state.
+            int64_t now = g_get_monotonic_time() / 1000;
+            const char* cd_label =
+                (recmeet::decide_cancel_button_state(
+                    now, g_tray.cancel_armed_until_ms)
+                        == recmeet::CancelButtonState::Armed)
+                ? recmeet::CANCEL_LABEL_ARMED
+                : recmeet::CANCEL_LABEL_IDLE;
+            auto* cd_item = gtk_menu_item_new_with_label(cd_label);
+            g_signal_connect(cd_item, "activate",
+                             G_CALLBACK(on_cancel_discard_clicked), nullptr);
+            gtk_menu_shell_append(GTK_MENU_SHELL(menu), cd_item);
+            g_tray.m_cancel_discard = cd_item;
+
             auto* ctx_item = gtk_menu_item_new_with_label("Edit Context...");
             g_signal_connect(ctx_item, "activate",
                              G_CALLBACK(+[](GtkMenuItem*, gpointer) { show_context_window(); }),
