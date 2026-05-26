@@ -1,6 +1,6 @@
 {
-  "iter_n": 220,
-  "anchor_sha": "509f4ad7cf3497893641207d9162b33a6784af0d",
+  "iter_n": 221,
+  "anchor_sha": "2a8f5474c20fadffe78ec160c5fb0a5407f48f5d",
   "active": [
     "feat-v2-full-stack-ci-timeout",
     "full-stack-captions-60min-regression",
@@ -9,8 +9,8 @@
     "test-handler-coverage-phase2c",
     "thin-client-recording-server",
     "tray-start-capture-fullstack-coverage",
-    "v2-captions-always-stream-client-renders",
-    "v2-captions-mid-recording-and-dual-source",
+    "v2-dual-source-recording",
+    "v2-release-execution-sequence",
     "webui-live-captions",
     "whisper-vocab-hint-bleed"
   ],
@@ -111,6 +111,8 @@
     "tray-stop-stuck-recording-state",
     "v1-doc-review-and-readme-local-ai-positioning",
     "v2-absorb-v1.6.0-gpu-bundle",
+    "v2-captions-always-stream-client-renders",
+    "v2-captions-mid-recording-and-dual-source",
     "v2-pre-phase-d-stabilization",
     "vad-segmentation",
     "validated-launching-firefly",
