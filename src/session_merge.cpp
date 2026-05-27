@@ -173,6 +173,13 @@ JobConfig make_job_config(
     if (!session_prefs.monitor_source.empty()) cfg.monitor_source = session_prefs.monitor_source;
     if (!session_prefs.whisper_model.empty())  cfg.whisper_model = session_prefs.whisper_model;
 
+    // v2-coexistence-with-v1 Phase 2B — diarize/vad overlay. Bool fields
+    // use std::optional<bool> rather than empty-string sentinels (no natural
+    // bool sentinel — false is a valid value). has_value() means "the
+    // session.init / update_prefs handler observed the key on the wire."
+    if (session_prefs.diarize.has_value())  cfg.diarize = *session_prefs.diarize;
+    if (session_prefs.vad.has_value())      cfg.vad     = *session_prefs.vad;
+
     // summarization_backend: explicit selector — `local` means use the
     // local llama path, `http` means HTTP API. Empty leaves whatever
     // daemon.yaml + session llm_model produced.

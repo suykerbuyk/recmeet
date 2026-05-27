@@ -546,6 +546,26 @@ struct ClientConfig {
 
     // -- Server registry (E.2(c)) --
     std::vector<ServerEntry> servers;
+
+    // -- v2-coexistence-with-v1 Phase 2A: DUPLICATE-not-MOVE additions.
+    //
+    // These fields mirror ServerConfig's same-named fields so the V2
+    // tray/client side can persist its own UI state in client.yaml without
+    // mutating server.yaml. ServerConfig keeps its versions unchanged — the
+    // server-side values remain the admin authority feeding JobConfig via
+    // make_job_config()'s base layer; the client-side values are remembered
+    // UI preferences pushed to the daemon via session.init (diarize / vad /
+    // whisper_model) or kept client-local (log_*, captions_enabled).
+    //
+    // captions_enabled is client-local ONLY (never crosses the wire — Phase
+    // C retirement is honored). log_* govern the tray's OWN logger output.
+    std::string log_level_str = "error";
+    fs::path    log_dir;
+    int         log_retention_hours = 4;
+    std::string whisper_model;            // empty = use server admin default
+    bool        diarize = true;
+    bool        vad = true;
+    bool        captions_enabled = true;  // overlay-visible preference (client-local)
 };
 
 /// Load ServerConfig from daemon.yaml. Uses path if provided, otherwise

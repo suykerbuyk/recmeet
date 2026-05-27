@@ -12,6 +12,7 @@
 #include <functional>
 #include <map>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <utility>   // std::pair (C.13 ResumeTokenResolver return)
@@ -62,6 +63,23 @@ struct SessionPreferences {
     std::string summarization_backend;   // "" / "http" / "local"
     std::string llm_model;
     int  caption_latency_ms = 500;
+
+    // v2-coexistence-with-v1 Phase 2B (rev-7 H-rev4-2):
+    //
+    // The existing string fields use empty-string-as-sentinel for "use server
+    // default". Boolean has no natural sentinel — `false` is a valid value.
+    // `std::optional<bool>` preserves three-state semantics (unset /
+    // explicit-false / explicit-true) at the cost of inconsistency with the
+    // surrounding fields. The inconsistency is intentional and bounded to
+    // boolean fields. `parse_preferences_into` populates from key presence
+    // in the JSON payload; `make_job_config` overlays via `.has_value()`.
+    //
+    // captions_enabled is deliberately NOT added here — Phase C retirement
+    // (server-owned + AND'd with capability at startup) is a hard
+    // architectural boundary. The client-side overlay-visible preference
+    // lives on ClientConfig only and never crosses the wire.
+    std::optional<bool> diarize;
+    std::optional<bool> vad;
 };
 
 // Method handler: receives a request, returns a response or error.

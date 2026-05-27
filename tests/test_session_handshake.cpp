@@ -653,3 +653,241 @@ TEST_CASE("A.6.1: session-only api_key wins when env unset and daemon.yaml empty
         CHECK(out.api_key == "sk-session");
     }
 }
+
+// ===========================================================================
+// v2-coexistence-with-v1 Phase 2B — SessionPreferences.diarize + .vad
+//
+// The new optional<bool> fields are populated by the daemon's
+// `parse_preferences_into` lambda from key presence in the JSON payload,
+// and overlay onto the JobConfig produced by `make_job_config` via
+// .has_value() guards. The wire entry points are session.init (via the
+// `preferences` sub-object) and session.update_prefs (flat top-level).
+//
+// captions_enabled is deliberately NOT on SessionPreferences — Phase C
+// retirement honored. A separate invariant test in test_captions_phase_c
+// pins the grep-level absence; here we cover the diarize/vad happy paths
+// + validation rejection + empty-body no-op.
+// ===========================================================================
+
+TEST_CASE("v2-coexistence Phase 2B: session.update_prefs diarize=false "
+          "lands on next make_job_config",
+          "[ipc][prefs][v2-coexistence]") {
+    SessionHarness h;
+    IpcClient c(h.sock_path);
+    REQUIRE(c.connect());
+
+    // Establish a clean slot.
+    {
+        JsonMap creds, prefs;
+        IpcResponse resp; IpcError err;
+        REQUIRE(c.session_init(creds, prefs, resp, err));
+    }
+
+    // Patch diarize=false.
+    JsonMap patch;
+    patch["diarize"] = false;
+    IpcResponse resp; IpcError err;
+    REQUIRE(c.session_update_prefs(patch, resp, err));
+    CHECK(json_val_as_bool(resp.result["ok"]) == true);
+
+    // Snapshot — the slot's diarize must be a populated optional carrying false.
+    SessionCredentials got_c;
+    SessionPreferences got_p;
+    REQUIRE(snapshot_session(h.server, c.client_id(), got_c, got_p));
+    REQUIRE(got_p.diarize.has_value());
+    CHECK(*got_p.diarize == false);
+    CHECK_FALSE(got_p.vad.has_value());  // vad untouched
+
+    // The merge into JobConfig must honor the false override even though
+    // the ServerConfig admin default is true.
+    ServerConfig yaml;
+    yaml.diarize = true;
+    yaml.vad     = true;
+    PostprocessInput input{};
+    JobConfig out = make_job_config(yaml, got_c, got_p, input,
+                                    [](const std::string&) { return std::string(); });
+    CHECK(out.diarize == false);  // session.update_prefs override won
+    CHECK(out.vad     == true);   // unchanged from admin default
+
+    c.close_connection();
+}
+
+TEST_CASE("v2-coexistence Phase 2B: session.update_prefs vad=true "
+          "lands on next make_job_config",
+          "[ipc][prefs][v2-coexistence]") {
+    SessionHarness h;
+    IpcClient c(h.sock_path);
+    REQUIRE(c.connect());
+
+    {
+        JsonMap creds, prefs;
+        IpcResponse resp; IpcError err;
+        REQUIRE(c.session_init(creds, prefs, resp, err));
+    }
+
+    JsonMap patch;
+    patch["vad"] = true;
+    IpcResponse resp; IpcError err;
+    REQUIRE(c.session_update_prefs(patch, resp, err));
+
+    SessionCredentials got_c;
+    SessionPreferences got_p;
+    REQUIRE(snapshot_session(h.server, c.client_id(), got_c, got_p));
+    REQUIRE(got_p.vad.has_value());
+    CHECK(*got_p.vad == true);
+
+    ServerConfig yaml;
+    yaml.vad = false;  // admin default disabled
+    PostprocessInput input{};
+    JobConfig out = make_job_config(yaml, got_c, got_p, input,
+                                    [](const std::string&) { return std::string(); });
+    CHECK(out.vad == true);  // session.update_prefs override won
+
+    c.close_connection();
+}
+
+TEST_CASE("v2-coexistence Phase 2B: session.update_prefs rejects non-bool diarize/vad",
+          "[ipc][prefs][v2-coexistence]") {
+    SessionHarness h;
+    IpcClient c(h.sock_path);
+    REQUIRE(c.connect());
+
+    {
+        JsonMap creds, prefs;
+        IpcResponse resp; IpcError err;
+        REQUIRE(c.session_init(creds, prefs, resp, err));
+    }
+
+    // String value for diarize → InvalidParams.
+    {
+        JsonMap patch;
+        patch["diarize"] = std::string("not-a-bool");
+        IpcResponse resp; IpcError err;
+        CHECK_FALSE(c.session_update_prefs(patch, resp, err));
+        CHECK(err.code == static_cast<int>(IpcErrorCode::InvalidParams));
+    }
+    // Int value for vad → InvalidParams.
+    {
+        JsonMap patch;
+        patch["vad"] = int64_t(1);  // not a bool — bare 1
+        IpcResponse resp; IpcError err;
+        CHECK_FALSE(c.session_update_prefs(patch, resp, err));
+        CHECK(err.code == static_cast<int>(IpcErrorCode::InvalidParams));
+    }
+
+    c.close_connection();
+}
+
+TEST_CASE("v2-coexistence Phase 2B: empty session.update_prefs body succeeds (no-op)",
+          "[ipc][prefs][v2-coexistence]") {
+    SessionHarness h;
+    IpcClient c(h.sock_path);
+    REQUIRE(c.connect());
+
+    {
+        JsonMap creds, prefs;
+        IpcResponse resp; IpcError err;
+        REQUIRE(c.session_init(creds, prefs, resp, err));
+    }
+
+    // Empty patch — no keys at all. Must succeed without mutating the slot.
+    JsonMap patch;
+    IpcResponse resp; IpcError err;
+    REQUIRE(c.session_update_prefs(patch, resp, err));
+    CHECK(json_val_as_bool(resp.result["ok"]) == true);
+
+    SessionCredentials got_c;
+    SessionPreferences got_p;
+    REQUIRE(snapshot_session(h.server, c.client_id(), got_c, got_p));
+    // Neither field acquired a value (no key on the wire).
+    CHECK_FALSE(got_p.diarize.has_value());
+    CHECK_FALSE(got_p.vad.has_value());
+
+    c.close_connection();
+}
+
+TEST_CASE("v2-coexistence Phase 2B: session.init preferences{diarize=false, vad=false} "
+          "produces JobConfig diarize/vad = false",
+          "[ipc][prefs][session_init][v2-coexistence]") {
+    SessionHarness h;
+    IpcClient c(h.sock_path);
+    REQUIRE(c.connect());
+
+    JsonMap creds;
+    JsonMap prefs;
+    prefs["diarize"] = false;
+    prefs["vad"]     = false;
+    IpcResponse resp; IpcError err;
+    REQUIRE(c.session_init(creds, prefs, resp, err));
+
+    SessionCredentials got_c;
+    SessionPreferences got_p;
+    REQUIRE(snapshot_session(h.server, c.client_id(), got_c, got_p));
+    REQUIRE(got_p.diarize.has_value());
+    CHECK(*got_p.diarize == false);
+    REQUIRE(got_p.vad.has_value());
+    CHECK(*got_p.vad == false);
+
+    // make_job_config with ServerConfig admin defaults of true/true must
+    // honor the session override of false/false.
+    ServerConfig yaml;
+    yaml.diarize = true;
+    yaml.vad     = true;
+    PostprocessInput input{};
+    JobConfig out = make_job_config(yaml, got_c, got_p, input,
+                                    [](const std::string&) { return std::string(); });
+    CHECK(out.diarize == false);
+    CHECK(out.vad     == false);
+
+    c.close_connection();
+}
+
+TEST_CASE("v2-coexistence Phase 2B: session.init with absent preferences "
+          "preserves admin defaults in JobConfig",
+          "[ipc][prefs][session_init][v2-coexistence]") {
+    SessionHarness h;
+    IpcClient c(h.sock_path);
+    REQUIRE(c.connect());
+
+    // session.init with empty preferences sub-object.
+    JsonMap creds;
+    JsonMap prefs;  // empty
+    IpcResponse resp; IpcError err;
+    REQUIRE(c.session_init(creds, prefs, resp, err));
+
+    SessionCredentials got_c;
+    SessionPreferences got_p;
+    REQUIRE(snapshot_session(h.server, c.client_id(), got_c, got_p));
+    // No diarize/vad key on the wire → optionals stay unset.
+    CHECK_FALSE(got_p.diarize.has_value());
+    CHECK_FALSE(got_p.vad.has_value());
+
+    // make_job_config inherits the ServerConfig defaults verbatim.
+    ServerConfig yaml;
+    yaml.diarize = true;
+    yaml.vad     = true;
+    PostprocessInput input{};
+    JobConfig out = make_job_config(yaml, got_c, got_p, input,
+                                    [](const std::string&) { return std::string(); });
+    CHECK(out.diarize == true);
+    CHECK(out.vad     == true);
+
+    c.close_connection();
+}
+
+TEST_CASE("v2-coexistence Phase 2B: session.init rejects non-bool diarize/vad in preferences",
+          "[ipc][prefs][session_init][v2-coexistence]") {
+    SessionHarness h;
+    IpcClient c(h.sock_path);
+    REQUIRE(c.connect());
+
+    // String value for diarize in session.init's preferences → InvalidParams.
+    JsonMap creds;
+    JsonMap prefs;
+    prefs["diarize"] = std::string("not-a-bool");
+    IpcResponse resp; IpcError err;
+    CHECK_FALSE(c.session_init(creds, prefs, resp, err));
+    CHECK(err.code == static_cast<int>(IpcErrorCode::InvalidParams));
+
+    c.close_connection();
+}

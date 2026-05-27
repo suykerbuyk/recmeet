@@ -1160,6 +1160,15 @@ ClientConfig load_client_config(const fs::path& config_path) {
     cfg.language   = get_val(entries, "transcription", "language", "");
     cfg.vocabulary = get_val(entries, "transcription", "vocabulary", "");
 
+    // v2-coexistence Phase 2A — DUPLICATE-not-MOVE additions. These mirror
+    // ServerConfig's identically-named fields so the tray can persist its
+    // own UI state in client.yaml without touching server.yaml. The
+    // whisper_model + diarize + vad triple is pushed to the daemon at
+    // session.init time (see daemon_handlers.cpp parse_preferences_into).
+    cfg.whisper_model = get_val(entries, "transcription", "whisper_model", "");
+    cfg.diarize       = get_bool(entries, "transcription", "diarize", true);
+    cfg.vad           = get_bool(entries, "transcription", "vad", true);
+
     // Summary — DUAL primary subset + E.2(a) style.
     cfg.provider  = get_val(entries, "summary", "provider", cfg.provider);
     cfg.api_url   = get_val(entries, "summary", "api_url", cfg.api_url);
@@ -1192,6 +1201,27 @@ ClientConfig load_client_config(const fs::path& config_path) {
     // Captions (client-side render knob).
     cfg.caption_normalize_display =
         get_bool(entries, "captions", "normalize_display", true);
+
+    // v2-coexistence Phase 2A — client-local captions overlay-visible
+    // preference. NEVER crosses the wire (Phase C retirement is honored);
+    // the tray reads this purely to remember whether the user wants the
+    // overlay shown after a restart.
+    cfg.captions_enabled = get_bool(entries, "captions", "enabled", true);
+
+    // v2-coexistence Phase 2A — logging block. Mirrors the
+    // load_server_config pattern at lines 1013-1019, including the
+    // RECMEET_LOG_LEVEL env override (a single env var is correct at this
+    // layer because the tray and daemon are different processes — they
+    // never race for the same env var).
+    cfg.log_level_str = get_val(entries, "logging", "level", "error");
+    std::string client_log_dir = get_val(entries, "logging", "directory", "");
+    if (!client_log_dir.empty()) cfg.log_dir = client_log_dir;
+    std::string client_log_retention =
+        get_val(entries, "logging", "retention_hours", "4");
+    if (!client_log_retention.empty())
+        cfg.log_retention_hours = std::stoi(client_log_retention);
+    if (const char* env_level = std::getenv("RECMEET_LOG_LEVEL"))
+        cfg.log_level_str = env_level;
 
     // [client] section — staging budget + caption latency + servers.
     {
@@ -1415,12 +1445,22 @@ void save_client_config(const ClientConfig& cfg, const fs::path& config_path) {
     if (cfg.mic_only) out << "  mic_only: true\n";
     if (cfg.keep_sources) out << "  keep_sources: true\n";
 
-    if (!cfg.language.empty() || !cfg.vocabulary.empty()) {
+    // v2-coexistence Phase 2A — transcription block now also carries the
+    // tray-remembered whisper_model / diarize / vad selection alongside the
+    // pre-existing language + vocabulary fields. Emit-when-non-default: any
+    // field that diverges from struct defaults triggers the block.
+    bool emit_transcription = !cfg.language.empty() || !cfg.vocabulary.empty()
+        || !cfg.whisper_model.empty() || !cfg.diarize || !cfg.vad;
+    if (emit_transcription) {
         out << "\ntranscription:\n";
         if (!cfg.language.empty())
             out << "  language: " << cfg.language << "\n";
         if (!cfg.vocabulary.empty())
             out << "  vocabulary: \"" << cfg.vocabulary << "\"\n";
+        if (!cfg.whisper_model.empty())
+            out << "  whisper_model: " << cfg.whisper_model << "\n";
+        if (!cfg.diarize) out << "  diarize: false\n";
+        if (!cfg.vad)     out << "  vad: false\n";
     }
 
     out << "\nsummary:\n"
@@ -1457,9 +1497,28 @@ void save_client_config(const ClientConfig& cfg, const fs::path& config_path) {
     if (!cfg.note_dir.empty())
         out << "  directory: \"" << cfg.note_dir.string() << "\"\n";
 
-    if (!cfg.caption_normalize_display) {
-        out << "\ncaptions:\n"
-            << "  normalize_display: false\n";
+    // v2-coexistence Phase 2A — captions block now also carries the
+    // client-local overlay-visible preference (NEVER crosses the wire —
+    // Phase C retirement is honored). Emit only when either field diverges
+    // from struct defaults.
+    if (!cfg.caption_normalize_display || !cfg.captions_enabled) {
+        out << "\ncaptions:\n";
+        if (!cfg.caption_normalize_display)
+            out << "  normalize_display: false\n";
+        if (!cfg.captions_enabled)
+            out << "  enabled: false\n";
+    }
+
+    // v2-coexistence Phase 2A — logging block. Mirrors save_server_config's
+    // emit-when-non-default pattern at lines 1325-1331.
+    if (cfg.log_level_str != "error" || !cfg.log_dir.empty() ||
+        cfg.log_retention_hours != 4) {
+        out << "\nlogging:\n"
+            << "  level: " << cfg.log_level_str << "\n";
+        if (!cfg.log_dir.empty())
+            out << "  directory: \"" << cfg.log_dir.string() << "\"\n";
+        if (cfg.log_retention_hours != 4)
+            out << "  retention_hours: " << cfg.log_retention_hours << "\n";
     }
 
     {

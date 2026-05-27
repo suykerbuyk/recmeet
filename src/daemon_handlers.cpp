@@ -175,6 +175,23 @@ void register_daemon_handlers(recmeet::IpcServer& server) {
                 return false;
             }
         }
+        // v2-coexistence-with-v1 Phase 2B — reject non-boolean payloads for
+        // diarize/vad at the wire boundary. The variant carries the type
+        // discriminator from the JSON parser, so a `"not-a-bool"` string in
+        // the request lands as a `std::string` alternative — held-or-not is
+        // the cheap check.
+        auto check_bool = [&](const char* k) -> bool {
+            auto it = src.find(k);
+            if (it == src.end()) return true;  // absent is fine
+            if (!std::holds_alternative<bool>(it->second)) {
+                err.code = static_cast<int>(IpcErrorCode::InvalidParams);
+                err.message = std::string(k) + " must be a boolean";
+                return false;
+            }
+            return true;
+        };
+        if (!check_bool("diarize")) return false;
+        if (!check_bool("vad"))     return false;
         return true;
     };
 
@@ -195,6 +212,15 @@ void register_daemon_handlers(recmeet::IpcServer& server) {
         auto lit = src.find("caption_latency_ms");
         if (lit != src.end()) dst.caption_latency_ms =
             static_cast<int>(json_val_as_int(lit->second));
+        // v2-coexistence-with-v1 Phase 2B — populate the new optional<bool>
+        // fields from key presence so the merge at make_job_config can
+        // distinguish "unset" from "explicit false".
+        auto get_bool_opt = [&](const char* k, std::optional<bool>& out) {
+            auto it = src.find(k);
+            if (it != src.end()) out = json_val_as_bool(it->second, false);
+        };
+        get_bool_opt("diarize", dst.diarize);
+        get_bool_opt("vad",     dst.vad);
     };
 
     // Helper: pull a nested sub-object out of req.params at `key` into a
@@ -328,6 +354,12 @@ void register_daemon_handlers(recmeet::IpcServer& server) {
         if (!from_req.summarization_backend.empty()) prefs.summarization_backend = from_req.summarization_backend;
         if (!from_req.llm_model.empty())             prefs.llm_model = from_req.llm_model;
         if (lit != req.params.end()) prefs.caption_latency_ms = from_req.caption_latency_ms;
+        // v2-coexistence-with-v1 Phase 2B — overlay diarize/vad only when
+        // the key is present in the patch. The has_value() check mirrors
+        // the caption_latency_ms key-presence pattern above so a partial
+        // patch preserves previously-set diarize/vad slot values.
+        if (from_req.diarize.has_value()) prefs.diarize = from_req.diarize;
+        if (from_req.vad.has_value())     prefs.vad     = from_req.vad;
         if (!server.set_session_preferences(req.client_id, prefs)) {
             err.code = static_cast<int>(IpcErrorCode::InternalError);
             err.message = "session slot unavailable";

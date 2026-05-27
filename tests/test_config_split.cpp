@@ -678,3 +678,84 @@ TEST_CASE("[e2.2b] client_config_from_map silently ignores dropped per-job keys"
     // throw and returned a usable struct.
     SUCCEED("client_config_from_map silently ignores dropped per-job keys");
 }
+
+// ===========================================================================
+// v2-coexistence-with-v1 Phase 2A — ClientConfig log_* / transcription
+// (whisper_model + diarize + vad) / captions.enabled round-trip.
+//
+// DUPLICATE-not-MOVE: ServerConfig keeps its same-named fields unchanged;
+// ClientConfig gains parallel slots so the tray can persist last-selected
+// UI state in client.yaml. The whisper_model + diarize + vad triple is the
+// only triplet that crosses the wire (session.init prefs); captions_enabled
+// and log_* stay client-local (Phase C retirement honored for captions;
+// log_* govern the tray's own logger output).
+// ===========================================================================
+
+TEST_CASE("[client][config] ClientConfig logging + transcription + captions blocks "
+          "round-trip via YAML",
+          "[client][config][v2-coexistence]") {
+    fs::path dir = make_tmp_dir("recmeet_test_client_v2_fields_rt");
+    fs::path path = dir / "client.yaml";
+
+    ClientConfig cfg;
+    // Logging block — diverged from struct defaults so all three fields emit.
+    cfg.log_level_str       = "debug";
+    cfg.log_dir             = "/tmp/recmeet-client/logs";
+    cfg.log_retention_hours = 12;
+    // Transcription block — new fields alongside language/vocabulary.
+    cfg.whisper_model       = "small.en";
+    cfg.diarize             = false;
+    cfg.vad                 = false;
+    cfg.language            = "en";
+    cfg.vocabulary          = "alpha,beta";
+    // Captions block — client-local overlay-visible preference.
+    cfg.captions_enabled    = false;
+
+    save_client_config(cfg, path);
+    REQUIRE(fs::exists(path));
+    CHECK(perms_are_0600(path));
+
+    ClientConfig loaded = load_client_config(path);
+
+    // Logging round-trip.
+    CHECK(loaded.log_level_str       == "debug");
+    CHECK(loaded.log_dir.string()    == "/tmp/recmeet-client/logs");
+    CHECK(loaded.log_retention_hours == 12);
+    // Transcription round-trip.
+    CHECK(loaded.whisper_model       == "small.en");
+    CHECK(loaded.diarize             == false);
+    CHECK(loaded.vad                 == false);
+    CHECK(loaded.language            == "en");
+    CHECK(loaded.vocabulary          == "alpha,beta");
+    // Captions round-trip.
+    CHECK(loaded.captions_enabled    == false);
+
+    fs::remove_all(dir);
+}
+
+TEST_CASE("[client][config] ClientConfig defaults apply when blocks absent",
+          "[client][config][v2-coexistence]") {
+    fs::path dir = make_tmp_dir("recmeet_test_client_v2_fields_defaults");
+    fs::path path = dir / "client.yaml";
+
+    // Write a client.yaml that omits the logging / new transcription /
+    // captions.enabled keys entirely. Loader must return struct defaults.
+    {
+        std::ofstream out(path);
+        out << "audio:\n"
+               "  device_pattern: \"alsa:hw0\"\n";
+    }
+
+    ClientConfig loaded = load_client_config(path);
+
+    // Struct defaults preserved.
+    CHECK(loaded.log_level_str       == "error");
+    CHECK(loaded.log_dir.empty());
+    CHECK(loaded.log_retention_hours == 4);
+    CHECK(loaded.whisper_model.empty());
+    CHECK(loaded.diarize             == true);
+    CHECK(loaded.vad                 == true);
+    CHECK(loaded.captions_enabled    == true);
+
+    fs::remove_all(dir);
+}
