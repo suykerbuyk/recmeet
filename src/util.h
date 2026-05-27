@@ -72,6 +72,40 @@ fs::path state_dir();
 fs::path models_dir();
 
 // ---------------------------------------------------------------------------
+// V2 split path helpers (v2-coexistence-with-v1, Phase 1)
+//
+// V1 and V2 must coexist on the same machine at the default user-prefix
+// install. V2 binaries (recmeet-server / recmeet-client / recmeet-cli) use
+// per-side XDG roots so a V1 install at `~/.config/recmeet/` is never
+// touched. The helpers below honor `XDG_CONFIG_HOME` / `XDG_DATA_HOME` /
+// `XDG_STATE_HOME` / `XDG_RUNTIME_DIR` with the standard `~/.config` /
+// `~/.local/share` / `~/.local/state` fallbacks. See
+// agentctx/tasks/v2-coexistence-with-v1.md for the design.
+// ---------------------------------------------------------------------------
+
+/// ~/.config/recmeet-server/
+fs::path server_config_dir();
+
+/// ~/.config/recmeet-client/
+fs::path client_config_dir();
+
+/// ~/.local/share/recmeet-server/
+fs::path server_data_dir();
+
+/// ~/.local/share/recmeet-client/
+fs::path client_data_dir();
+
+/// ~/.local/state/recmeet-server/
+fs::path server_state_dir();
+
+/// $XDG_RUNTIME_DIR/recmeet-server/  (no on-disk fallback — runtime dir is
+/// required for socket placement; callers handle the empty-path case).
+fs::path server_runtime_dir();
+
+/// `server_runtime_dir() / "server.sock"` as a string for IPC bind/connect.
+std::string server_socket_path();
+
+// ---------------------------------------------------------------------------
 // Audio file naming
 // ---------------------------------------------------------------------------
 

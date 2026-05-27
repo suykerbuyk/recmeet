@@ -57,6 +57,121 @@ TEST_CASE("models_dir: is subdirectory of data_dir", "[util]") {
     CHECK(mdir.string().find(ddir.string()) == 0);
 }
 
+// ---------------------------------------------------------------------------
+// v2-coexistence-with-v1 Phase 1 — split path helpers.
+//
+// Each helper has two axes to exercise: (1) the default XDG fallback path
+// (HOME fixed, XDG env unset) and (2) the explicit XDG env override path.
+// The env-override and HOME-fallback cases are kept separate so a failure
+// modes points cleanly at the broken branch. `server_socket_path()` is
+// asserted as `server_runtime_dir() / "server.sock"` to pin the composition
+// invariant the daemon's `--socket` default consumes.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// RAII helper: clear an env var on construction, restore the prior value
+// (if any) on destruction. Used by the split-path tests to enforce a
+// known XDG state regardless of the developer's shell environment.
+struct EnvScope {
+    const char* name;
+    std::string prior;
+    bool had_prior = false;
+    EnvScope(const char* n, const char* val) : name(n) {
+        if (const char* p = std::getenv(name)) {
+            prior = p;
+            had_prior = true;
+        }
+        if (val) {
+            ::setenv(name, val, /*overwrite=*/1);
+        } else {
+            ::unsetenv(name);
+        }
+    }
+    ~EnvScope() {
+        if (had_prior)
+            ::setenv(name, prior.c_str(), /*overwrite=*/1);
+        else
+            ::unsetenv(name);
+    }
+};
+
+} // namespace
+
+TEST_CASE("server_config_dir: defaults to ~/.config/recmeet-server", "[util][v2-paths]") {
+    EnvScope config_scope("XDG_CONFIG_HOME", nullptr);
+    EnvScope home_scope("HOME", "/home/test-user");
+    auto dir = server_config_dir();
+    CHECK(dir.string() == "/home/test-user/.config/recmeet-server");
+    CHECK(dir.filename() == "recmeet-server");
+}
+
+TEST_CASE("client_config_dir: defaults to ~/.config/recmeet-client", "[util][v2-paths]") {
+    EnvScope config_scope("XDG_CONFIG_HOME", nullptr);
+    EnvScope home_scope("HOME", "/home/test-user");
+    auto dir = client_config_dir();
+    CHECK(dir.string() == "/home/test-user/.config/recmeet-client");
+    CHECK(dir.filename() == "recmeet-client");
+}
+
+TEST_CASE("server_data_dir: defaults to ~/.local/share/recmeet-server", "[util][v2-paths]") {
+    EnvScope data_scope("XDG_DATA_HOME", nullptr);
+    EnvScope home_scope("HOME", "/home/test-user");
+    auto dir = server_data_dir();
+    CHECK(dir.string() == "/home/test-user/.local/share/recmeet-server");
+    CHECK(dir.filename() == "recmeet-server");
+}
+
+TEST_CASE("client_data_dir: defaults to ~/.local/share/recmeet-client", "[util][v2-paths]") {
+    EnvScope data_scope("XDG_DATA_HOME", nullptr);
+    EnvScope home_scope("HOME", "/home/test-user");
+    auto dir = client_data_dir();
+    CHECK(dir.string() == "/home/test-user/.local/share/recmeet-client");
+    CHECK(dir.filename() == "recmeet-client");
+}
+
+TEST_CASE("server_state_dir: defaults to ~/.local/state/recmeet-server", "[util][v2-paths]") {
+    EnvScope state_scope("XDG_STATE_HOME", nullptr);
+    EnvScope home_scope("HOME", "/home/test-user");
+    auto dir = server_state_dir();
+    CHECK(dir.string() == "/home/test-user/.local/state/recmeet-server");
+    CHECK(dir.filename() == "recmeet-server");
+}
+
+TEST_CASE("server_runtime_dir: honors XDG_RUNTIME_DIR", "[util][v2-paths]") {
+    EnvScope runtime_scope("XDG_RUNTIME_DIR", "/run/user/9999");
+    auto dir = server_runtime_dir();
+    CHECK(dir.string() == "/run/user/9999/recmeet-server");
+    CHECK(dir.filename() == "recmeet-server");
+}
+
+TEST_CASE("server_socket_path: composes runtime dir + server.sock", "[util][v2-paths]") {
+    EnvScope runtime_scope("XDG_RUNTIME_DIR", "/run/user/9999");
+    auto sock = server_socket_path();
+    CHECK(sock == "/run/user/9999/recmeet-server/server.sock");
+    // Composition invariant: must literally be runtime_dir / "server.sock".
+    CHECK(sock == (server_runtime_dir() / "server.sock").string());
+}
+
+TEST_CASE("server_config_dir + client_config_dir: honor XDG_CONFIG_HOME override",
+          "[util][v2-paths]") {
+    EnvScope config_scope("XDG_CONFIG_HOME", "/custom/cfg");
+    EnvScope home_scope("HOME", "/home/test-user");
+    // Override wins over HOME — both server + client land under /custom/cfg.
+    CHECK(server_config_dir().string() == "/custom/cfg/recmeet-server");
+    CHECK(client_config_dir().string() == "/custom/cfg/recmeet-client");
+}
+
+TEST_CASE("server_data_dir + client_data_dir + server_state_dir: honor XDG_*_HOME overrides",
+          "[util][v2-paths]") {
+    EnvScope data_scope("XDG_DATA_HOME", "/custom/data");
+    EnvScope state_scope("XDG_STATE_HOME", "/custom/state");
+    EnvScope home_scope("HOME", "/home/test-user");
+    CHECK(server_data_dir().string()  == "/custom/data/recmeet-server");
+    CHECK(client_data_dir().string()  == "/custom/data/recmeet-client");
+    CHECK(server_state_dir().string() == "/custom/state/recmeet-server");
+}
+
 TEST_CASE("create_output_dir: creates timestamped directory", "[util]") {
     auto base = recmeet::test::tmp_path("recmeet_test_output");
     fs::create_directories(base);

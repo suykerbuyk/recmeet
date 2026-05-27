@@ -4036,6 +4036,14 @@ int main(int argc, char* argv[]) {
 
     g_tray.cfg = load_legacy_config_as_job_config();
 
+    // v2-coexistence Phase 1 — explicit log-dir fallback so V2 client logs
+    // land under `client_data_dir()/logs` instead of fanning out to the
+    // legacy `data_dir()/logs` default in log.cpp:147. Once Phase 2A lands
+    // `ClientConfig.log_dir`, the loaded value seeds this branch; until
+    // then it's always empty and the fallback fires.
+    if (g_tray.cfg.log_dir.empty())
+        g_tray.cfg.log_dir = client_data_dir() / "logs";
+
     // Initialize logging (tray always logs to stderr — journald or interactive)
     auto log_level = parse_log_level(g_tray.cfg.log_level_str);
     log_init(log_level, g_tray.cfg.log_dir, g_tray.cfg.log_retention_hours, true);

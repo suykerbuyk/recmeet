@@ -35,6 +35,44 @@ fs::path state_dir()  { return xdg_dir("XDG_STATE_HOME", ".local/state"); }
 fs::path models_dir() { return data_dir() / "models"; }
 
 // ---------------------------------------------------------------------------
+// V2 split path helpers — v2-coexistence-with-v1 Phase 1.
+//
+// Mirror of `xdg_dir` but parameterized on the V2 leaf name so the server
+// + client sides land in disjoint trees. `xdg_runtime_leaf` differs from
+// `xdg_dir` in that `XDG_RUNTIME_DIR` has no on-disk fallback per spec —
+// when it is unset there simply is no runtime dir to return.
+// ---------------------------------------------------------------------------
+
+static fs::path xdg_leaf(const char* env_var, const char* fallback_suffix,
+                         const char* leaf) {
+    if (const char* val = std::getenv(env_var); val && val[0] != '\0')
+        return fs::path(val) / leaf;
+    if (const char* home = std::getenv("HOME"))
+        return fs::path(home) / fallback_suffix / leaf;
+    return fs::path(".") / fallback_suffix / leaf;
+}
+
+static fs::path xdg_runtime_leaf(const char* leaf) {
+    if (const char* val = std::getenv("XDG_RUNTIME_DIR"); val && val[0] != '\0')
+        return fs::path(val) / leaf;
+    // No on-disk fallback for runtime dir; return an empty-prefix path so
+    // callers compose against / under the leaf alone. socket_path() callers
+    // typically resolve via systemd or honor an explicit --socket flag.
+    return fs::path("/run/user/") / leaf;
+}
+
+fs::path server_config_dir()  { return xdg_leaf("XDG_CONFIG_HOME", ".config",      "recmeet-server"); }
+fs::path client_config_dir()  { return xdg_leaf("XDG_CONFIG_HOME", ".config",      "recmeet-client"); }
+fs::path server_data_dir()    { return xdg_leaf("XDG_DATA_HOME",   ".local/share", "recmeet-server"); }
+fs::path client_data_dir()    { return xdg_leaf("XDG_DATA_HOME",   ".local/share", "recmeet-client"); }
+fs::path server_state_dir()   { return xdg_leaf("XDG_STATE_HOME",  ".local/state", "recmeet-server"); }
+fs::path server_runtime_dir() { return xdg_runtime_leaf("recmeet-server"); }
+
+std::string server_socket_path() {
+    return (server_runtime_dir() / "server.sock").string();
+}
+
+// ---------------------------------------------------------------------------
 // Phase D.5 — atomic_write_file
 // ---------------------------------------------------------------------------
 //

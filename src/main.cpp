@@ -667,6 +667,16 @@ int main(int argc, char* argv[]) {
         }
     }
 
+    // v2-coexistence Phase 1 (C-rev6-3) — explicit log-dir fallback so V2
+    // CLI logs land under `server_data_dir()/logs` instead of the legacy
+    // `data_dir()/logs` default in log.cpp:147. The fallback targets the
+    // local `cfg` (post-`JobConfig cfg = cli.cfg;` copy at line 655) because
+    // log_init below reads `cfg.log_dir`, not `cli.cfg.log_dir`. CLI is
+    // server-equivalent for log location (same posture as the daemon — it
+    // runs worker-equivalent transcribe/diarize work).
+    if (cfg.log_dir.empty())
+        cfg.log_dir = server_data_dir() / "logs";
+
     // Initialize logging (stderr only on interactive TTY, not subprocess pipe)
     auto log_level = parse_log_level(cfg.log_level_str);
     log_init(log_level, cfg.log_dir, cfg.log_retention_hours, isatty(STDERR_FILENO));
