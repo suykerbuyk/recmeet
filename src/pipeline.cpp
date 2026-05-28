@@ -265,17 +265,14 @@ std::string load_meeting_id(const fs::path& out_dir) {
 
 
 fs::path resolve_caption_model_dir(const std::string& name) {
-    // Default model directory name pinned by Phase 0.2. Phase 4 will
-    // expand this into proper config plumbing; for now this string is the
-    // single source of truth.
+    // Default model directory name pinned by Phase 0.2.
     constexpr const char* kDefaultCaptionModel = "en-2023-06-26";
     std::string subdir = name.empty() ? std::string(kDefaultCaptionModel) : name;
 
-    const char* home = std::getenv("HOME");
-    fs::path base = home && home[0]
-        ? fs::path(home) / ".local" / "share" / "recmeet"
-        : fs::path("/tmp") / "recmeet";
-    return base / "models" / "sherpa" / "online" / subdir;
+    // v2-coexistence: caption models live under the server-side data dir
+    // (`~/.local/share/recmeet-server/models/sherpa/online/<name>/`). Operators
+    // sharing a model pool with V1 use the MIGRATION.md symlink recipe.
+    return server_data_dir() / "models" / "sherpa" / "online" / subdir;
 }
 
 
