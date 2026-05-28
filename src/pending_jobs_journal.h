@@ -10,8 +10,8 @@
 // resolved via `job.status` (D.3 wiring), and the local UI is rehydrated
 // from the daemon's record-of-truth.
 //
-// File: `data_dir() / "pending_jobs.json"` →
-//        `~/.local/share/recmeet/pending_jobs.json`.
+// File: `server_state_dir() / "pending_jobs.json"` →
+//        `~/.local/state/recmeet-server/pending_jobs.json`.
 //
 // **Disjointness with the `.pending` sidecar** (D.5 plan, line 398):
 // a WAV is either in-flight (journal entry, no sidecar) OR save-for-later

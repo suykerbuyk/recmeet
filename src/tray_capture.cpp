@@ -18,7 +18,7 @@ namespace recmeet {
 namespace tray_capture {
 
 fs::path default_staging_dir() {
-    return data_dir() / "staging";
+    return client_data_dir() / "staging";
 }
 
 std::string format_timestamp(std::time_t t) {

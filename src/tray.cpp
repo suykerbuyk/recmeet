@@ -1294,7 +1294,7 @@ static void post_reconnect_resync() {
                 // meeting dir, but the resync path here is conservative
                 // and just pulls them into a known location. The exact
                 // destination is a D.4 follow-up (per-job UI affordances).
-                fs::path out_dir = recmeet::data_dir() / "fetched"
+                fs::path out_dir = recmeet::client_data_dir() / "fetched"
                                  / std::to_string(j.job_id);
                 std::error_code ec;
                 fs::create_directories(out_dir, ec);

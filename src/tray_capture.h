@@ -20,7 +20,7 @@ namespace recmeet {
 namespace tray_capture {
 
 /// Default staging directory for tray-side recordings. Concrete
-/// value: ~/.local/share/recmeet/staging/ (via data_dir()).
+/// value: ~/.local/share/recmeet-client/staging/ (via client_data_dir()).
 fs::path default_staging_dir();
 
 /// Format the canonical "YYYY-MM-DD_HH-MM" timestamp matching the

@@ -132,7 +132,7 @@ static bool parse_profile(const std::string& json, SpeakerProfile& out) {
 // ---------------------------------------------------------------------------
 
 fs::path default_speaker_db_dir() {
-    return data_dir() / "speakers";
+    return server_data_dir() / "speakers";
 }
 
 std::vector<SpeakerProfile> load_speaker_db(const fs::path& db_dir) {

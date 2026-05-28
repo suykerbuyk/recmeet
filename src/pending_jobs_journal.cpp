@@ -177,7 +177,7 @@ std::string serialize_entries(const std::vector<PendingJobsJournal::Entry>& v) {
 } // anonymous namespace
 
 PendingJobsJournal::PendingJobsJournal()
-    : path_(data_dir() / "pending_jobs.json") {
+    : path_(server_state_dir() / "pending_jobs.json") {
 }
 
 PendingJobsJournal::PendingJobsJournal(fs::path path)
