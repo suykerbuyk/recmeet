@@ -1,6 +1,6 @@
 {
-  "iter_n": 224,
-  "anchor_sha": "911a158a648d6f3bf379c071dfc139b445e272e0",
+  "iter_n": 225,
+  "anchor_sha": "371606403d31061808ec604e667f069f607af6a8",
   "active": [
     "feat-v2-full-stack-ci-timeout",
     "full-stack-captions-60min-regression",
