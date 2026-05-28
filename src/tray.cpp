@@ -2263,7 +2263,7 @@ void apply_discard() {
 bool apply_submit_with_context(const CapturedContext& ctx, std::string& err_msg) {
     if (!g_tray.daemon_connected) {
         if (!connect_to_daemon()) {
-            err_msg = "daemon not running — start recmeet-daemon and try again";
+            err_msg = "server not running — start recmeet-server and try again";
             return false;
         }
     }
@@ -3173,7 +3173,7 @@ static void on_refresh_devices(GtkMenuItem*, gpointer) {
 
 static void on_update_models(GtkMenuItem*, gpointer) {
     if (!g_tray.daemon_connected) {
-        notify("Daemon not running", "Start recmeet-daemon first.");
+        notify("Server not running", "Start recmeet-server first.");
         return;
     }
     if (g_tray.recording || g_tray.downloading) return;
@@ -4020,7 +4020,7 @@ namespace {
 // stdout-based smoke probe.
 void print_headless_only_rejection() {
     fputs(
-        "recmeet-tray: --headless requires --listen-now\n"
+        "recmeet-client: --headless requires --listen-now\n"
         "  (a headless tray with no HTTP listener has no way to be\n"
         "   interacted with — pass both flags, or drop --headless to\n"
         "   run a normal GUI tray)\n",
@@ -4112,7 +4112,7 @@ int main(int argc, char* argv[]) {
     if (!headless) {
         G_GNUC_BEGIN_IGNORE_DEPRECATIONS
         g_tray.indicator = app_indicator_new(
-            "recmeet-tray", ICON_IDLE,
+            "recmeet-client", ICON_IDLE,
             APP_INDICATOR_CATEGORY_APPLICATION_STATUS);
         G_GNUC_END_IGNORE_DEPRECATIONS
 
@@ -4224,13 +4224,13 @@ int main(int argc, char* argv[]) {
     if (listen_now) {
         const int port = recmeet::start_web_listener(g_tray.ipc);
         if (port <= 0) {
-            log_error("recmeet-tray: --listen-now requested but WebUI "
+            log_error("recmeet-client: --listen-now requested but WebUI "
                       "listener failed to bind");
             return 2;
         }
     }
 
-    log_info("recmeet-tray %s running (%s, %zu mic(s), %zu monitor(s), "
+    log_info("recmeet-client %s running (%s, %zu mic(s), %zu monitor(s), "
              "listener-port=%d)",
              RECMEET_VERSION,
              headless ? "headless" : "gui",

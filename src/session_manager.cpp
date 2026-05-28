@@ -195,7 +195,7 @@ std::string SessionManager::log_prefix(const std::string& token) {
 // The matching declaration in `session_manager.h` is gated by the same
 // macro so production callers cannot reach it even in test-enabled builds.
 // `-ffunction-sections -fdata-sections` + `-Wl,--gc-sections` (set in
-// `CMakeLists.txt:34-35`) strip this symbol from `recmeet-daemon` because
+// `CMakeLists.txt:34-35`) strip this symbol from `recmeet-server` because
 // nothing in the production link references it.
 void SessionManager::insert_for_test(const std::string& token,
                                      const std::string& client_id) {

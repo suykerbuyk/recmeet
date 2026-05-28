@@ -29,7 +29,7 @@ void ResumeTokenStore::reload() {
 // Parse the persisted JSON object `{"<addr>": "<token>", ...}`. The format
 // is intentionally minimal — flat string-to-string map — and we hand-parse
 // rather than dragging a JSON library across the IPC boundary. The file is
-// always one this process (or a prior `recmeet-tray`) wrote, so we don't
+// always one this process (or a prior `recmeet-client`) wrote, so we don't
 // have to tolerate adversarial input. Malformed contents are treated as an
 // empty map; the next `put` will rewrite the file from scratch.
 void ResumeTokenStore::load_from_disk() {

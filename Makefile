@@ -128,17 +128,17 @@ integration-t2-1: ensure-submodules
 	systemd-run --user --scope -p MemoryMax=8G -p MemorySwapMax=0 \
 	    ./$(BUILD_DIR)/recmeet_tests "[integration][t2-1]"
 
-# V2 thin-client end-to-end gate: forks the real recmeet-daemon binary on
+# V2 thin-client end-to-end gate: forks the real recmeet-server binary on
 # 127.0.0.1:29991, sends process.submit + 0x01 upload over TCP with PSK
 # auth, polls job.list, fetches results, validates artifacts. The single
 # automated proof that the V2 thin-client architecture works as a whole
 # system. Models (whisper base, sherpa diarization, VAD) are pre-fetched
-# via `recmeet --download-models` so the test itself can avoid the
+# via `recmeet-cli --download-models` so the test itself can avoid the
 # network round-trip; subsequent runs hit the local cache.
 integration-e2e: ensure-submodules
 	cmake -B $(BUILD_DIR) -G Ninja $(CMAKE_OPTS) -DRECMEET_BUILD_TESTS=ON
 	ninja -C $(BUILD_DIR)
-	./$(BUILD_DIR)/recmeet --download-models --model base
+	./$(BUILD_DIR)/recmeet-cli --download-models --model base
 	./$(BUILD_DIR)/recmeet_tests "[e2e]"
 
 benchmark: ensure-submodules
@@ -149,10 +149,10 @@ benchmark: ensure-submodules
 full-stack: ensure-submodules
 	cmake -B $(BUILD_DIR) -G Ninja $(CMAKE_OPTS) -DRECMEET_BUILD_TESTS=ON
 	ninja -C $(BUILD_DIR)
-	./$(BUILD_DIR)/recmeet --download-models --model base
+	./$(BUILD_DIR)/recmeet-cli --download-models --model base
 	RECMEET_TEST_PHASE_ECHO=1 ./$(BUILD_DIR)/recmeet_tests "[full-stack]"
 
-# Phase E.6 smoke gate — spawns recmeet-daemon + recmeet-tray (headless,
+# Phase E.6 smoke gate — spawns recmeet-server + recmeet-client (headless,
 # eager listener) in an isolated sandbox and exercises the embedded
 # WebUI's HTTP surface against the live daemon. Fast (<10s); CI-friendly
 # (no display required); permanent regression gate. Extend
@@ -179,42 +179,42 @@ install: build
 	@# error. Relinking is cheap (no recompile of object files; ~5s for the
 	@# four binaries) and only happens on the install path, so it doesn't
 	@# slow day-to-day `make build`.
-	rm -f $(BUILD_DIR)/recmeet $(BUILD_DIR)/recmeet-daemon \
-	      $(BUILD_DIR)/recmeet-tray $(BUILD_DIR)/recmeet-web
+	rm -f $(BUILD_DIR)/recmeet-cli $(BUILD_DIR)/recmeet-server \
+	      $(BUILD_DIR)/recmeet-client $(BUILD_DIR)/recmeet-web
 	ninja -C $(BUILD_DIR)
 	DESTDIR=$(DESTDIR) cmake --install $(BUILD_DIR)
 ifndef DESTDIR
 	@echo ""
 	@echo "--- Downloading default models ---"
-	./$(BUILD_DIR)/recmeet --no-daemon --download-models || echo "Warning: model download failed (retry with: recmeet --download-models)"
+	./$(BUILD_DIR)/recmeet-cli --no-daemon --download-models || echo "Warning: model download failed (retry with: recmeet-cli --download-models)"
 	@echo ""
-	@echo "--- Enabling recmeet-daemon ---"
+	@echo "--- Enabling recmeet-server ---"
 	systemctl --user daemon-reload 2>/dev/null || true
-	systemctl --user enable --now recmeet-daemon.service 2>/dev/null && echo "Daemon enabled and started." || echo "Warning: could not enable daemon (no systemd user session?)"
+	systemctl --user enable --now recmeet-server.service 2>/dev/null && echo "Server enabled and started." || echo "Warning: could not enable server (no systemd user session?)"
 	@echo ""
-	@echo "Install complete. Run 'recmeet --status' to verify."
+	@echo "Install complete. Run 'recmeet-cli --status' to verify."
 endif
 
 uninstall:
 	@echo "--- Stopping recmeet services ---"
-	-systemctl --user disable --now recmeet-tray.service 2>/dev/null || true
-	-systemctl --user disable --now recmeet-daemon.service 2>/dev/null || true
-	-systemctl --user disable --now recmeet-daemon.socket 2>/dev/null || true
-	-pkill -f recmeet-tray 2>/dev/null || true
-	-pkill -f recmeet-daemon 2>/dev/null || true
+	-systemctl --user disable --now recmeet-client.service 2>/dev/null || true
+	-systemctl --user disable --now recmeet-server.service 2>/dev/null || true
+	-systemctl --user disable --now recmeet-server.socket 2>/dev/null || true
+	-pkill -f recmeet-client 2>/dev/null || true
+	-pkill -f recmeet-server 2>/dev/null || true
 	systemctl --user daemon-reload 2>/dev/null || true
 	@echo ""
 	@echo "--- Removing installed files from $(DESTDIR)$(PREFIX) ---"
-	rm -fv $(DESTDIR)$(PREFIX)/bin/recmeet
-	rm -fv $(DESTDIR)$(PREFIX)/bin/recmeet-daemon
-	rm -fv $(DESTDIR)$(PREFIX)/bin/recmeet-tray
+	rm -fv $(DESTDIR)$(PREFIX)/bin/recmeet-cli
+	rm -fv $(DESTDIR)$(PREFIX)/bin/recmeet-server
+	rm -fv $(DESTDIR)$(PREFIX)/bin/recmeet-client
 	rm -fv $(DESTDIR)$(PREFIX)/bin/recmeet-web
 	rm -fv $(DESTDIR)$(PREFIX)/bin/recmeet-mcp
 	rm -fv $(DESTDIR)$(PREFIX)/bin/recmeet-agent
-	rm -fv $(DESTDIR)$(PREFIX)/share/applications/recmeet-tray.desktop
-	rm -fv $(DESTDIR)$(PREFIX)/share/systemd/user/recmeet-daemon.service
-	rm -fv $(DESTDIR)$(PREFIX)/share/systemd/user/recmeet-daemon.socket
-	rm -fv $(DESTDIR)$(PREFIX)/share/systemd/user/recmeet-tray.service
+	rm -fv $(DESTDIR)$(PREFIX)/share/applications/recmeet-client.desktop
+	rm -fv $(DESTDIR)$(PREFIX)/share/systemd/user/recmeet-server.service
+	rm -fv $(DESTDIR)$(PREFIX)/share/systemd/user/recmeet-server.socket
+	rm -fv $(DESTDIR)$(PREFIX)/share/systemd/user/recmeet-client.service
 	rm -fv $(DESTDIR)$(PREFIX)/share/systemd/user/recmeet-web.service
 	rm -rfv $(DESTDIR)$(PREFIX)/share/recmeet/web/
 	-rmdir $(DESTDIR)$(PREFIX)/share/recmeet 2>/dev/null || true
@@ -223,12 +223,14 @@ uninstall:
 	-rmdir $(DESTDIR)$(PREFIX)/share/doc/recmeet 2>/dev/null || true
 	@echo ""
 	@echo "--- Removing auto-downloaded models ---"
-	rm -rfv $(HOME)/.local/share/recmeet/models/whisper/
-	rm -rfv $(HOME)/.local/share/recmeet/models/sherpa/
+	rm -rfv $(HOME)/.local/share/recmeet-server/models/whisper/
+	rm -rfv $(HOME)/.local/share/recmeet-server/models/sherpa/
 	@echo ""
 	@echo "Done."
-	@echo "  Preserved: ~/.config/recmeet (config), ~/.local/share/recmeet/logs/ (logs)"
-	@echo "  Preserved: ~/.local/share/recmeet/models/llama/ (user LLM models)"
+	@echo "  Preserved: ~/.config/recmeet-server, ~/.config/recmeet-client (V2 configs)"
+	@echo "  Preserved: ~/.local/share/recmeet-server/logs/ (V2 server logs)"
+	@echo "  Preserved: ~/.local/share/recmeet-server/models/llama/ (user LLM models)"
+	@echo "  Preserved: ~/.config/recmeet, ~/.local/share/recmeet (V1 install, untouched)"
 	@echo "  Preserved: meetings/ (recordings)"
 
 package-deb: build
@@ -241,14 +243,14 @@ package-arch:
 	cd dist/arch && makepkg -sf
 
 daemon-start: build
-	./$(BUILD_DIR)/recmeet-daemon &
-	@echo "Daemon started (PID $$!)"
+	./$(BUILD_DIR)/recmeet-server &
+	@echo "Server started (PID $$!)"
 
 daemon-stop:
-	@./$(BUILD_DIR)/recmeet --stop 2>/dev/null || pkill -f recmeet-daemon || echo "Daemon not running"
+	@./$(BUILD_DIR)/recmeet-cli --stop 2>/dev/null || pkill -f recmeet-server || echo "Server not running"
 
 daemon-status:
-	@./$(BUILD_DIR)/recmeet --status
+	@./$(BUILD_DIR)/recmeet-cli --status
 
 coverage:
 	cd tools && go test ./... -coverprofile=coverage.out
@@ -309,7 +311,7 @@ clean-ort:
 # Wipes only the FetchContent populate dirs (sherpa-onnx, catch2) so the next
 # build re-fetches and re-applies any FetchContent PATCH_COMMAND. Use this
 # when toggling RECMEET_PATCH_SHERPA_ARENA — `make clean` would do the same
-# but also wipes compile artifacts, costing a full recmeet rebuild.
+# but also wipes compile artifacts, costing a full recmeet-cli rebuild.
 clean-deps:
 	rm -rf $(BUILD_DIR)/_deps $(BUILD_DIR)/CMakeCache.txt $(BUILD_DIR)/CMakeFiles
 

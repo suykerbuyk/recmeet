@@ -161,7 +161,7 @@ int client_record_no_sigaction(const JobConfig& cfg, const std::string& addr,
 
     IpcClient client(addr);
     if (!client.connect()) {
-        fprintf(stderr, "Error: daemon not running. Start with: recmeet-daemon\n");
+        fprintf(stderr, "Error: server not running. Start with: recmeet-server\n");
         return kClientConnectFailedExitCode;
     }
 

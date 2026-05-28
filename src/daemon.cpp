@@ -319,7 +319,7 @@ static fs::path write_job_config(const PostprocessJob& job) {
 static long read_systemd_memory_property(const char* prop) {
     char cmd[256];
     std::snprintf(cmd, sizeof(cmd),
-                  "systemctl --user show recmeet-daemon.service -p %s 2>/dev/null", prop);
+                  "systemctl --user show recmeet-server.service -p %s 2>/dev/null", prop);
     FILE* f = ::popen(cmd, "r");
     if (!f) return -1;
     char buf[256] = {0};
@@ -335,7 +335,7 @@ static long read_systemd_memory_property(const char* prop) {
 static int set_systemd_memory_property(const char* prop, const char* value) {
     char cmd[256];
     std::snprintf(cmd, sizeof(cmd),
-                  "systemctl --user set-property recmeet-daemon.service %s=%s",
+                  "systemctl --user set-property recmeet-server.service %s=%s",
                   prop, value);
     return std::system(cmd);
 }
@@ -1426,9 +1426,9 @@ static void stream_worker_loop(IpcServer& server) {
 
 static void print_usage() {
     fprintf(stderr,
-        "Usage: recmeet-daemon [OPTIONS]\n"
+        "Usage: recmeet-server [OPTIONS]\n"
         "\n"
-        "Run the recmeet daemon (IPC server for CLI and tray clients).\n"
+        "Run the recmeet V2 server daemon (IPC server for CLI and client tray).\n"
         "\n"
         "Options:\n"
         "  --socket PATH       Unix socket path (default: $XDG_RUNTIME_DIR/recmeet-server/server.sock)\n"
@@ -1481,7 +1481,7 @@ int main(int argc, char* argv[]) {
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
         if ((arg == "-h" || arg == "--help")) { print_usage(); return 0; }
-        if ((arg == "-v" || arg == "--version")) { printf("recmeet-daemon %s\n", RECMEET_VERSION); return 0; }
+        if ((arg == "-v" || arg == "--version")) { printf("recmeet-server %s\n", RECMEET_VERSION); return 0; }
         if (arg == "--socket" && i + 1 < argc) { socket_path = argv[++i]; continue; }
         if (arg == "--listen" && i + 1 < argc) { socket_path = argv[++i]; continue; }
         if (arg == "--log-level" && i + 1 < argc) { log_level_str = argv[++i]; continue; }
@@ -1504,7 +1504,7 @@ int main(int argc, char* argv[]) {
     // NONE → log_info() inside banner_emit() is a no-op), so the only
     // surviving sink is backend_info.cpp's `fprintf(stderr, ...)`. We
     // dup2 stdout over stderr first so the banner lands on stdout per the
-    // operator-facing contract (script-friendly capture: `recmeet-daemon
+    // operator-facing contract (script-friendly capture: `recmeet-server
     // --check-backends | grep 'active backend'`).
     if (check_backends) {
         ::fflush(stderr);
@@ -1575,7 +1575,7 @@ int main(int argc, char* argv[]) {
     int pid_fd = open(pid_path.c_str(), O_WRONLY | O_CREAT, 0644);
     if (pid_fd >= 0) {
         if (flock(pid_fd, LOCK_EX | LOCK_NB) < 0) {
-            fprintf(stderr, "Another recmeet-daemon is already running.\n");
+            fprintf(stderr, "Another recmeet-server is already running.\n");
             close(pid_fd);
             return 1;
         }
@@ -1601,7 +1601,7 @@ int main(int argc, char* argv[]) {
 
     // Discover runtime-loadable ggml backends (libggml-vulkan.so / libggml-cpu-*.so
     // installed alongside the binary) and surface which device the daemon will
-    // use, so `journalctl --user -u recmeet-daemon.service` answers the GPU-or-CPU
+    // use, so `journalctl --user -u recmeet-server.service` answers the GPU-or-CPU
     // question without an `ldd` round-trip. See agentctx/tasks/runtime-loadable-
     // gpu-backends.md (Step 4) and auto-detect-vulkan-backend.md (Step 5).
     load_backends();
@@ -2096,7 +2096,7 @@ int main(int argc, char* argv[]) {
         std::string token = token_env ? token_env : "";
         if (token.empty()) {
             fprintf(stderr,
-                    "recmeet-daemon: refusing to start TCP listener without "
+                    "recmeet-server: refusing to start TCP listener without "
                     "RECMEET_AUTH_TOKEN set.\n"
                     "Set RECMEET_AUTH_TOKEN to a strong shared secret, or use "
                     "--listen with a Unix socket path for local-only mode.\n");
@@ -2144,7 +2144,7 @@ int main(int argc, char* argv[]) {
     sigaction(SIGHUP, &sa, nullptr);
 
     log_info("daemon: listening on %s", socket_path.c_str());
-    fprintf(stderr, "recmeet-daemon %s listening on %s\n", RECMEET_VERSION, socket_path.c_str());
+    fprintf(stderr, "recmeet-server %s listening on %s\n", RECMEET_VERSION, socket_path.c_str());
     log_debug("daemon: entering event loop");
 
     server.run();

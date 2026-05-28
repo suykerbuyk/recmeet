@@ -2438,7 +2438,7 @@ void register_daemon_handlers(recmeet::IpcServer& server) {
     // --- Phase C.13 — admin.evict (operator session-revocation) ---
     //
     // admin.evict { prefix } — forced eviction of a resume_token by prefix.
-    //                          Sole caller today is `recmeet-daemon --evict`
+    //                          Sole caller today is `recmeet-server --evict`
     //                          (a separate CLI invocation routed through the
     //                          Unix socket; peer-credential trust is the gate
     //                          — Unix clients bypass PSK at accept time per

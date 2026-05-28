@@ -46,8 +46,8 @@ option(RECMEET_USE_NOTIFY "Enable desktop notifications via libnotify" ON)
 option(RECMEET_BUILD_TESTS "Build unit tests" ON)
 # Phase 1 — C++ source coverage. When ON, injects `--coverage -O0 -g` into
 # compile + link flags for first-party targets ONLY (recmeet_ipc,
-# recmeet_capture, recmeet_core, recmeet_live_capture, recmeet, recmeet-daemon,
-# recmeet-tray, recmeet_tests). Vendor subbuilds (whisper.cpp, llama.cpp,
+# recmeet_capture, recmeet_core, recmeet_live_capture, recmeet-cli, recmeet-server,
+# recmeet-client, recmeet_tests). Vendor subbuilds (whisper.cpp, llama.cpp,
 # sherpa-onnx, onnxruntime, cpp-httplib, catch2) are NOT instrumented — the
 # flags are applied via target_compile_options / target_link_options on each
 # first-party target, never globally. See `make cxx-coverage` for the
@@ -408,10 +408,10 @@ target_sources(recmeet_core PRIVATE src/session_manager.cpp)
 
 # Phase C.9 — live-recording library. Owns `run_recording()` /
 # `run_pipeline()` and the CaptionEngine-with-capture wrapper, all of which
-# the CLI standalone mode (`recmeet` without `--daemon`) still needs. The
+# the CLI standalone mode (`recmeet-cli` without `--daemon`) still needs. The
 # daemon-side path was retired in C.9 (process.submit + process.stream
 # replace record.start), so the daemon does NOT link this lib — keeping
-# `recmeet-daemon` PipeWire/Pulse/recmeet_capture-free.
+# `recmeet-server` PipeWire/Pulse/recmeet_capture-free.
 add_library(recmeet_live_capture STATIC
     src/live_recording.cpp
     src/reprocess_batch.cpp  # CLI-only batch driver — calls run_pipeline()
@@ -424,14 +424,14 @@ target_link_libraries(recmeet_live_capture PUBLIC
 
 # CLI binary — links the live-capture lib so the standalone (no-daemon)
 # path can still record audio locally.
-add_executable(recmeet src/main.cpp)
-target_link_libraries(recmeet PRIVATE recmeet_core recmeet_live_capture)
+add_executable(recmeet-cli src/main.cpp)
+target_link_libraries(recmeet-cli PRIVATE recmeet_core recmeet_live_capture)
 
-# Daemon binary — links recmeet_core only. After C.9 it must NOT pull in
+# Server (daemon) binary — links recmeet_core only. After C.9 it must NOT pull in
 # PipeWire / PulseAudio / recmeet_capture. Verify with
-# `ldd build/recmeet-daemon | grep -E 'pipewire|pulse'` — expect no hits.
-add_executable(recmeet-daemon src/daemon.cpp src/daemon_handlers.cpp)
-target_link_libraries(recmeet-daemon PRIVATE recmeet_core)
+# `ldd build/recmeet-server | grep -E 'pipewire|pulse'` — expect no hits.
+add_executable(recmeet-server src/daemon.cpp src/daemon_handlers.cpp)
+target_link_libraries(recmeet-server PRIVATE recmeet_core)
 
 # Tray binary
 # Phase B.1+B.2: tray owns the local audio capture lifecycle, so it links
@@ -469,23 +469,23 @@ if(RECMEET_BUILD_TRAY)
         COMMENT "Generating embedded WebUI asset bundle (web_assets.h)"
         VERBATIM)
 
-    add_executable(recmeet-tray
+    add_executable(recmeet-client
         src/tray.cpp
         src/tray_web.cpp
         vendor/cpp-httplib/httplib.cpp
         ${_RECMEET_WEB_ASSETS_HDR})
-    target_include_directories(recmeet-tray PRIVATE
+    target_include_directories(recmeet-client PRIVATE
         vendor/cpp-httplib
         ${CMAKE_CURRENT_BINARY_DIR}/generated
         ${CMAKE_CURRENT_BINARY_DIR})
-    target_link_libraries(recmeet-tray PRIVATE
+    target_link_libraries(recmeet-client PRIVATE
         recmeet_ipc
         recmeet_capture
         PkgConfig::SNDFILE
         PkgConfig::GTK3
         PkgConfig::APPINDICATOR
     )
-    target_compile_definitions(recmeet-tray PRIVATE
+    target_compile_definitions(recmeet-client PRIVATE
         RECMEET_ICON_DIR="${CMAKE_INSTALL_FULL_DATADIR}/icons"
     )
 endif()
@@ -705,7 +705,7 @@ if(RECMEET_BUILD_TESTS)
         # Phase E.3 + E.4 — binary slimming assertions
         # (tray excludes ML deps; daemon excludes pulse/gtk).
         tests/test_binary_slim.cpp
-        # Phase E.4.1 — `recmeet-daemon --check-backends` diagnostic CLI flag.
+        # Phase E.4.1 — `recmeet-server --check-backends` diagnostic CLI flag.
         tests/test_check_backends.cpp
         # Phase E.1-fix — regression tests for the 5 C.9-legacy refs migrated
         # to v2 (process.submit / local StopToken on SIGINT) + the unused
@@ -733,8 +733,8 @@ if(RECMEET_BUILD_TESTS)
         # registers the 11 new + 3 existing speakers/meetings verbs +
         # process.reprocess. Embedded cpp-httplib unity TU is linked here.
         tests/test_tray_web.cpp
-        # Phase E.6.3 — `recmeet-tray --listen-now / --headless` flag
-        # parser tests. Spawns the real recmeet-tray binary to exercise
+        # Phase E.6.3 — `recmeet-client --listen-now / --headless` flag
+        # parser tests. Spawns the real recmeet-client binary to exercise
         # the pre-gtk_init flag pre-parse in main().
         tests/test_tray_cli.cpp
         # tmp-dir-isolation-full-stack-tests-v2 Phase 1 — per-process test
@@ -757,7 +757,7 @@ if(RECMEET_BUILD_TESTS)
         # its unit tests. Gated by RECMEET_TEST_PHASE_ECHO=1 env var.
         tests/test_progress_phase_echo.cpp
         # Phase 2b — production IPC verb registrations. Same TU the daemon
-        # binary links via `recmeet-daemon`; pulling it into recmeet_tests
+        # binary links via `recmeet-server`; pulling it into recmeet_tests
         # lets the new `DaemonTestHarness` exercise the production code
         # path instead of stubbing each verb. The `g_*` globals the
         # handlers reach for (defined in src/daemon.cpp in production) are
@@ -788,12 +788,12 @@ if(RECMEET_BUILD_TESTS)
     # `recmeet_tests` (so the test TUs see the gated declaration in
     # `session_manager.h`). The macro is only set when RECMEET_BUILD_TESTS
     # is ON; a tests-off production build never sees the symbol — and even
-    # when tests ARE built, `recmeet-daemon` (which also links
+    # when tests ARE built, `recmeet-server` (which also links
     # `recmeet_core`) drops the unused seam under `-Wl,--gc-sections`.
     target_compile_definitions(recmeet_core  PRIVATE RECMEET_TESTING)
     target_compile_definitions(recmeet_tests PRIVATE RECMEET_TESTING)
     # Phase E.3 + E.4 — `test_binary_slim.cpp` needs an absolute build-
-    # tree path to invoke `ldd build/recmeet-tray` regardless of where
+    # tree path to invoke `ldd build/recmeet-client` regardless of where
     # the test binary is launched from (catch_discover_tests sets
     # WORKING_DIRECTORY to the binary dir, but `./build` is a relative
     # path the user might also invoke from). Env override
@@ -826,11 +826,11 @@ if(RECMEET_COVERAGE)
         recmeet_capture
         recmeet_core
         recmeet_live_capture
-        recmeet
-        recmeet-daemon
+        recmeet-cli
+        recmeet-server
     )
     if(RECMEET_BUILD_TRAY)
-        list(APPEND _RECMEET_COVERAGE_TARGETS recmeet-tray)
+        list(APPEND _RECMEET_COVERAGE_TARGETS recmeet-client)
     endif()
     if(RECMEET_BUILD_TESTS)
         list(APPEND _RECMEET_COVERAGE_TARGETS recmeet_tests)
@@ -846,8 +846,8 @@ endif()
 install(CODE "set(CMAKE_INSTALL_DO_STRIP ON)")
 include(GNUInstallDirs)
 
-install(TARGETS recmeet RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
-install(TARGETS recmeet-daemon RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+install(TARGETS recmeet-cli RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+install(TARGETS recmeet-server RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 
 # Install vendored whisper.cpp + llama.cpp shared libraries. The ggml
 # backend MODULE plugins (libggml-base.so, libggml-cpu.so, libggml-vulkan.so,
@@ -894,27 +894,27 @@ if(IS_DIRECTORY "${_ORT_LOCAL_LIB}")
     install(FILES ${_ORT_LIBS} DESTINATION ${CMAKE_INSTALL_LIBDIR})
 endif()
 
-# systemd user service for daemon
-set(RECMEET_DAEMON_EXEC "${CMAKE_INSTALL_FULL_BINDIR}/recmeet-daemon")
-configure_file(dist/recmeet-daemon.service.in
-    ${CMAKE_BINARY_DIR}/recmeet-daemon.service @ONLY)
-install(FILES ${CMAKE_BINARY_DIR}/recmeet-daemon.service
+# systemd user service for V2 server (daemon)
+set(RECMEET_SERVER_EXEC "${CMAKE_INSTALL_FULL_BINDIR}/recmeet-server")
+configure_file(dist/recmeet-server.service.in
+    ${CMAKE_BINARY_DIR}/recmeet-server.service @ONLY)
+install(FILES ${CMAKE_BINARY_DIR}/recmeet-server.service
     DESTINATION ${CMAKE_INSTALL_DATADIR}/systemd/user)
-install(FILES dist/recmeet-daemon.socket
+install(FILES dist/recmeet-server.socket
     DESTINATION ${CMAKE_INSTALL_DATADIR}/systemd/user)
 
 if(RECMEET_BUILD_TRAY)
-    install(TARGETS recmeet-tray RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
-    install(FILES dist/recmeet-tray.desktop
+    install(TARGETS recmeet-client RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+    install(FILES dist/recmeet-client.desktop
         DESTINATION ${CMAKE_INSTALL_DATADIR}/applications)
     install(DIRECTORY share/icons/hicolor
         DESTINATION ${CMAKE_INSTALL_DATADIR}/icons)
 
     # systemd user service (prefix-aware ExecStart path)
-    set(RECMEET_TRAY_EXEC "${CMAKE_INSTALL_FULL_BINDIR}/recmeet-tray")
-    configure_file(dist/recmeet-tray.service.in
-        ${CMAKE_BINARY_DIR}/recmeet-tray.service @ONLY)
-    install(FILES ${CMAKE_BINARY_DIR}/recmeet-tray.service
+    set(RECMEET_CLIENT_EXEC "${CMAKE_INSTALL_FULL_BINDIR}/recmeet-client")
+    configure_file(dist/recmeet-client.service.in
+        ${CMAKE_BINARY_DIR}/recmeet-client.service @ONLY)
+    install(FILES ${CMAKE_BINARY_DIR}/recmeet-client.service
         DESTINATION ${CMAKE_INSTALL_DATADIR}/systemd/user)
 endif()
 

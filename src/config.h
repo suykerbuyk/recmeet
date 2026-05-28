@@ -487,7 +487,7 @@ struct ServerConfig {
 
     // -- Web server (legacy fields; pre-E.6.2 these drove the
     //    standalone web binary's --port / --bind. The binary was folded
-    //    into recmeet-tray (src/tray_web.cpp) in Phase E.6.2 — the
+    //    into recmeet-client (src/tray_web.cpp) in Phase E.6.2 — the
     //    embedded listener now kernel-picks a port and the tray-side
     //    readers were deleted. Fields preserved for the subprocess wire
     //    format only; emit-side readers in tray.cpp are gone.) --

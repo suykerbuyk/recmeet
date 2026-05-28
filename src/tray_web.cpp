@@ -38,7 +38,7 @@
 
 // Generated header — produced by cmake/embed_assets.cmake at configure time;
 // resolved via the `${CMAKE_CURRENT_BINARY_DIR}/generated` include dir
-// stamped onto both recmeet-tray and recmeet_tests.
+// stamped onto both recmeet-client and recmeet_tests.
 #include "web_assets.h"
 #include "ipc_client.h"
 #include "ipc_protocol.h"

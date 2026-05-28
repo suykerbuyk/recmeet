@@ -95,7 +95,7 @@ const char* find_unenumerable_non_cpu_backend() {
 // RECMEET_LOG_LEVEL >= info, and an unconditional fprintf to stderr makes
 // it visible under journalctl / interactive even at the default `error`
 // level. Mirrors the daemon's existing "listening on" precedent at the
-// recmeet-daemon entry point.
+// recmeet-server entry point.
 __attribute__((format(printf, 1, 2)))
 void banner_emit(const char* fmt, ...) {
     char buf[1024];

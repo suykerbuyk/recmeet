@@ -1,10 +1,10 @@
 [Unit]
-Description=Recmeet Meeting Recorder Daemon
+Description=Recmeet V2 Server (recording / transcription / summarization daemon)
 Documentation=https://github.com/suykerbuyk/recmeet
 
 [Service]
 Type=simple
-ExecStart=@RECMEET_DAEMON_EXEC@
+ExecStart=@RECMEET_SERVER_EXEC@
 ExecReload=/bin/kill -HUP $MAINPID
 
 # --- Logging / runtime tuning ---
