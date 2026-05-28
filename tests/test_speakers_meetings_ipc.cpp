@@ -524,3 +524,122 @@ TEST_CASE("meetings.read_note returns InvalidParams not_found when no Meeting_*.
     CHECK(err.code == static_cast<int>(IpcErrorCode::InvalidParams));
     CHECK(contains(err.message, "not_found"));
 }
+
+// ---------------------------------------------------------------------------
+// `.XX` attempt-counter selection coverage. The handler MUST return the
+// highest-numbered `.NN` attempt when multiple exist, and MUST fall back
+// to the newest-mtime legacy when no migration has run yet. See:
+//   src/daemon_handlers.cpp  — meetings.read_note handler block
+//   agentctx/tasks/meeting-note-attempt-counter.md (rev-4, Phase 2)
+// ---------------------------------------------------------------------------
+
+TEST_CASE("meetings.read_note returns the single .00 attempt when only one exists",
+          "[e6][ipc][speakers-meetings][note-attempts]") {
+    Fixture fx("mread_single_00");
+    const std::string mid = new_uuid_v4();
+    auto mp = fx.make_meeting("2026-05-20_14-02", mid);
+    const std::string body = "# Attempt 00\n";
+    {
+        std::ofstream out(mp / "Meeting_2026-05-20_14-02.00.md");
+        out << body;
+    }
+    auto client = fx.make_client();
+    JsonMap params;
+    params["meeting_id"] = mid;
+    IpcResponse resp;
+    IpcError err;
+    REQUIRE(client->call("meetings.read_note", params, resp, err));
+    CHECK(json_val_as_string(resp.result["path"])
+          == "Meeting_2026-05-20_14-02.00.md");
+    CHECK(json_val_as_string(resp.result["content"]) == body);
+}
+
+TEST_CASE("meetings.read_note returns the highest-numbered .NN attempt",
+          "[e6][ipc][speakers-meetings][note-attempts]") {
+    Fixture fx("mread_highest");
+    const std::string mid = new_uuid_v4();
+    auto mp = fx.make_meeting("2026-05-20_14-03", mid);
+    // Three attempts. The handler must return .02 (numeric DESC, NOT
+    // first-match-wins). Reverse-order writes so that lexicographic
+    // sort would also resolve to .02 — we want the digit-DESC contract
+    // to hold even when the underlying directory_iterator order doesn't
+    // happen to coincide.
+    {
+        std::ofstream a(mp / "Meeting_2026-05-20_14-03.02.md");
+        a << "# Attempt 02\n";
+        std::ofstream b(mp / "Meeting_2026-05-20_14-03.01.md");
+        b << "# Attempt 01\n";
+        std::ofstream c(mp / "Meeting_2026-05-20_14-03.00_oldest_topic.md");
+        c << "# Attempt 00\n";
+    }
+    auto client = fx.make_client();
+    JsonMap params;
+    params["meeting_id"] = mid;
+    IpcResponse resp;
+    IpcError err;
+    REQUIRE(client->call("meetings.read_note", params, resp, err));
+    CHECK(json_val_as_string(resp.result["path"])
+          == "Meeting_2026-05-20_14-03.02.md");
+    CHECK(json_val_as_string(resp.result["content"]) == "# Attempt 02\n");
+}
+
+TEST_CASE("meetings.read_note prefers numbered .NN over legacy un-numbered",
+          "[e6][ipc][speakers-meetings][note-attempts]") {
+    Fixture fx("mread_mixed");
+    const std::string mid = new_uuid_v4();
+    auto mp = fx.make_meeting("2026-05-20_14-04", mid);
+    // Mixed state: one legacy un-numbered note (rank -1) + one .00
+    // (rank 0). The handler must return .00 because 0 > -1, regardless
+    // of which one happens to have a newer mtime.
+    {
+        std::ofstream legacy(mp / "Meeting_2026-05-20_14-04_old_topic.md");
+        legacy << "# Legacy unmigrated\n";
+        std::ofstream numbered(mp / "Meeting_2026-05-20_14-04.00.md");
+        numbered << "# Attempt 00\n";
+    }
+    auto client = fx.make_client();
+    JsonMap params;
+    params["meeting_id"] = mid;
+    IpcResponse resp;
+    IpcError err;
+    REQUIRE(client->call("meetings.read_note", params, resp, err));
+    CHECK(json_val_as_string(resp.result["path"])
+          == "Meeting_2026-05-20_14-04.00.md");
+    CHECK(json_val_as_string(resp.result["content"]) == "# Attempt 00\n");
+}
+
+TEST_CASE("meetings.read_note tie-breaks legacy-only notes by newest mtime",
+          "[e6][ipc][speakers-meetings][note-attempts]") {
+    Fixture fx("mread_legacy_tie");
+    const std::string mid = new_uuid_v4();
+    auto mp = fx.make_meeting("2026-05-20_14-05", mid);
+    // Two legacy un-numbered notes (no migration has run yet — e.g.
+    // first read after a binary upgrade, before any new write). They
+    // both rank -1; the handler must return the one with the NEWER
+    // mtime. Matches the Go MCP tool's existing behavior in the
+    // unmigrated state (tools/meetingdata/meetings.go:101-104) — keeps
+    // the two implementations consistent until the Go side adopts the
+    // `.XX` scheme (filed as meetingdata-attempt-aware follow-up).
+    fs::path older = mp / "Meeting_2026-05-20_14-05_older.md";
+    fs::path newer = mp / "Meeting_2026-05-20_14-05_newer.md";
+    {
+        std::ofstream a(older);
+        a << "# Older\n";
+        std::ofstream b(newer);
+        b << "# Newer\n";
+    }
+    using ft = fs::file_time_type;
+    auto base = ft::clock::now() - std::chrono::hours(2);
+    fs::last_write_time(older, base);
+    fs::last_write_time(newer, base + std::chrono::hours(1));
+
+    auto client = fx.make_client();
+    JsonMap params;
+    params["meeting_id"] = mid;
+    IpcResponse resp;
+    IpcError err;
+    REQUIRE(client->call("meetings.read_note", params, resp, err));
+    CHECK(json_val_as_string(resp.result["path"])
+          == "Meeting_2026-05-20_14-05_newer.md");
+    CHECK(json_val_as_string(resp.result["content"]) == "# Newer\n");
+}

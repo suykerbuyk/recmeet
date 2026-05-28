@@ -41,12 +41,14 @@
 #include "upload_session.h"
 #include "util.h"
 
+#include <algorithm>
 #include <csignal>
 #include <cstring>
 #include <fstream>
 #include <iterator>
 #include <memory>
 #include <mutex>
+#include <regex>
 #include <string>
 #include <thread>
 #include <utility>
@@ -2239,6 +2241,16 @@ void register_daemon_handlers(recmeet::IpcServer& server) {
     // Read Meeting_*.md from the meeting directory ONLY. No note_dir
     // fallback (deliberate behavior change — see plan migration note #1).
     // If no Meeting_*.md is found, return InvalidParams "not_found".
+    //
+    // When multiple attempts exist (one per reprocess), return the
+    // highest-numbered `.NN`. Legacy un-numbered notes (no `.NN`) rank
+    // as `-1` and tie-break by newest `fs::last_write_time` — matches
+    // the Go MCP tool's existing behavior in the unmigrated state
+    // (tools/meetingdata/meetings.go:101-104). The handler operates on
+    // a single per-meeting directory by V2 wire-format-at-rest
+    // invariant, so no per-file timestamp filter is needed — every
+    // `Meeting_*.md` entry in `meeting_path` shares a timestamp by
+    // construction.
     server.on("meetings.read_note",
               [](const IpcRequest& req, IpcResponse& resp, IpcError& err) {
         try {
@@ -2268,7 +2280,22 @@ void register_daemon_handlers(recmeet::IpcServer& server) {
             const fs::path meeting_path = *hit;
 
             // Find Meeting_*.md in the meeting dir. No note_dir fallback.
-            fs::path note_path;
+            // Collect every matching entry; rank by `.NN` (numeric DESC)
+            // with mtime DESC as the legacy `-1` tiebreak.
+            struct Candidate {
+                fs::path path;
+                int attempt;                  // -1 for legacy (no `.NN`)
+                fs::file_time_type mtime;     // used only for -1 tiebreak
+            };
+            std::vector<Candidate> candidates;
+            // Match `.NN` immediately after a `YYYY-MM-DD_HH-MM` timestamp.
+            // The regex captures the digit group between the literal `.`
+            // after the timestamp and either the optional `_<title>` or
+            // the closing `.md`. Anchored on `Meeting_` and `.md` for
+            // discipline; the per-directory invariant means every entry
+            // here is for the same recording.
+            static const std::regex kAttemptRe(
+                R"(^Meeting_\d{4}-\d{2}-\d{2}_\d{2}-\d{2}\.(\d+)(?:_.*)?\.md$)");
             std::error_code ec;
             if (fs::is_directory(meeting_path, ec)) {
                 for (const auto& entry : fs::directory_iterator(meeting_path, ec)) {
@@ -2282,15 +2309,42 @@ void register_daemon_handlers(recmeet::IpcServer& server) {
                     if (fname.size() < pre_n + suf_n) continue;
                     if (fname.compare(0, pre_n, PREFIX) != 0) continue;
                     if (fname.compare(fname.size() - suf_n, suf_n, SUFFIX) != 0) continue;
-                    note_path = entry.path();
-                    break;
+                    Candidate c;
+                    c.path = entry.path();
+                    c.attempt = -1;
+                    std::smatch m;
+                    if (std::regex_match(fname, m, kAttemptRe)) {
+                        try {
+                            c.attempt = std::stoi(m[1].str());
+                        } catch (const std::exception&) {
+                            c.attempt = -1;
+                        }
+                    }
+                    std::error_code mt_ec;
+                    c.mtime = fs::last_write_time(c.path, mt_ec);
+                    if (mt_ec) {
+                        // A known-good legacy beats one we can't stat.
+                        c.mtime = fs::file_time_type::min();
+                    }
+                    candidates.push_back(std::move(c));
                 }
             }
-            if (note_path.empty()) {
+            if (candidates.empty()) {
                 err.code = static_cast<int>(IpcErrorCode::InvalidParams);
                 err.message = "meetings.read_note: not_found";
                 return false;
             }
+            // Primary: numeric `.NN` DESC. Secondary (for the legacy -1
+            // tie): mtime DESC. The mtime field is populated for every
+            // candidate but is only used as a tiebreaker — a numbered
+            // attempt always outranks any legacy regardless of mtimes.
+            std::sort(candidates.begin(), candidates.end(),
+                      [](const Candidate& a, const Candidate& b) {
+                          if (a.attempt != b.attempt)
+                              return a.attempt > b.attempt;
+                          return a.mtime > b.mtime;
+                      });
+            const fs::path note_path = candidates.front().path;
 
             std::ifstream in(note_path, std::ios::binary);
             if (!in) {

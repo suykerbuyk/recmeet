@@ -44,8 +44,14 @@ bool has_meeting_note(const fs::path& dir) {
         if (ec) return false;
         if (!entry.is_regular_file()) continue;
         const std::string fname = entry.path().filename().string();
-        // Meeting_<timestamp>[_Title].md — match the prefix+suffix only;
-        // the daemon's note.cpp emits this exact convention.
+        // Meeting_<timestamp>[.<NN>][_Title].md — match the prefix+suffix
+        // only; the daemon's note.cpp emits this convention. The `.XX`
+        // attempt counter (between `<timestamp>` and the optional title)
+        // is intentionally transparent here: this is a boolean "does any
+        // meeting note exist for this directory?" probe, so all of the
+        // new-form `Meeting_<ts>.NN.md`, the new-form-with-title
+        // `Meeting_<ts>.NN_<title>.md`, and any unmigrated legacy
+        // `Meeting_<ts>[_<title>].md` all satisfy the predicate equally.
         constexpr const char* PREFIX = "Meeting_";
         constexpr const char* SUFFIX = ".md";
         const std::size_t pre_n = std::strlen(PREFIX);

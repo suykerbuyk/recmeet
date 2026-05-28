@@ -578,9 +578,17 @@ fs::path resolve_note_parent(const JobConfig& cfg, const fs::path& meeting_dir,
     return parent;
 }
 
-/// Glob `<note_parent>/Meeting_<timestamp>*.md` (the trailing `*` matters —
-/// notes carry an AI-derived title suffix). Returns true if at least one
-/// match exists.
+/// Glob `<note_parent>/Meeting_<timestamp>*.md` and return true if at
+/// least one match exists. The trailing `*` covers ALL of:
+///   * legacy             — `Meeting_<ts>.md`
+///   * legacy + title     — `Meeting_<ts>_<title>.md`
+///   * new-form           — `Meeting_<ts>.<NN>.md`
+///   * new-form + title   — `Meeting_<ts>.<NN>_<title>.md`
+/// The `.XX` attempt counter (introduced for reprocess-attempt ordering)
+/// is intentionally transparent here — this is a boolean "did we ever
+/// write a note for this recording?" probe used to skip already-noted
+/// meetings in a batch reprocess. Any attempt (numbered or legacy) for
+/// the timestamp satisfies the predicate equally.
 bool note_exists_for(const fs::path& note_parent, const std::string& timestamp) {
     std::error_code ec;
     if (!fs::is_directory(note_parent, ec)) return false;
