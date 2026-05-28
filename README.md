@@ -28,11 +28,11 @@ The result: full transcriptions with speaker labels, professionally structured s
 
 recmeet is a **thin-client / heavy-compute-server** system:
 
-- The **client** (tray applet or `recmeet` CLI) owns audio capture via the `recmeet_capture` library — PipeWire/PulseAudio live on the client host, not the daemon.
-- The **daemon** (`recmeet-daemon`) owns the heavy ML pipeline (transcribe, diarize, identify, summarize, stream-asr captions) and routes jobs through a typed `JobQueue` with three concurrency slots.
-- They communicate over **Unix socket** (default — local-only, trusted via kernel peer credentials) or **TCP with PSK auth** (`--listen host:port` + `RECMEET_AUTH_TOKEN` env var — for running the daemon on a separate machine).
+- The **client** (`recmeet-client` tray applet or `recmeet-cli`) owns audio capture via the `recmeet_capture` library — PipeWire/PulseAudio live on the client host, not the server.
+- The **server** (`recmeet-server`) owns the heavy ML pipeline (transcribe, diarize, identify, summarize, stream-asr captions) and routes jobs through a typed `JobQueue` with three concurrency slots.
+- They communicate over **Unix socket** (default — local-only, trusted via kernel peer credentials) or **TCP with PSK auth** (`--listen host:port` + `RECMEET_AUTH_TOKEN` env var — for running the server on a separate machine).
 
-The standalone in-process path (`recmeet --no-daemon`) is also still supported — it runs the full pipeline directly, identical to the legacy single-process flow. See `docs/ARCHITECTURE.md` for the full V2 picture and `docs/IPC-VERBS.md` for the IPC verb reference.
+The standalone in-process path (`recmeet-cli --no-daemon`) is also still supported — it runs the full pipeline directly, identical to the legacy single-process flow. See `docs/ARCHITECTURE.md` for the full V2 picture, `docs/MIGRATION.md` for the V1 → V2 / coexistence guide, and `docs/IPC-VERBS.md` for the IPC verb reference.
 
 ## Quick start
 
@@ -72,58 +72,58 @@ make
 
 ### Run
 
-#### Local daemon mode (recommended for desktop use)
+#### Local server mode (recommended for desktop use)
 
 ```bash
-# Start the daemon (Unix socket — default)
-./build/recmeet-daemon &
+# Start the server (Unix socket — default)
+./build/recmeet-server &
 
-# CLI: connects to the running daemon automatically
+# CLI: connects to the running server automatically
 export XAI_API_KEY=your-key-here
-./build/recmeet --model base
+./build/recmeet-cli --model base
 
-# Or use the system tray applet (also a daemon client)
-./build/recmeet-tray
+# Or use the system tray applet (also a server client)
+./build/recmeet-client
 
-# Headless WebUI mode — runs the tray without a GUI status icon, but
+# Headless WebUI mode — runs the client without a GUI status icon, but
 # binds the embedded WebUI HTTP listener at startup (kernel-picked port
 # on 127.0.0.1). Useful on a server box without a desktop, or for
 # scripted access to the speaker/meeting management endpoints. Discover
 # the bound port from the startup log line or via `ss -ltnp`. This
 # combination subsumes the `recmeet-webd` use case that was deferred
 # from the V2 binary plan.
-./build/recmeet-tray --headless --listen-now
+./build/recmeet-client --headless --listen-now
 
-# Daemon-control commands
-./build/recmeet --status              # query daemon state
-./build/recmeet --stop                # cancel a job in progress
+# Server-control commands
+./build/recmeet-cli --status              # query server state
+./build/recmeet-cli --stop                # cancel a job in progress
 ```
 
-#### Standalone mode (no daemon)
+#### Standalone mode (no server)
 
 ```bash
-# Smoke test — no daemon, no API key, mic only
-./build/recmeet --no-daemon --mic-only --no-summary --no-diarize --model tiny
+# Smoke test — no server, no API key, mic only
+./build/recmeet-cli --no-daemon --mic-only --no-summary --no-diarize --model tiny
 
 # Full pipeline in-process
 export XAI_API_KEY=your-key-here
-./build/recmeet --no-daemon --model base
+./build/recmeet-cli --no-daemon --model base
 ```
 
-`--no-daemon` runs the entire pipeline in the CLI process, exactly as the legacy single-process build did. Use it when you don't want a daemon at all, or for one-off CLI work on a host where the daemon isn't installed.
+`--no-daemon` runs the entire pipeline in the CLI process, exactly as the legacy single-process build did. Use it when you don't want a server at all, or for one-off CLI work on a host where the server isn't installed.
 
-#### Remote daemon (V2 client/server over TCP)
+#### Remote server (V2 client/server over TCP)
 
-Run the daemon on one machine, drive it from another. The TCP listener **requires** PSK authentication via `RECMEET_AUTH_TOKEN`; the daemon fails to start without it.
+Run the server on one machine, drive it from another. The TCP listener **requires** PSK authentication via `RECMEET_AUTH_TOKEN`; the server fails to start without it.
 
 ```bash
 # Server host (the box doing the heavy compute):
 export RECMEET_AUTH_TOKEN="$(openssl rand -hex 32)"
-./build/recmeet-daemon --listen 0.0.0.0:29991
+./build/recmeet-server --listen 0.0.0.0:29991
 
 # Client host (your laptop):
 export RECMEET_AUTH_TOKEN="<same token as above>"
-./build/recmeet --daemon-addr server.lan:29991 --mic-only --model base
+./build/recmeet-cli --daemon-addr server.lan:29991 --mic-only --model base
 ```
 
 Do **not** expose the daemon TCP port directly to the public internet. The PSK gate is a fail-stop, not an encryption layer; put TLS (stunnel, an SSH tunnel, or a reverse proxy) in front if the traffic crosses untrusted networks. Unix-socket listeners bypass the PSK check because they're already gated by filesystem permissions and kernel peer credentials.
@@ -134,14 +134,14 @@ For the full thin-client deployment playbook — PSK generation and rotation, Ta
 
 ```bash
 # Full pipeline with local LLM (no API key, no network)
-./build/recmeet --model base \
-    --llm-model ~/.local/share/recmeet/models/llama/Qwen2.5-7B-Instruct-Q4_K_M.gguf
+./build/recmeet-cli --model base \
+    --llm-model ~/.local/share/recmeet-server/models/llama/Qwen2.5-7B-Instruct-Q4_K_M.gguf
 
 # Reprocess an old recording with speaker diarization
-./build/recmeet --reprocess meetings/2026-02-21_17-34/ --num-speakers 2
+./build/recmeet-cli --reprocess meetings/2026-02-21_17-34/ --num-speakers 2
 
 # List available audio sources (on the client host — the client owns capture)
-./build/recmeet --list-sources
+./build/recmeet-cli --list-sources
 ```
 
 See [QUICKSTART.md](QUICKSTART.md) for a step-by-step installation and usage guide, including the full standalone / local-daemon / remote-server walkthroughs.
@@ -159,7 +159,7 @@ Record ──► Transcribe ──► Diarize ──► Identify ──► Summa
 
 3. **Diarize** (optional, on by default): sherpa-onnx labels each segment with `Speaker_01`, `Speaker_02`, etc. using neural speaker embeddings and clustering. Configurable threshold for tuning speaker count detection. Long audio (over ~17 minutes at default settings) is automatically processed in overlapping chunks; chunk-local speaker IDs are stitched into a global registry by cosine-similarity matching on raw centroids, keeping peak memory bounded by chunk size rather than meeting length. See `docs/ARCHITECTURE.md#diarization` for the chunk + stitch flow.
 
-4. **Identify** (optional, on by default when speakers are enrolled): Matches diarization clusters against enrolled voiceprints using cosine similarity on 3D-Speaker embeddings. Enrolled speakers get their real names (`John`, `Alice`) instead of generic labels. The speaker database lives at `~/.local/share/recmeet/speakers/` — one JSON file per person containing their averaged embedding vectors. Enroll speakers from past recordings with `recmeet --enroll "Name" --from meetings/DIR/`. Enrolled names are automatically passed to whisper as vocabulary hints, improving transcription accuracy for unusual names.
+4. **Identify** (optional, on by default when speakers are enrolled): Matches diarization clusters against enrolled voiceprints using cosine similarity on 3D-Speaker embeddings. Enrolled speakers get their real names (`John`, `Alice`) instead of generic labels. The speaker database lives at `~/.local/share/recmeet-server/speakers/` — one JSON file per person containing their averaged embedding vectors. Enroll speakers from past recordings with `recmeet-cli --enroll "Name" --from meetings/DIR/`. Enrolled names are automatically passed to whisper as vocabulary hints, improving transcription accuracy for unusual names.
 
 5. **Summarize**: Either a cloud API call (xAI, OpenAI, or Anthropic — all use the same OpenAI-compatible endpoint) or a local GGUF model via llama.cpp. Same structured prompt for both paths. Dynamic context sizing with token-level truncation for long meetings.
 
@@ -182,10 +182,10 @@ Uses any OpenAI-compatible endpoint. Three providers are built in:
 ```bash
 # Set an API key (env var, config file, or --api-key flag)
 export XAI_API_KEY=your-key-here
-./build/recmeet --model base --provider xai
+./build/recmeet-cli --model base --provider xai
 
 # Switch providers
-./build/recmeet --model base --provider openai
+./build/recmeet-cli --model base --provider openai
 ```
 
 API keys are resolved in priority order: environment variable > per-provider entry in `config.yaml` > legacy `api_key` field.
@@ -200,11 +200,11 @@ mkdir -p ~/.local/share/recmeet/models/llama/
 # Place your .gguf file there, or use any path
 
 # Run with local summarization
-./build/recmeet --model base \
-    --llm-model ~/.local/share/recmeet/models/llama/Qwen2.5-7B-Instruct-Q4_K_M.gguf
+./build/recmeet-cli --model base \
+    --llm-model ~/.local/share/recmeet-server/models/llama/Qwen2.5-7B-Instruct-Q4_K_M.gguf
 ```
 
-Or set it permanently in `~/.config/recmeet/config.yaml`:
+Or set it permanently in `~/.config/recmeet-server/daemon.yaml` (see `docs/MIGRATION.md` for the V2 config-dir layout):
 
 ```yaml
 summary:
@@ -262,16 +262,16 @@ approximate and complementary.
 
 ```bash
 # CLI: opt in for this recording only
-./build/recmeet --mic-only --show-captions
+./build/recmeet-cli --mic-only --show-captions
 
 # CLI: choose a different streaming model (defaults to en-2023-06-26)
-./build/recmeet --show-captions --caption-model en-small
+./build/recmeet-cli --show-captions --caption-model en-small
 
 # CLI: list cached + available streaming caption models
-./build/recmeet --list-caption-models
+./build/recmeet-cli --list-caption-models
 
 # CLI: explicitly disable captions even if config has them on
-./build/recmeet --no-captions
+./build/recmeet-cli --no-captions
 ```
 
 The tray applet has a **"Show Live Captions"** checkbox in its menu;
@@ -341,7 +341,7 @@ cmake -B build -G Ninja -DRECMEET_GGML_VULKAN=ON
 cmake -B build -G Ninja -DRECMEET_GGML_VULKAN=OFF
 ```
 
-At daemon startup, look for the **active-backend banner** on stderr or in `journalctl --user -u recmeet-daemon.service`:
+At server startup, look for the **active-backend banner** on stderr or in `journalctl --user -u recmeet-server.service`:
 
     ggml: backend registry: CPU, Vulkan
     ggml: active backend: Vulkan (AMD Radeon Pro W5500 (RADV NAVI10), 8192 MB)
@@ -388,7 +388,7 @@ Re-run the postprocessing pipeline (transcription, diarization, summarization, n
 
 ```bash
 # Reprocess a single meeting directory
-./build/recmeet --reprocess meetings/2026-02-21_17-34/ --num-speakers 2
+./build/recmeet-cli --reprocess meetings/2026-02-21_17-34/ --num-speakers 2
 ```
 
 Useful after upgrading whisper / diarization models, tweaking summary prompts, or recovering meetings whose original postprocessing failed (e.g. OOM on long audio before chunked diarization).
@@ -398,13 +398,13 @@ Useful after upgrading whisper / diarization models, tweaking summary prompts, o
 To reprocess every meeting under a parent directory in one pass:
 
 ```bash
-./build/recmeet --reprocess-batch ~/meetings/
+./build/recmeet-cli --reprocess-batch ~/meetings/
 ```
 
 Inspect what would be done first:
 
 ```bash
-./build/recmeet --reprocess-batch ~/meetings/ --dry-run
+./build/recmeet-cli --reprocess-batch ~/meetings/ --dry-run
 ```
 
 The batch driver:
@@ -422,7 +422,7 @@ A single Ctrl-C aborts the current meeting, stops the loop, prints what complete
 **Memory headroom on 16 GB hosts.** For batch runs over a parent directory containing long meetings, pass `--diarize-chunk-minutes 12` to narrow the chunked-diarize window from the default 15 min:
 
 ```bash
-./build/recmeet --reprocess-batch ~/meetings/ --diarize-chunk-minutes 12
+./build/recmeet-cli --reprocess-batch ~/meetings/ --diarize-chunk-minutes 12
 ```
 
 This widens per-chunk RSS headroom at a small cost to per-chunk centroid quality — useful when reprocessing many long meetings back-to-back where library caches accumulate residual host overhead between iterations. The default of 15 min is the iter-121 quality/memory pick; 12 min is the documented stress-test value, not a regression. The chunked-diarize path is automatic — it engages whenever audio length exceeds `chunk_minutes·60 + chunk_overlap_sec + 120` seconds (≈17.5 min at default, ≈14.5 min at 12).
@@ -501,16 +501,16 @@ Options:
   -v, --version        Show version
 ```
 
-### recmeet-daemon
+### recmeet-server
 
 ```
-Usage: recmeet-daemon [OPTIONS]
+Usage: recmeet-server [OPTIONS]
 
-Run the recmeet daemon (V2 IPC server for CLI and tray clients).
-The daemon owns the heavy ML pipeline; clients own audio capture.
+Run the recmeet V2 server (IPC server for CLI and client tray).
+The server owns the heavy ML pipeline; clients own audio capture.
 
 Options:
-  --socket PATH        Unix socket path (default: $XDG_RUNTIME_DIR/recmeet/daemon.sock)
+  --socket PATH        Unix socket path (default: $XDG_RUNTIME_DIR/recmeet-server/server.sock)
   --listen ADDRESS     Listen address: Unix path or host:port for TCP
                        TCP requires RECMEET_AUTH_TOKEN (PSK auth, fail-stop)
   --log-level LEVEL    Log level: none, error, warn, info, debug (default: info)
@@ -520,11 +520,15 @@ Options:
   -v, --version        Show version
 ```
 
-`--socket` and `--listen` are aliases — both accept a Unix path or `host:port`. Use `--listen 0.0.0.0:29991` together with `RECMEET_AUTH_TOKEN=<secret>` to run the daemon as a remote server.
+`--socket` and `--listen` are aliases — both accept a Unix path or `host:port`. Use `--listen 0.0.0.0:29991` together with `RECMEET_AUTH_TOKEN=<secret>` to run the server as a remote host.
 
 ## Configuration
 
-`~/.config/recmeet/config.yaml` — all fields are optional, CLI flags override.
+V2 splits config across two files:
+- `~/.config/recmeet-server/daemon.yaml` — admin defaults for the server (transcription / diarization / summarization / captions).
+- `~/.config/recmeet-client/client.yaml` — tray-remembered UI selections + per-user paths.
+
+Both are optional; CLI flags override. See `docs/MIGRATION.md` for the V1 → V2 mapping.
 
 ```yaml
 audio:
@@ -660,31 +664,31 @@ See [docs/BUILD.md](docs/BUILD.md) for packaging details and per-distro build de
 
 ### Autostart via systemd
 
-The daemon and tray each have a systemd user service. The tray service depends on the daemon — enabling the tray automatically pulls in the daemon.
+The server and client each have a systemd user service. The client service depends on the server — enabling the client automatically pulls in the server.
 
 ```bash
-# Daemon only (headless / CLI usage)
-systemctl --user enable --now recmeet-daemon.service
+# Server only (headless / CLI usage)
+systemctl --user enable --now recmeet-server.service
 
-# Daemon + tray (desktop usage — daemon starts automatically)
-systemctl --user enable --now recmeet-tray.service
+# Server + client (desktop usage — server starts automatically)
+systemctl --user enable --now recmeet-client.service
 
 # Check status
-systemctl --user status recmeet-daemon.service
-systemctl --user status recmeet-tray.service
+systemctl --user status recmeet-server.service
+systemctl --user status recmeet-client.service
 
 # Stop and disable
-systemctl --user disable --now recmeet-tray.service
-systemctl --user disable --now recmeet-daemon.service
+systemctl --user disable --now recmeet-client.service
+systemctl --user disable --now recmeet-server.service
 ```
 
-Socket activation is also available — `recmeet-daemon.socket` starts the daemon on first connection:
+Socket activation is also available — `recmeet-server.socket` starts the server on first connection:
 
 ```bash
-systemctl --user enable --now recmeet-daemon.socket
+systemctl --user enable --now recmeet-server.socket
 ```
 
-The tray service is tied to `graphical-session.target` and restarts automatically on crash. On Sway, your config must activate that target — see [docs/BUILD.md](docs/BUILD.md) for details.
+The client service is tied to `graphical-session.target` and restarts automatically on crash. On Sway, your config must activate that target — see [docs/BUILD.md](docs/BUILD.md) for details.
 
 ### Postprocessing memory limits
 
@@ -692,7 +696,7 @@ The tray service is tied to `graphical-session.target` and restarts automaticall
 
 The architecture has three layers of containment, each load-bearing:
 
-1. **systemd cgroup caps** (`dist/recmeet-daemon.service.in`): `MemoryHigh=10G` / `MemoryMax=14G` / `MemorySwapMax=0`. Cgroup-enforced so even an unrecoverable workload reaps only this unit, not the whole host.
+1. **systemd cgroup caps** (`dist/recmeet-server.service.in`): `MemoryHigh=10G` / `MemoryMax=14G` / `MemorySwapMax=0`. Cgroup-enforced so even an unrecoverable workload reaps only this unit, not the whole host.
 2. **Subprocess isolation**: postprocessing runs as a forked child. Crashes or the cgroup hard-cap kill only the child; the daemon stays alive, the audio is preserved, the operator gets a precise error.
 3. **Chunked diarization** (T2.1, iter 121): when audio exceeds `chunk_minutes·60 + chunk_overlap_sec + 120` seconds (≈17.5 min at default chunk_minutes=15), the pipeline auto-engages `diarize_chunked()` — slices audio into overlapping windows, reuses one `DiarizeSession` and one `SpeakerEmbeddingSession` across all chunks, stitches per-chunk centroids into a global registry by cosine similarity, then bypasses the second extractor pass via `identify_speakers_with_centroids()` (T2.2 H1). Per-chunk peak working set stays ≤ 6 GB on the 60-min fixture.
 
@@ -716,15 +720,15 @@ From there, the project evolved through extensive iteration: doubling test cover
 
 ## Architecture
 
-Four C++ binaries share a common static library. The **client** binaries (CLI and tray) own audio capture; the **daemon** owns the heavy ML pipeline (transcribe, diarize, identify, summarize, stream-asr captions). They communicate over Unix socket or TCP using a framed wire protocol (NDJSON control frames plus binary upload / artifact / streaming-PCM frames). Two additional Go binaries provide AI-powered tooling.
+Four C++ binaries share a common static library. The **client** binaries (`recmeet-cli` and `recmeet-client`) own audio capture; the **server** (`recmeet-server`) owns the heavy ML pipeline (transcribe, diarize, identify, summarize, stream-asr captions). They communicate over Unix socket or TCP using a framed wire protocol (NDJSON control frames plus binary upload / artifact / streaming-PCM frames). Two additional Go binaries provide AI-powered tooling.
 
 ```
 recmeet_core     (static library — pipeline + IPC)
 recmeet_capture  (client-side capture library — PipeWire + PulseAudio)
     |
-    +-- recmeet-daemon  (daemon — pipeline + IPC server; does NOT link PipeWire/PulseAudio)
-    +-- recmeet         (CLI — dual-mode: thin daemon client or standalone in-process)
-    +-- recmeet-tray    (system tray — daemon client, GTK3 + AppIndicator)
+    +-- recmeet-server  (server daemon — pipeline + IPC; does NOT link PipeWire/PulseAudio)
+    +-- recmeet-cli     (CLI — dual-mode: thin server client or standalone in-process)
+    +-- recmeet-client  (system tray — server client, GTK3 + AppIndicator)
     +-- recmeet_tests   (Catch2 test suite)
 
 tools/  (Go module — github.com/syketech/recmeet-tools)
@@ -733,10 +737,10 @@ tools/  (Go module — github.com/syketech/recmeet-tools)
     +-- recmeet-agent  (AI agent CLI — meeting prep + follow-up workflows)
 ```
 
-### Daemon mode (recommended)
+### Server mode (recommended)
 
 ```
-recmeet-tray / recmeet (CLI)                 recmeet-daemon
+recmeet-client / recmeet-cli                 recmeet-server
         |                                          |
    [capture]                                   [JobQueue: 3 typed slots]
    (PipeWire / PulseAudio)  ── IPC ──►   [transcribe | diarize | summarize]
@@ -747,7 +751,7 @@ recmeet-tray / recmeet (CLI)                 recmeet-daemon
               TCP + PSK    (--listen / --daemon-addr, RECMEET_AUTH_TOKEN)
 ```
 
-The CLI auto-detects a running daemon and operates as a client. Use `--no-daemon` to force standalone in-process mode. The tray connects to the daemon and reconnects automatically with exponential backoff if the daemon restarts. A per-client `session.init` handshake carries credentials and per-session preferences (provider, model, language, etc.) so a single daemon can serve multiple clients with different settings.
+The CLI auto-detects a running server and operates as a client. Use `--no-daemon` to force standalone in-process mode. The client tray connects to the server and reconnects automatically with exponential backoff if the server restarts. A per-client `session.init` handshake carries credentials and per-session preferences (provider, model, language, diarize, vad, etc.) so a single server can serve multiple clients with different settings.
 
 ### IPC protocol (V2)
 

@@ -4,13 +4,13 @@ Step-by-step guide to installing, configuring, and using recmeet.
 
 ## V2 architecture at a glance
 
-recmeet is a **thin-client / heavy-compute-server** system. The client (tray or CLI) captures audio locally via PipeWire/PulseAudio. The daemon (`recmeet-daemon`) does the heavy ML work — transcription, diarization, speaker identification, summarization, and streaming live captions. Clients talk to the daemon over a Unix socket (default, local-only) or TCP (`--listen` / `--daemon-addr` with PSK auth, for running the daemon on a separate machine).
+recmeet is a **thin-client / heavy-compute-server** system. The client (tray or CLI) captures audio locally via PipeWire/PulseAudio. The daemon (`recmeet-server`) does the heavy ML work — transcription, diarization, speaker identification, summarization, and streaming live captions. Clients talk to the daemon over a Unix socket (default, local-only) or TCP (`--listen` / `--daemon-addr` with PSK auth, for running the daemon on a separate machine).
 
 Three operating modes are supported, in order of increasing setup cost:
 
-1. **Standalone mode** — `recmeet --no-daemon` runs the entire pipeline in the CLI process. No daemon, no IPC, no setup. Same flags as the legacy single-process build.
-2. **Local daemon mode** — start `recmeet-daemon` (or use the systemd user unit) and let the tray / CLI auto-connect to its Unix socket. This is the default for desktop users.
-3. **Remote server mode** — run `recmeet-daemon --listen 0.0.0.0:29991` on a beefy machine, connect from your laptop with `recmeet --daemon-addr server:29991`. Requires a PSK (`RECMEET_AUTH_TOKEN`) and is intended for trusted networks only.
+1. **Standalone mode** — `recmeet-cli --no-daemon` runs the entire pipeline in the CLI process. No server, no IPC, no setup. Same flags as the legacy single-process build.
+2. **Local server mode** — start `recmeet-server` (or use the systemd user unit) and let the tray / CLI auto-connect to its Unix socket. This is the default for desktop users.
+3. **Remote server mode** — run `recmeet-server --listen 0.0.0.0:29991` on a beefy machine, connect from your laptop with `recmeet-cli --daemon-addr server:29991`. Requires a PSK (`RECMEET_AUTH_TOKEN`) and is intended for trusted networks only.
 
 Sections 3–6 walk through each of these flows. For the architecture in detail, see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md); for multi-host deployment recipes, see [docs/V2-DEPLOYMENT.md](docs/V2-DEPLOYMENT.md); for the IPC verb reference, see [docs/IPC-VERBS.md](docs/IPC-VERBS.md).
 
@@ -51,9 +51,9 @@ This produces four C++ binaries in `build/`:
 
 | Binary | Purpose |
 |--------|---------|
-| `recmeet` | CLI tool (standalone or daemon client) |
-| `recmeet-daemon` | Background daemon (owns pipeline logic) |
-| `recmeet-tray` | System tray applet (GTK3, daemon client) |
+| `recmeet-cli` | CLI tool (standalone or server client) |
+| `recmeet-server` | Server daemon (owns pipeline logic) |
+| `recmeet-client` | System tray applet (GTK3, server client) |
 | `recmeet_tests` | Test suite |
 
 `make build` also builds the Go-based AI tools (requires Go 1.25+):
@@ -68,7 +68,7 @@ This produces four C++ binaries in `build/`:
 The simplest way to verify everything works — no daemon, no IPC, no API key:
 
 ```bash
-./build/recmeet --no-daemon --mic-only --no-summary --no-diarize --model tiny
+./build/recmeet-cli --no-daemon --mic-only --no-summary --no-diarize --model tiny
 # Speak into your mic, then press Ctrl+C to stop.
 ```
 
@@ -82,12 +82,12 @@ Use standalone mode when:
 
 ## 4. Mode B — Local daemon (recommended for desktop use)
 
-The local daemon is the default desktop experience. It runs in the background, exposes a Unix socket at `$XDG_RUNTIME_DIR/recmeet/daemon.sock`, and serves the tray and CLI as thin clients. The daemon owns the heavy ML pipeline; the client owns audio capture.
+The local server is the default desktop experience. It runs in the background, exposes a Unix socket at `$XDG_RUNTIME_DIR/recmeet-server/server.sock`, and serves the tray and CLI as thin clients. The server owns the heavy ML pipeline; the client owns audio capture.
 
 ### Start manually
 
 ```bash
-./build/recmeet-daemon &
+./build/recmeet-server &
 ```
 
 ### Or install and use systemd
@@ -101,8 +101,8 @@ make install                                        # installs to ~/.local, down
 ### Verify it's running
 
 ```bash
-recmeet --status
-# Output: Daemon: running / State: idle
+recmeet-cli --status
+# Output: Server: running / State: idle
 ```
 
 The CLI auto-detects the running daemon. The first command the client sends after connecting is `session.init`, which carries credentials and per-session preferences (provider, model, language, etc.) — so a single daemon can serve multiple clients with different settings.
@@ -122,33 +122,33 @@ openssl rand -hex 32
 
 ```bash
 export RECMEET_AUTH_TOKEN="7c2f9a..."        # same secret on both sides
-./build/recmeet-daemon --listen 0.0.0.0:29991
-# recmeet-daemon: PSK auth enabled for TCP listener
-# recmeet-daemon listening on 0.0.0.0:29991
+./build/recmeet-server --listen 0.0.0.0:29991
+# recmeet-server: PSK auth enabled for TCP listener
+# recmeet-server listening on 0.0.0.0:29991
 ```
 
 To run under systemd, drop the token into an EnvironmentFile readable only by your user:
 
 ```bash
-mkdir -p ~/.config/systemd/user/recmeet-daemon.service.d
-cat >~/.config/systemd/user/recmeet-daemon.service.d/listen.conf <<'EOF'
+mkdir -p ~/.config/systemd/user/recmeet-server.service.d
+cat >~/.config/systemd/user/recmeet-server.service.d/listen.conf <<'EOF'
 [Service]
 Environment=RECMEET_AUTH_TOKEN=7c2f9a...
 ExecStart=
-ExecStart=/usr/local/bin/recmeet-daemon --listen 0.0.0.0:29991
+ExecStart=/usr/local/bin/recmeet-server --listen 0.0.0.0:29991
 EOF
 systemctl --user daemon-reload
-systemctl --user restart recmeet-daemon.service
+systemctl --user restart recmeet-server.service
 ```
 
 ### Client host
 
 ```bash
 export RECMEET_AUTH_TOKEN="7c2f9a..."        # same secret as the server
-recmeet --daemon-addr server.lan:29991 --mic-only --model base
+recmeet-cli --daemon-addr server.lan:29991 --mic-only --model base
 ```
 
-Or, set the daemon address in your shell environment so every `recmeet` invocation picks it up automatically:
+Or, set the server address in your shell environment so every `recmeet-cli` invocation picks it up automatically:
 
 ```bash
 export RECMEET_DAEMON_ADDR=server.lan:29991
@@ -183,7 +183,8 @@ export ANTHROPIC_API_KEY=your-key-here # Anthropic
 ```
 
 ```yaml
-# Option 2: Config file (~/.config/recmeet/config.yaml)
+# Option 2: Config file (~/.config/recmeet-client/client.yaml)
+# (V2 keeps the api_keys block on the client side — same shape as V1.)
 api_keys:
   xai: "xai-..."
   openai: "sk-..."
@@ -195,25 +196,25 @@ Environment variables always override config file keys. The tray stores keys ent
 To switch providers:
 
 ```bash
-recmeet --provider openai --model base
+recmeet-cli --provider openai --model base
 ```
 
 ### Local LLM (fully offline)
 
-Download a GGUF model and point recmeet at it:
+Download a GGUF model and point recmeet-cli at it:
 
 ```bash
-mkdir -p ~/.local/share/recmeet/models/llama
-curl -L -o ~/.local/share/recmeet/models/llama/Qwen2.5-7B-Instruct-Q4_K_M.gguf \
+mkdir -p ~/.local/share/recmeet-server/models/llama
+curl -L -o ~/.local/share/recmeet-server/models/llama/Qwen2.5-7B-Instruct-Q4_K_M.gguf \
     https://huggingface.co/Qwen/Qwen2.5-7B-Instruct-GGUF/resolve/main/qwen2.5-7b-instruct-q4_k_m.gguf
 
-recmeet --llm-model ~/.local/share/recmeet/models/llama/Qwen2.5-7B-Instruct-Q4_K_M.gguf
+recmeet-cli --llm-model ~/.local/share/recmeet-server/models/llama/Qwen2.5-7B-Instruct-Q4_K_M.gguf
 ```
 
 ### No summarization
 
 ```bash
-recmeet --no-summary
+recmeet-cli --no-summary
 ```
 
 ## 7. Record a meeting
@@ -223,17 +224,17 @@ The recording flow looks the same from the user's seat regardless of which mode 
 ### Via CLI (with daemon running)
 
 ```bash
-recmeet --model base
+recmeet-cli --model base
 # Recording starts. Press Ctrl+C to stop.
 # Phases print as they happen: recording → transcribing → diarizing → summarizing → complete
 ```
 
-The CLI auto-detects the daemon. If the daemon isn't running, it falls back to standalone mode (unless you pass `--daemon`, which makes daemon presence required).
+The CLI auto-detects the server. If the server isn't running, it falls back to standalone mode (unless you pass `--daemon`, which makes server presence required).
 
 ### Via tray applet
 
 ```bash
-recmeet-tray                          # or: systemctl --user start recmeet-tray.service
+recmeet-client                          # or: systemctl --user start recmeet-client.service
 ```
 
 Click the tray icon, select **Record** to start, **Stop Recording** to finish. The tray connects to the daemon and shows status updates in real time. The tray is always a client — it does not have a standalone mode.
@@ -241,14 +242,14 @@ Click the tray icon, select **Record** to start, **Stop Recording** to finish. T
 ### Force standalone mode (no daemon)
 
 ```bash
-recmeet --no-daemon --model base
+recmeet-cli --no-daemon --model base
 ```
 
-### Point the CLI at a remote daemon
+### Point the CLI at a remote server
 
 ```bash
 export RECMEET_AUTH_TOKEN="<shared PSK>"
-recmeet --daemon-addr server.lan:29991 --model base
+recmeet-cli --daemon-addr server.lan:29991 --model base
 ```
 
 ### Enable live captions (optional)
@@ -272,19 +273,19 @@ int8 and fp32 weights); recmeet loads only the ~74 MB int8 set at
 runtime. The CLI prompts before downloading on first use:
 
 ```bash
-recmeet --mic-only --show-captions
+recmeet-cli --mic-only --show-captions
 # Streaming caption model 'en-2023-06-26' (~310 MB) is not cached.
 # Download now? [y/N]
 ```
 
 The tray applet shows the same prompt the first time you tick "Show
 Live Captions". The model is cached at
-`~/.local/share/recmeet/models/sherpa/online/en-2023-06-26/`.
+`~/.local/share/recmeet-server/models/sherpa/online/en-2023-06-26/`.
 
 **2. Verify by recording a short test clip**
 
 ```bash
-recmeet --mic-only --show-captions --no-summary --model tiny
+recmeet-cli --mic-only --show-captions --no-summary --model tiny
 # Speak something. You should see captions appear on stderr in real
 # time, e.g.:
 #   [caption] hello and welcome to the meeting
@@ -308,19 +309,32 @@ parses round-trip with ffmpeg.
 **3. List available caption models**
 
 ```bash
-recmeet --list-caption-models
+recmeet-cli --list-caption-models
 # en-2023-06-26  (~310 MB)  cached
 # en-small       (~128 MB)  not cached
 ```
 
 **4. Persist via config**
 
+V2 splits the caption preference across two files:
+
 ```yaml
-# ~/.config/recmeet/config.yaml
+# ~/.config/recmeet-server/daemon.yaml — server liveness
 captions:
   enabled: true
   model: en-2023-06-26
 ```
+
+```yaml
+# ~/.config/recmeet-client/client.yaml — client overlay visibility
+captions:
+  enabled: true
+```
+
+The server side gates whether the daemon stands up a streaming ASR
+engine at all; the client side controls whether the tray renders the
+overlay. Both default to `true`. See `docs/ARCHITECTURE.md` for the
+full split.
 
 The tray's "Show Live Captions" checkbox writes this for you.
 
@@ -413,7 +427,7 @@ general:
 CLI flags override config file values. The daemon reloads config on `SIGHUP`:
 
 ```bash
-kill -HUP $(pidof recmeet-daemon)
+kill -HUP $(pidof recmeet-server)
 ```
 
 ## 10. Daemon management
@@ -440,9 +454,9 @@ recmeet --daemon-addr /path/to/sock   # point at a non-default Unix socket
 ### Listen address (daemon side)
 
 ```bash
-recmeet-daemon                                       # default: $XDG_RUNTIME_DIR/recmeet/daemon.sock
-recmeet-daemon --listen /tmp/recmeet.sock            # custom Unix path
-RECMEET_AUTH_TOKEN=<secret> recmeet-daemon --listen 0.0.0.0:29991   # TCP (PSK required)
+recmeet-server                                       # default: $XDG_RUNTIME_DIR/recmeet/daemon.sock
+recmeet-server --listen /tmp/recmeet.sock            # custom Unix path
+RECMEET_AUTH_TOKEN=<secret> recmeet-server --listen 0.0.0.0:29991   # TCP (PSK required)
 ```
 
 TCP listeners fail-stop without `RECMEET_AUTH_TOKEN`. Unix-socket listeners bypass the PSK check (they're already gated by filesystem permissions and kernel peer credentials).
@@ -451,16 +465,16 @@ TCP listeners fail-stop without `RECMEET_AUTH_TOKEN`. Unix-socket listeners bypa
 
 ```bash
 # Daemon only
-systemctl --user enable --now recmeet-daemon.service
+systemctl --user enable --now recmeet-server.service
 
 # Daemon + tray (tray automatically starts daemon)
-systemctl --user enable --now recmeet-tray.service
+systemctl --user enable --now recmeet-client.service
 
 # Socket activation (daemon starts on first connection)
-systemctl --user enable --now recmeet-daemon.socket
+systemctl --user enable --now recmeet-server.socket
 
 # Logs
-journalctl --user -u recmeet-daemon.service -f
+journalctl --user -u recmeet-server.service -f
 ```
 
 ## 11. Model management
@@ -738,15 +752,15 @@ recmeet --num-speakers 3
 
 ## Troubleshooting
 
-**"Daemon: not running"** — Start the daemon: `recmeet-daemon &` or `systemctl --user start recmeet-daemon.service`
+**"Daemon: not running"** — Start the daemon: `recmeet-server &` or `systemctl --user start recmeet-server.service`
 
-**"Another recmeet-daemon is already running"** — A daemon is already active. Use `recmeet --status` to check, or `pkill recmeet-daemon` to kill a stale instance.
+**"Another recmeet-server is already running"** — A daemon is already active. Use `recmeet --status` to check, or `pkill recmeet-server` to kill a stale instance.
 
 **No audio captured** — Verify PipeWire is running: `pw-cli info`. List sources with `recmeet --list-sources` and check that your mic appears.
 
 **Whisper model not found** — Models are auto-downloaded on first use. If behind a proxy, download manually (see [docs/BUILD.md](docs/BUILD.md)).
 
-**Tray shows "Disconnected"** — The tray reconnects automatically when the daemon starts. Check `systemctl --user status recmeet-daemon.service`.
+**Tray shows "Disconnected"** — The tray reconnects automatically when the daemon starts. Check `systemctl --user status recmeet-server.service`.
 
 **Summary skipped / no API key warning** — Set your API key in the environment (`XAI_API_KEY`, `OPENAI_API_KEY`, or `ANTHROPIC_API_KEY`), in `~/.config/recmeet/config.yaml` under `api_keys:`, or enter it when the tray prompts you. Alternatively, use `--llm-model` for local summarization, or `--no-summary` to suppress the warning.
 
@@ -764,6 +778,6 @@ recmeet --reprocess chunk2.wav --num-speakers 2
 ```
 
 …or raise `RECMEET_RSS_LIMIT_MB` and `MemoryMax` in
-`dist/recmeet-daemon.service.in` and reinstall (`make install` then
+`dist/recmeet-server.service.in` and reinstall (`make install` then
 `systemctl --user daemon-reload && systemctl --user restart
-recmeet-daemon.service`).
+recmeet-server.service`).

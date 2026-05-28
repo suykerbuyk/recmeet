@@ -66,7 +66,7 @@ endif
 endif
 
 # ── Targets ─────────────────────────────────────────────────────────
-.PHONY: build build-onnxruntime test integration integration-cxx integration-go integration-go-coverage integration-t2-1 integration-e2e benchmark full-stack install uninstall package-deb package-rpm package-arch clean coverage cxx-coverage help daemon-start daemon-stop daemon-status ensure-submodules smoke
+.PHONY: build build-onnxruntime test integration integration-cxx integration-go integration-go-coverage integration-t2-1 integration-e2e benchmark full-stack install uninstall package-deb package-rpm package-arch clean coverage cxx-coverage help daemon-start daemon-stop daemon-status ensure-submodules smoke v2-gate
 
 # Idempotent submodule populate. Triggered as a prerequisite of every target
 # that runs CMake, so a fresh `git clone` (without --recurse-submodules) or a
@@ -166,6 +166,13 @@ full-stack: ensure-submodules
 # invocations that bypass this target.
 smoke: build
 	./scripts/smoke.sh
+
+# V2-coexistence-with-V1 grep guards. Fails the build if any of the
+# Phase 2/3 cleanups regresses (legacy migration helpers, orphan config
+# conversion helpers, hardcoded socket-path callsites, V1 binary names
+# in production). Pure grep — no build dependency; runs in < 1 s.
+v2-gate:
+	@./scripts/ci-v2-coexistence-gate.sh
 
 install: build
 	@# Force-relink the C++ binaries before install. CMake's install-time
@@ -329,7 +336,8 @@ help:
 	@echo "  make integration-e2e   V2 thin-client gate: real daemon over TCP + PSK"
 	@echo "  make benchmark     Build + run benchmark tests"
 	@echo "  make full-stack    Build + run end-to-end pipeline tests"
-	@echo "  make smoke         Run Phase E.6 smoke gate (HTTP shapes against live daemon)"
+	@echo "  make smoke         Run Phase E.6 smoke gate (HTTP shapes against live server)"
+	@echo "  make v2-gate       Run V2-coexistence grep guards (legacy helpers + V1 binary names)"
 	@echo "  make install       Build + install to PREFIX (default: ~/.local)"
 	@echo "  make uninstall     Remove installed files from PREFIX"
 	@echo "  make daemon-start  Build + start daemon in background"

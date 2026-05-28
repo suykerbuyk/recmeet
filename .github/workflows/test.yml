@@ -57,13 +57,14 @@ jobs:
         run: ./scripts/build-onnxruntime.sh
 
       # whisper.cpp / sherpa-onnx models for the full-stack and e2e
-      # suites. Auto-downloaded by `recmeet --download-models` on
-      # cache miss; cached forever once populated.
+      # suites. Auto-downloaded by `recmeet-cli --download-models` on
+      # cache miss; cached forever once populated. Path follows the V2
+      # split — models live under recmeet-server/ now.
       - name: Restore model cache
         uses: actions/cache@v4
         with:
-          path: ~/.local/share/recmeet/models
-          key: recmeet-models-base-v1
+          path: ~/.local/share/recmeet-server/models
+          key: recmeet-models-base-v2
 
       # ccache shrinks repeat rebuilds from ~5 min to ~30 sec.
       - name: Restore ccache
@@ -96,9 +97,16 @@ jobs:
       - name: Unit tests (C++ + Go)
         run: make test
 
-      # Phase E.6 smoke gate — spawns recmeet-daemon + recmeet-tray in an
+      # V2 coexistence grep gate — verifies legacy migration helpers,
+      # orphan ServerConfig/ClientConfig conversion helpers, and V1
+      # binary names are not regressed into the production tree. Pure
+      # grep, < 1 s; gates the build before we spend test minutes.
+      - name: V2 coexistence gate
+        run: make v2-gate
+
+      # Phase E.6 smoke gate — spawns recmeet-server + recmeet-client in an
       # isolated sandbox and exercises the embedded WebUI's HTTP surface
-      # against the live daemon. Fast (<4s); catches tray/WebUI/daemon
+      # against the live server. Fast (<4s); catches client/WebUI/server
       # integration regressions that unit tests miss. Wired here (after
       # unit tests, before integration) per
       # `agentctx/tasks/test-and-verification-hardening.md` Phase 1.
@@ -109,7 +117,7 @@ jobs:
       # dirs — smoke.sh writes its own context.json into the V2 fixture
       # at copy time, and discover_meetings() only requires the directory
       # to exist (see src/meetings_browse.cpp:63).
-      - name: Smoke gate (WebUI + daemon)
+      - name: Smoke gate (WebUI + server)
         env:
           LEGACY_SRC: ${{ github.workspace }}/tests/fixtures/smoke/legacy_v1
           V2_SRC: ${{ github.workspace }}/tests/fixtures/smoke/v2_meeting
@@ -124,8 +132,8 @@ jobs:
       - name: V2 thin-client e2e (TCP)
         run: make integration-e2e
 
-      # Full-stack pipeline disabled on CI runners — the daemon-spawning
-      # tests in tests/test_full_stack_*.cpp spawn a real recmeet-daemon
+      # Full-stack pipeline disabled on CI runners — the server-spawning
+      # tests in tests/test_full_stack_*.cpp spawn a real recmeet-server
       # and run whisper transcription + sherpa-onnx diarization on
       # 3-4 minute fixture audio. The per-test 300s wait_for_terminal
       # budget assumes "90-180s on CI cold start" but real GitHub
@@ -156,6 +164,9 @@ jobs:
       - name: Surface failing logs (on failure)
         if: failure()
         run: |
-          echo "::group::recmeet daemon logs"
-          find ~/.local/share/recmeet/logs -type f -printf '\n=== %p ===\n' -exec tail -200 {} \; 2>/dev/null || echo "(no logs)"
+          echo "::group::recmeet-server logs"
+          find ~/.local/share/recmeet-server/logs -type f -printf '\n=== %p ===\n' -exec tail -200 {} \; 2>/dev/null || echo "(no V2 server logs)"
+          # Also tail V1-path logs in case a regression test still
+          # writes there.
+          find ~/.local/share/recmeet/logs -type f -printf '\n=== %p ===\n' -exec tail -200 {} \; 2>/dev/null || true
           echo "::endgroup::"

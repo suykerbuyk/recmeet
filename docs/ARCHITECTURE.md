@@ -2,7 +2,11 @@
 
 ## Purpose
 
-Recmeet records, transcribes, and summarizes meetings entirely on-device. The system is split into a **thin client** (tray or CLI) that owns local audio capture and a **headless daemon** that owns heavy compute — transcription with whisper.cpp, diarization with sherpa-onnx, voiceprint identification, and summarization (local llama.cpp or a cloud API). The client streams or uploads audio to the daemon over a framed IPC transport; the daemon enqueues postprocess work in a typed-slot `JobQueue`, processes it in a subprocess for memory containment, and emits routed events back to the originating client. Everything runs on the user's machine unless a cloud summarization provider is configured.
+Recmeet records, transcribes, and summarizes meetings entirely on-device. The system is split into a **thin client** (`recmeet-client` tray or `recmeet-cli`) that owns local audio capture and a **headless server** (`recmeet-server`) that owns heavy compute — transcription with whisper.cpp, diarization with sherpa-onnx, voiceprint identification, and summarization (local llama.cpp or a cloud API). The client streams or uploads audio to the server over a framed IPC transport; the server enqueues postprocess work in a typed-slot `JobQueue`, processes it in a subprocess for memory containment, and emits routed events back to the originating client. Everything runs on the user's machine unless a cloud summarization provider is configured.
+
+V2 renamed the V1 binaries: `recmeet-daemon` → `recmeet-server`,
+`recmeet-tray` → `recmeet-client`, `recmeet` → `recmeet-cli`. Default
+paths split along the same boundary (see `docs/MIGRATION.md`).
 
 Two additional Go binaries provide AI-powered tooling — an MCP server for IDE integration and an agent CLI for automated meeting prep and follow-up. They read meeting artifacts directly from disk and are unaffected by IPC changes.
 
@@ -10,9 +14,9 @@ Two additional Go binaries provide AI-powered tooling — an MCP server for IDE 
 
 ```mermaid
 graph TD
-    CLI["recmeet<br/>(CLI, client or standalone)"]
-    TRAY["recmeet-tray<br/>(system tray + embedded WebUI listener)"]
-    DAEMON["recmeet-daemon<br/>(headless compute server)"]
+    CLI["recmeet-cli<br/>(CLI, client or standalone)"]
+    TRAY["recmeet-client<br/>(system tray + embedded WebUI listener)"]
+    DAEMON["recmeet-server<br/>(headless compute server)"]
     LISTEN["Unix socket OR<br/>TCP host:port<br/>(framed wire protocol)"]
     CAPTURE["recmeet_capture<br/>(PipeWire / PulseAudio,<br/>client-only)"]
     CORE["recmeet_core<br/>(ML pipeline,<br/>daemon + standalone CLI)"]
@@ -48,13 +52,13 @@ graph TD
 
 Key V2 facts the diagram encodes:
 
-- **Audio capture is client-side.** Only the tray, the standalone CLI, and the `recmeet_live_capture` shim link `recmeet_capture` (which holds the PipeWire / PulseAudio surface). The daemon does **not** link PipeWire or PulseAudio — verify with `ldd build/recmeet-daemon | grep -E 'pipewire|pulse'` (expect no hits). See `CMakeLists.txt:251-265` (capture lib) and `CMakeLists.txt:357-361` (daemon target).
-- **Two transports, one wire format.** The daemon's `--listen` flag accepts either a Unix socket path or a `host:port`. TCP listeners require `RECMEET_AUTH_TOKEN` at startup and a PSK handshake per connection; Unix listeners rely on kernel peer credentials.
-- **Standalone CLI still works.** `recmeet --no-daemon` runs `run_recording()` + `run_postprocessing()` in-process via `recmeet_live_capture`. This is unchanged from V1 and is the only path that touches both capture and ML pipeline in the same address space.
+- **Audio capture is client-side.** Only `recmeet-client`, `recmeet-cli` (standalone mode), and the `recmeet_live_capture` shim link `recmeet_capture` (which holds the PipeWire / PulseAudio surface). The server does **not** link PipeWire or PulseAudio — verify with `ldd build/recmeet-server | grep -E 'pipewire|pulse'` (expect no hits). See `CMakeLists.txt:251-265` (capture lib) and `CMakeLists.txt:357-361` (server target).
+- **Two transports, one wire format.** The server's `--listen` flag accepts either a Unix socket path or a `host:port`. TCP listeners require `RECMEET_AUTH_TOKEN` at startup and a PSK handshake per connection; Unix listeners rely on kernel peer credentials.
+- **Standalone CLI still works.** `recmeet-cli --no-daemon` runs `run_recording()` + `run_postprocessing()` in-process via `recmeet_live_capture`. This is unchanged from V1 and is the only path that touches both capture and ML pipeline in the same address space.
 
 ## Build System and Binary Topology
 
-CMake builds four static libraries — `recmeet_ipc`, `recmeet_capture`, `recmeet_core`, and `recmeet_live_capture` — and links them into the C++ executables in a deliberately layered way. The split exists so the daemon never has to link audio-stack dependencies and the IPC surface never has to link ML dependencies.
+CMake builds four static libraries — `recmeet_ipc`, `recmeet_capture`, `recmeet_core`, and `recmeet_live_capture` — and links them into the C++ executables in a deliberately layered way. The split exists so the server never has to link audio-stack dependencies and the IPC surface never has to link ML dependencies.
 
 | Library | Source | Holds | Links |
 |---|---|---|---|
@@ -65,13 +69,64 @@ CMake builds four static libraries — `recmeet_ipc`, `recmeet_capture`, `recmee
 
 | Executable | Source | Links | Feature-gated |
 |---|---|---|---|
-| `recmeet` (CLI) | `src/main.cpp` | `recmeet_core`, `recmeet_live_capture` | — |
-| `recmeet-daemon` | `src/daemon.cpp` | `recmeet_core` only (no capture, no PipeWire/Pulse) | — |
-| `recmeet-tray` | `src/tray.cpp` + `src/tray_web.cpp` + `vendor/cpp-httplib/httplib.cpp` + generated `web_assets.h` | `recmeet_ipc`, `recmeet_capture`, SNDFILE, GTK3, ayatana-appindicator3 | `RECMEET_BUILD_TRAY` |
+| `recmeet-cli` | `src/main.cpp` | `recmeet_core`, `recmeet_live_capture` | — |
+| `recmeet-server` | `src/daemon.cpp` | `recmeet_core` only (no capture, no PipeWire/Pulse) | — |
+| `recmeet-client` | `src/tray.cpp` + `src/tray_web.cpp` + `vendor/cpp-httplib/httplib.cpp` + generated `web_assets.h` | `recmeet_ipc`, `recmeet_capture`, SNDFILE, GTK3, ayatana-appindicator3 | `RECMEET_BUILD_TRAY` |
 | `recmeet-mcp` | `tools/cmd/recmeet-mcp/main.go` | mcp-go | — |
 | `recmeet-agent` | `tools/cmd/recmeet-agent/main.go` | anthropic-sdk-go, cobra | — |
 
-The daemon-side `streaming_session.cpp` lives in `recmeet_core` (not in `recmeet_capture`) because it composes `caption_engine` + `job_queue` and consumes network `0x03` audio frames — it never touches the local audio stack. See `CMakeLists.txt:315-321`.
+The server-side `streaming_session.cpp` lives in `recmeet_core` (not in `recmeet_capture`) because it composes `caption_engine` + `job_queue` and consumes network `0x03` audio frames — it never touches the local audio stack. See `CMakeLists.txt:315-321`.
+
+## V2 captions split: server liveness vs client overlay-visible
+
+V2 separates two related-but-distinct caption preferences across the
+server / client divide:
+
+- **`ServerConfig.captions_enabled`** (server-side, in `daemon.yaml`)
+  gates whether the server's `StreamingSession` stands up a sherpa
+  online-ASR engine at all. AND'd at runtime with the actual hardware
+  capability (sherpa model directory present, hardware decoder
+  available); the effective value is reported on `session.init` as
+  `captions_supported`.
+- **`ClientConfig.captions_enabled`** (client-side, in `client.yaml`)
+  controls whether the tray overlays the streamed captions on screen
+  at all. Even when the server happily streams `caption.partial` /
+  `caption.final` events, the client may hide the overlay if the
+  operator unchecked the tray's "Show captions" menu item. The wire
+  is unchanged — the server keeps streaming; the client just doesn't
+  render.
+
+The wire-protocol field `SessionPreferences::captions_enabled` was
+**retired in Phase C** of the captions-always-stream plan and is **not**
+re-introduced in V2. Negotiating capability happens once on
+`session.init` (server-side liveness); rendering is a pure client
+concern (client-side overlay visibility).
+
+## `session.update_prefs` schema
+
+`session.update_prefs` accepts a JSON object whose keys override the
+session's effective preferences for subsequent jobs:
+
+| Field | Type | Semantics |
+|---|---|---|
+| `output_dir` | string | Per-session note output directory |
+| `note_dir` | string | Per-session note-additions directory |
+| `language` | string | Whisper language hint |
+| `vocabulary` | string | Whisper biased-decoding hints (comma-separated) |
+| `whisper_model` | string | Whisper model name (e.g. `base`, `medium`) |
+| `caption_latency_ms` | int | Server's live-caption commit latency |
+| `diarize` | bool | Toggle diarization for this session |
+| `vad` | bool | Toggle VAD pre-filter for this session |
+
+Boolean fields use **key-presence semantics**: omit the key to
+preserve the prior value; include the key with `true` or `false` to
+override. String fields use empty-string-as-sentinel for "use server
+default". Unknown keys are ignored. Non-boolean JSON for `diarize` /
+`vad` returns `IpcError {code: InvalidParams}`.
+
+The same parser handles `session.init`'s `preferences` payload, so
+clients can push their full remembered selection on connect and skip
+the follow-up `session.update_prefs` round-trip.
 
 ### Feature flags (CMake options)
 

@@ -1,11 +1,16 @@
 #!/usr/bin/env bash
 # scripts/smoke.sh — end-to-end recmeet smoke gate (Phase E.6).
 #
-# Spawns recmeet-daemon + recmeet-tray (--listen-now --headless) in an
+# Spawns recmeet-server + recmeet-client (--listen-now --headless) in an
 # isolated sandbox and exercises the embedded WebUI's HTTP surface
-# against the live daemon. Permanent CI artifact — extend the assertion
-# list as new phases land. Currently covers Phase E.6 (tray-bundled
+# against the live server. Permanent CI artifact — extend the assertion
+# list as new phases land. Currently covers Phase E.6 (client-bundled
 # WebUI).
+#
+# Coexistence note: V2 (server/client) binds the V2-specific socket
+# (default $XDG_RUNTIME_DIR/recmeet-server/server.sock). An existing
+# V1 install at the legacy socket path does NOT collide, so we no
+# longer stop V1's recmeet-daemon.service at smoke-start.
 #
 # Invariants:
 #   - NO `set -e`: assertions tally pass/fail and the suite runs to
@@ -15,16 +20,17 @@
 #     only, silently bypassing the gate on the daemon).
 #   - `XDG_DATA_HOME` is NOT overridden — model cache reuse is desirable
 #     for speed + bandwidth + determinism.
-#   - Daemon log grep matches uppercase `[ERROR]` / `[WARN]` (rev-2 C2).
-#   - Sandbox daemon.yaml schema uses `speaker_id.database`, NOT
+#   - Server log grep matches uppercase `[ERROR]` / `[WARN]` (rev-2 C2).
+#   - Sandbox server.yaml schema uses `speaker_id.database`, NOT
 #     `server.speaker_db` (rev-2 C3, verified at src/config.cpp:340-343).
-#   - On failure (rc != 0) the cleanup trap dumps the daemon log tail
+#   - On failure (rc != 0) the cleanup trap dumps the server log tail
 #     BEFORE nuking the sandbox so the operator sees the failure context
 #     (rev-2 M3).
 #   - Cleanup wait is bounded by a 5s watchdog that escalates to
-#     SIGKILL so the script can never hang on a wedged tray (rev-2 M2).
-#   - Pre-flight stops the V1 systemd daemon if it was running; cleanup
-#     restarts it ONLY if it was active at start.
+#     SIGKILL so the script can never hang on a wedged client (rev-2 M2).
+#   - V2 coexistence: V1 and V2 bind different default sockets, so we
+#     do NOT stop a running V1 recmeet-daemon.service. The smoke gate
+#     uses its own sandbox socket regardless.
 #
 # Exit codes:
 #   0  All assertions passed.
@@ -46,8 +52,8 @@ cd "$PROJECT_ROOT"
 # Pre-flight
 # ---------------------------------------------------------------------------
 
-test -x build/recmeet-daemon || { echo "scripts/smoke.sh: build/recmeet-daemon missing — run 'make build' first." >&2; exit 1; }
-test -x build/recmeet-tray   || { echo "scripts/smoke.sh: build/recmeet-tray missing — run 'make build' first." >&2; exit 1; }
+test -x build/recmeet-server || { echo "scripts/smoke.sh: build/recmeet-server missing — run 'make build' first." >&2; exit 1; }
+test -x build/recmeet-client || { echo "scripts/smoke.sh: build/recmeet-client missing — run 'make build' first." >&2; exit 1; }
 
 # Freshness gate — refuse to run against a stale binary. `make smoke`
 # already depends on `build`, so this primarily fires when smoke.sh is
@@ -68,10 +74,10 @@ test -x build/recmeet-tray   || { echo "scripts/smoke.sh: build/recmeet-tray mis
 # Override with RECMEET_SMOKE_SKIP_FRESHNESS=1 for the rare case where
 # mtimes are noise (fresh git checkout on a system whose clock skewed).
 if [ "${RECMEET_SMOKE_SKIP_FRESHNESS:-0}" != "1" ]; then
-    if [ build/recmeet-daemon -nt build/recmeet-tray ]; then
-        REF=build/recmeet-daemon
+    if [ build/recmeet-server -nt build/recmeet-client ]; then
+        REF=build/recmeet-server
     else
-        REF=build/recmeet-tray
+        REF=build/recmeet-client
     fi
     STALE=$(find src tests CMakeLists.txt cmake \
                  \( -name '*.cpp' -o -name '*.h' -o -name '*.hpp' \
@@ -104,29 +110,26 @@ if [ ! -d "$LEGACY_SRC" ] || [ ! -d "$V2_SRC" ]; then
     exit 1
 fi
 
-# V1 daemon snapshot — capture state at start so cleanup can restore it.
-V1_WAS_ACTIVE=0
-if systemctl --user is-active --quiet recmeet-daemon.service 2>/dev/null; then
-    V1_WAS_ACTIVE=1
-    echo "scripts/smoke.sh: stopping V1 recmeet-daemon.service (will restart at exit)"
-    systemctl --user stop recmeet-daemon.service
-fi
+# V2 coexistence: V1 and V2 bind different default sockets ($XDG_RUNTIME_DIR/
+# recmeet/daemon.sock vs $XDG_RUNTIME_DIR/recmeet-server/server.sock), so we
+# do NOT need to stop a running V1 recmeet-daemon.service. The smoke gate's
+# sandbox uses its own --socket path regardless of what V1 is doing.
 
 # ---------------------------------------------------------------------------
 # Sandbox
 # ---------------------------------------------------------------------------
 
 SMOKE_ROOT="$(mktemp -d -t recmeet-smoke-XXXXXX)"
-mkdir -p "$SMOKE_ROOT"/{meetings,speakers,logs,xdg-config/recmeet}
+mkdir -p "$SMOKE_ROOT"/{meetings,speakers,logs,xdg-config/recmeet-server}
 
 # Export ONCE so BOTH binary spawns inherit it (rev-2 C1).
 export XDG_CONFIG_HOME="$SMOKE_ROOT/xdg-config"
 
-# daemon.yaml — rev-2 C3 corrected schema. `speaker_id.database` is the
-# YAML key the V2 daemon reads at src/config.cpp:340-343 — NOT
-# `server.speaker_db`.
-cat > "$SMOKE_ROOT/xdg-config/recmeet/daemon.yaml" <<EOF
-# recmeet daemon configuration (E.6 smoke-gate sandbox)
+# daemon.yaml — V2 split-path: lives at recmeet-server/daemon.yaml.
+# `speaker_id.database` is the YAML key the V2 daemon reads at
+# src/config.cpp:340-343 — NOT `server.speaker_db`.
+cat > "$SMOKE_ROOT/xdg-config/recmeet-server/daemon.yaml" <<EOF
+# recmeet-server configuration (E.6 smoke-gate sandbox)
 server:
   meetings_root: "$SMOKE_ROOT/meetings"
 speaker_id:
@@ -167,11 +170,11 @@ DAEMON_PID=""
 TRAY_PID=""
 cleanup() {
     local rc=$?
-    # On failure (or unclean exit), tail the daemon log so the operator
+    # On failure (or unclean exit), tail the server log so the operator
     # sees the failure context BEFORE we nuke the sandbox (rev-2 M3).
     if [ "$rc" -ne 0 ] && [ -d "$SMOKE_ROOT/logs" ]; then
         echo
-        echo "=== Daemon log tail (assertion failure context) ==="
+        echo "=== Server log tail (assertion failure context) ==="
         # shellcheck disable=SC2012
         if ls -1 "$SMOKE_ROOT/logs"/*.log >/dev/null 2>&1; then
             tail -50 "$SMOKE_ROOT/logs"/*.log
@@ -203,10 +206,6 @@ cleanup() {
     kill "$WATCHDOG" 2>/dev/null || true
 
     rm -rf "$SMOKE_ROOT"
-
-    if [ "$V1_WAS_ACTIVE" = "1" ]; then
-        systemctl --user start recmeet-daemon.service 2>/dev/null || true
-    fi
 }
 trap cleanup EXIT
 
@@ -250,10 +249,10 @@ assert_jq() {
 }
 
 # ---------------------------------------------------------------------------
-# Spawn daemon
+# Spawn server (V2 recmeet-server)
 # ---------------------------------------------------------------------------
 
-build/recmeet-daemon \
+build/recmeet-server \
     --socket "$SMOKE_ROOT/daemon.sock" \
     --log-dir "$SMOKE_ROOT/logs" >/dev/null 2>&1 &
 DAEMON_PID=$!
@@ -264,36 +263,36 @@ for _ in $(seq 1 50); do
     sleep 0.1
 done
 if [ ! -S "$SMOKE_ROOT/daemon.sock" ]; then
-    echo "scripts/smoke.sh: daemon failed to bind $SMOKE_ROOT/daemon.sock within 5s" >&2
+    echo "scripts/smoke.sh: server failed to bind $SMOKE_ROOT/daemon.sock within 5s" >&2
     exit 2
 fi
 
 # ---------------------------------------------------------------------------
-# Spawn tray (--headless + --listen-now — the CI smoke shape)
+# Spawn client (--headless + --listen-now — the CI smoke shape)
 # ---------------------------------------------------------------------------
 
-build/recmeet-tray \
+build/recmeet-client \
     --daemon "$SMOKE_ROOT/daemon.sock" \
     --listen-now --headless >/dev/null 2>&1 &
 TRAY_PID=$!
 
-# Poll for listener bind via `ss -ltnp` (up to 5s). The tray's startup
+# Poll for listener bind via `ss -ltnp` (up to 5s). The client's startup
 # log line "embedded WebUI listening on http://127.0.0.1:<port>" is an
 # alternative discovery path if `ss` proves flaky in the future, but
 # `ss` is reliable on Linux and avoids parsing a freeform log stream.
 PORT=""
 for _ in $(seq 1 50); do
-    PORT=$(ss -ltnp 2>/dev/null | awk '/recmeet-tray/ {print $4}' \
+    PORT=$(ss -ltnp 2>/dev/null | awk '/recmeet-client/ {print $4}' \
            | awk -F: '{print $NF}' | head -1)
     [ -n "$PORT" ] && break
     sleep 0.1
 done
 if [ -z "$PORT" ]; then
-    echo "scripts/smoke.sh: tray failed to bind WebUI listener within 5s" >&2
+    echo "scripts/smoke.sh: client failed to bind WebUI listener within 5s" >&2
     exit 3
 fi
 URL="http://127.0.0.1:$PORT"
-echo "scripts/smoke.sh: daemon socket=$SMOKE_ROOT/daemon.sock  tray listener=$URL"
+echo "scripts/smoke.sh: server socket=$SMOKE_ROOT/daemon.sock  client listener=$URL"
 
 # ---------------------------------------------------------------------------
 # Assertions
@@ -361,18 +360,18 @@ else
     record fail "GET /app.js has Cache-Control: no-cache"
 fi
 
-# Daemon log — rev-2 C2: match uppercase [ERROR] / [WARN] (the log
+# Server log — rev-2 C2: match uppercase [ERROR] / [WARN] (the log
 # format from src/log.cpp:174 emits "[ERROR]", "[WARN]", "[INFO]";
 # the prior lowercase grep was a silent gate bypass).
 if ls -1 "$SMOKE_ROOT/logs"/*.log >/dev/null 2>&1; then
     if grep -qE '\[(ERROR|WARN)\]' "$SMOKE_ROOT/logs"/*.log; then
-        record fail "daemon log free of ERROR/WARN" \
+        record fail "server log free of ERROR/WARN" \
                     "$(grep -E '\[(ERROR|WARN)\]' "$SMOKE_ROOT/logs"/*.log | head -3 | tr '\n' ' | ')"
     else
-        record ok "daemon log free of ERROR/WARN"
+        record ok "server log free of ERROR/WARN"
     fi
 else
-    record fail "daemon log free of ERROR/WARN" "no log files produced"
+    record fail "server log free of ERROR/WARN" "no log files produced"
 fi
 
 # ---------------------------------------------------------------------------
