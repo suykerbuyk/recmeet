@@ -1431,7 +1431,7 @@ static void print_usage() {
         "Run the recmeet daemon (IPC server for CLI and tray clients).\n"
         "\n"
         "Options:\n"
-        "  --socket PATH       Unix socket path (default: $XDG_RUNTIME_DIR/recmeet/daemon.sock)\n"
+        "  --socket PATH       Unix socket path (default: $XDG_RUNTIME_DIR/recmeet-server/server.sock)\n"
         "  --listen ADDRESS    Listen address: Unix path or host:port for TCP\n"
         "  --log-level LEVEL   Log level: none, error, warn, info, debug (default: info)\n"
         "  --log-dir DIR       Log file directory\n"
@@ -1454,7 +1454,7 @@ static void print_usage() {
 // ---------------------------------------------------------------------------
 
 int main(int argc, char* argv[]) {
-    std::string socket_path = default_socket_path();
+    std::string socket_path = server_socket_path();
     std::string log_level_str = "info";
     fs::path log_dir;
     int log_retention_hours = 4;
@@ -1530,7 +1530,7 @@ int main(int argc, char* argv[]) {
     // itself per src/ipc_server.cpp:501-513).
     if (!evict_prefix.empty()) {
         // Use the same listen address resolution the daemon itself would —
-        // empty `socket_path` means default Unix socket (default_socket_path()).
+        // empty `socket_path` means default Unix socket (server_socket_path()).
         IpcClient client(socket_path);
         if (!client.connect()) {
             fprintf(stderr, "Daemon not running (cannot reach %s)\n",

@@ -325,7 +325,7 @@ struct IpcAddress {
 // Returns false on invalid input (e.g. port out of range, bare IPv6).
 bool parse_ipc_address(const std::string& addr, IpcAddress& out);
 
-// Default address (Unix socket at default_socket_path()).
+// Default address (Unix socket at server_socket_path()).
 IpcAddress default_ipc_address();
 
 // ---------------------------------------------------------------------------

@@ -3,6 +3,7 @@
 
 #include "ipc_protocol.h"
 #include "json_util.h"
+#include "util.h"
 
 #include <cstdlib>
 #include <unistd.h>
@@ -516,7 +517,7 @@ bool parse_ipc_address(const std::string& addr, IpcAddress& out) {
 IpcAddress default_ipc_address() {
     IpcAddress addr;
     addr.transport = IpcTransport::Unix;
-    addr.socket_path = default_socket_path();
+    addr.socket_path = server_socket_path();
     return addr;
 }
 
