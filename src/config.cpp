@@ -825,90 +825,6 @@ void save_legacy_config_as_job_config(const JobConfig& cfg, const fs::path& conf
 // save_config so the existing 193 consumers compile unchanged. Wave 2.2b
 // retypes consumers and removes the monolithic surface.
 
-ServerConfig to_server_config(const JobConfig& cfg) {
-    ServerConfig s;
-    s.whisper_model              = cfg.whisper_model;
-    s.llm_model                  = cfg.llm_model;
-    s.llm_mmap                   = cfg.llm_mmap;
-    s.captions_enabled           = cfg.captions_enabled;
-    s.caption_model              = cfg.caption_model;
-    s.provider                   = cfg.provider;
-    s.api_url                    = cfg.api_url;
-    s.api_key                    = cfg.api_key;
-    s.api_model                  = cfg.api_model;
-    s.api_keys                   = cfg.api_keys;
-    s.diarize                    = cfg.diarize;
-    s.num_speakers               = cfg.num_speakers;
-    s.cluster_threshold          = cfg.cluster_threshold;
-    s.chunk_minutes              = cfg.chunk_minutes;
-    s.chunk_overlap_sec          = cfg.chunk_overlap_sec;
-    s.stitch_threshold           = cfg.stitch_threshold;
-    s.speaker_id                 = cfg.speaker_id;
-    s.speaker_threshold          = cfg.speaker_threshold;
-    s.speaker_db                 = cfg.speaker_db;
-    s.vad                        = cfg.vad;
-    s.vad_threshold              = cfg.vad_threshold;
-    s.vad_min_silence            = cfg.vad_min_silence;
-    s.vad_min_speech             = cfg.vad_min_speech;
-    s.vad_max_speech             = cfg.vad_max_speech;
-    s.threads                    = cfg.threads;
-    s.log_level_str              = cfg.log_level_str;
-    s.log_dir                    = cfg.log_dir;
-    s.log_retention_hours        = cfg.log_retention_hours;
-    s.web_port                   = cfg.web_port;
-    s.web_bind                   = cfg.web_bind;
-    s.max_message_bytes          = cfg.max_message_bytes;
-    s.max_upload_bytes           = cfg.max_upload_bytes;
-    s.max_clients                = cfg.max_clients;
-    s.slot_postprocess           = cfg.slot_postprocess;
-    s.slot_streaming             = cfg.slot_streaming;
-    s.slot_model_download        = cfg.slot_model_download;
-    s.allow_client_downloads     = cfg.allow_client_downloads;
-    s.retain_terminal_hours      = cfg.retain_terminal_hours;
-    s.diarization_cache_ttl_secs = cfg.diarization_cache_ttl_secs;
-    // iter-172 plan addendum — lift the legacy `output_dir` (a JobConfig /
-    // pre-split monolith field) into ServerConfig's new server-side slot.
-    // The client's ClientConfig.output_dir continues to carry the client's
-    // at-rest view; the daemon now consults `meetings_root` for "where do
-    // meetings live on this host".
-    s.meetings_root              = cfg.output_dir;
-    return s;
-}
-
-ClientConfig to_client_config(const JobConfig& cfg) {
-    ClientConfig c;
-    c.device_pattern             = cfg.device_pattern;
-    c.mic_source                 = cfg.mic_source;
-    c.monitor_source             = cfg.monitor_source;
-    c.mic_only                   = cfg.mic_only;
-    c.keep_sources               = cfg.keep_sources;
-    c.language                   = cfg.language;
-    c.vocabulary                 = cfg.vocabulary;
-    c.summary_style              = cfg.summary_style;
-    c.no_summary                 = cfg.no_summary;
-    c.provider                   = cfg.provider;
-    c.api_url                    = cfg.api_url;
-    c.api_key                    = cfg.api_key;
-    c.api_model                  = cfg.api_model;
-    c.api_keys                   = cfg.api_keys;
-    c.llm_model                  = cfg.llm_model;
-    c.llm_mmap                   = cfg.llm_mmap;
-    c.caption_latency_ms         = cfg.caption_latency_ms;
-    c.caption_normalize_display  = cfg.caption_normalize_display;
-    c.output_dir                 = cfg.output_dir;
-    c.output_dir_explicit        = cfg.output_dir_explicit;
-    c.note_dir                   = cfg.note_dir;
-    c.note                       = cfg.note;
-    c.staging_max_bytes          = cfg.staging_max_bytes;
-    c.servers                    = cfg.servers;
-    // Per-job dynamic fields (context_file, context_inline, reprocess_dir,
-    // reprocess_batch_dir, reprocess_batch_dry_run, batch_mode, enroll_mode,
-    // enroll_name) are intentionally dropped on convert — they live on
-    // JobConfig only (E.2(d.1), Wave 2.2b) and transit via session.init /
-    // PostprocessInput, never via the at-rest ClientConfig.
-    return c;
-}
-
 ServerConfig load_server_config(const fs::path& config_path) {
     ServerConfig cfg;
     fs::path path = config_path.empty() ? config_dir() / "daemon.yaml" : config_path;
@@ -1119,8 +1035,7 @@ ServerConfig load_server_config(const fs::path& config_path) {
 
         // iter-172 — meetings_root: the daemon's on-disk meeting-tree root.
         // Default is "./meetings" (the struct default); operator may override
-        // via `[server] meetings_root`. The legacy single-file migration shim
-        // (to_server_config) lifts the pre-split `output_dir` into this slot.
+        // via `[server] meetings_root`.
         std::string mr = get_val(entries, "server", "meetings_root", "");
         if (!mr.empty()) cfg.meetings_root = mr;
     }
@@ -1249,6 +1164,78 @@ ClientConfig load_client_config(const fs::path& config_path) {
         }
     }
     cfg.servers = parse_yaml_servers(raw, "client", "servers");
+
+    return cfg;
+}
+
+// v2-coexistence Phase 2F.1 — split-config projection into JobConfig for the
+// CLI. The CLI runs server-equivalent worker code (transcribe / diarize /
+// summarize) so it inherits server-side admin defaults from server.yaml
+// (log_*, transcription / diarization / vad / threads / providers); it also
+// pulls client-side at-rest preferences from client.yaml (output_dir,
+// language, vocabulary, etc.). Per-invocation JobConfig-native fields
+// (mic_source, monitor_source, reprocess_dir, context_*, etc.) are left at
+// JobConfig's struct defaults and overridden via getopt in cli.cpp.
+JobConfig load_cli_config(const fs::path& server_path,
+                          const fs::path& client_path) {
+    ServerConfig s = load_server_config(server_path);
+    ClientConfig c = load_client_config(client_path);
+
+    JobConfig cfg;
+
+    // -- From ServerConfig (admin defaults for worker-equivalent work) --
+    cfg.whisper_model           = s.whisper_model;
+    cfg.captions_enabled        = s.captions_enabled;
+    cfg.caption_model           = s.caption_model;
+    cfg.diarize                 = s.diarize;
+    cfg.num_speakers            = s.num_speakers;
+    cfg.cluster_threshold       = s.cluster_threshold;
+    cfg.chunk_minutes           = s.chunk_minutes;
+    cfg.chunk_overlap_sec       = s.chunk_overlap_sec;
+    cfg.stitch_threshold        = s.stitch_threshold;
+    cfg.speaker_id              = s.speaker_id;
+    cfg.speaker_threshold       = s.speaker_threshold;
+    cfg.speaker_db              = s.speaker_db;
+    cfg.vad                     = s.vad;
+    cfg.vad_threshold           = s.vad_threshold;
+    cfg.vad_min_silence         = s.vad_min_silence;
+    cfg.vad_min_speech          = s.vad_min_speech;
+    cfg.vad_max_speech          = s.vad_max_speech;
+    cfg.threads                 = s.threads;
+    cfg.log_level_str           = s.log_level_str;
+    cfg.log_dir                 = s.log_dir;
+    cfg.log_retention_hours     = s.log_retention_hours;
+
+    // -- From ClientConfig (client-side at-rest preferences) --
+    cfg.device_pattern          = c.device_pattern;
+    cfg.language                = c.language;
+    cfg.vocabulary              = c.vocabulary;
+    cfg.summary_style           = c.summary_style;
+    cfg.no_summary              = c.no_summary;
+    cfg.output_dir              = c.output_dir;
+    cfg.output_dir_explicit     = c.output_dir_explicit;
+    cfg.note_dir                = c.note_dir;
+    cfg.note                    = c.note;
+    cfg.caption_latency_ms      = c.caption_latency_ms;
+    cfg.caption_normalize_display = c.caption_normalize_display;
+    cfg.staging_max_bytes       = c.staging_max_bytes;
+    cfg.servers                 = c.servers;
+
+    // -- DUAL primary: provider / API keys come from ClientConfig (primary);
+    //    ServerConfig holds the daemon-side fallback. CLI is client-rooted
+    //    for provider selection. --
+    cfg.provider                = c.provider;
+    cfg.api_url                 = c.api_url;
+    cfg.api_key                 = c.api_key;
+    cfg.api_model               = c.api_model;
+    cfg.api_keys                = c.api_keys;
+    cfg.llm_model               = c.llm_model;
+    cfg.llm_mmap                = c.llm_mmap;
+
+    // JobConfig-native per-invocation fields (mic_source, monitor_source,
+    // mic_only, keep_sources, reprocess_dir, reprocess_batch_dir,
+    // reprocess_batch_dry_run, context_file, context_inline) are left at
+    // JobConfig defaults; getopt overrides per-run.
 
     return cfg;
 }
@@ -1546,53 +1533,6 @@ void save_client_config(const ClientConfig& cfg, const fs::path& config_path) {
 
     out.close();
     chmod(path.c_str(), 0600);
-}
-
-void migrate_legacy_config_if_present(const fs::path& cfg_dir_in) {
-    fs::path cfg_dir = cfg_dir_in.empty() ? config_dir() : cfg_dir_in;
-    fs::path old_path    = cfg_dir / "config.yaml";
-    fs::path daemon_path = cfg_dir / "daemon.yaml";
-    fs::path client_path = cfg_dir / "client.yaml";
-    fs::path backup_path = cfg_dir / "config.yaml.v1-backup";
-
-    if (!fs::exists(old_path))
-        return;  // nothing to migrate
-
-    if (fs::exists(daemon_path) || fs::exists(client_path)) {
-        log_info("config: migration skip — split files already exist");
-        return;
-    }
-
-    // Load the monolithic legacy file, split, then write both halves.
-    JobConfig legacy = load_legacy_config_as_job_config(old_path);
-    ServerConfig srv = to_server_config(legacy);
-    // A1.6 — migration override: `to_server_config` field-copies
-    // `captions_enabled` from a JobConfig whose default is `false`. Without
-    // this override, every host migrating a pre-split monolithic
-    // `config.yaml` would inherit `captions_enabled=false`, and the
-    // startup AND-in in daemon.cpp would silently keep them in the
-    // captions-off state — defeating the default-ON intent for existing
-    // recmeet hosts. Force ON post-migration so fresh installs AND
-    // legacy-migrated hosts both default ON. Operators who explicitly
-    // want captions off can edit the generated daemon.yaml (the
-    // ServerConfig emitter now round-trips `enabled: false` correctly).
-    srv.captions_enabled = true;
-    ClientConfig cli = to_client_config(legacy);
-
-    save_server_config(srv, daemon_path);
-    save_client_config(cli, client_path);
-
-    // Atomic rename of legacy file to backup. fs::rename is atomic on the
-    // same filesystem (config_dir is always a single FS in practice).
-    fs::rename(old_path, backup_path);
-
-    // chmod the new files explicitly (save_*_config already did so, but the
-    // rename above does not change perms — preserve the security posture).
-    chmod(daemon_path.c_str(), 0600);
-    chmod(client_path.c_str(), 0600);
-
-    log_info("config: migrated config.yaml → daemon.yaml + client.yaml "
-             "(legacy preserved as config.yaml.v1-backup)");
 }
 
 } // namespace recmeet

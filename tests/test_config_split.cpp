@@ -3,10 +3,11 @@
 //
 // Phase E.2 Wave 2.2a — split-config test suite.
 //
-// Validates the new ServerConfig / ClientConfig load+save APIs, the legacy
-// migration helper (`migrate_legacy_config_if_present`), and the
+// Validates the new ServerConfig / ClientConfig load+save APIs and the
 // config_to_map / config_from_map overloads. The monolithic JobConfig struct
 // is preserved alongside; Wave 2.2b retypes consumers and removes it.
+// The legacy migration helper and its test cases were removed in
+// v2-coexistence-with-v1 Phase 2C.
 //
 // All TEST_CASEs are tagged `[e2]` so the orchestrator can grep-verify the
 // scope of Wave 2.2a.
@@ -232,220 +233,7 @@ TEST_CASE("[e2] DUAL provider/api_keys round-trip on ClientConfig",
 }
 
 // ===========================================================================
-// (4) migrate_legacy_config_if_present — fresh migration
-// ===========================================================================
-
-TEST_CASE("[e2] migrate_legacy_config_if_present — fresh migration",
-          "[e2][config_split][migration]") {
-    fs::path dir = make_tmp_dir("recmeet_test_e2_migrate_fresh");
-    fs::path legacy = dir / "config.yaml";
-    fs::path daemon_path = dir / "daemon.yaml";
-    fs::path client_path = dir / "client.yaml";
-    fs::path backup_path = dir / "config.yaml.v1-backup";
-
-    // Write a legacy config with values in BOTH client-y and server-y sections.
-    {
-        std::ofstream out(legacy);
-        out << "audio:\n"
-               "  device_pattern: \"alsa:hw0\"\n"
-               "  mic_only: true\n"
-               "\ntranscription:\n"
-               "  model: small\n"
-               "  language: en\n"
-               "  vocabulary: \"foo,bar\"\n"
-               "\nsummary:\n"
-               "  provider: anthropic\n"
-               "  model: claude-sonnet-4-6\n"
-               "  style: bullet\n"
-               "\napi_keys:\n"
-               "  anthropic: \"sk-legacy-mig\"\n"
-               "\ndiarization:\n"
-               "  enabled: false\n"
-               "  num_speakers: 3\n"
-               "\nspeaker_id:\n"
-               "  enabled: false\n"
-               "\nvad:\n"
-               "  enabled: false\n"
-               "\ncaptions:\n"
-               "  enabled: true\n"
-               "  model: en-2023-06-26\n"
-               "  normalize_display: false\n"
-               "\ngeneral:\n"
-               "  threads: 4\n"
-               "\nlogging:\n"
-               "  level: info\n"
-               "\noutput:\n"
-               "  directory: \"/tmp/meetings\"\n"
-               "\nnotes:\n"
-               "  domain: engineering\n"
-               "\nweb:\n"
-               "  port: 9090\n"
-               "\nipc:\n"
-               "  max_clients: 32\n"
-               "\nserver:\n"
-               "  allow_client_downloads: false\n"
-               "  retain_terminal_hours: 12\n"
-               "\nclient:\n"
-               "  caption_latency_ms: 750\n"
-               "  staging_max_bytes: 1073741824\n"
-               "  servers:\n"
-               "    - name: default\n"
-               "      address: \"unix:/tmp/x.sock\"\n";
-    }
-    // Read the legacy content so we can verify the backup matches.
-    std::string legacy_content = read_file(legacy);
-
-    migrate_legacy_config_if_present(dir);
-
-    REQUIRE(fs::exists(daemon_path));
-    REQUIRE(fs::exists(client_path));
-    REQUIRE(fs::exists(backup_path));
-    REQUIRE_FALSE(fs::exists(legacy));
-
-    // Backup byte-for-byte matches the legacy content (atomic rename, no
-    // copy+delete).
-    CHECK(read_file(backup_path) == legacy_content);
-
-    // Perms 0600 on both new files.
-    CHECK(perms_are_0600(daemon_path));
-    CHECK(perms_are_0600(client_path));
-
-    // Values made it into the right struct.
-    ServerConfig srv = load_server_config(daemon_path);
-    ClientConfig cli = load_client_config(client_path);
-
-    // Server-side (daemon.yaml):
-    CHECK(srv.whisper_model            == "small");
-    CHECK(srv.threads                  == 4);
-    CHECK(srv.web_port                 == 9090);
-    CHECK(srv.max_clients              == 32);
-    CHECK(srv.allow_client_downloads   == false);
-    CHECK(srv.retain_terminal_hours    == 12);
-    CHECK(srv.diarize                  == false);
-    CHECK(srv.num_speakers             == 3);
-    CHECK(srv.speaker_id               == false);
-    CHECK(srv.vad                      == false);
-    CHECK(srv.captions_enabled         == true);
-    CHECK(srv.caption_model            == "en-2023-06-26");
-    CHECK(srv.log_level_str            == "info");
-    // DUAL fallback: provider / api_keys also land on the daemon side.
-    CHECK(srv.provider                 == "anthropic");
-    CHECK(srv.api_keys["anthropic"]    == "sk-legacy-mig");
-
-    // Client-side (client.yaml):
-    CHECK(cli.device_pattern           == "alsa:hw0");
-    CHECK(cli.mic_only                 == true);
-    CHECK(cli.language                 == "en");
-    CHECK(cli.vocabulary               == "foo,bar");
-    CHECK(cli.summary_style            == "bullet");
-    CHECK(cli.no_summary               == false);
-    CHECK(cli.caption_latency_ms       == 750);
-    CHECK(cli.caption_normalize_display == false);
-    CHECK(cli.output_dir.string()      == "/tmp/meetings");
-    CHECK(cli.note.domain              == "engineering");
-    CHECK(cli.staging_max_bytes        == static_cast<size_t>(1073741824));
-    REQUIRE(cli.servers.size()         == 1);
-    CHECK(cli.servers[0].name          == "default");
-    CHECK(cli.servers[0].address       == "unix:/tmp/x.sock");
-    // DUAL primary: provider / api_keys land on the client side too.
-    CHECK(cli.provider                 == "anthropic");
-    CHECK(cli.api_keys["anthropic"]    == "sk-legacy-mig");
-
-    fs::remove_all(dir);
-}
-
-// ===========================================================================
-// (5) migrate_legacy_config_if_present — idempotency
-// ===========================================================================
-
-TEST_CASE("[e2] migrate_legacy_config_if_present — idempotency",
-          "[e2][config_split][migration]") {
-    fs::path dir = make_tmp_dir("recmeet_test_e2_migrate_idem");
-    fs::path legacy = dir / "config.yaml";
-    fs::path daemon_path = dir / "daemon.yaml";
-    fs::path client_path = dir / "client.yaml";
-    fs::path backup_path = dir / "config.yaml.v1-backup";
-
-    {
-        std::ofstream out(legacy);
-        out << "transcription:\n  model: tiny\n";
-    }
-
-    // First call performs the migration.
-    migrate_legacy_config_if_present(dir);
-    REQUIRE(fs::exists(daemon_path));
-    REQUIRE(fs::exists(client_path));
-    REQUIRE(fs::exists(backup_path));
-
-    // Snapshot post-migration state.
-    std::string daemon_before = read_file(daemon_path);
-    std::string client_before = read_file(client_path);
-    std::string backup_before = read_file(backup_path);
-
-    // Second call must be a no-op.
-    migrate_legacy_config_if_present(dir);
-
-    // No legacy file recreated.
-    CHECK_FALSE(fs::exists(legacy));
-    // Files unchanged byte-for-byte.
-    CHECK(read_file(daemon_path) == daemon_before);
-    CHECK(read_file(client_path) == client_before);
-    CHECK(read_file(backup_path) == backup_before);
-
-    fs::remove_all(dir);
-}
-
-// ===========================================================================
-// (6) migrate_legacy_config_if_present — no legacy file
-// ===========================================================================
-
-TEST_CASE("[e2] migrate_legacy_config_if_present — no legacy file",
-          "[e2][config_split][migration]") {
-    fs::path dir = make_tmp_dir("recmeet_test_e2_migrate_nolegacy");
-
-    // Empty dir — no exception, no files written.
-    REQUIRE_NOTHROW(migrate_legacy_config_if_present(dir));
-    CHECK_FALSE(fs::exists(dir / "daemon.yaml"));
-    CHECK_FALSE(fs::exists(dir / "client.yaml"));
-    CHECK_FALSE(fs::exists(dir / "config.yaml.v1-backup"));
-
-    fs::remove_all(dir);
-}
-
-// ===========================================================================
-// (7) migrate_legacy_config_if_present — split files already present
-// ===========================================================================
-
-TEST_CASE("[e2] migrate_legacy_config_if_present — split files already present",
-          "[e2][config_split][migration]") {
-    fs::path dir = make_tmp_dir("recmeet_test_e2_migrate_already");
-    fs::path legacy = dir / "config.yaml";
-    fs::path daemon_path = dir / "daemon.yaml";
-    fs::path client_path = dir / "client.yaml";
-
-    // Pre-create all three files.
-    { std::ofstream out(legacy);      out << "transcription:\n  model: legacy\n"; }
-    { std::ofstream out(daemon_path); out << "# preexisting daemon\n"; }
-    { std::ofstream out(client_path); out << "# preexisting client\n"; }
-
-    std::string legacy_before = read_file(legacy);
-    std::string daemon_before = read_file(daemon_path);
-    std::string client_before = read_file(client_path);
-
-    migrate_legacy_config_if_present(dir);
-
-    // Legacy NOT renamed (we don't clobber existing split state).
-    CHECK(fs::exists(legacy));
-    CHECK(read_file(legacy) == legacy_before);
-    CHECK(read_file(daemon_path) == daemon_before);
-    CHECK(read_file(client_path) == client_before);
-    CHECK_FALSE(fs::exists(dir / "config.yaml.v1-backup"));
-
-    fs::remove_all(dir);
-}
-
-// ===========================================================================
-// (8) config_json overloads — ServerConfig round-trip
+// (4) config_json overloads — ServerConfig round-trip
 // ===========================================================================
 
 TEST_CASE("[e2] config_json overloads — ServerConfig round-trip",
@@ -756,6 +544,261 @@ TEST_CASE("[client][config] ClientConfig defaults apply when blocks absent",
     CHECK(loaded.diarize             == true);
     CHECK(loaded.vad                 == true);
     CHECK(loaded.captions_enabled    == true);
+
+    fs::remove_all(dir);
+}
+
+// ===========================================================================
+// v2-coexistence-with-v1 Phase 2G — fresh server (empty XDG dirs / no
+// server.yaml on disk) reports ServerConfig.captions_enabled = true. With
+// Phase 2C deleting the migration helper's `srv.captions_enabled = true`
+// override, the cascade now relies entirely on `load_server_config`'s YAML
+// loader returning the struct default for an absent `captions.enabled` key.
+// ===========================================================================
+
+TEST_CASE("[server][config] fresh server reports captions_enabled = true",
+          "[server][config][v2-coexistence]") {
+    fs::path dir = make_tmp_dir("recmeet_test_server_v2_fresh_captions");
+    fs::path path = dir / "daemon.yaml";
+
+    REQUIRE_FALSE(fs::exists(path));
+
+    // load_server_config against a non-existent path returns a default-
+    // constructed ServerConfig with every YAML-derived field at its struct
+    // default. ServerConfig.captions_enabled = true (see config.h:432).
+    ServerConfig srv = load_server_config(path);
+    CHECK(srv.captions_enabled == true);
+
+    fs::remove_all(dir);
+}
+
+// ===========================================================================
+// v2-coexistence-with-v1 Phase 2F.1 — load_cli_config projects ServerConfig
+// + ClientConfig into JobConfig for CLI consumption.
+// ===========================================================================
+
+TEST_CASE("[cli][config] load_cli_config with empty dirs returns defaults",
+          "[cli][config][v2-coexistence]") {
+    fs::path dir = make_tmp_dir("recmeet_test_cli_config_empty");
+    fs::path server_path = dir / "server.yaml";
+    fs::path client_path = dir / "client.yaml";
+
+    REQUIRE_FALSE(fs::exists(server_path));
+    REQUIRE_FALSE(fs::exists(client_path));
+
+    JobConfig cfg = load_cli_config(server_path, client_path);
+
+    // From ServerConfig defaults.
+    CHECK(cfg.captions_enabled  == true);    // 2G cascade
+    CHECK(cfg.diarize           == true);
+    CHECK(cfg.vad               == true);
+    CHECK(cfg.log_level_str     == "error");
+    CHECK(cfg.log_retention_hours == 4);
+    CHECK(cfg.whisper_model     == "base");
+    // From ClientConfig defaults.
+    CHECK(cfg.output_dir.string() == "./meetings");
+    CHECK(cfg.language.empty());
+    CHECK(cfg.vocabulary.empty());
+
+    fs::remove_all(dir);
+}
+
+TEST_CASE("[cli][config] load_cli_config projects server.yaml + client.yaml "
+          "into JobConfig",
+          "[cli][config][v2-coexistence]") {
+    fs::path dir = make_tmp_dir("recmeet_test_cli_config_populated");
+    fs::path server_path = dir / "daemon.yaml";
+    fs::path client_path = dir / "client.yaml";
+
+    {
+        ServerConfig srv;
+        srv.whisper_model       = "medium";
+        srv.diarize             = false;
+        srv.vad                 = false;
+        srv.threads             = 8;
+        srv.log_level_str       = "debug";
+        srv.log_retention_hours = 24;
+        srv.captions_enabled    = false;
+        save_server_config(srv, server_path);
+    }
+    {
+        ClientConfig cli;
+        cli.language            = "fr";
+        cli.vocabulary          = "alpha,beta";
+        cli.output_dir          = "/tmp/cli-test-meetings";
+        cli.note_dir            = "/tmp/cli-test-notes";
+        cli.provider            = "anthropic";
+        cli.api_model           = "claude-x";
+        // log_* on ClientConfig should NOT be projected — CLI uses server's
+        // log_*. We set a divergent value here to verify exclusion.
+        cli.log_level_str       = "warn";
+        cli.log_retention_hours = 99;
+        save_client_config(cli, client_path);
+    }
+
+    JobConfig cfg = load_cli_config(server_path, client_path);
+
+    // Server-projected fields.
+    CHECK(cfg.whisper_model       == "medium");
+    CHECK(cfg.diarize             == false);
+    CHECK(cfg.vad                 == false);
+    CHECK(cfg.threads             == 8);
+    CHECK(cfg.log_level_str       == "debug");      // from server, not client
+    CHECK(cfg.log_retention_hours == 24);           // from server, not client
+    CHECK(cfg.captions_enabled    == false);
+
+    // Client-projected fields.
+    CHECK(cfg.language               == "fr");
+    CHECK(cfg.vocabulary             == "alpha,beta");
+    CHECK(cfg.output_dir.string()    == "/tmp/cli-test-meetings");
+    CHECK(cfg.note_dir.string()      == "/tmp/cli-test-notes");
+    CHECK(cfg.provider               == "anthropic");
+    CHECK(cfg.api_model              == "claude-x");
+
+    fs::remove_all(dir);
+}
+
+// ===========================================================================
+// v2-coexistence-with-v1 Phase 2F.2 — vocab CLI write path updates
+// client.yaml's vocabulary field via load-mutate-save; does NOT modify
+// server.yaml. Exercises the helper functions directly to mirror what
+// main.cpp's --add-vocab handler does.
+// ===========================================================================
+
+TEST_CASE("[cli][vocab] vocab write touches client.yaml only",
+          "[cli][vocab][v2-coexistence]") {
+    fs::path dir = make_tmp_dir("recmeet_test_cli_vocab_split");
+    fs::path server_path = dir / "daemon.yaml";
+    fs::path client_path = dir / "client.yaml";
+
+    // Stage server.yaml with a single attribute we can verify is unchanged.
+    {
+        ServerConfig srv;
+        srv.threads = 7;  // arbitrary diverged value
+        save_server_config(srv, server_path);
+    }
+    // Stage client.yaml with an existing vocabulary + other fields the
+    // operator might have set.
+    {
+        ClientConfig cli;
+        cli.vocabulary = "foo";
+        cli.language   = "en";
+        cli.output_dir = "/tmp/operator-meetings";
+        save_client_config(cli, client_path);
+    }
+
+    std::string server_before = [&]{
+        std::ifstream in(server_path);
+        std::stringstream ss; ss << in.rdbuf(); return ss.str();
+    }();
+
+    // Mirror main.cpp's --add-vocab handler load-mutate-save flow.
+    ClientConfig client_cfg = load_client_config(client_path);
+    client_cfg.vocabulary += ", bar";
+    save_client_config(client_cfg, client_path);
+
+    // server.yaml byte-for-byte unchanged.
+    std::string server_after = [&]{
+        std::ifstream in(server_path);
+        std::stringstream ss; ss << in.rdbuf(); return ss.str();
+    }();
+    CHECK(server_before == server_after);
+
+    // client.yaml's vocabulary updated; other fields preserved.
+    ClientConfig reloaded = load_client_config(client_path);
+    CHECK(reloaded.vocabulary       == "foo, bar");
+    CHECK(reloaded.language         == "en");
+    CHECK(reloaded.output_dir.string() == "/tmp/operator-meetings");
+
+    fs::remove_all(dir);
+}
+
+// ===========================================================================
+// v2-coexistence-with-v1 Phase 2E.4 — on_edit_config bootstrap-on-missing
+// creates a valid client.yaml at client_config_dir() / "client.yaml". The
+// tray's GTK callback cannot be invoked from the test harness, but the
+// underlying primitive (save_client_config on a fresh ClientConfig produces
+// a re-loadable YAML file at the expected path) IS testable.
+// ===========================================================================
+
+TEST_CASE("[tray][edit_config] bootstrap creates valid client.yaml",
+          "[tray][edit_config][v2-coexistence]") {
+    fs::path dir = make_tmp_dir("recmeet_test_tray_edit_config_bootstrap");
+    fs::path path = dir / "client.yaml";
+
+    REQUIRE_FALSE(fs::exists(path));
+
+    // Mirror the on_edit_config bootstrap branch: fresh ClientConfig
+    // (struct defaults) saved at the target path.
+    ClientConfig cfg;
+    save_client_config(cfg, path);
+
+    REQUIRE(fs::exists(path));
+    CHECK(perms_are_0600(path));
+
+    // The bootstrapped file must round-trip through the loader.
+    ClientConfig reloaded = load_client_config(path);
+    CHECK(reloaded.log_level_str    == "error");
+    CHECK(reloaded.captions_enabled == true);
+    CHECK(reloaded.diarize          == true);
+    CHECK(reloaded.vad              == true);
+
+    fs::remove_all(dir);
+}
+
+// ===========================================================================
+// v2-coexistence-with-v1 Phase 2E.1 — tray boot via load_client_config:
+// with no client.yaml present, returns struct defaults; with populated
+// client.yaml, returns the persisted values. Mirrors the tray startup
+// rewire at src/tray.cpp:4037.
+// ===========================================================================
+
+TEST_CASE("[tray][config] load_client_config returns defaults when absent",
+          "[tray][config][v2-coexistence]") {
+    fs::path dir = make_tmp_dir("recmeet_test_tray_config_empty");
+    fs::path path = dir / "client.yaml";
+
+    REQUIRE_FALSE(fs::exists(path));
+
+    ClientConfig cfg = load_client_config(path);
+    CHECK(cfg.log_level_str    == "error");
+    CHECK(cfg.log_retention_hours == 4);
+    CHECK(cfg.whisper_model.empty());
+    CHECK(cfg.diarize          == true);
+    CHECK(cfg.vad              == true);
+    CHECK(cfg.captions_enabled == true);
+    CHECK(cfg.provider         == "xai");
+
+    fs::remove_all(dir);
+}
+
+TEST_CASE("[tray][config] load_client_config returns persisted values",
+          "[tray][config][v2-coexistence]") {
+    fs::path dir = make_tmp_dir("recmeet_test_tray_config_populated");
+    fs::path path = dir / "client.yaml";
+
+    {
+        ClientConfig cfg;
+        cfg.log_level_str       = "info";
+        cfg.log_retention_hours = 8;
+        cfg.whisper_model       = "large-v3";
+        cfg.diarize             = false;
+        cfg.vad                 = false;
+        cfg.captions_enabled    = false;
+        cfg.language            = "es";
+        cfg.output_dir          = "/tmp/tray-out";
+        save_client_config(cfg, path);
+    }
+
+    ClientConfig loaded = load_client_config(path);
+    CHECK(loaded.log_level_str       == "info");
+    CHECK(loaded.log_retention_hours == 8);
+    CHECK(loaded.whisper_model       == "large-v3");
+    CHECK(loaded.diarize             == false);
+    CHECK(loaded.vad                 == false);
+    CHECK(loaded.captions_enabled    == false);
+    CHECK(loaded.language            == "es");
+    CHECK(loaded.output_dir.string() == "/tmp/tray-out");
 
     fs::remove_all(dir);
 }

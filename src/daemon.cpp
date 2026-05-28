@@ -242,11 +242,6 @@ static void signal_handler(int sig) {
         if (g_server) {
             g_server->post([] {
                 try {
-                    // Legacy config.yaml → daemon.yaml + client.yaml migration
-                    // (no-op once daemon.yaml exists). Must run before
-                    // load_server_config() so operator-edited legacy config
-                    // takes effect on SIGHUP.
-                    migrate_legacy_config_if_present();
                     std::lock_guard<std::mutex> lk(g_server_config_mu);
                     g_server_config = load_server_config();
                     log_info("daemon: config reloaded via SIGHUP");
@@ -1618,11 +1613,6 @@ int main(int argc, char* argv[]) {
     // Load config — Phase E.2 W2.2b. The server snapshot is the only
     // daemon-global config now; per-job JobConfig is assembled at each
     // enqueue seam via `make_job_config_with_real_env`.
-    //
-    // Legacy config.yaml → daemon.yaml + client.yaml migration runs first
-    // (no-op once daemon.yaml exists). This keeps single-file legacy
-    // installs (and tests that stage a config.yaml) working transparently.
-    migrate_legacy_config_if_present();
     {
         std::lock_guard<std::mutex> lk(g_server_config_mu);
         g_server_config = load_server_config();

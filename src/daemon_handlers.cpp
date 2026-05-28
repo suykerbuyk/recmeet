@@ -77,10 +77,6 @@ void register_daemon_handlers(recmeet::IpcServer& server) {
 
     server.on("config.reload", [](const IpcRequest& req, IpcResponse& resp, IpcError& err) {
         try {
-            // Mirror startup + SIGHUP: run legacy migration first so an
-            // operator who edited config.yaml mid-flight gets it migrated
-            // and applied (no-op once daemon.yaml exists).
-            migrate_legacy_config_if_present();
             {
                 std::lock_guard<std::mutex> lk(g_server_config_mu);
                 g_server_config = load_server_config();
