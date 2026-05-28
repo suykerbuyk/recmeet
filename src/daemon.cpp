@@ -1677,17 +1677,24 @@ int main(int argc, char* argv[]) {
 
     notify_init();
 
-    // Resolve path to recmeet binary for subprocess postprocessing
+    // Resolve path to recmeet-cli binary for subprocess postprocessing.
+    // V2 renamed the CLI binary; check the V2 name first, then fall
+    // back to the V1 name so a partial-rollout install (V2 server +
+    // V1 CLI on PATH) still works.
     {
         std::error_code ec;
         auto self = fs::read_symlink("/proc/self/exe", ec);
         if (!ec) {
-            auto sibling = self.parent_path() / "recmeet";
-            if (fs::exists(sibling, ec))
-                g_self_exe = sibling.string();
+            for (const char* name : {"recmeet-cli", "recmeet"}) {
+                auto sibling = self.parent_path() / name;
+                if (fs::exists(sibling, ec)) {
+                    g_self_exe = sibling.string();
+                    break;
+                }
+            }
         }
         if (g_self_exe.empty())
-            g_self_exe = "recmeet";
+            g_self_exe = "recmeet-cli";
     }
 
     // Create server
