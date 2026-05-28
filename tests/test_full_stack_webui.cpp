@@ -263,7 +263,7 @@ TEST_CASE("V2 full-stack webui: HTTP write endpoints drive real daemon state",
     fs::path daemon_bin = full_stack::find_daemon_binary();
     fs::path tray_bin = full_stack::find_tray_binary();
     if (tray_bin.empty()) {
-        SKIP("recmeet-tray binary not built (RECMEET_BUILD_TRAY=OFF?)");
+        SKIP("recmeet-client binary not built (RECMEET_BUILD_TRAY=OFF?)");
     }
 
     // --------------------------------------------------------------------

@@ -163,12 +163,12 @@ struct SpawnedDaemon {
             }
             if (transport == Transport::TCP) {
                 ::execl(daemon_bin.c_str(),
-                        "recmeet-daemon",
+                        "recmeet-server",
                         "--listen", tcp_addr.c_str(),
                         static_cast<char*>(nullptr));
             } else {
                 ::execl(daemon_bin.c_str(),
-                        "recmeet-daemon",
+                        "recmeet-server",
                         "--socket", unix_socket.c_str(),
                         static_cast<char*>(nullptr));
             }
@@ -325,29 +325,29 @@ private:
 };
 
 // ---------------------------------------------------------------------------
-// find_daemon_binary — resolve the path to a built `recmeet-daemon`.
+// find_daemon_binary — resolve the path to a built `recmeet-server`.
 //
 // Tests typically run from the worktree's build/ dir, so the binary sits at
-// `<root>/build/recmeet-daemon`. For worktree-isolated builds
+// `<root>/build/recmeet-server`. For worktree-isolated builds
 // (`make BUILD_DIR=build-foo`) we fall back to scanning siblings of `build/`
-// for a `recmeet-daemon` binary. FAILs the calling test if neither resolves.
+// for a `recmeet-server` binary. FAILs the calling test if neither resolves.
 inline fs::path find_daemon_binary() {
     fs::path root = recmeet::test_helpers::find_project_root();
     REQUIRE(!root.empty());
-    fs::path candidate = root / "build" / "recmeet-daemon";
+    fs::path candidate = root / "build" / "recmeet-server";
     if (fs::exists(candidate)) return candidate;
     for (const auto& entry : fs::directory_iterator(root)) {
         if (!entry.is_directory()) continue;
-        fs::path probe = entry.path() / "recmeet-daemon";
+        fs::path probe = entry.path() / "recmeet-server";
         if (fs::exists(probe)) return probe;
     }
-    FAIL("recmeet-daemon binary not found under " << root.string());
+    FAIL("recmeet-server binary not found under " << root.string());
     return {};
 }
 
 // ---------------------------------------------------------------------------
-// find_tray_binary — resolve the path to a built `recmeet-tray`. Same
-// sibling-scan fallback as find_daemon_binary; the tray binary is only
+// find_tray_binary — resolve the path to a built `recmeet-client`. Same
+// sibling-scan fallback as find_daemon_binary; the client binary is only
 // emitted on a build that has GTK+AppIndicator (RECMEET_BUILD_TRAY=ON),
 // so we surface the missing-binary case as a SKIP via a sentinel return
 // (empty path) so the [full-stack][webui] test can check_skip rather
@@ -355,11 +355,11 @@ inline fs::path find_daemon_binary() {
 inline fs::path find_tray_binary() {
     fs::path root = recmeet::test_helpers::find_project_root();
     if (root.empty()) return {};
-    fs::path candidate = root / "build" / "recmeet-tray";
+    fs::path candidate = root / "build" / "recmeet-client";
     if (fs::exists(candidate)) return candidate;
     for (const auto& entry : fs::directory_iterator(root)) {
         if (!entry.is_directory()) continue;
-        fs::path probe = entry.path() / "recmeet-tray";
+        fs::path probe = entry.path() / "recmeet-client";
         if (fs::exists(probe)) return probe;
     }
     return {};
@@ -451,7 +451,7 @@ struct SpawnedTray {
             // override path (src/config.cpp:378-379) is what we ride here.
             setenv("RECMEET_LOG_LEVEL", "info", 1);
             ::execl(tray_bin.c_str(),
-                    "recmeet-tray",
+                    "recmeet-client",
                     "--daemon", daemon_socket.c_str(),
                     "--listen-now",
                     "--headless",

@@ -69,7 +69,7 @@ std::string build_dir() {
 }
 
 std::string tray_path() {
-    return build_dir() + "/recmeet-tray";
+    return build_dir() + "/recmeet-client";
 }
 
 bool contains(const std::string& haystack, std::string_view needle) {
@@ -201,7 +201,7 @@ constexpr std::string_view kRejectMsg = "--headless requires --listen-now";
 // ============================================================================
 // Case 1 — --headless alone is REJECTED at startup.
 // ============================================================================
-TEST_CASE("recmeet-tray --headless alone is rejected with exit 1",
+TEST_CASE("recmeet-client --headless alone is rejected with exit 1",
           "[e6][cli]") {
     auto r = spawn_tray({"--headless"}, 2000);
     // Process must have exited on its own (no kill needed) — the
@@ -222,7 +222,7 @@ TEST_CASE("recmeet-tray --headless alone is rejected with exit 1",
 // --headless-alone rejection diagnostic*, not the process living to
 // SIGTERM time. The diagnostic-vs-anything-else split is the
 // load-bearing assertion.
-TEST_CASE("recmeet-tray --listen-now alone is accepted (no rejection)",
+TEST_CASE("recmeet-client --listen-now alone is accepted (no rejection)",
           "[e6][cli]") {
     auto r = spawn_tray({"--listen-now"}, 1500);
     INFO("stderr: " << r.stderr_out);
@@ -244,7 +244,7 @@ TEST_CASE("recmeet-tray --listen-now alone is accepted (no rejection)",
 // reach that state, then SIGTERM; it must have been alive at SIGTERM
 // time (i.e. `had_to_kill == true`) AND must not have emitted the
 // rejection diagnostic.
-TEST_CASE("recmeet-tray --listen-now --headless is accepted (smoke shape)",
+TEST_CASE("recmeet-client --listen-now --headless is accepted (smoke shape)",
           "[e6][cli]") {
     auto r = spawn_tray({"--listen-now", "--headless"}, 1500);
     INFO("stderr: " << r.stderr_out);
@@ -265,7 +265,7 @@ TEST_CASE("recmeet-tray --listen-now --headless is accepted (smoke shape)",
 // host without DISPLAY the process exits early from gtk_init; on a
 // developer's machine it lives until SIGTERM. Either is acceptable —
 // the contract under test is the absence of the rejection diagnostic.
-TEST_CASE("recmeet-tray default (no flags) is the GUI path (no rejection)",
+TEST_CASE("recmeet-client default (no flags) is the GUI path (no rejection)",
           "[e6][cli]") {
     auto r = spawn_tray({}, 1500);
     INFO("stderr: " << r.stderr_out);

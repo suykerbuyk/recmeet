@@ -263,7 +263,7 @@ extern "C" void batch_daemon_sigint_handler(int);
 
 TEST_CASE("client_stop emits friendly migration error and exit 2",
           "[e1-fix]") {
-    // The cheapest substantive check: run the actual recmeet binary
+    // The cheapest substantive check: run the actual recmeet-cli binary
     // with --stop and capture stderr + exit code. The binary is built
     // alongside the tests in the same build dir.
     fs::path repo_root;
@@ -271,7 +271,7 @@ TEST_CASE("client_stop emits friendly migration error and exit 2",
         std::error_code ec;
         repo_root = fs::canonical("/proc/self/exe", ec).parent_path();
     }
-    fs::path recmeet_bin = repo_root / "recmeet";
+    fs::path recmeet_bin = repo_root / "recmeet-cli";
     REQUIRE(fs::exists(recmeet_bin));
 
     // Use a popen-like pipe to capture stderr.

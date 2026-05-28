@@ -4,7 +4,7 @@
 // Phase E.3 + E.4 — binary slimming assertions.
 //
 // Three tests, all tagged `[binary-slim]`:
-//   1. tray_excludes_ml_deps      — `ldd recmeet-tray` must not list any of
+//   1. tray_excludes_ml_deps      — `ldd recmeet-client` must not list any of
 //                                   {libonnxruntime, libsherpa-onnx,
 //                                    libwhisper, libllama, libggml}, and
 //                                   `nm -u` must not contain undefined
@@ -13,7 +13,7 @@
 //                                   `recmeet_core` into the tray, which
 //                                   would pull the full ML stack in
 //                                   transitively.
-//   2. daemon_excludes_pulse_gtk  — `ldd recmeet-daemon` must not list any
+//   2. daemon_excludes_pulse_gtk  — `ldd recmeet-server` must not list any
 //                                   of {libpulse*, libgtk-3, libgdk-3}
 //                                   (libgdk_pixbuf is a separate image-
 //                                   decoding library, explicitly allowed),
@@ -83,7 +83,7 @@ bool contains(const std::string& haystack, std::string_view needle) {
 } // namespace
 
 TEST_CASE("tray excludes ML deps", "[binary-slim][e3]") {
-    const std::string tray = build_dir() + "/recmeet-tray";
+    const std::string tray = build_dir() + "/recmeet-client";
     const std::string ldd_out = run_capture("ldd '" + tray + "'");
     REQUIRE_FALSE(ldd_out.empty());
 
@@ -121,7 +121,7 @@ TEST_CASE("tray excludes ML deps", "[binary-slim][e3]") {
 }
 
 TEST_CASE("daemon excludes pulse and gtk", "[binary-slim][e4]") {
-    const std::string daemon = build_dir() + "/recmeet-daemon";
+    const std::string daemon = build_dir() + "/recmeet-server";
     const std::string ldd_out = run_capture("ldd '" + daemon + "'");
     REQUIRE_FALSE(ldd_out.empty());
 
@@ -169,8 +169,8 @@ TEST_CASE("binaries have expected core deps", "[binary-slim][sanity]") {
     // probes the wrong path, returns empty, or the binary is static —
     // in which case the negative-only assertions above would
     // pathologically pass.
-    const std::string tray = build_dir() + "/recmeet-tray";
-    const std::string daemon = build_dir() + "/recmeet-daemon";
+    const std::string tray = build_dir() + "/recmeet-client";
+    const std::string daemon = build_dir() + "/recmeet-server";
 
     const std::string tray_ldd = run_capture("ldd '" + tray + "'");
     REQUIRE_FALSE(tray_ldd.empty());
@@ -198,7 +198,7 @@ TEST_CASE("binaries have expected core deps", "[binary-slim][sanity]") {
 // grep for any httplib:: occurrence picks up either the inlined member
 // functions or the unity-TU httplib.cpp definitions.
 TEST_CASE("tray has httplib symbols linked", "[binary-slim][e6][sanity]") {
-    const std::string tray = build_dir() + "/recmeet-tray";
+    const std::string tray = build_dir() + "/recmeet-client";
     const std::string nm_out = run_capture("nm '" + tray + "'");
     REQUIRE_FALSE(nm_out.empty());
     REQUIRE(contains(nm_out, "httplib"));
