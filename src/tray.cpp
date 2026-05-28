@@ -90,7 +90,7 @@ struct TrayState {
     // `main()` and never cleared — toggle-at-runtime is not supported.
     bool headless = false;
 
-    JobConfig cfg;
+    ClientConfig cfg;
     IpcClient ipc;   // daemon connection
     std::string daemon_addr;  // --daemon ADDRESS or RECMEET_DAEMON_ADDR
 
@@ -324,6 +324,19 @@ static void build_menu();
 static void refresh_sources();
 static void fetch_provider_models();
 static void close_context_window();
+
+// v2-coexistence Phase 2E.3 (rev-7 L-rev6-2) — wraps the persist call so the
+// 17 menu-setter callsites share a single try/catch with log-and-continue
+// posture. The tray cannot fail a menu callback on a transient disk write
+// error; we log and move on. CLI commands use explicit fprintf+return-1
+// (fail-loud posture) and do NOT use this helper.
+static void try_save_client_config(const ClientConfig& cfg) {
+    try {
+        save_client_config(cfg);
+    } catch (const std::exception& e) {
+        log_error("[tray] persist client cfg failed: %s", e.what());
+    }
+}
 
 // --- Helpers ---
 
@@ -901,6 +914,13 @@ static bool connect_to_daemon() {
             prefs["monitor_source"] = g_tray.cfg.monitor_source;
         if (!g_tray.cfg.whisper_model.empty())
             prefs["whisper_model"] = g_tray.cfg.whisper_model;
+        // v2-coexistence Phase 2E.2 — push remembered diarize/vad selections
+        // to the server on session.init. Unconditional (no sentinel) because
+        // bool has no natural "use server default" value; the daemon-side
+        // parse_preferences_into reads these via key presence into
+        // std::optional<bool> fields on SessionPreferences.
+        prefs["diarize"] = g_tray.cfg.diarize;
+        prefs["vad"]     = g_tray.cfg.vad;
         if (!g_tray.cfg.llm_model.empty()) {
             prefs["llm_model"] = g_tray.cfg.llm_model;
             prefs["summarization_backend"] = std::string("local");
@@ -1961,7 +1981,7 @@ static void on_record(GtkMenuItem*, gpointer) {
                 if (!entered.empty()) {
                     g_tray.cfg.api_keys[prov->name] = entered;
                     g_tray.cfg.api_key = entered;
-                    save_legacy_config_as_job_config(g_tray.cfg);
+                    try_save_client_config(g_tray.cfg);
                     // Push the fresh key over to the daemon for the
                     // current session so the Submit path picks it up.
                     if (g_tray.daemon_connected && g_tray.session_inited) {
@@ -2784,21 +2804,21 @@ static void on_mic_selected(GtkCheckMenuItem* item, gpointer data) {
     if (!gtk_check_menu_item_get_active(item)) return;
     auto* name = static_cast<const char*>(data);
     g_tray.cfg.mic_source = name ? name : "";
-    save_legacy_config_as_job_config(g_tray.cfg);
+    try_save_client_config(g_tray.cfg);
 }
 
 static void on_monitor_selected(GtkCheckMenuItem* item, gpointer data) {
     if (!gtk_check_menu_item_get_active(item)) return;
     auto* name = static_cast<const char*>(data);
     g_tray.cfg.monitor_source = name ? name : "";
-    save_legacy_config_as_job_config(g_tray.cfg);
+    try_save_client_config(g_tray.cfg);
 }
 
 static void on_model_selected(GtkCheckMenuItem* item, gpointer data) {
     if (!gtk_check_menu_item_get_active(item)) return;
     auto* name = static_cast<const char*>(data);
     g_tray.cfg.whisper_model = name;
-    save_legacy_config_as_job_config(g_tray.cfg);
+    try_save_client_config(g_tray.cfg);
 
     // Trigger model download if daemon is connected and idle
     if (g_tray.daemon_connected && !g_tray.recording && !g_tray.downloading) {
@@ -2808,33 +2828,67 @@ static void on_model_selected(GtkCheckMenuItem* item, gpointer data) {
         IpcError err;
         g_tray.ipc.call("models.ensure", params, resp, err, 5000);
     }
+
+    // v2-coexistence Phase 2E.3 — propagate remembered whisper_model to the
+    // current session so the next process.submit honors the new selection.
+    if (g_tray.daemon_connected && g_tray.session_inited) {
+        JsonMap prefs;
+        prefs["whisper_model"] = std::string(name);
+        IpcResponse resp; IpcError err;
+        if (!g_tray.ipc.session_update_prefs(prefs, resp, err, 5000)) {
+            log_warn("[tray] session.update_prefs(whisper_model) failed: %s",
+                     err.message.c_str());
+        }
+    }
 }
 
 static void on_language_selected(GtkCheckMenuItem* item, gpointer data) {
     if (!gtk_check_menu_item_get_active(item)) return;
     auto* code = static_cast<const char*>(data);
     g_tray.cfg.language = code ? code : "";
-    save_legacy_config_as_job_config(g_tray.cfg);
+    try_save_client_config(g_tray.cfg);
 }
 
 static void on_mic_only_toggled(GtkCheckMenuItem* item, gpointer) {
     g_tray.cfg.mic_only = gtk_check_menu_item_get_active(item);
-    save_legacy_config_as_job_config(g_tray.cfg);
+    try_save_client_config(g_tray.cfg);
 }
 
 static void on_no_summary_toggled(GtkCheckMenuItem* item, gpointer) {
     g_tray.cfg.no_summary = gtk_check_menu_item_get_active(item);
-    save_legacy_config_as_job_config(g_tray.cfg);
+    try_save_client_config(g_tray.cfg);
 }
 
 static void on_diarize_toggled(GtkCheckMenuItem* item, gpointer) {
     g_tray.cfg.diarize = gtk_check_menu_item_get_active(item);
-    save_legacy_config_as_job_config(g_tray.cfg);
+    try_save_client_config(g_tray.cfg);
+
+    // v2-coexistence Phase 2E.3 — propagate to current session.
+    if (g_tray.daemon_connected && g_tray.session_inited) {
+        JsonMap prefs;
+        prefs["diarize"] = g_tray.cfg.diarize;
+        IpcResponse resp; IpcError err;
+        if (!g_tray.ipc.session_update_prefs(prefs, resp, err, 5000)) {
+            log_warn("[tray] session.update_prefs(diarize) failed: %s",
+                     err.message.c_str());
+        }
+    }
 }
 
 static void on_vad_toggled(GtkCheckMenuItem* item, gpointer) {
     g_tray.cfg.vad = gtk_check_menu_item_get_active(item);
-    save_legacy_config_as_job_config(g_tray.cfg);
+    try_save_client_config(g_tray.cfg);
+
+    // v2-coexistence Phase 2E.3 — propagate to current session.
+    if (g_tray.daemon_connected && g_tray.session_inited) {
+        JsonMap prefs;
+        prefs["vad"] = g_tray.cfg.vad;
+        IpcResponse resp; IpcError err;
+        if (!g_tray.ipc.session_update_prefs(prefs, resp, err, 5000)) {
+            log_warn("[tray] session.update_prefs(vad) failed: %s",
+                     err.message.c_str());
+        }
+    }
 }
 
 // Phase 5.4 — Live captions toggle. Persists the user's overlay-visible
@@ -2848,7 +2902,9 @@ static void on_captions_enabled_toggled(GtkCheckMenuItem* item, gpointer) {
     // Persist the user's overlay-visible default to config (today's
     // behavior, kept).
     g_tray.cfg.captions_enabled = new_state;
-    save_legacy_config_as_job_config(g_tray.cfg);
+    // v2-coexistence Phase 2E.3 — captions setter is IPC-silent per Phase C
+    // retirement (captions_enabled never crosses the wire). Client-local only.
+    try_save_client_config(g_tray.cfg);
     // B3.3 — when a recording is in progress, also mutate the live
     // overlay-visible state and show/hide the overlay immediately. No
     // IPC call — the server keeps the engine running because rev 5's
@@ -2882,7 +2938,7 @@ static void on_provider_selected(GtkCheckMenuItem* item, gpointer data) {
             build_menu(); // user cancelled — revert radio state
             return;
         }
-        save_legacy_config_as_job_config(g_tray.cfg);
+        try_save_client_config(g_tray.cfg);
         build_menu();
         return;
     }
@@ -2899,7 +2955,7 @@ static void on_provider_selected(GtkCheckMenuItem* item, gpointer data) {
         g_tray.cfg.api_key = (kit != g_tray.cfg.api_keys.end()) ? kit->second : "";
     }
 
-    save_legacy_config_as_job_config(g_tray.cfg);
+    try_save_client_config(g_tray.cfg);
     fetch_provider_models();
     build_menu();
 }
@@ -2909,7 +2965,7 @@ static void on_api_model_selected(GtkCheckMenuItem* item, gpointer data) {
     auto* model = static_cast<const char*>(data);
     if (model) {
         g_tray.cfg.api_model = model;
-        save_legacy_config_as_job_config(g_tray.cfg);
+        try_save_client_config(g_tray.cfg);
     }
 }
 
@@ -3009,7 +3065,7 @@ static void choose_gguf_model() {
     std::string path = run_gguf_chooser("Select LLM Model (.gguf)");
     if (!path.empty()) {
         g_tray.cfg.llm_model = path;
-        save_legacy_config_as_job_config(g_tray.cfg);
+        try_save_client_config(g_tray.cfg);
         build_menu();
     }
 }
@@ -3020,7 +3076,7 @@ static void on_set_output_dir(GtkMenuItem*, gpointer) {
     std::string path = run_folder_chooser("Select Output Directory");
     if (!path.empty()) {
         g_tray.cfg.output_dir = path;
-        save_legacy_config_as_job_config(g_tray.cfg);
+        try_save_client_config(g_tray.cfg);
         build_menu();
     }
 }
@@ -3029,7 +3085,7 @@ static void on_set_note_dir(GtkMenuItem*, gpointer) {
     std::string path = run_folder_chooser("Select Note Directory");
     if (!path.empty()) {
         g_tray.cfg.note_dir = path;
-        save_legacy_config_as_job_config(g_tray.cfg);
+        try_save_client_config(g_tray.cfg);
         build_menu();
     }
 }
@@ -3065,9 +3121,13 @@ static void on_open_latest_session(GtkMenuItem*, gpointer) {
 // --- Utility actions ---
 
 static void on_edit_config(GtkMenuItem*, gpointer) {
-    fs::path cfg_path = config_dir() / "config.yaml";
+    // v2-coexistence Phase 2E.4 — open client.yaml under the V2 split path.
+    // The daemon's server.yaml is not surfaced through this menu item;
+    // operators edit it directly. Bootstrap-on-missing creates a fresh
+    // client.yaml from current in-memory g_tray.cfg.
+    fs::path cfg_path = client_config_dir() / "client.yaml";
     if (!fs::exists(cfg_path))
-        save_legacy_config_as_job_config(g_tray.cfg);
+        try_save_client_config(g_tray.cfg);
 
     const char* editor = std::getenv("EDITOR");
     if (!editor) editor = "nvim";
@@ -4034,7 +4094,7 @@ int main(int argc, char* argv[]) {
     if (!g_tray.daemon_addr.empty())
         g_tray.ipc.set_address(g_tray.daemon_addr);
 
-    g_tray.cfg = load_legacy_config_as_job_config();
+    g_tray.cfg = load_client_config();
 
     // v2-coexistence Phase 1 — explicit log-dir fallback so V2 client logs
     // land under `client_data_dir()/logs` instead of fanning out to the
