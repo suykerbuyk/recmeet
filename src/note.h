@@ -54,4 +54,44 @@ MeetingMetadata extract_meeting_metadata(const std::string& summary);
 /// Remove the metadata block (Title/Tags/Description lines) from the summary body.
 std::string strip_metadata_block(const std::string& summary);
 
+// ---------------------------------------------------------------------------
+// note_internal — implementation helpers exported for direct unit-test
+// reachability. NOT a public API for production consumers; the only
+// non-test caller is `write_meeting_note()` in src/note.cpp.
+//
+// Convention precedent: this is the first `*_internal` namespace in the
+// recmeet/ source tree (verified iter 228 via `git grep
+// 'namespace.*_internal' src/`). Subsequent test-only helper exports
+// SHOULD follow this shape: a nested `namespace <topic>_internal` inside
+// the owning component's public header, with this same one-line comment
+// explaining the test-only contract.
+// ---------------------------------------------------------------------------
+namespace note_internal {
+
+/// Scan `note_parent` for any meeting-note files matching
+/// `timestamp_prefix`, migrate legacy un-numbered notes to the `.XX`
+/// attempt-counter scheme (mtime-ASC, filename-ASC tiebreak), and return
+/// the attempt number the caller's about-to-be-written note should take.
+///
+/// Self-healing: every call re-scans, so a partial-migration state
+/// (e.g. a prior `fs::rename` failed mid-way due to a transient EACCES)
+/// is picked up and completed on the next write. The "never gap-fill"
+/// invariant is preserved — a failed rename still consumes the slot, so
+/// the returned attempt number is always strictly greater than every
+/// `.XX` currently on disk.
+///
+/// Caller contract: `note_parent` MUST already exist (the helper does
+/// not create it). On `directory_iterator` failure (permissions/ENOSPC
+/// on the directory itself), throws `RecmeetError`. Per-file rename
+/// failures during migration are logged via `log_warn` but do not throw.
+///
+/// `timestamp_prefix` is the `YYYY-MM-DD_HH-MM` substring that
+/// `write_meeting_note` composes between `Meeting_` and the optional
+/// `_<safe_title>` suffix. The helper regex-escapes it defensively
+/// before interpolation.
+int next_attempt_and_migrate(const fs::path& note_parent,
+                             const std::string& timestamp_prefix);
+
+} // namespace note_internal
+
 } // namespace recmeet

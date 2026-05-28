@@ -423,6 +423,282 @@ TEST_CASE("write_meeting_note: note_dir creates year/month for different dates",
     fs::remove_all(note_dir);
 }
 
+// ---------------------------------------------------------------------------
+// `.XX` attempt-counter + migration helper coverage. See:
+//   src/note.h        — namespace recmeet::note_internal
+//   src/note.cpp      — next_attempt_and_migrate()
+//   agentctx/tasks/meeting-note-attempt-counter.md (rev-4, Phase 1)
+//
+// These tests exercise the helper DIRECTLY (via the `note_internal` export)
+// AND through `write_meeting_note()` (which calls the helper as a side
+// effect on every write). The helper is the contract; the writer is the
+// only production consumer.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// Minimal `MeetingData` builder for the attempt-counter tests. The
+// counter logic doesn't care about title/summary/etc — date+time+output
+// are all the helper looks at.
+MeetingData make_attempt_data(const fs::path& dir,
+                              const std::string& date = "2026-05-26",
+                              const std::string& time = "14:30",
+                              const std::string& title = "") {
+    MeetingData d;
+    d.date = date;
+    d.time = time;
+    d.output_dir = dir;
+    d.title = title;
+    return d;
+}
+
+// Pull the filename out of a write_meeting_note() return path.
+std::string written_filename(const fs::path& p) {
+    return p.filename().string();
+}
+
+} // anonymous namespace
+
+TEST_CASE("note_internal: first write to empty dir → .00", "[note][note-attempts]") {
+    auto dir = tmp_dir();
+    NoteConfig cfg;
+    auto path = write_meeting_note(cfg, make_attempt_data(dir));
+    CHECK(written_filename(path) == "Meeting_2026-05-26_14-30.00.md");
+    fs::remove_all(dir);
+}
+
+TEST_CASE("note_internal: second write same timestamp → .01", "[note][note-attempts]") {
+    auto dir = tmp_dir();
+    NoteConfig cfg;
+    auto p1 = write_meeting_note(cfg, make_attempt_data(dir));
+    auto p2 = write_meeting_note(cfg, make_attempt_data(dir));
+    CHECK(written_filename(p1) == "Meeting_2026-05-26_14-30.00.md");
+    CHECK(written_filename(p2) == "Meeting_2026-05-26_14-30.01.md");
+    fs::remove_all(dir);
+}
+
+TEST_CASE("note_internal: single legacy note migrated to .00; new write .01",
+          "[note][note-attempts]") {
+    auto dir = tmp_dir();
+    // Drop a legacy un-numbered note on disk.
+    {
+        std::ofstream out(dir / "Meeting_2026-05-26_14-30_old_topic.md");
+        out << "legacy content";
+    }
+    NoteConfig cfg;
+    auto path = write_meeting_note(cfg, make_attempt_data(dir));
+    // The legacy file is migrated to .00 with its original suffix.
+    CHECK(fs::exists(dir / "Meeting_2026-05-26_14-30.00_old_topic.md"));
+    CHECK_FALSE(fs::exists(dir / "Meeting_2026-05-26_14-30_old_topic.md"));
+    // The new write takes .01.
+    CHECK(written_filename(path) == "Meeting_2026-05-26_14-30.01.md");
+    fs::remove_all(dir);
+}
+
+TEST_CASE("note_internal: multi-legacy mtime-ordered migration",
+          "[note][note-attempts]") {
+    auto dir = tmp_dir();
+    // Create three legacy files with deliberate mtime spread. Filenames
+    // are NOT in mtime order — verifies mtime is the primary sort key.
+    auto write_legacy = [&](const std::string& name) {
+        std::ofstream out(dir / name);
+        out << name;
+    };
+    write_legacy("Meeting_2026-05-26_14-30_zebra.md");
+    write_legacy("Meeting_2026-05-26_14-30_alpha.md");
+    write_legacy("Meeting_2026-05-26_14-30_middle.md");
+
+    // Force mtimes: alpha=oldest, zebra=middle, middle=newest.
+    using ft = fs::file_time_type;
+    auto base = ft::clock::now() - std::chrono::hours(10);
+    fs::last_write_time(dir / "Meeting_2026-05-26_14-30_alpha.md",
+                        base);
+    fs::last_write_time(dir / "Meeting_2026-05-26_14-30_zebra.md",
+                        base + std::chrono::hours(1));
+    fs::last_write_time(dir / "Meeting_2026-05-26_14-30_middle.md",
+                        base + std::chrono::hours(2));
+
+    NoteConfig cfg;
+    auto path = write_meeting_note(cfg, make_attempt_data(dir));
+
+    // Mtime-ASC migration: alpha → .00, zebra → .01, middle → .02.
+    CHECK(fs::exists(dir / "Meeting_2026-05-26_14-30.00_alpha.md"));
+    CHECK(fs::exists(dir / "Meeting_2026-05-26_14-30.01_zebra.md"));
+    CHECK(fs::exists(dir / "Meeting_2026-05-26_14-30.02_middle.md"));
+    // New write takes .03.
+    CHECK(written_filename(path) == "Meeting_2026-05-26_14-30.03.md");
+    fs::remove_all(dir);
+}
+
+TEST_CASE("note_internal: multi-legacy mtime-tied → lexicographic tiebreak",
+          "[note][note-attempts]") {
+    auto dir = tmp_dir();
+    auto write_legacy = [&](const std::string& name) {
+        std::ofstream out(dir / name);
+        out << name;
+    };
+    write_legacy("Meeting_2026-05-26_14-30_gamma.md");
+    write_legacy("Meeting_2026-05-26_14-30_alpha.md");
+    write_legacy("Meeting_2026-05-26_14-30_beta.md");
+
+    // Force all mtimes to the SAME value — sort must fall back to
+    // filename ascending (alpha → .00, beta → .01, gamma → .02).
+    auto t = fs::file_time_type::clock::now() - std::chrono::hours(1);
+    fs::last_write_time(dir / "Meeting_2026-05-26_14-30_gamma.md", t);
+    fs::last_write_time(dir / "Meeting_2026-05-26_14-30_alpha.md", t);
+    fs::last_write_time(dir / "Meeting_2026-05-26_14-30_beta.md", t);
+
+    NoteConfig cfg;
+    auto path = write_meeting_note(cfg, make_attempt_data(dir));
+
+    CHECK(fs::exists(dir / "Meeting_2026-05-26_14-30.00_alpha.md"));
+    CHECK(fs::exists(dir / "Meeting_2026-05-26_14-30.01_beta.md"));
+    CHECK(fs::exists(dir / "Meeting_2026-05-26_14-30.02_gamma.md"));
+    CHECK(written_filename(path) == "Meeting_2026-05-26_14-30.03.md");
+    fs::remove_all(dir);
+}
+
+TEST_CASE("note_internal: self-healing partial migration",
+          "[note][note-attempts]") {
+    auto dir = tmp_dir();
+    // Pre-populate a numbered .00 (as if a prior write migrated one
+    // legacy file) AND a still-unmigrated legacy file (as if the prior
+    // call's second rename failed transiently). The helper must pick
+    // up the orphan and renumber it ABOVE the existing .00.
+    {
+        std::ofstream a(dir / "Meeting_2026-05-26_14-30.00_already.md");
+        a << "already";
+        std::ofstream b(dir / "Meeting_2026-05-26_14-30_orphan.md");
+        b << "orphan";
+    }
+    NoteConfig cfg;
+    auto path = write_meeting_note(cfg, make_attempt_data(dir));
+    // Orphan picks up .01 (max_seen was 0 from the .00; ++max_seen → 1).
+    CHECK(fs::exists(dir / "Meeting_2026-05-26_14-30.00_already.md"));
+    CHECK(fs::exists(dir / "Meeting_2026-05-26_14-30.01_orphan.md"));
+    CHECK_FALSE(fs::exists(dir / "Meeting_2026-05-26_14-30_orphan.md"));
+    // New write takes .02.
+    CHECK(written_filename(path) == "Meeting_2026-05-26_14-30.02.md");
+    fs::remove_all(dir);
+}
+
+TEST_CASE("note_internal: sparse attempt numbers → max+1 (never gap-fill)",
+          "[note][note-attempts]") {
+    auto dir = tmp_dir();
+    // Pre-populate .00 and .02 (no .01 — operator deleted it). The
+    // helper must NOT fill the gap; the new write goes to .03.
+    {
+        std::ofstream a(dir / "Meeting_2026-05-26_14-30.00.md");
+        a << "0";
+        std::ofstream c(dir / "Meeting_2026-05-26_14-30.02.md");
+        c << "2";
+    }
+    NoteConfig cfg;
+    auto path = write_meeting_note(cfg, make_attempt_data(dir));
+    CHECK(written_filename(path) == "Meeting_2026-05-26_14-30.03.md");
+    // Pre-existing files unchanged; no .01 was created.
+    CHECK(fs::exists(dir / "Meeting_2026-05-26_14-30.00.md"));
+    CHECK(fs::exists(dir / "Meeting_2026-05-26_14-30.02.md"));
+    CHECK_FALSE(fs::exists(dir / "Meeting_2026-05-26_14-30.01.md"));
+    fs::remove_all(dir);
+}
+
+TEST_CASE("note_internal: all .XX deleted → next write resets to .00",
+          "[note][note-attempts]") {
+    auto dir = tmp_dir();
+    NoteConfig cfg;
+    auto p1 = write_meeting_note(cfg, make_attempt_data(dir));
+    auto p2 = write_meeting_note(cfg, make_attempt_data(dir));
+    CHECK(written_filename(p1) == "Meeting_2026-05-26_14-30.00.md");
+    CHECK(written_filename(p2) == "Meeting_2026-05-26_14-30.01.md");
+    fs::remove(p1);
+    fs::remove(p2);
+    // Empty again — monotonic-only reset (no persistent sidecar).
+    auto p3 = write_meeting_note(cfg, make_attempt_data(dir));
+    CHECK(written_filename(p3) == "Meeting_2026-05-26_14-30.00.md");
+    fs::remove_all(dir);
+}
+
+TEST_CASE("note_internal: empty title preserves trailing dot pattern",
+          "[note][note-attempts]") {
+    auto dir = tmp_dir();
+    NoteConfig cfg;
+    auto path = write_meeting_note(cfg, make_attempt_data(dir));
+    // No title → filename ends with `.NN.md` (no underscore between
+    // counter and `.md`).
+    CHECK(written_filename(path) == "Meeting_2026-05-26_14-30.00.md");
+    fs::remove_all(dir);
+}
+
+TEST_CASE("note_internal: YYYY/MM flat-layout isolation across timestamps",
+          "[note][note-attempts]") {
+    // When note_dir is set, files for distinct timestamps land in
+    // <note_dir>/YYYY/MM/. Two timestamps in the same month share a
+    // directory — the helper must scope its scan to ONE timestamp.
+    auto audio_dir = tmp_dir();
+    auto note_dir = recmeet::test::tmp_path("recmeet_test_note_isolation");
+    fs::create_directories(note_dir);
+
+    NoteConfig cfg;
+    MeetingData d1 = make_attempt_data(audio_dir, "2026-05-26", "14:30");
+    d1.note_dir = note_dir;
+    MeetingData d2 = make_attempt_data(audio_dir, "2026-05-26", "15:00");
+    d2.note_dir = note_dir;
+
+    auto p_15_00 = write_meeting_note(cfg, d2);
+    auto p_14_30 = write_meeting_note(cfg, d1);
+    auto p_14_30_b = write_meeting_note(cfg, d1);  // second @ 14:30
+
+    // Both timestamps live in note_dir/2026/05/.
+    fs::path year_month = note_dir / "2026" / "05";
+    CHECK(p_15_00 == year_month / "Meeting_2026-05-26_15-00.00.md");
+    CHECK(p_14_30 == year_month / "Meeting_2026-05-26_14-30.00.md");
+    CHECK(p_14_30_b == year_month / "Meeting_2026-05-26_14-30.01.md");
+    // The 15:00 note must NOT have been renumbered by 14:30's helper call.
+    CHECK(fs::exists(year_month / "Meeting_2026-05-26_15-00.00.md"));
+
+    fs::remove_all(audio_dir);
+    fs::remove_all(note_dir);
+}
+
+TEST_CASE("note_internal: .99 → .100 rollover (unbounded zero-pad)",
+          "[note][note-attempts]") {
+    auto dir = tmp_dir();
+    // Pre-populate .98 and .99 — next write must produce .100 numerically.
+    {
+        std::ofstream a(dir / "Meeting_2026-05-26_14-30.98.md");
+        a << "98";
+        std::ofstream b(dir / "Meeting_2026-05-26_14-30.99.md");
+        b << "99";
+    }
+    NoteConfig cfg;
+    auto path = write_meeting_note(cfg, make_attempt_data(dir));
+    CHECK(written_filename(path) == "Meeting_2026-05-26_14-30.100.md");
+    fs::remove_all(dir);
+}
+
+TEST_CASE("note_internal: idempotent on already-migrated state",
+          "[note][note-attempts]") {
+    auto dir = tmp_dir();
+    NoteConfig cfg;
+    // Bring the dir to a steady state: three notes, all `.XX`.
+    write_meeting_note(cfg, make_attempt_data(dir));  // .00
+    write_meeting_note(cfg, make_attempt_data(dir));  // .01
+    write_meeting_note(cfg, make_attempt_data(dir));  // .02
+
+    // Direct calls to the helper must return the SAME number twice in
+    // a row with no intervening write, and must not rename anything.
+    int n1 = note_internal::next_attempt_and_migrate(dir, "2026-05-26_14-30");
+    int n2 = note_internal::next_attempt_and_migrate(dir, "2026-05-26_14-30");
+    CHECK(n1 == 3);
+    CHECK(n2 == 3);
+    // On-disk state is unchanged.
+    CHECK(fs::exists(dir / "Meeting_2026-05-26_14-30.00.md"));
+    CHECK(fs::exists(dir / "Meeting_2026-05-26_14-30.01.md"));
+    CHECK(fs::exists(dir / "Meeting_2026-05-26_14-30.02.md"));
+    fs::remove_all(dir);
+}
+
 TEST_CASE("write_meeting_note: handles empty summary gracefully", "[note]") {
     auto dir = tmp_dir();
 
