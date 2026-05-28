@@ -96,7 +96,7 @@ CliResult parse_cli(int argc, char* argv[]) {
     };
 
     CliResult result;
-    result.cfg = load_legacy_config_as_job_config();
+    result.cfg = load_cli_config();
 
     int opt;
     while ((opt = getopt_long(argc, argv, "hv", long_opts, nullptr)) != -1) {

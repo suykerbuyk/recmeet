@@ -364,6 +364,24 @@ JobConfig load_legacy_config_as_job_config(const fs::path& config_path = {});
 /// otherwise ~/.config/recmeet/config.yaml.
 void save_legacy_config_as_job_config(const JobConfig& cfg, const fs::path& config_path = {});
 
+/// v2-coexistence Phase 2F.1 — load split server+client config and project
+/// into a JobConfig for CLI consumption. The CLI runs server-equivalent
+/// worker code (transcribe/diarize/summarize) so log_* + transcription/
+/// diarization knobs come from ServerConfig; output_dir / language /
+/// vocabulary / api_keys / etc. come from ClientConfig.
+///
+/// JobConfig-native per-invocation fields (mic_source, monitor_source,
+/// mic_only, keep_sources, reprocess_dir, context_file, context_inline,
+/// reprocess_batch_dir, reprocess_batch_dry_run, dry_run) are left at
+/// JobConfig defaults — getopt overrides per run.
+///
+/// Both path overloads are for test isolation; defaults resolve to
+/// `server_config_dir() / "server.yaml"` and
+/// `client_config_dir() / "client.yaml"` via load_server_config /
+/// load_client_config.
+JobConfig load_cli_config(const fs::path& server_path = {},
+                          const fs::path& client_path = {});
+
 // ---------------------------------------------------------------------------
 // Phase E.2 Wave 2.2a — split config: ServerConfig + ClientConfig
 // ---------------------------------------------------------------------------
@@ -584,31 +602,5 @@ void save_server_config(const ServerConfig& cfg, const fs::path& config_path = {
 
 /// Save ClientConfig to client.yaml. Writes with 0600 perms.
 void save_client_config(const ClientConfig& cfg, const fs::path& config_path = {});
-
-/// Extract a ServerConfig from a monolithic JobConfig (used by the legacy
-/// migration path).
-ServerConfig to_server_config(const JobConfig& cfg);
-
-/// Extract a ClientConfig from a monolithic JobConfig (used by the legacy
-/// migration path).
-ClientConfig to_client_config(const JobConfig& cfg);
-
-/// Migrate legacy ~/.config/recmeet/config.yaml into daemon.yaml +
-/// client.yaml if (and only if) the legacy file exists AND neither split
-/// file is present yet. Idempotent — calling repeatedly with already-
-/// migrated state is a no-op.
-///
-/// Behavior:
-///   1. If `config.yaml` does not exist → return (nothing to migrate).
-///   2. If `daemon.yaml` or `client.yaml` exists → return (already
-///      migrated; log skip).
-///   3. Otherwise: load legacy config, split into ServerConfig +
-///      ClientConfig, write daemon.yaml + client.yaml (0600), and
-///      rename legacy file to `config.yaml.v1-backup`.
-///
-/// Never invoked from `load_config()` — opt-in only until Wave 2.2b
-/// reroutes consumers. The `config_dir` overload is for test isolation;
-/// defaults to `util.h::config_dir()`.
-void migrate_legacy_config_if_present(const fs::path& config_dir = {});
 
 } // namespace recmeet

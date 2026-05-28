@@ -417,7 +417,16 @@ int main(int argc, char* argv[]) {
             }
             cli.cfg.vocabulary += ", " + word;
         }
-        save_legacy_config_as_job_config(cli.cfg);
+        // v2-coexistence Phase 2F.2 — vocabulary is a ClientConfig field;
+        // load-mutate-save preserves operator's other client.yaml fields.
+        try {
+            ClientConfig client_cfg = load_client_config();
+            client_cfg.vocabulary = cli.cfg.vocabulary;
+            save_client_config(client_cfg);
+        } catch (const std::exception& e) {
+            fprintf(stderr, "Error: cannot save vocabulary to client.yaml: %s\n", e.what());
+            return 1;
+        }
         printf("Added '%s' to vocabulary.\n", word.c_str());
         return 0;
     }
@@ -444,7 +453,15 @@ int main(int argc, char* argv[]) {
             if (i > 0) cli.cfg.vocabulary += ", ";
             cli.cfg.vocabulary += words[i];
         }
-        save_legacy_config_as_job_config(cli.cfg);
+        // v2-coexistence Phase 2F.2 — vocabulary lives in client.yaml.
+        try {
+            ClientConfig client_cfg = load_client_config();
+            client_cfg.vocabulary = cli.cfg.vocabulary;
+            save_client_config(client_cfg);
+        } catch (const std::exception& e) {
+            fprintf(stderr, "Error: cannot save vocabulary to client.yaml: %s\n", e.what());
+            return 1;
+        }
         printf("Removed '%s' from vocabulary.\n", target.c_str());
         return 0;
     }
@@ -454,7 +471,15 @@ int main(int argc, char* argv[]) {
             printf("Vocabulary is already empty.\n");
         } else {
             cli.cfg.vocabulary.clear();
-            save_legacy_config_as_job_config(cli.cfg);
+            // v2-coexistence Phase 2F.2 — vocabulary lives in client.yaml.
+            try {
+                ClientConfig client_cfg = load_client_config();
+                client_cfg.vocabulary = cli.cfg.vocabulary;
+                save_client_config(client_cfg);
+            } catch (const std::exception& e) {
+                fprintf(stderr, "Error: cannot save vocabulary to client.yaml: %s\n", e.what());
+                return 1;
+            }
             printf("Cleared all vocabulary words.\n");
         }
         return 0;
