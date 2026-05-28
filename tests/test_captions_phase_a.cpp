@@ -241,7 +241,7 @@ TEST_CASE("daemon startup gate logs and disables captions when the model "
 
     auto workdir = captions_test_tmp_dir("t3_bogus_model");
     fs::path xdg_config = workdir / "xdg";
-    fs::create_directories(xdg_config / "recmeet");
+    fs::create_directories(xdg_config / "recmeet-server");
     fs::path stderr_log = workdir / "daemon.stderr.log";
     fs::path socket_path = workdir / "ipc.sock";
 
@@ -251,7 +251,7 @@ TEST_CASE("daemon startup gate logs and disables captions when the model "
     // does not exist. The startup AND-in collapses that to runtime false
     // and logs the reason.
     {
-        std::ofstream daemon_yaml(xdg_config / "recmeet" / "daemon.yaml");
+        std::ofstream daemon_yaml(xdg_config / "recmeet-server" / "daemon.yaml");
         REQUIRE(daemon_yaml.is_open());
         daemon_yaml << "# T3 test fixture — captions on, but model path bogus\n"
                     << "captions:\n"
@@ -307,7 +307,7 @@ TEST_CASE("session.init reports captions_supported=false in no-sherpa builds",
 
     auto workdir = captions_test_tmp_dir("t4_no_sherpa");
     fs::path xdg_config = workdir / "xdg";
-    fs::create_directories(xdg_config / "recmeet");
+    fs::create_directories(xdg_config / "recmeet-server");
     fs::path stderr_log = workdir / "daemon.stderr.log";
     fs::path socket_path = workdir / "ipc.sock";
 
@@ -315,7 +315,7 @@ TEST_CASE("session.init reports captions_supported=false in no-sherpa builds",
     // build flips runtime_capable to false regardless, so the gate logs
     // "RECMEET_USE_SHERPA=OFF build" and writes false back.
     {
-        std::ofstream daemon_yaml(xdg_config / "recmeet" / "daemon.yaml");
+        std::ofstream daemon_yaml(xdg_config / "recmeet-server" / "daemon.yaml");
         REQUIRE(daemon_yaml.is_open());
         daemon_yaml << "# T4 fixture — no-sherpa build\n";
     }

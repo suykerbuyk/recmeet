@@ -170,11 +170,11 @@ std::string get_meeting_id(IpcClient& client, int64_t job_id) {
 // dirs so concurrent test runs (and the operator's real `~/meetings/`)
 // stay untouched. We write `daemon.yaml` directly to skip the legacy-
 // migration shim; the daemon's `load_server_config` reads this file
-// straight from $XDG_CONFIG_HOME/recmeet/daemon.yaml.
+// straight from $XDG_CONFIG_HOME/recmeet-server/daemon.yaml (v2 split-paths).
 void write_daemon_yaml(const fs::path& xdg_config_dir,
                        const fs::path& meetings_root,
                        const fs::path& speaker_db) {
-    fs::path cfg_dir = xdg_config_dir / "recmeet";
+    fs::path cfg_dir = xdg_config_dir / "recmeet-server";
     fs::create_directories(cfg_dir);
     std::ofstream cfg(cfg_dir / "daemon.yaml");
     REQUIRE(cfg.is_open());

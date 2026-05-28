@@ -4,6 +4,7 @@
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/matchers/catch_matchers_floating_point.hpp>
 #include "ipc_protocol.h"
+#include "util.h"
 
 using namespace recmeet;
 
@@ -363,7 +364,9 @@ TEST_CASE("parse_ipc_address: empty string → default Unix", "[ipc]") {
     IpcAddress addr;
     REQUIRE(parse_ipc_address("", addr));
     CHECK(addr.transport == IpcTransport::Unix);
-    CHECK(addr.socket_path == default_socket_path());
+    // v2-coexistence Phase 3: default_ipc_address now resolves to
+    // server_socket_path() (~/.config/recmeet-server/server.sock by default).
+    CHECK(addr.socket_path == server_socket_path());
     CHECK(addr.port == 0);
 }
 
@@ -428,7 +431,9 @@ TEST_CASE("parse_ipc_address: IPv6 bracket notation → rejected (future)", "[ip
 TEST_CASE("default_ipc_address: returns Unix transport", "[ipc]") {
     IpcAddress addr = default_ipc_address();
     CHECK(addr.transport == IpcTransport::Unix);
-    CHECK(addr.socket_path == default_socket_path());
+    // v2-coexistence Phase 3: default_ipc_address now resolves to
+    // server_socket_path() (~/.config/recmeet-server/server.sock by default).
+    CHECK(addr.socket_path == server_socket_path());
 }
 
 // ===========================================================================
