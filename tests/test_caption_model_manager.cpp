@@ -255,8 +255,11 @@ TEST_CASE("parse_cli: --list-caption-models sets the flag",
 TEST_CASE("parse_cli: defaults — no caption flags = config's captions_enabled",
           "[caption-model-manager][cli]") {
     auto cli = run_cli({"recmeet"});
-    // JobConfig defaults to captions_enabled=false, so no flag → false.
-    CHECK(cli.cfg.captions_enabled == false);
+    // v2-coexistence Phase 2G — ServerConfig.captions_enabled defaults to
+    // true, and load_cli_config projects ServerConfig.captions_enabled into
+    // JobConfig.captions_enabled. With no server.yaml present (empty XDG
+    // dir), the default ON survives — the captions cascade is intact.
+    CHECK(cli.cfg.captions_enabled == true);
     CHECK(cli.caption_force_on == false);
     CHECK(cli.caption_force_off == false);
     CHECK(cli.list_caption_models == false);

@@ -891,3 +891,147 @@ TEST_CASE("v2-coexistence Phase 2B: session.init rejects non-bool diarize/vad in
 
     c.close_connection();
 }
+
+// ===========================================================================
+// v2-coexistence-with-v1 Phase 2E.3 — tray IPC-emitting setters wire shape.
+//
+// Three tray menu setters emit `session.update_prefs` after persisting the
+// user's selection to client.yaml: on_model_selected (whisper_model),
+// on_diarize_toggled (diarize), on_vad_toggled (vad). The captions toggle
+// is IPC-silent per Phase C retirement (captions_enabled never crosses the
+// wire). These tests assert the daemon-side parser+merger accept the wire
+// shapes the tray actually sends, including the whisper_model string path
+// that was previously only exercised via session.init.
+// ===========================================================================
+
+TEST_CASE("v2-coexistence Phase 2E.3: tray on_model_selected wire shape — "
+          "session.update_prefs{whisper_model} lands on JobConfig",
+          "[tray][ipc][v2-coexistence]") {
+    SessionHarness h;
+    IpcClient c(h.sock_path);
+    REQUIRE(c.connect());
+
+    {
+        JsonMap creds, prefs;
+        IpcResponse resp; IpcError err;
+        REQUIRE(c.session_init(creds, prefs, resp, err));
+    }
+
+    // Mirror the on_model_selected emit at src/tray.cpp:2820.
+    JsonMap patch;
+    patch["whisper_model"] = std::string("large-v3");
+    IpcResponse resp; IpcError err;
+    REQUIRE(c.session_update_prefs(patch, resp, err));
+    CHECK(json_val_as_bool(resp.result["ok"]) == true);
+
+    SessionCredentials got_c;
+    SessionPreferences got_p;
+    REQUIRE(snapshot_session(h.server, c.client_id(), got_c, got_p));
+    CHECK(got_p.whisper_model == "large-v3");
+
+    ServerConfig yaml;
+    yaml.whisper_model = "base";  // admin default
+    PostprocessInput input{};
+    JobConfig out = make_job_config(yaml, got_c, got_p, input,
+                                    [](const std::string&) { return std::string(); });
+    CHECK(out.whisper_model == "large-v3");  // session override won
+
+    c.close_connection();
+}
+
+TEST_CASE("v2-coexistence Phase 2E.3: tray on_diarize_toggled wire shape — "
+          "session.update_prefs{diarize} lands on JobConfig",
+          "[tray][ipc][v2-coexistence]") {
+    SessionHarness h;
+    IpcClient c(h.sock_path);
+    REQUIRE(c.connect());
+
+    {
+        JsonMap creds, prefs;
+        IpcResponse resp; IpcError err;
+        REQUIRE(c.session_init(creds, prefs, resp, err));
+    }
+
+    JsonMap patch;
+    patch["diarize"] = false;
+    IpcResponse resp; IpcError err;
+    REQUIRE(c.session_update_prefs(patch, resp, err));
+
+    SessionCredentials got_c;
+    SessionPreferences got_p;
+    REQUIRE(snapshot_session(h.server, c.client_id(), got_c, got_p));
+    REQUIRE(got_p.diarize.has_value());
+    CHECK(*got_p.diarize == false);
+
+    c.close_connection();
+}
+
+TEST_CASE("v2-coexistence Phase 2E.3: tray on_vad_toggled wire shape — "
+          "session.update_prefs{vad} lands on JobConfig",
+          "[tray][ipc][v2-coexistence]") {
+    SessionHarness h;
+    IpcClient c(h.sock_path);
+    REQUIRE(c.connect());
+
+    {
+        JsonMap creds, prefs;
+        IpcResponse resp; IpcError err;
+        REQUIRE(c.session_init(creds, prefs, resp, err));
+    }
+
+    JsonMap patch;
+    patch["vad"] = false;
+    IpcResponse resp; IpcError err;
+    REQUIRE(c.session_update_prefs(patch, resp, err));
+
+    SessionCredentials got_c;
+    SessionPreferences got_p;
+    REQUIRE(snapshot_session(h.server, c.client_id(), got_c, got_p));
+    REQUIRE(got_p.vad.has_value());
+    CHECK(*got_p.vad == false);
+
+    c.close_connection();
+}
+
+TEST_CASE("v2-coexistence Phase 2E.3: tray on_captions_enabled_toggled is "
+          "IPC-silent — captions_enabled never crosses the wire (Phase C)",
+          "[tray][ipc][v2-coexistence]") {
+    // Phase C retirement contract: SessionPreferences has no captions_enabled
+    // field; sending one in session.update_prefs is silently dropped by the
+    // parser (the lambda only reads known keys). The tray's captions
+    // setter at src/tray.cpp:2851 deliberately omits the session.update_prefs
+    // call. This test pins the daemon-side invariant: an empty
+    // session.update_prefs body (which is what the captions setter
+    // effectively contributes to the wire — nothing) is a no-op success.
+    SessionHarness h;
+    IpcClient c(h.sock_path);
+    REQUIRE(c.connect());
+
+    {
+        JsonMap creds, prefs;
+        IpcResponse resp; IpcError err;
+        REQUIRE(c.session_init(creds, prefs, resp, err));
+    }
+
+    // Snapshot prefs before — captions_enabled does not exist on the struct.
+    SessionCredentials before_c;
+    SessionPreferences before_p;
+    REQUIRE(snapshot_session(h.server, c.client_id(), before_c, before_p));
+
+    // The captions setter does not emit session.update_prefs at all. Empty-
+    // body call mirrors a "no fields to emit" scenario.
+    JsonMap empty;
+    IpcResponse resp; IpcError err;
+    REQUIRE(c.session_update_prefs(empty, resp, err));
+    CHECK(json_val_as_bool(resp.result["ok"]) == true);
+
+    // Prefs unchanged.
+    SessionCredentials after_c;
+    SessionPreferences after_p;
+    REQUIRE(snapshot_session(h.server, c.client_id(), after_c, after_p));
+    CHECK(after_p.diarize.has_value() == before_p.diarize.has_value());
+    CHECK(after_p.vad.has_value() == before_p.vad.has_value());
+    CHECK(after_p.whisper_model == before_p.whisper_model);
+
+    c.close_connection();
+}

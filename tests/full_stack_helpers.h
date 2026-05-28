@@ -579,19 +579,23 @@ private:
 };
 
 // ---------------------------------------------------------------------------
-// write_minimal_test_config — write a minimal daemon config.yaml under
-// `<xdg_config_dir>/recmeet/config.yaml`.
+// write_minimal_test_config — write a minimal daemon config under
+// `<xdg_config_dir>/recmeet/daemon.yaml`.
 //
 // Each disable_* flag corresponds to a top-level section the daemon
 // honors at config load. Defaults match the existing `[e2e][thin-client]`
 // test's needs (summary off, diarization + VAD as caller wants).
+//
+// v2-coexistence Phase 2C — the daemon no longer migrates the legacy
+// `config.yaml` to `daemon.yaml`. Write directly to the file the daemon
+// reads (`load_server_config()` resolves `config_dir() / "daemon.yaml"`).
 inline void write_minimal_test_config(const fs::path& xdg_config_dir,
                                       bool disable_summary = true,
                                       bool disable_diarization = false,
                                       bool disable_vad = false) {
     fs::path cfg_dir = xdg_config_dir / "recmeet";
     fs::create_directories(cfg_dir);
-    std::ofstream cfg(cfg_dir / "config.yaml");
+    std::ofstream cfg(cfg_dir / "daemon.yaml");
     REQUIRE(cfg.is_open());
     cfg << "# recmeet full-stack test config\n";
     if (disable_summary) {
