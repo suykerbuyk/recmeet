@@ -612,6 +612,16 @@ if(RECMEET_BUILD_TESTS)
         # SKIPs cleanly on hosts without an audio server / playback
         # CLI; `make full-stack` runs it locally, CI does not.
         tests/test_full_stack_live.cpp
+        # Phase 3 of meeting-note-attempt-counter (iter 228) —
+        # `[full-stack][note-attempts]` end-to-end coverage for the `.XX`
+        # attempt-counter feature. Drives process.submit + chunked upload,
+        # process.reprocess, meetings.read_note, and process.fetch against
+        # a SpawnedDaemon over Unix; asserts on-disk filename shape
+        # (Meeting_<ts>.00*.md + Meeting_<ts>.01*.md), highest-attempt
+        # selection by read_note, and multi-`.md` artifact return from
+        # fetch. Closes the subprocess + IPC + disk-write seam the
+        # in-process unit tests can't exercise.
+        tests/test_full_stack_note_attempts.cpp
         tests/test_integration_pipeline.cpp
         tests/streaming_capture_tests.cpp
         tests/streaming_engine_tests.cpp

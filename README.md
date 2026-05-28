@@ -357,7 +357,8 @@ meetings/2026-02-20_14-30/
   audio_2026-02-20_14-30.wav      # Mixed mic + monitor (16kHz mono S16LE)
   context_2026-02-20_14-30.json   # Pre-recording context note (only if provided)
   speakers_2026-02-20_14-30.json  # Per-meeting speaker data (only if --diarize)
-  Meeting_2026-02-20_14-30_Project_Kickoff.md  # Meeting note
+  Meeting_2026-02-20_14-30.00_Project_Kickoff.md  # Meeting note (first attempt)
+  Meeting_2026-02-20_14-30.01_Updated_Kickoff_Plan.md  # Reprocess attempt 1
 ```
 
 Up to four files per meeting. The audio + meeting note are always present. The context file is written only when the user provided context (via the tray dialog, `--context-text`, or `--context-file`) — it persists the prompt across reprocess. The speakers file is written only when diarization runs.
@@ -380,7 +381,7 @@ When speakers are enrolled via `--enroll`, their real names replace generic `Spe
 
 ### Meeting note
 
-Filename includes an AI-derived title (e.g. `Meeting_2026-02-20_14-30_Project_Kickoff.md`). Contains YAML frontmatter with enriched metadata (date, time, type, domain, status, tags, participants, duration), a summary callout, action item checkboxes, and a foldable transcript section. Compatible with Obsidian Dataview.
+Filename includes a zero-padded reprocess-attempt counter (`.00`, `.01`, ...) and an AI-derived title (e.g. `Meeting_2026-02-20_14-30.00_Project_Kickoff.md`). The counter is inserted between the timestamp and the title, sorts oldest-to-newest within a single recording, and increments by one each time the meeting is reprocessed — preserving every prior attempt's note for comparison instead of overwriting it. Existing un-numbered notes from earlier recmeet versions are migrated to the new form on the first new write (sorted by file mtime: oldest becomes `.00`, next `.01`, and so on; filename ascending as the tiebreak). Contains YAML frontmatter with enriched metadata (date, time, type, domain, status, tags, participants, duration), a summary callout, action item checkboxes, and a foldable transcript section. Compatible with Obsidian Dataview.
 
 ## Reprocess
 
