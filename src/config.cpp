@@ -827,7 +827,7 @@ void save_legacy_config_as_job_config(const JobConfig& cfg, const fs::path& conf
 
 ServerConfig load_server_config(const fs::path& config_path) {
     ServerConfig cfg;
-    fs::path path = config_path.empty() ? config_dir() / "daemon.yaml" : config_path;
+    fs::path path = config_path.empty() ? server_config_dir() / "daemon.yaml" : config_path;
 
     // DUAL fallback: env-provided API key seeds api_key the same way
     // the monolithic load_config does.
@@ -1045,7 +1045,7 @@ ServerConfig load_server_config(const fs::path& config_path) {
 
 ClientConfig load_client_config(const fs::path& config_path) {
     ClientConfig cfg;
-    fs::path path = config_path.empty() ? config_dir() / "client.yaml" : config_path;
+    fs::path path = config_path.empty() ? client_config_dir() / "client.yaml" : config_path;
 
     // DUAL primary: env-provided API key seeds api_key.
     for (size_t i = 0; i < NUM_PROVIDERS; ++i) {
@@ -1243,7 +1243,7 @@ JobConfig load_cli_config(const fs::path& server_path,
 void save_server_config(const ServerConfig& cfg, const fs::path& config_path) {
     fs::path path;
     if (config_path.empty()) {
-        fs::path dir = config_dir();
+        fs::path dir = server_config_dir();
         fs::create_directories(dir);
         path = dir / "daemon.yaml";
     } else {
@@ -1410,7 +1410,7 @@ void save_server_config(const ServerConfig& cfg, const fs::path& config_path) {
 void save_client_config(const ClientConfig& cfg, const fs::path& config_path) {
     fs::path path;
     if (config_path.empty()) {
-        fs::path dir = config_dir();
+        fs::path dir = client_config_dir();
         fs::create_directories(dir);
         path = dir / "client.yaml";
     } else {
