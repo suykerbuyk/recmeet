@@ -2,7 +2,7 @@
 Description=Recmeet Daemon Socket
 
 [Socket]
-ListenStream=%t/recmeet/daemon.sock
+ListenStream=%t/recmeet-server/server.sock
 SocketMode=0700
 
 [Install]
