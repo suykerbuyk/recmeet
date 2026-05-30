@@ -173,7 +173,7 @@ std::string get_meeting_id(IpcClient& client, int64_t job_id) {
 // promoted, per plan guidance.
 void write_daemon_yaml(const fs::path& xdg_config_dir,
                        const fs::path& meetings_root) {
-    fs::path cfg_dir = xdg_config_dir / "recmeet";
+    fs::path cfg_dir = xdg_config_dir / "recmeet-server";
     fs::create_directories(cfg_dir);
     std::ofstream cfg(cfg_dir / "daemon.yaml");
     REQUIRE(cfg.is_open());

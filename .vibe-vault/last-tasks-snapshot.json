@@ -1,10 +1,9 @@
 {
-  "iter_n": 228,
-  "anchor_sha": "5fcbbda1e8bcd512511875a8b955c81eb2356f25",
+  "iter_n": 229,
+  "anchor_sha": "285166a6f245606c44c20d50ae1cfa206ce62ac7",
   "active": [
     "feat-v2-full-stack-ci-timeout",
     "full-stack-captions-60min-regression",
-    "full-stack-webui-meeting-dir-regression",
     "meeting-note-handler-pipeline-layout-mismatch",
     "meetingdata-attempt-aware",
     "sherpa-onnx-1-13-bump",
@@ -45,6 +44,7 @@
     "fix-watchdog-diarization-deadlock",
     "floofy-percolating-dahl",
     "full-stack-pipeline-integration-test",
+    "full-stack-webui-meeting-dir-regression",
     "fullstack-captions-quality-gates",
     "giggly-dreaming-cascade",
     "gleaming-mixing-squirrel",

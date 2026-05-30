@@ -165,7 +165,7 @@ std::string get_meeting_id(IpcClient& client, int64_t job_id) {
 void write_daemon_yaml(const fs::path& xdg_config_dir,
                        const fs::path& meetings_root,
                        const fs::path& speaker_db) {
-    fs::path cfg_dir = xdg_config_dir / "recmeet";
+    fs::path cfg_dir = xdg_config_dir / "recmeet-server";
     fs::create_directories(cfg_dir);
     std::ofstream cfg(cfg_dir / "daemon.yaml");
     REQUIRE(cfg.is_open());
@@ -197,9 +197,9 @@ void write_daemon_yaml(const fs::path& xdg_config_dir,
 // approach silently no-ops when the file is absent. Writing the file is
 // the structurally correct fix.
 void write_tray_config_yaml(const fs::path& xdg_config_dir) {
-    fs::path cfg_dir = xdg_config_dir / "recmeet";
+    fs::path cfg_dir = xdg_config_dir / "recmeet-client";
     fs::create_directories(cfg_dir);
-    std::ofstream cfg(cfg_dir / "config.yaml");
+    std::ofstream cfg(cfg_dir / "client.yaml");
     REQUIRE(cfg.is_open());
     cfg << "# recmeet tray config (full-stack webui test)\n"
         << "logging:\n"
