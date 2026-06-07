@@ -25,6 +25,8 @@ compile_commands.json
 CLAUDE.md
 commit.msg
 .claude/
+.grok/
+.vibe-palace/
 
 # makepkg artifacts
 dist/arch/src/
