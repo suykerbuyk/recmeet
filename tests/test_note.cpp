@@ -721,3 +721,101 @@ TEST_CASE("write_meeting_note: handles empty summary gracefully", "[note]") {
 
     fs::remove_all(dir);
 }
+
+// ---------------------------------------------------------------------------
+// migrate_stray_meeting_notes — flatten pre-fix <meeting_dir>/YYYY/MM/ notes
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// Create `<parent>/<rel>` and write `body` into it (parents auto-created).
+void seed_file(const fs::path& parent, const fs::path& rel,
+               const std::string& body) {
+    fs::path full = parent / rel;
+    fs::create_directories(full.parent_path());
+    std::ofstream out(full);
+    out << body;
+}
+
+} // namespace
+
+TEST_CASE("migrate_stray_meeting_notes: flattens YYYY/MM note + prunes buckets",
+          "[note][note-migration]") {
+    auto root = recmeet::test::tmp_path("recmeet_test_migrate");
+    fs::create_directories(root);
+    const std::string ts = "2026-05-26_14-30";
+    const fs::path mdir = root / ts;
+    // Pre-fix layout: note buried in <meeting_dir>/2026/05/.
+    seed_file(mdir, fs::path("2026") / "05" / ("Meeting_" + ts + ".00_Title.md"),
+              "body");
+
+    std::size_t moved = migrate_stray_meeting_notes(root);
+
+    CHECK(moved == 1);
+    CHECK(fs::exists(mdir / ("Meeting_" + ts + ".00_Title.md")));   // flat now
+    CHECK_FALSE(fs::exists(mdir / "2026" / "05"));                  // pruned
+    CHECK_FALSE(fs::exists(mdir / "2026"));                         // pruned
+
+    fs::remove_all(root);
+}
+
+TEST_CASE("migrate_stray_meeting_notes: idempotent — second run is a no-op",
+          "[note][note-migration]") {
+    auto root = recmeet::test::tmp_path("recmeet_test_migrate_idem");
+    fs::create_directories(root);
+    const std::string ts = "2026-05-26_14-30";
+    seed_file(root / ts,
+              fs::path("2026") / "05" / ("Meeting_" + ts + ".00.md"), "body");
+
+    CHECK(migrate_stray_meeting_notes(root) == 1);
+    CHECK(migrate_stray_meeting_notes(root) == 0);   // nothing left to move
+    CHECK(fs::exists(root / ts / ("Meeting_" + ts + ".00.md")));
+
+    fs::remove_all(root);
+}
+
+TEST_CASE("migrate_stray_meeting_notes: never clobbers an existing flat note",
+          "[note][note-migration]") {
+    auto root = recmeet::test::tmp_path("recmeet_test_migrate_collide");
+    fs::create_directories(root);
+    const std::string ts = "2026-05-26_14-30";
+    const fs::path mdir = root / ts;
+    const std::string fname = "Meeting_" + ts + ".00.md";
+    // A flat note already exists; the buried copy must NOT overwrite it.
+    seed_file(mdir, fname, "flat-wins");
+    seed_file(mdir, fs::path("2026") / "05" / fname, "buried-loses");
+
+    std::size_t moved = migrate_stray_meeting_notes(root);
+
+    CHECK(moved == 0);
+    CHECK(read_file(mdir / fname) == "flat-wins");              // untouched
+    CHECK(fs::exists(mdir / "2026" / "05" / fname));            // stray kept
+    CHECK(read_file(mdir / "2026" / "05" / fname) == "buried-loses");
+
+    fs::remove_all(root);
+}
+
+TEST_CASE("migrate_stray_meeting_notes: ignores non-meeting dirs and subdirs",
+          "[note][note-migration]") {
+    auto root = recmeet::test::tmp_path("recmeet_test_migrate_ignore");
+    fs::create_directories(root);
+    // Not a canonical meeting dir name → skipped entirely.
+    seed_file(root, fs::path("not-a-meeting") / "2026" / "05"
+                        / "Meeting_2026-05-26_14-30.00.md", "x");
+    // Canonical meeting dir, but the buried file is NOT a meeting note.
+    seed_file(root, fs::path("2026-05-26_14-30") / "2026" / "05" / "stray.txt",
+              "y");
+    // Canonical meeting dir with an unrelated (non-YYYY) subdir → untouched.
+    seed_file(root, fs::path("2026-05-26_15-00") / "attachments"
+                        / "Meeting_2026-05-26_15-00.00.md", "z");
+
+    std::size_t moved = migrate_stray_meeting_notes(root);
+
+    CHECK(moved == 0);
+    CHECK(fs::exists(root / "not-a-meeting" / "2026" / "05"
+                     / "Meeting_2026-05-26_14-30.00.md"));
+    CHECK(fs::exists(root / "2026-05-26_15-00" / "attachments"
+                     / "Meeting_2026-05-26_15-00.00.md"));
+
+    fs::remove_all(root);
+}

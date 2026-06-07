@@ -162,6 +162,13 @@ else
         > "$SMOKE_ROOT/meetings/v2_meeting/context.json"
 fi
 
+# Seed a flat Meeting_*.md so `meetings.read_note` has a note to return,
+# independent of whatever layout $V2_SRC (operator-local real data) carries.
+# read_note resolves the dir via meeting_id from context.json and matches
+# `Meeting_*.md` non-recursively, so a flat note here guarantees a hit.
+printf '# Smoke note\n' \
+    > "$SMOKE_ROOT/meetings/v2_meeting/Meeting_2020-01-01_00-00.00_Smoke.md"
+
 # ---------------------------------------------------------------------------
 # Cleanup trap (rev-2 M2 + M3)
 # ---------------------------------------------------------------------------
@@ -320,14 +327,13 @@ assert_status "GET /api/meetings/<v2>/speakers is 200" \
 assert_jq "GET /api/meetings/<v2>/speakers is array shape" \
     "$URL/api/meetings/$V2_MID/speakers" '. | type == "array"'
 
-# Note endpoint — rev-2 M1: accept set is 200|400 (the translator does
-# NOT emit 404 for missing notes; src/tray_web.cpp:150-161 confirms).
-NOTE_STATUS=$(curl -sS "$URL/api/meetings/$V2_MID/note" \
-              -o /dev/null -w '%{http_code}')
-case "$NOTE_STATUS" in
-    200|400|404) record ok   "GET /api/meetings/<v2>/note returns 200|400|404 (HTTP $NOTE_STATUS)" ;;
-    *)           record fail "GET /api/meetings/<v2>/note returns 200|400|404" "got $NOTE_STATUS" ;;
-esac
+# Note endpoint — strict 200 now that the flat-layout fix lets read_note
+# reach the daemon's own meeting dir. We seed a flat Meeting_*.md into the
+# v2_meeting dir above, so the non-recursive handler always finds a note.
+# (Was a permissive 200|400|404 while the layout-mismatch bug masked the
+# 404 — see meeting-note-handler-pipeline-layout-mismatch.)
+assert_status "GET /api/meetings/<v2>/note is 200" \
+    "$URL/api/meetings/$V2_MID/note" 200
 
 # Speakers endpoint.
 assert_status "GET /api/speakers is 200" "$URL/api/speakers" 200

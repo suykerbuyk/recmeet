@@ -54,6 +54,16 @@ MeetingMetadata extract_meeting_metadata(const std::string& summary);
 /// Remove the metadata block (Title/Tags/Description lines) from the summary body.
 std::string strip_metadata_block(const std::string& summary);
 
+/// One-time migration: relocate stray `<meeting_dir>/<YYYY>/<MM>/Meeting_*.md`
+/// notes up into `<meeting_dir>/` for every canonical meeting dir under
+/// `meetings_root`. Default-config recordings written before the flat-layout
+/// fix landed their notes in a YYYY/MM bucket the non-recursive readers
+/// (meetings.read_note, enumerate_artifacts) never enter; this flattens them.
+/// Idempotent and collision-safe (never clobbers an existing flat note);
+/// empty YYYY/MM dirs are pruned best-effort. Returns the count moved.
+/// Intended caller: daemon startup, before MeetingIndex::rebuild_from_disk.
+std::size_t migrate_stray_meeting_notes(const fs::path& meetings_root);
+
 // ---------------------------------------------------------------------------
 // note_internal — implementation helpers exported for direct unit-test
 // reachability. NOT a public API for production consumers; the only

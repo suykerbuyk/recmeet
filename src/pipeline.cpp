@@ -949,9 +949,14 @@ PipelineResult run_postprocessing(const JobConfig& cfg, const PostprocessInput& 
         if (!cfg.note_dir.empty()) {
             md.note_dir = cfg.note_dir;
             fs::create_directories(md.note_dir);
-        } else {
-            md.note_dir = input.out_dir;
         }
+        // else: leave md.note_dir empty. The writer (note.cpp:295) then writes
+        // the note flat in md.output_dir (= the meeting dir) with no YYYY/MM
+        // wrapper, matching the documented contract (config.h:192 "empty = use
+        // output_dir") and the non-recursive read paths (meetings.read_note,
+        // enumerate_artifacts). Setting md.note_dir = input.out_dir here would
+        // trip the writer's YYYY/MM branch and bury the note where the readers
+        // never look.
 
         // AI-derived metadata
         md.title = metadata.title;

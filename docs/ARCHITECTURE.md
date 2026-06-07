@@ -1091,7 +1091,7 @@ The shared data access layer. Both the MCP server and agent import this package 
 
 **Config loading** — Parses `~/.config/recmeet/config.yaml` using a line-based YAML parser that matches the C++ parser's behavior (flat sections with indented key-value pairs, not full YAML spec). Resolves `$XDG_CONFIG_HOME` and `$XDG_DATA_HOME` for paths.
 
-**Meeting discovery** — Scans the output directory for directories matching `YYYY-MM-DD_HH-MM`, finds audio files (timestamped or legacy `audio.wav`), and locates corresponding note files across multiple directory structures (meeting dir, `YYYY/MM/` subdirs, note dir root).
+**Meeting discovery** — Scans the output directory for directories matching `YYYY-MM-DD_HH-MM`, finds audio files (timestamped or legacy `audio.wav`), and locates corresponding note files across multiple directory structures (meeting dir, `YYYY/MM/` subdirs, note dir root). Note: with the default (unset) `note_dir`, the canonical note location is **flat in the meeting dir** (`<meeting_dir>/Meeting_*.md`) — the daemon's `meetings.read_note` / `process.fetch` read paths scan it non-recursively, and a one-time startup migration relocates any legacy `<meeting_dir>/YYYY/MM/` notes up into the meeting dir. The `YYYY/MM/` hierarchy is only produced when an explicit `note_dir` is configured. The Go `meetingdata` reader keeps tolerating all layouts for backward compatibility (see the `meetingdata-attempt-aware` follow-up).
 
 **Note parsing** — Extracts YAML frontmatter, callout sections (summary, context, transcript using `> [!type]` syntax), and action items. Search supports keyword matching against title, summary, tags, and participants, with date range and participant filters.
 

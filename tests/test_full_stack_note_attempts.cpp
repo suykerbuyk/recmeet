@@ -29,32 +29,24 @@
 // test-and-verification-hardening, iter 215; reference pattern:
 // tests/test_full_stack_webui.cpp).
 //
-// Scope note (iter 228 — what this test deliberately does NOT assert):
+// Full end-to-end contract (the layout-mismatch bug is now fixed — see
+// meeting-note-handler-pipeline-layout-mismatch task / src/pipeline.cpp):
 //
-//   * meetings.read_note over real IPC. The Phase 2 IPC tests in
-//     tests/test_speakers_meetings_ipc.cpp cover the handler's
-//     highest-attempt-wins + legacy-mtime-tiebreak ordering against
-//     the production handler via DaemonTestHarness. Driving it
-//     end-to-end here was attempted and surfaced a pre-existing
-//     architecture mismatch: the production pipeline routes notes to
-//     `<meeting_dir>/<YYYY>/<MM>/Meeting_*.md` (because pipeline.cpp:953
-//     sets `md.note_dir = input.out_dir` as a fallback, and the writer's
-//     YYYY/MM branch fires for any non-empty note_dir), while the
-//     meetings.read_note handler iterates `meeting_path` non-recursively
-//     and therefore never sees the note at all. That is a real bug
-//     orthogonal to this commit series — opening that scope here would
-//     conflate two independent concerns. The mismatch is surfaced in
-//     the orchestrator report so the operator can decide the followup.
+//   * meetings.read_note over real IPC. With `note_dir` unset, the FIXED
+//     pipeline writes the note flat in the meeting dir (no YYYY/MM
+//     bucket), so the non-recursive `meetings.read_note` handler finds
+//     it. This test drives the handler end-to-end and asserts it returns
+//     the highest-attempt note's markdown (the `.01` after reprocess).
+//     The Phase 2 IPC tests in tests/test_speakers_meetings_ipc.cpp cover
+//     the handler's highest-attempt-wins + legacy-mtime-tiebreak ordering
+//     against seeded fixtures; this adds the production-pipeline-writes-it
+//     leg those tests can't reach.
 //
-//   * process.fetch returning N `.md` artifacts. Same root cause: the
-//     fetch enumerator (`enumerate_artifacts` in src/fetch_artifacts.cpp)
-//     is intentionally non-recursive and excludes the YYYY/MM subtree,
-//     so the daemon's own pipeline output is never reachable via fetch
-//     in the V1 layout. Plan rev-4 decision 10 cited fetch as
-//     pre-verified by source inspection of `enumerate_artifacts` — but
-//     the inspection missed that no `.md` actually lands in `out_dir`
-//     under the current pipeline. Same architectural conversation as
-//     above; same out-of-scope verdict.
+//   * process.fetch returning the `.md` artifacts. Same fix: the note now
+//     lands flat in `Job::input.out_dir`, so the non-recursive
+//     `enumerate_artifacts` (src/fetch_artifacts.cpp) ships it as a 0x02
+//     binary frame. This test asserts a successful fetch returns at least
+//     one `.md` artifact written to disk.
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -214,18 +206,15 @@ TEST_CASE("V2 full-stack note-attempts: submit writes .00, reprocess writes .01"
 
     // --------------------------------------------------------------------
     // 3. IPC client + session init. We deliberately leave `note_dir`
-    //    UNSET in session prefs so the pipeline falls back to writing
-    //    the note INSIDE the per-meeting `<output_dir>/<ts>/` directory
-    //    (note.cpp:160 — `data.note_dir.empty() ? data.output_dir`).
-    //    Why this matters: `process.fetch` enumerates artifacts non-
-    //    recursively in `Job::input.out_dir` (= the meeting dir);
-    //    setting `note_dir` would push notes to
-    //    `<note_dir>/<YYYY>/<MM>/Meeting_*.md`, which is outside
-    //    `out_dir` and would never be returned by fetch. The decision-10
-    //    contract (fetch returns ALL `.md` attempts for the meeting) is
-    //    therefore only observable in the no-note_dir layout — and that
-    //    is the layout the V2 thin-client uses (the client owns its
-    //    own note_dir / Obsidian vault path post-fetch).
+    //    UNSET in session prefs so the pipeline writes the note flat
+    //    INSIDE the per-meeting `<output_dir>/<ts>/` directory
+    //    (note.cpp — `data.note_dir.empty() ? data.output_dir`, and the
+    //    writer's YYYY/MM branch only fires for an explicit note_dir).
+    //    Why this matters: `meetings.read_note` + `process.fetch` both
+    //    scan the meeting dir non-recursively, so the flat layout is the
+    //    one where the daemon can read back its own output. This is the
+    //    layout the V2 thin-client uses (the client owns its own note_dir
+    //    / Obsidian vault path post-fetch).
     // --------------------------------------------------------------------
     IpcClient client(sock_path.string());
     REQUIRE(client.connect());
@@ -300,19 +289,14 @@ TEST_CASE("V2 full-stack note-attempts: submit writes .00, reprocess writes .01"
     const std::string ts = meeting_dir.filename().string();
     INFO("Meeting timestamp: " << ts);
 
-    // Note layout: the V1/V2 pipeline routes every note through
-    // `<note_parent>/YYYY/MM/Meeting_<ts>.NN[_<title>].md` because
-    // `pipeline.cpp::run_postprocessing()` sets
-    // `md.note_dir = input.out_dir` as the fallback when `cfg.note_dir`
-    // is empty (pipeline.cpp:949-954), and the writer's YYYY/MM-subdir
-    // branch (note.cpp:300-305) fires for any non-empty `note_dir`
-    // regardless of whether it equals `output_dir`. The note therefore
-    // lands at `<meeting_dir>/<YYYY>/<MM>/Meeting_<ts>.NN*.md`.
-    //
-    // This is the layout the directory scan must target.
-    const std::string year = ts.substr(0, 4);
-    const std::string month = ts.substr(5, 2);
-    const fs::path note_layout_dir = meeting_dir / year / month;
+    // Note layout: with `note_dir` unset the pipeline writes the note
+    // flat in the meeting dir — `<meeting_dir>/Meeting_<ts>.NN[_<title>].md`
+    // — per the documented contract (config.h:192) now that the
+    // `md.note_dir = input.out_dir` fallback is gone (pipeline.cpp). The
+    // writer's YYYY/MM-subdir branch (note.cpp) only fires for an explicit
+    // non-empty `note_dir`. This flat dir is what both the directory scan
+    // below and the daemon's non-recursive read paths target.
+    const fs::path note_layout_dir = meeting_dir;
 
     // After the first write, the only `Meeting_*.md` on disk must be
     // `Meeting_<ts>.00[_<title>].md` — confirms the writer composed the
@@ -404,6 +388,54 @@ TEST_CASE("V2 full-stack note-attempts: submit writes .00, reprocess writes .01"
         }
         CHECK_FALSE(note00_name.empty());
         CHECK_FALSE(note01_name.empty());
+    }
+
+    // --------------------------------------------------------------------
+    // 5b. meetings.read_note over real IPC must return the HIGHEST attempt
+    //     (`.01`) the daemon's own pipeline just wrote. This is the leg the
+    //     layout-mismatch bug used to break: the flat-layout fix lets the
+    //     non-recursive handler reach the note. We compare the returned
+    //     markdown byte-for-byte against the `.01` file on disk.
+    // --------------------------------------------------------------------
+    {
+        JsonMap p;
+        p["meeting_id"] = meeting_id;
+        IpcResponse resp;
+        IpcError err;
+        REQUIRE(client.call("meetings.read_note", p, resp, err,
+                            /*timeout_ms=*/5000));
+        const std::string content = json_val_as_string(resp.result["content"]);
+        CHECK_FALSE(content.empty());
+
+        std::ifstream in(note_layout_dir / note01_name, std::ios::binary);
+        std::ostringstream buf;
+        buf << in.rdbuf();
+        INFO("read_note returned " << content.size() << " bytes; .01 on disk = "
+             << note01_name);
+        CHECK(content == buf.str());
+    }
+
+    // --------------------------------------------------------------------
+    // 5c. process.fetch must ship the `.md` note(s) as binary frames now
+    //     that they live flat in the meeting dir (= Job::input.out_dir).
+    //     A successful fetch returns at least one `.md` artifact on disk.
+    // --------------------------------------------------------------------
+    {
+        fs::path fetch_dst = workdir / "fetched";
+        IpcError fetch_err;
+        auto written = client.fetch_artifacts(reprocess_job_id, fetch_dst,
+                                              fetch_err, /*timeout_ms=*/10000);
+        INFO("fetch_artifacts error: " << fetch_err.message);
+        INFO("fetch_artifacts returned " << written.size() << " artifacts");
+        CHECK(fetch_err.message.empty());
+        std::size_t md_count = 0;
+        for (const auto& path : written) {
+            CHECK(fs::exists(path));
+            const std::string nm = path.filename().string();
+            if (nm.size() >= 3 && nm.compare(nm.size() - 3, 3, ".md") == 0)
+                ++md_count;
+        }
+        CHECK(md_count >= 1);
     }
 
     // --------------------------------------------------------------------

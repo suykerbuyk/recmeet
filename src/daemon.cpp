@@ -21,6 +21,7 @@
 #include "notify.h"
 #include "pipeline.h"
 #include "meeting_index.h"
+#include "note.h"
 #include "meetings_browse.h"
 #include "session_manager.h"
 #include "streaming_session.h"
@@ -1654,6 +1655,17 @@ int main(int argc, char* argv[]) {
     // `context.json`, and repopulates the map. Cost amortizes against
     // startup; no on-disk index file in v1.
     {
+        // One-time flat-layout migration: pre-fix default-config recordings
+        // wrote notes into a `<meeting_dir>/YYYY/MM/` bucket the non-recursive
+        // read paths never enter. Flatten them BEFORE the index rebuild so the
+        // on-disk state is canonical before any reprocess can run. (The index
+        // keys off context.json, not notes, so order doesn't affect bindings.)
+        std::size_t moved =
+            recmeet::migrate_stray_meeting_notes(g_server_config.meetings_root);
+        if (moved)
+            log_info("daemon: migrated %zu stray meeting note%s to flat layout",
+                     moved, moved == 1 ? "" : "s");
+
         g_meeting_index = std::make_unique<MeetingIndex>();
         std::size_t n = g_meeting_index->rebuild_from_disk(g_server_config.meetings_root);
         log_info("daemon: meeting index ready (rebuilt %zu binding%s from %s)",

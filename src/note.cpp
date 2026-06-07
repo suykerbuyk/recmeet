@@ -445,4 +445,106 @@ fs::path write_meeting_note(const NoteConfig& config, const MeetingData& data) {
     return note_path;
 }
 
+namespace {
+
+// True for a `YYYY-MM-DD_HH-MM` (canonical) meeting dir name, optionally
+// with a `_<n>` collision suffix. Mirrors reprocess_batch.cpp's
+// meeting_dir_regex(); kept local to avoid a cross-TU dependency.
+bool looks_like_meeting_dir(const std::string& name) {
+    static const std::regex re(R"(^\d{4}-\d{2}-\d{2}_\d{2}-\d{2}(?:_\d+)?$)");
+    return std::regex_match(name, re);
+}
+
+bool is_year_dir(const std::string& name) {
+    static const std::regex re(R"(^\d{4}$)");
+    return std::regex_match(name, re);
+}
+
+bool is_month_dir(const std::string& name) {
+    static const std::regex re(R"(^\d{2}$)");
+    return std::regex_match(name, re);
+}
+
+bool is_meeting_note(const std::string& name) {
+    return starts_with(name, "Meeting_")
+           && name.size() >= 3
+           && name.compare(name.size() - 3, 3, ".md") == 0;
+}
+
+// Move every `<meeting_dir>/<YYYY>/<MM>/Meeting_*.md` up into
+// `<meeting_dir>/`. Returns the count moved. Pre-fix default-config notes
+// landed in this YYYY/MM bucket (see pipeline.cpp / config.h:192); the
+// readers (meetings.read_note, enumerate_artifacts) scan the meeting dir
+// non-recursively, so the buckets must be flattened. Idempotent and
+// collision-safe: an existing flat note of the same name is never
+// clobbered. Best-effort empty-dir pruning after the moves.
+std::size_t migrate_one_meeting_dir(const fs::path& meeting_dir) {
+    std::size_t moved = 0;
+    std::error_code ec;
+    for (const auto& yentry : fs::directory_iterator(meeting_dir, ec)) {
+        if (ec) break;
+        if (!yentry.is_directory(ec) || ec) continue;
+        const fs::path year_dir = yentry.path();
+        if (!is_year_dir(year_dir.filename().string())) continue;
+
+        for (const auto& mentry : fs::directory_iterator(year_dir, ec)) {
+            if (ec) break;
+            if (!mentry.is_directory(ec) || ec) continue;
+            const fs::path month_dir = mentry.path();
+            if (!is_month_dir(month_dir.filename().string())) continue;
+
+            for (const auto& nentry : fs::directory_iterator(month_dir, ec)) {
+                if (ec) break;
+                if (!nentry.is_regular_file(ec) || ec) continue;
+                const std::string fname = nentry.path().filename().string();
+                if (!is_meeting_note(fname)) continue;
+
+                const fs::path dst = meeting_dir / fname;
+                std::error_code exist_ec;
+                if (fs::exists(dst, exist_ec)) {
+                    log_warn("note migration: flat note already exists, "
+                             "leaving stray copy: %s",
+                             nentry.path().string().c_str());
+                    continue;
+                }
+                std::error_code mv_ec;
+                fs::rename(nentry.path(), dst, mv_ec);
+                if (mv_ec) {
+                    log_warn("note migration: rename failed %s -> %s: %s",
+                             nentry.path().string().c_str(),
+                             dst.string().c_str(), mv_ec.message().c_str());
+                    continue;
+                }
+                ++moved;
+            }
+            // Prune the now-(maybe-)empty month dir; ignore non-empty/errors.
+            std::error_code rm_ec;
+            fs::remove(month_dir, rm_ec);
+        }
+        std::error_code rm_ec;
+        fs::remove(year_dir, rm_ec);
+    }
+    return moved;
+}
+
+} // anonymous namespace
+
+std::size_t migrate_stray_meeting_notes(const fs::path& meetings_root) {
+    std::error_code ec;
+    if (!fs::is_directory(meetings_root, ec)) return 0;
+
+    std::size_t moved = 0;
+    for (const auto& entry : fs::directory_iterator(meetings_root, ec)) {
+        if (ec) {
+            log_warn("note migration: directory_iterator error at %s: %s",
+                     meetings_root.string().c_str(), ec.message().c_str());
+            break;
+        }
+        if (!entry.is_directory(ec) || ec) continue;
+        if (!looks_like_meeting_dir(entry.path().filename().string())) continue;
+        moved += migrate_one_meeting_dir(entry.path());
+    }
+    return moved;
+}
+
 } // namespace recmeet
