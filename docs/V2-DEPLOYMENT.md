@@ -49,28 +49,28 @@ make install
 
 This:
 
-1. Builds the four C++ binaries (`recmeet`, `recmeet-daemon`, `recmeet-tray`, `recmeet-web`).
+1. Builds the three C++ binaries (`recmeet-server`, `recmeet-client`, `recmeet-cli`). (V1's separate `recmeet-web` is gone — the WebUI now ships embedded in `recmeet-client`.)
 2. Installs to `$DESTDIR$PREFIX` (default `/usr/local`).
-3. Drops the systemd user units (`recmeet-daemon.service`, `recmeet-daemon.socket`, `recmeet-tray.service`) under `share/systemd/user/`.
-4. Runs `recmeet --no-daemon --download-models` to seed the model cache.
-5. Enables and starts `recmeet-daemon.service` via `systemctl --user enable --now`.
+3. Drops the systemd user units (`recmeet-server.service`, `recmeet-server.socket`, `recmeet-client.service`) under `share/systemd/user/`.
+4. Runs `recmeet-cli --no-daemon --download-models` to seed the model cache.
+5. Enables and starts `recmeet-server.service` via `systemctl --user enable --now`.
 
 If `make install` runs under `DESTDIR` (i.e. you are packaging, not installing into a live session) it skips the model download and the `systemctl --user` step — the package's post-install scripts are expected to handle them on the target machine.
 
 ### Verify
 
 ```bash
-recmeet --status
+recmeet-cli --status
 ```
 
-Expected output is a JSON-ish status line showing the daemon's composite state — one of `idle`, `postprocessing`, `streaming`, or `downloading`, plus per-slot booleans. If `recmeet --status` reports "daemon not running", check:
+Expected output is a JSON-ish status line showing the daemon's composite state — one of `idle`, `postprocessing`, `streaming`, or `downloading`, plus per-slot booleans. If `recmeet-cli --status` reports "daemon not running", check:
 
 ```bash
-systemctl --user status recmeet-daemon.service
-journalctl --user -u recmeet-daemon.service -n 50
+systemctl --user status recmeet-server.service
+journalctl --user -u recmeet-server.service -n 50
 ```
 
-The tray icon (ayatana-appindicator) should appear automatically if `recmeet-tray.service` is enabled or the desktop session autostarts `recmeet-tray.desktop`. Right-click the icon for the menu (Start / Stop / Reprocess / Settings).
+The tray icon (ayatana-appindicator) should appear automatically if `recmeet-client.service` is enabled or the desktop session autostarts `recmeet-client.desktop`. Right-click the icon for the menu (Start / Stop / Reprocess / Settings).
 
 ### Where things live
 
@@ -100,22 +100,22 @@ Decide on a listening port (29991 used throughout this guide for examples) and a
 
 ```bash
 RECMEET_AUTH_TOKEN=$(openssl rand -hex 32) \
-  recmeet-daemon --listen 0.0.0.0:29991 --log-level info
+  recmeet-server --listen 0.0.0.0:29991 --log-level info
 ```
 
-The daemon will fail-fast and refuse to start if `--listen` parses as TCP but `RECMEET_AUTH_TOKEN` is unset — there is no warn-and-continue path. The error message is `recmeet-daemon: refusing to start TCP listener without RECMEET_AUTH_TOKEN set.` on stderr, logged as `daemon: refusing TCP startup — RECMEET_AUTH_TOKEN unset` in the log file.
+The daemon will fail-fast and refuse to start if `--listen` parses as TCP but `RECMEET_AUTH_TOKEN` is unset — there is no warn-and-continue path. The error message is `recmeet-server: refusing to start TCP listener without RECMEET_AUTH_TOKEN set.` on stderr, logged as `daemon: refusing TCP startup — RECMEET_AUTH_TOKEN unset` in the log file.
 
 **systemd user unit** (production):
 
-Override the shipped `recmeet-daemon.service` via a drop-in:
+Override the shipped `recmeet-server.service` via a drop-in:
 
 ```bash
-mkdir -p ~/.config/systemd/user/recmeet-daemon.service.d
-cat > ~/.config/systemd/user/recmeet-daemon.service.d/listen.conf <<'EOF'
+mkdir -p ~/.config/systemd/user/recmeet-server.service.d
+cat > ~/.config/systemd/user/recmeet-server.service.d/listen.conf <<'EOF'
 [Service]
 EnvironmentFile=%h/.config/recmeet/daemon.env
 ExecStart=
-ExecStart=/usr/local/bin/recmeet-daemon --listen 0.0.0.0:29991
+ExecStart=/usr/local/bin/recmeet-server --listen 0.0.0.0:29991
 EOF
 
 install -m 0600 /dev/stdin ~/.config/recmeet/daemon.env <<EOF
@@ -123,8 +123,8 @@ RECMEET_AUTH_TOKEN=$(openssl rand -hex 32)
 EOF
 
 systemctl --user daemon-reload
-systemctl --user restart recmeet-daemon.service
-systemctl --user status recmeet-daemon.service
+systemctl --user restart recmeet-server.service
+systemctl --user status recmeet-server.service
 ```
 
 The empty `ExecStart=` first line is required by systemd to clear the unit's shipped command before the override takes effect.
@@ -133,7 +133,7 @@ Verify the listener is up from the daemon host:
 
 ```bash
 ss -lnt | grep 29991
-journalctl --user -u recmeet-daemon.service | grep "PSK auth enabled"
+journalctl --user -u recmeet-server.service | grep "PSK auth enabled"
 ```
 
 You should see `daemon: PSK auth enabled for TCP listener` in the log on each start.
@@ -191,13 +191,13 @@ From the laptop:
 
 ```bash
 # CLI client, one-shot reprocess of a directory containing audio.wav
-recmeet --daemon-addr server:29991 --reprocess ~/audio/2026-05-15
+recmeet-cli --daemon-addr server:29991 --reprocess ~/audio/2026-05-15
 
 # CLI client, query daemon status
-recmeet --daemon-addr server:29991 --status
+recmeet-cli --daemon-addr server:29991 --status
 
 # Tray, configured via env var
-RECMEET_DAEMON_ADDR=server:29991 recmeet-tray
+RECMEET_DAEMON_ADDR=server:29991 recmeet-client
 ```
 
 `--daemon-addr` implicitly enables client mode (it sets `DaemonMode::Force`) so you do not need `--daemon` alongside it. If `RECMEET_DAEMON_ADDR` is set in the environment it acts as the fallback when `--daemon-addr` is not on the command line.
@@ -221,7 +221,7 @@ stunnel sits in front of the daemon, listens on a public port with a valid certi
 **Daemon side** (`/etc/stunnel/recmeet.conf`):
 
 ```ini
-[recmeet-daemon]
+[recmeet-server]
 accept = 0.0.0.0:29992
 connect = 127.0.0.1:29991
 cert = /etc/letsencrypt/live/recmeet.example.org/fullchain.pem
@@ -233,7 +233,7 @@ ciphers = TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256
 Run the daemon bound to loopback only:
 
 ```bash
-recmeet-daemon --listen 127.0.0.1:29991
+recmeet-server --listen 127.0.0.1:29991
 ```
 
 **Client side** (`/etc/stunnel/recmeet.conf`):
@@ -248,13 +248,13 @@ CAfile = /etc/ssl/certs/ca-certificates.crt
 checkHost = recmeet.example.org
 ```
 
-Then point the recmeet client at the local stunnel:
+Then point the recmeet-cli client at the local stunnel:
 
 ```bash
-recmeet --daemon-addr 127.0.0.1:29991 --status
+recmeet-cli --daemon-addr 127.0.0.1:29991 --status
 ```
 
-The recmeet client thinks it is talking to a local TCP daemon; stunnel does the TLS wrap transparently. Certificate lifecycle (renewal, distribution of the CA bundle, host verification) is the operator's responsibility.
+The recmeet-cli client thinks it is talking to a local TCP daemon; stunnel does the TLS wrap transparently. Certificate lifecycle (renewal, distribution of the CA bundle, host verification) is the operator's responsibility.
 
 ### Pattern B: WireGuard mesh
 
@@ -277,7 +277,7 @@ Then bind the daemon to the mesh address:
 
 ```bash
 RECMEET_AUTH_TOKEN=$(openssl rand -hex 32) \
-  recmeet-daemon --listen 10.42.0.1:29991
+  recmeet-server --listen 10.42.0.1:29991
 ```
 
 **Client side** (`/etc/wireguard/wg0.conf`):
@@ -297,7 +297,7 @@ PersistentKeepalive = 25
 And connect:
 
 ```bash
-recmeet --daemon-addr 10.42.0.1:29991 --status
+recmeet-cli --daemon-addr 10.42.0.1:29991 --status
 ```
 
 Tailscale, Nebula, or any other mesh VPN works the same way — substitute the mesh's interface address for `10.42.0.x`. The PSK is still required; treat it as belt-and-suspenders against a compromised mesh peer or a misconfigured `AllowedIPs`.
@@ -311,21 +311,21 @@ The daemon does NOT hot-reload `RECMEET_AUTH_TOKEN`. `SIGHUP` reloads `daemon.ya
 1. Generate the new token: `openssl rand -hex 32`.
 2. Update the `EnvironmentFile` (or wherever the token is sourced from) on the daemon host.
 3. Distribute the new token to every connecting client.
-4. `systemctl --user restart recmeet-daemon.service` — or `kill -TERM $(cat ~/.local/share/recmeet/runtime/daemon-tcp.pid)` if you are running it directly.
-5. Verify with `journalctl --user -u recmeet-daemon.service | tail -n 20` — look for `daemon: PSK auth enabled for TCP listener`.
+4. `systemctl --user restart recmeet-server.service` — or `kill -TERM $(cat ~/.local/share/recmeet/runtime/daemon-tcp.pid)` if you are running it directly.
+5. Verify with `journalctl --user -u recmeet-server.service | tail -n 20` — look for `daemon: PSK auth enabled for TCP listener`.
 
 Plan rotations during a quiet window. A restart drops every in-flight TCP connection and aborts any non-terminal job — postprocess, streaming, or model download. Phase D.3 reconnect with `resume_token` mitigates the operator-visible impact: once the daemon comes back, every tray that already shared the new PSK re-attaches its prior `client_id` and the per-slot drain queue (Phase D.1 / D.2) resumes from where it parked. Trays that have not yet been re-keyed see `auth.error: invalid_token` and surface "PSK rotation in progress" in their status row.
 
 ### Revocation
 
-Per-token revocation **does** exist as of C.13 — `recmeet-daemon --evict <resume_token_prefix>` removes a specific session from the daemon's lookup table immediately, so the next reconnect from that client falls back to fresh-token issuance. Use this for "this laptop was lost, kill its session without disturbing other clients." Coarse "log everyone out" still requires PSK rotation (which silently invalidates every outstanding `resume_token` on next reconnect, since the PSK check happens before the token lookup).
+Per-token revocation **does** exist as of C.13 — `recmeet-server --evict <resume_token_prefix>` removes a specific session from the daemon's lookup table immediately, so the next reconnect from that client falls back to fresh-token issuance. Use this for "this laptop was lost, kill its session without disturbing other clients." Coarse "log everyone out" still requires PSK rotation (which silently invalidates every outstanding `resume_token` on next reconnect, since the PSK check happens before the token lookup).
 
 ```bash
 # Find suspect tokens in the journal (prefixes are logged, full tokens never are)
-journalctl --user -u recmeet-daemon.service | grep "client_id=c-" | tail
+journalctl --user -u recmeet-server.service | grep "client_id=c-" | tail
 
 # Evict a specific session by token prefix (8+ hex chars)
-recmeet-daemon --evict abcd1234
+recmeet-server --evict abcd1234
 ```
 
 The TTLs on the resume-token map (24 h for the session binding, 1 h for orphaned in-flight jobs, 24 h for terminal jobs awaiting fetch) provide hands-off cleanup; `--evict` is the surgical override.
@@ -352,16 +352,16 @@ Failure reasons are `auth_required` (client sent something other than an `auth.t
 
 | Unit | Type | Purpose |
 |---|---|---|
-| `recmeet-daemon.service` | simple | Runs the daemon; restarts on failure (`RestartSec=5`). Memory caps via `MemoryHigh=10G` / `MemoryMax=14G`. See `dist/recmeet-daemon.service.in`. |
-| `recmeet-daemon.socket` | socket | Defines `ListenStream=%t/recmeet/daemon.sock` with `SocketMode=0700`. Present in the install tree but the daemon does not currently consume systemd-passed fds (it binds its own listen socket). |
-| `recmeet-tray.service` | simple | Optional — runs the tray applet under the user's graphical session. |
+| `recmeet-server.service` | simple | Runs the daemon; restarts on failure (`RestartSec=5`). Memory caps via `MemoryHigh=10G` / `MemoryMax=14G`. See `dist/recmeet-server.service.in`. |
+| `recmeet-server.socket` | socket | Defines `ListenStream=%t/recmeet/daemon.sock` with `SocketMode=0700`. Present in the install tree but the daemon does not currently consume systemd-passed fds (it binds its own listen socket). |
+| `recmeet-client.service` | simple | Optional — runs the tray applet under the user's graphical session. |
 
 After install, the daemon is enabled and started automatically:
 
 ```bash
-systemctl --user is-enabled recmeet-daemon.service
-systemctl --user status   recmeet-daemon.service
-journalctl --user -u recmeet-daemon.service -f
+systemctl --user is-enabled recmeet-server.service
+systemctl --user status   recmeet-server.service
+journalctl --user -u recmeet-server.service -f
 ```
 
 ### System-wide service (multi-user host)
@@ -369,7 +369,7 @@ journalctl --user -u recmeet-daemon.service -f
 The shipped unit is a `--user` unit and runs as the invoking user. To run a single daemon for multiple users, write a custom system unit:
 
 ```ini
-# /etc/systemd/system/recmeet-daemon.service
+# /etc/systemd/system/recmeet-server.service
 [Unit]
 Description=Recmeet Daemon (system-wide)
 
@@ -378,7 +378,7 @@ Type=simple
 User=recmeet
 Group=recmeet
 EnvironmentFile=/etc/recmeet/daemon.env
-ExecStart=/usr/local/bin/recmeet-daemon --listen 0.0.0.0:29991
+ExecStart=/usr/local/bin/recmeet-server --listen 0.0.0.0:29991
 Restart=on-failure
 RestartSec=5
 
@@ -401,7 +401,7 @@ install -m 0600 -o recmeet -g recmeet /dev/stdin /etc/recmeet/daemon.env <<EOF
 RECMEET_AUTH_TOKEN=$(openssl rand -hex 32)
 EOF
 systemctl daemon-reload
-systemctl enable --now recmeet-daemon.service
+systemctl enable --now recmeet-server.service
 ```
 
 Caveats:
@@ -411,7 +411,7 @@ Caveats:
 
 ### Socket activation
 
-`recmeet-daemon.socket` is installed alongside the service unit but **not consumed**. The daemon does its own `bind()` + `listen()` (see `src/daemon.cpp` `--listen` handling). Enabling `recmeet-daemon.socket` does nothing useful today. Track this if socket activation matters to you; the unit is shipped as a placeholder for future wiring.
+`recmeet-server.socket` is installed alongside the service unit but **not consumed**. The daemon does its own `bind()` + `listen()` (see `src/daemon.cpp` `--listen` handling). Enabling `recmeet-server.socket` does nothing useful today. Track this if socket activation matters to you; the unit is shipped as a placeholder for future wiring.
 
 ## Storage and capacity planning
 
@@ -451,7 +451,7 @@ Postprocess uploads stage under `fs::temp_directory_path()` (effectively `/tmp` 
 
 Cleanup is best-effort on subprocess exit and `UploadSession` destruction. Orphans can accumulate if the daemon crashes, the kill-grace machine fails to clean up its child, or `tmpfs` is not auto-reaped on reboot. Plan for one of:
 
-- Periodic daemon restart (the unit's `RestartSec` and a daily `systemctl --user restart recmeet-daemon.service` cron).
+- Periodic daemon restart (the unit's `RestartSec` and a daily `systemctl --user restart recmeet-server.service` cron).
 - Mounting `/tmp` as `tmpfs` so it clears on reboot (the default on most modern distros).
 - A cron sweep: `find /tmp -maxdepth 1 -name 'recmeet-*' -mtime +1 -exec rm -rf {} +`.
 
@@ -460,7 +460,7 @@ Cleanup is best-effort on subprocess exit and `UploadSession` destruction. Orpha
 ### Liveness
 
 ```bash
-recmeet --daemon-addr server:29991 --status
+recmeet-cli --daemon-addr server:29991 --status
 ```
 
 The verb is `status.get`. The response is:
@@ -487,7 +487,7 @@ There is no separate readiness probe today. Liveness is readiness — the daemon
 
 No first-class metrics endpoint today. Workarounds:
 
-- `recmeet --daemon-addr ... --status` for state polling.
+- `recmeet-cli --daemon-addr ... --status` for state polling.
 - `job.list` (via the CLI's planned `--list-jobs` surface; for now via a custom client) to enumerate per-client jobs and inspect their states.
 - Parse `~/.local/share/recmeet/logs/recmeet-*.log` for completion / error patterns.
 
@@ -525,8 +525,8 @@ Defaults of note:
 
 ## Troubleshooting
 
-**`recmeet-daemon: refusing to start TCP listener without RECMEET_AUTH_TOKEN set.`**
-Set `RECMEET_AUTH_TOKEN` in the environment before `recmeet-daemon --listen <host:port>`. There is no warn-and-continue; either set the token or switch to a Unix-socket listener via `--listen /path/to/daemon.sock`.
+**`recmeet-server: refusing to start TCP listener without RECMEET_AUTH_TOKEN set.`**
+Set `RECMEET_AUTH_TOKEN` in the environment before `recmeet-server --listen <host:port>`. There is no warn-and-continue; either set the token or switch to a Unix-socket listener via `--listen /path/to/daemon.sock`.
 
 **Client aborts with `auth.error: invalid_token`**
 The token the client sent does not match the daemon's `RECMEET_AUTH_TOKEN`. Common causes: token rotated on the server but not pushed to the client; client picked up the token from a stale `.env`; client and server reading from different shell rc files.
@@ -535,7 +535,7 @@ The token the client sent does not match the daemon's `RECMEET_AUTH_TOKEN`. Comm
 The client's first frame was something other than `{"type":"auth.token","token":"..."}`. Either the client is configured for Unix (which skips PSK) but is connecting to a TCP listener, or its build predates Phase A.1.
 
 **Connection drops immediately after `auth.ok`, log mentions protocol version**
-Client and daemon were built from different protocol revisions. `IPC_PROTOCOL_VERSION = 3` is stamped into every `auth.ok` frame; mismatch aborts the connection on the client side. Rebuild both ends from the same revision. Useful diagnostic: `recmeet --version` and `recmeet-daemon --version`.
+Client and daemon were built from different protocol revisions. `IPC_PROTOCOL_VERSION = 3` is stamped into every `auth.ok` frame; mismatch aborts the connection on the client side. Rebuild both ends from the same revision. Useful diagnostic: `recmeet-cli --version` and `recmeet-server --version`.
 
 **`Method not found` on a `record.start` request**
 The client is V1; the daemon is V2 (or vice versa). `record.start`, `record.stop`, `job.context`, `sources.list`, and `config.update` were removed in Phase C.9 / A.6. V2 clients submit work via `process.submit` (file uploads) or `process.stream` (live audio). Update the client.
@@ -554,7 +554,7 @@ ipc:
 The relevant slot is occupied AND the slot's FIFO is also at its policy limit. In V2 the postprocess slot queues additional submissions rather than rejecting them, so `Busy` is rare — when it does fire it usually means the streaming slot or model-download slot is already in use and the verb's target slot has a hard reject policy. Check `job.list` to see what is in flight.
 
 **Subprocess crash mid-postprocess**
-Each postprocess job runs in a fresh `recmeet --subprocess-mode` child for crash isolation against onnxruntime heap corruption (see `ARCHITECTURE.md` Postprocess subprocess isolation, iter 90). On crash:
+Each postprocess job runs in a fresh `recmeet-cli --subprocess-mode` child for crash isolation against onnxruntime heap corruption (see `ARCHITECTURE.md` Postprocess subprocess isolation, iter 90). On crash:
 - The daemon's `pp_worker_loop` logs the subprocess exit status.
 - The job ends in `failed` state in the job registry.
 - The originating client gets a `progress.job { phase: "failed" }` event.
@@ -563,7 +563,7 @@ Each postprocess job runs in a fresh `recmeet --subprocess-mode` child for crash
 **Long-running streaming session, RAM looks fine but `/tmp` grows**
 This is by design. The streaming session is disk-backed — incoming `0x03` PCM frames go straight to `<tmp>/recmeet-stream-<job_id>-<token>.wav` rather than buffering in RAM. RSS stays flat; `/tmp` usage grows at PCM rate. Plan disk accordingly (rough rate: 16 kHz mono S16LE = 32 kB/sec = 115 MB/hour; stereo doubles it).
 
-**`recmeet --status` from the client says "daemon not running" but the server's `systemctl status` is green**
+**`recmeet-cli --status` from the client says "daemon not running" but the server's `systemctl status` is green**
 Check that `--daemon-addr` (or `RECMEET_DAEMON_ADDR`) on the client side points to the right host and port. Check that the daemon's `--listen` is on a reachable interface (not `127.0.0.1` if the client is remote). Check that there is no firewall (`ufw`, `iptables`, security group) blocking the port on the daemon side.
 
 ## Migration from V1 (forward-looking)
