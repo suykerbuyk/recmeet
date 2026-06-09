@@ -301,9 +301,17 @@ endif()
 # fallback for `.monitor` sources) joined this lib because the only
 # remaining consumer is the live-recording path (`run_recording` in
 # `src/live_recording.cpp`), which now lives in `recmeet_live_capture`.
+#
+# v2-dual-source-recording Phase 1.0: `audio_mixer.cpp` (in-memory S16LE PCM
+# buffer helpers — `mix_audio` + `validate_min_duration`) moved here from
+# `recmeet_core` so the tray (`recmeet-client`, which links recmeet_capture
+# but NOT recmeet_core) can mix mic+monitor offline at Stop. Its sole prior
+# caller, `live_recording.cpp`, still reaches it via recmeet_live_capture's
+# recmeet_capture link.
 set(CAPTURE_SOURCES
     src/audio_capture.cpp
     src/audio_monitor.cpp
+    src/audio_mixer.cpp
     src/device_enum.cpp
     src/tray_capture.cpp
 )
@@ -323,7 +331,6 @@ target_link_libraries(recmeet_capture PUBLIC
 # PulseAudio. The daemon links only `recmeet_core` and stays capture-free.
 set(CORE_SOURCES
     src/audio_file.cpp
-    src/audio_mixer.cpp
     src/job_queue.cpp
     src/model_manager.cpp
     src/transcribe.cpp

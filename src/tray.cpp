@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 #include "audio_capture.h"
+#include "audio_mixer.h"
+#include "audio_monitor.h"
 #include "caption_format.h"
 #include "config.h"
 #include "config_json.h"
@@ -265,6 +267,24 @@ struct TrayState {
         std::vector<int16_t> stream_buffer;
         std::string stream_token;       // empty → no live streaming session
         guint stream_pump_id = 0;       // GTK timeout draining stream_buffer
+
+        // v2-dual-source-recording Phase 1.1 — monitor (system-audio)
+        // capture for dual-source recording. Exactly ONE of pw_monitor /
+        // mon_pa is active per recording (V1 pattern,
+        // live_recording.cpp:316-341): a `.monitor` source name goes
+        // straight to PulseMonitorCapture; any other sink name tries
+        // PipeWireCapture(capture_sink=true) and falls back to
+        // PulseMonitorCapture on failure. Unlike the mic, the monitor has a
+        // single consumer (the offline mix at Stop) and is neither streamed
+        // nor captioned, so there is NO external buffer/mutex/subscriber —
+        // both capture classes append every chunk to an internal vector
+        // regardless of callbacks (audio_capture.cpp:83-84,
+        // audio_monitor.cpp), and we `drain()` once at Stop and mix offline
+        // (§H). `dual_mode` reflects whether a monitor capture is actually
+        // live; it gates the monitor teardown/mix across stop/cancel.
+        std::unique_ptr<PipeWireCapture> pw_monitor;
+        std::unique_ptr<PulseMonitorCapture> mon_pa;
+        bool dual_mode = false;
     } capture_state;
 
     // test-and-verification-hardening item #4 — "Cancel & Discard" tray
@@ -1714,9 +1734,62 @@ std::string tray_resolve_mic_source() {
     return "";
 }
 
+// v2-dual-source-recording — resolve the monitor (system-audio loopback)
+// source for dual-source recording. Priority mirrors
+// tray_resolve_mic_source: explicit g_tray.cfg.monitor_source >
+// device_pattern auto-detect (.monitor) > empty. Empty means "no monitor
+// found" — the caller records mic-only with a warning (V1 parity,
+// live_recording.cpp:257-269). Echo rule (§E): only DetectedSources.monitor
+// — a real sink loopback — is auto-selected; we never synthesize
+// `mic_source + ".monitor"`, which would double-count local voice.
+std::string tray_resolve_monitor_source() {
+    if (!g_tray.cfg.monitor_source.empty()) return g_tray.cfg.monitor_source;
+    try {
+        auto detected = detect_sources(g_tray.cfg.device_pattern);
+        if (!detected.monitor.empty()) return detected.monitor;
+    } catch (const std::exception& e) {
+        log_warn("[tray] detect_sources (monitor) failed: %s", e.what());
+    }
+    return "";
+}
+
+// v2-dual-source-recording §C — shared monitor-capture teardown for the
+// dual-source Stop and Cancel paths (one source of truth so the two never
+// diverge). Stops whichever monitor capture is live (pw_monitor XOR mon_pa),
+// drains its internal buffer, resets the owning unique_ptr, and clears
+// `dual_mode`. Returns the drained samples: Stop mixes them, Cancel discards
+// them. No-op returning empty when no monitor is active (single-mic
+// recording). The mic capture is torn down separately by the caller because
+// its ordering (relative to the streaming session + wav_buffer drain)
+// differs between Stop and Cancel.
+std::vector<int16_t> tray_teardown_monitor_capture() {
+    std::vector<int16_t> out;
+    if (g_tray.capture_state.pw_monitor) {
+        g_tray.capture_state.pw_monitor->stop();
+        out = g_tray.capture_state.pw_monitor->drain();
+        g_tray.capture_state.pw_monitor.reset();
+    } else if (g_tray.capture_state.mon_pa) {
+        g_tray.capture_state.mon_pa->stop();
+        out = g_tray.capture_state.mon_pa->drain();
+        g_tray.capture_state.mon_pa.reset();
+    }
+    g_tray.capture_state.dual_mode = false;
+    return out;
+}
+
 }  // anonymous namespace
 
 namespace tray {
+
+// v2-dual-source-recording §G — parameters for start_capture. The legacy
+// single-mic call site set only `mic_source`; dual-source recording also
+// passes a resolved `monitor_source` and sets `dual_mode = true`. An empty
+// `monitor_source` (or `dual_mode == false`) selects the single-mic path.
+struct CaptureStartParams {
+    std::string mic_source;
+    std::string monitor_source;   // empty → not dual
+    bool dual_mode = false;
+};
 
 // Phase B.2 — start local capture. Idempotent: returns false if a
 // capture is already running. On success:
@@ -1729,8 +1802,16 @@ namespace tray {
 //     without coordination.
 //
 // `err_msg` is populated with an operator-facing message on failure.
-bool start_capture(const std::string& mic_source, std::string& err_msg) {
-    if (g_tray.capture_state.pw) {
+//
+// v2-dual-source-recording §G — params struct so the caller can request
+// dual-source (mic + monitor) capture. `monitor_source` empty / `dual_mode`
+// false → today's single-mic path, unchanged.
+bool start_capture(const CaptureStartParams& params, std::string& err_msg) {
+    const std::string& mic_source = params.mic_source;
+    // Idempotency guard: refuse if ANY capture (mic OR monitor) is live, not
+    // just the mic — a half-torn-down dual session must not be re-entered.
+    if (g_tray.capture_state.pw || g_tray.capture_state.pw_monitor ||
+        g_tray.capture_state.mon_pa) {
         err_msg = "capture already running";
         return false;
     }
@@ -1800,8 +1881,59 @@ bool start_capture(const std::string& mic_source, std::string& err_msg) {
         return false;
     }
 
-    log_info("[tray] capture started: source=%s wav=%s",
-             mic_source.c_str(), wav_path.c_str());
+    // v2-dual-source-recording §B — start the monitor capture for dual mode.
+    // The mic above is already capturing; a monitor that fails to open
+    // degrades to mic-only with a warning (acceptance: "not a hard failure")
+    // rather than aborting an in-progress recording. V1 branching
+    // (live_recording.cpp:316-341): a `.monitor` name uses pa_simple
+    // directly; any other sink name tries PipeWire CAPTURE_SINK then falls
+    // back to pa_simple.
+    g_tray.capture_state.dual_mode = false;
+    if (params.dual_mode && !params.monitor_source.empty()) {
+        const std::string& mon = params.monitor_source;
+        const std::string suffix = ".monitor";
+        bool is_pa_monitor =
+            mon.size() >= suffix.size() &&
+            mon.compare(mon.size() - suffix.size(), suffix.size(), suffix) == 0;
+        try {
+            if (is_pa_monitor) {
+                g_tray.capture_state.mon_pa =
+                    std::make_unique<PulseMonitorCapture>(mon);
+                g_tray.capture_state.mon_pa->start();
+            } else {
+                try {
+                    g_tray.capture_state.pw_monitor =
+                        std::make_unique<PipeWireCapture>(mon, /*capture_sink=*/true);
+                    g_tray.capture_state.pw_monitor->start();
+                } catch (const RecmeetError& e) {
+                    log_warn("[tray] PipeWire monitor failed (%s); "
+                             "falling back to pa_simple", e.what());
+                    g_tray.capture_state.pw_monitor.reset();
+                    g_tray.capture_state.mon_pa =
+                        std::make_unique<PulseMonitorCapture>(mon);
+                    g_tray.capture_state.mon_pa->start();
+                }
+            }
+            g_tray.capture_state.dual_mode = true;
+            // Provenance only — stored in the sidecar `mic_source` field, never
+            // re-opened as a device.
+            g_tray.capture_state.wav_source = mic_source + "+" + mon;
+            log_info("[tray] dual-source capture: mic=%s monitor=%s (%s)",
+                     mic_source.c_str(), mon.c_str(),
+                     g_tray.capture_state.pw_monitor ? "pipewire" : "pulse");
+        } catch (const std::exception& e) {
+            // Monitor unavailable → degrade to mic-only (non-fatal).
+            log_warn("[tray] monitor capture failed (%s); recording mic only",
+                     e.what());
+            g_tray.capture_state.pw_monitor.reset();
+            g_tray.capture_state.mon_pa.reset();
+            g_tray.capture_state.dual_mode = false;
+        }
+    }
+
+    log_info("[tray] capture started: source=%s wav=%s dual=%d",
+             mic_source.c_str(), wav_path.c_str(),
+             (int)g_tray.capture_state.dual_mode);
     return true;
 }
 
@@ -1857,15 +1989,45 @@ bool stop_capture(std::string& err_msg) {
     g_tray.capture_state.pw.reset();
     g_tray.capture_state.wav_handle = 0;
 
+    // v2-dual-source-recording §H — tear down the monitor capture too and
+    // drain its internal buffer (no external buffer; both capture classes
+    // accumulate every chunk internally). Mirrors V1 stop ordering
+    // (live_recording.cpp:359-371): stop, then drain. `had_monitor` is
+    // captured before the teardown resets the unique_ptrs.
+    const bool had_monitor =
+        g_tray.capture_state.pw_monitor || g_tray.capture_state.mon_pa;
+    std::vector<int16_t> mon_samples = tray_teardown_monitor_capture();
+
     std::vector<int16_t> drained;
     {
         std::lock_guard<std::mutex> lk(g_tray.capture_state.wav_mtx);
         drained.swap(g_tray.capture_state.wav_buffer);
     }
 
+    // v2-dual-source-recording §4/§F — offline mix at Stop. A single
+    // mix_audio() call over the two complete buffers (zero cumulative
+    // drift). finalize_dual_mix applies the non-fatal monitor gate: a
+    // silent/short monitor degrades to mic-only (V1
+    // live_recording.cpp:382-397). The mic buffer is always preserved for
+    // the operator's Submit/Save choice.
+    std::vector<int16_t> staged;
+    if (had_monitor) {
+        auto res = recmeet::finalize_dual_mix(std::move(drained),
+                                              std::move(mon_samples), 1.0);
+        staged = std::move(res.audio);
+        if (res.mixed)
+            log_info("[tray] dual-source mixed to %zu samples", staged.size());
+        else
+            log_warn("[tray] monitor audio unusable; staged mic only "
+                     "(%zu samples)", staged.size());
+    } else {
+        staged = std::move(drained);
+    }
+    // dual_mode already cleared by tray_teardown_monitor_capture() above.
+
     fs::path wav_path = g_tray.capture_state.wav_path;
     std::string write_err;
-    if (!tray_capture::write_wav(wav_path, drained, write_err)) {
+    if (!tray_capture::write_wav(wav_path, staged, write_err)) {
         err_msg = "WAV write failed: " + write_err;
         // Don't leave a half-written file around.
         std::error_code ec;
@@ -1879,7 +2041,7 @@ bool stop_capture(std::string& err_msg) {
 
     g_tray.capture_state.waiting_disposition = true;
     log_info("[tray] capture stopped: %zu samples written to %s",
-             drained.size(), wav_path.c_str());
+             staged.size(), wav_path.c_str());
     return true;
 }
 
@@ -2003,8 +2165,24 @@ static void on_record(GtkMenuItem*, gpointer) {
         return;
     }
 
+    // v2-dual-source-recording §D — resolve the monitor (system-audio)
+    // source for dual-mode capture. `mic_only` short-circuits to single
+    // source (today's path); otherwise auto-detect/resolve a `.monitor`
+    // loopback. An empty monitor in non-mic_only mode records mic-only with
+    // a warning (V1 parity, live_recording.cpp:257-269).
+    tray::CaptureStartParams cap_params;
+    cap_params.mic_source = mic_source;
+    if (!g_tray.cfg.mic_only) {
+        cap_params.monitor_source = tray_resolve_monitor_source();
+        if (!cap_params.monitor_source.empty()) {
+            cap_params.dual_mode = true;
+        } else {
+            log_warn("[tray] no monitor source found — recording mic only");
+        }
+    }
+
     std::string start_err;
-    if (!tray::start_capture(mic_source, start_err)) {
+    if (!tray::start_capture(cap_params, start_err)) {
         notify("Recording failed", start_err);
         log_error("[tray] start_capture failed: %s", start_err.c_str());
         return;
@@ -2196,11 +2374,14 @@ namespace tray {
 //   * meeting_id                          — UUID v4 minted at start_capture
 //   * waiting_disposition                 — dialog-pending flag (false ==
 //                                           Idle)
-// Does NOT touch the unique_ptr `pw`, the `wav_buffer`, or the streaming
-// fields; those have lifecycle owners (stop_capture / cancel_capture)
-// because the order of teardown matters (the RT thread must quiesce
-// before the buffer can be safely drained, and the streaming session
-// must be cancelled on the daemon side before the GTK pump retires).
+// Does NOT touch the unique_ptr `pw`, the monitor captures (`pw_monitor` /
+// `mon_pa`), the `wav_buffer`, or the streaming fields; those have lifecycle
+// owners (stop_capture / cancel_capture) because the order of teardown
+// matters (the RT thread must quiesce before the buffer can be safely
+// drained, and the streaming session must be cancelled on the daemon side
+// before the GTK pump retires). The `dual_mode` flag IS reset here (it is a
+// plain bool like `waiting_disposition`, already cleared by stop/cancel; the
+// re-assert keeps the Idle defaults uniform across every disposition path).
 //
 // Called from FOUR places, all reset to the same Idle field defaults:
 //   * apply_discard           (state 2: post-Stop dialog Discard)
@@ -2218,6 +2399,7 @@ static void clear_capture_fields() {
     g_tray.capture_state.wav_source.clear();
     g_tray.capture_state.meeting_id.clear();
     g_tray.capture_state.waiting_disposition = false;
+    g_tray.capture_state.dual_mode = false;
 }
 
 // Discard the staged WAV immediately. Plan acceptance line: "Discard-
@@ -2568,6 +2750,13 @@ bool cancel_capture() {
     g_tray.capture_state.pw->stop();
     g_tray.capture_state.pw.reset();
     g_tray.capture_state.wav_handle = 0;
+
+    // v2-dual-source-recording §C — tear down the monitor capture too.
+    // Cancel discards all audio, so the drained monitor samples are dropped
+    // on the floor (the shared helper drains + resets; without this a
+    // cancelled dual recording would leak the monitor's pw_thread_loop /
+    // Pulse thread).
+    (void)tray_teardown_monitor_capture();
 
     // Step 3: drop the buffered samples WITHOUT writing a WAV. This is
     // the core behavioral difference vs stop_capture — `write_wav` is

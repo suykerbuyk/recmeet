@@ -63,7 +63,7 @@ CMake builds four static libraries — `recmeet_ipc`, `recmeet_capture`, `recmee
 | Library | Source | Holds | Links |
 |---|---|---|---|
 | `recmeet_ipc` | `src/ipc_*`, `src/config*`, `src/session_merge.cpp`, `src/fetch_artifacts.cpp` | Wire protocol, framing, session-credential merge, artifact enumeration | Threads, CURL, (libnotify) |
-| `recmeet_capture` | `src/audio_capture.cpp`, `src/audio_monitor.cpp`, `src/device_enum.cpp`, `src/tray_capture.cpp` | PipeWire + PulseAudio capture, source enumeration, tray's fan-out shim | `recmeet_ipc`, PIPEWIRE, PULSE, PULSE_SIMPLE, SNDFILE |
+| `recmeet_capture` | `src/audio_capture.cpp`, `src/audio_monitor.cpp`, `src/audio_mixer.cpp`, `src/device_enum.cpp`, `src/tray_capture.cpp` | PipeWire + PulseAudio capture, source enumeration, mic+monitor mix helpers (`mix_audio` / `finalize_dual_mix` / `validate_min_duration`), tray's fan-out shim | `recmeet_ipc`, PIPEWIRE, PULSE, PULSE_SIMPLE, SNDFILE |
 | `recmeet_core` | ML pipeline (`pipeline.cpp`, `transcribe.cpp`, `diarize.cpp`, `summarize.cpp`, `note.cpp`, `speaker_id.cpp`, `vad.cpp`, `caption_engine.cpp`), plus C.7 `job_queue.cpp`, C.10a `streaming_session.cpp`, C.2 `upload_session.cpp`, C.8 `diarization_cache.cpp` | Postprocess pipeline, server-side JobQueue, server-side upload + streaming session managers, diarization cache | `recmeet_ipc`, SNDFILE, whisper, (llama), (sherpa) |
 | `recmeet_live_capture` | `src/live_recording.cpp`, `src/reprocess_batch.cpp` | `run_recording()` / `run_pipeline()` for the standalone CLI; batch reprocess driver | `recmeet_core`, `recmeet_capture` |
 
@@ -253,9 +253,10 @@ A GTK system tray applet using ayatana-appindicator. In V2 the tray **owns local
 
 The tray owns:
 
-- A `PipeWireCapture` (or `PulseMonitorCapture` for monitor sources) instance.
-- A `wav_buffer` of int16 samples protected by `wav_mtx`; `start_capture()` clears it, the capture's audio callback appends on every chunk, `stop_capture()` drains it to a staging WAV under `$XDG_RUNTIME_DIR/recmeet/staging/`.
-- When live captions are enabled, a second fan-out subscriber that pumps the same audio frames to a `process.stream` session on the daemon (stacking the streaming feed on top of the WAV staging feed — both consume from the same capture).
+- A mic `PipeWireCapture` instance.
+- A `wav_buffer` of int16 samples protected by `wav_mtx`; `start_capture()` clears it, the mic capture's audio callback appends on every chunk, `stop_capture()` drains it to a staging WAV under `client_data_dir()/staging/` (`~/.local/share/recmeet-client/staging/`).
+- When live captions are enabled, a second fan-out subscriber that pumps the same audio frames to a `process.stream` session on the daemon (stacking the streaming feed on top of the WAV staging feed — both consume from the same mic capture).
+- **Dual-source (mic + system audio):** when `mic_only` is false and a monitor source resolves, a *second* capture for the system-audio loopback — `pw_monitor` (`PipeWireCapture` with `capture_sink`) for sink names, or `mon_pa` (`PulseMonitorCapture`) for `.monitor` names / on PipeWire failure (V1 backend rules). The monitor has a single consumer and is neither streamed nor captioned, so it uses no external buffer — both capture classes accumulate internally and the tray `drain()`s the monitor once at Stop. `stop_capture()` then mixes mic+monitor offline via a single `mix_audio()` call (`finalize_dual_mix`, in `recmeet_capture`) into the one staging WAV — zero cumulative drift. A silent/short/unopenable monitor degrades to mic-only with a warning (never a hard failure); `mic_only = true` keeps the single-mic path. See `v2-dual-source-recording`.
 
 After capture stops the tray is in a `waiting_disposition` state — the operator picks **Submit** (send to daemon via `process.submit` + `0x01` upload frames), **Save** (keep the WAV on disk), or **Discard** (unlink).
 
